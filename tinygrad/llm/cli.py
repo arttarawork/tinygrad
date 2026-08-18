@@ -140,7 +140,7 @@ def main():
   args = parser.parse_args()
 
   # load the model
-  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, args.device_map)
+  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, device_map=args.device_map)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "

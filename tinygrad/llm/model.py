@@ -405,7 +405,7 @@ class Transformer:
     return self.jit[(resolve(tokens.shape[1] != 1), temperature is None)](tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, device_map:str|dict[int,str]|None=None,
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, *, device_map:str|dict[int,str]|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
