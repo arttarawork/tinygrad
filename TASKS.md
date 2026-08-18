@@ -141,9 +141,12 @@ can be built and proven before the dock ships.
   per-layer KV-cache device (`model.py:200-204`), boundary copies at the `@function` block seam
   (`model.py:145-151`). Prototype homogeneous first: `("CPU:0","CPU:1")` / NULL.
   *Done when:* a model runs split across two same-backend devices with correct output.
-- **T3.2 — Heterogeneous pipeline: METAL+CPU rehearsal** `[MAC]` deps: T3.1
-  Swap one side for CPU. Verify only COPY crosses backends, JIT capture degrades gracefully to
-  per-backend graphs + eager boundary copies, and measure boundary cost/token.
+- **T3.2 — Heterogeneous pipeline: METAL+CPU rehearsal** `[MAC]` deps: T3.1 ✅
+  Swap one side for CPU. T3.1 already proved (homogeneous): mixed-device JIT capture works with no
+  fallback, only COPY spans devices, and graph batching forms per-backend islands (METAL graphed,
+  CPU sequential) — exactly the Stage A shape. Remaining here: do it cross-BACKEND, measure
+  boundary cost/token, and **force realize for split models** (unrealized lazy initializers get
+  captured and re-run every step — T3.1 finding).
   *Done when:* qwen3-8b runs layers split METAL/CPU, output correct, boundary cost quantified.
 - **T3.3 — MoE placement policy** `[MAC]` deps: T3.2 (WS3.A)
   Sub-layer split: attention+norms+KV on device A, routed-expert FFN tensors on device B
@@ -216,7 +219,7 @@ flowchart LR
 | 2026-08-18 | T1.4 | **done (premise refuted)** | `task/T1.4-topk-1kernel` | `d24bdb713` (+19, tests only): topk is already 1 kernel in-model; 1 is the rangeify floor. Tie-exact + kernel-count tests pin it. 388 tests + mypy + ruff green. Design-doc "4 routing kernels" claim corrected. |
 | 2026-08-18 | T1.5 | **done** | `task/T1.5-temp0-rng` | `f53ceb67f` (+51/−7): greedy uses `temperature=None` sentinel from `generate()`; jits keyed `(is_prefill, greedy)` — no recapture thrash. THREEFRY gone from temp-0 graph (rollout 35→33 kernels/token; RNG was full-vocab). Tests+mypy+ruff green. Note: old temp-0 path broke logit ties randomly; argmax (lowest index) is now the semantics. |
 | 2026-08-18 | T1.6 | **done** | `task/T1.6-jit-input-cache` | `b5ddb2797` (+17/−3, jit.py only): caches per-input `substitute`+`unbind_all` keyed on view structure (interned-UOp identity; unsound-key guard + 32-entry cap). `_prepare_jit_inputs` 51.6→22.6 µs/call (−56%). 126 jit tests + mypy + ruff green. Note: `test/test_jit.py` doesn't exist at baseline — suites are `test/backend/test_jit.py` + `test/unit/test_jit*.py`. |
-| 2026-08-18 | T3.1 | agent running | `task/T3.1-device-map` | wave 1 |
+| 2026-08-18 | T3.1 | **done** | `task/T3.1-device-map` | `59d1eb2dd` (+88/−6): `parse_device_map` (ranges/auto-even/dict) + `--device-map`; placement before `load_state_dict`; `.to()` seam in forward (zero-cost when trivial). Split CPU:0/CPU:1 tokens identical to single-device; KV+freqs follow activations for free. **JIT captures the mixed trace end-to-end** — only COPY spans devices (asserted per captured call). Found upstream fused-rand_like bug (see memory.md §4). Tests+mypy+ruff green. |
 
 ## Parallelization notes
 

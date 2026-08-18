@@ -109,6 +109,22 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   fp16 memory; the design doc's kernel work aims to make the default (fused dequant) win outright.
 
 ### Multi-device extras
+- **T3.1 findings (2026-08-18, `task/T3.1-device-map`):** mixed-device (CPU:0/CPU:1) TinyJit
+  capture works end-to-end with no fallback — rollout 63 PROGRAM + 3 COPY calls, only COPY spans
+  devices, same-device assert never fires. KV cache + freqs_cis follow activations via
+  `_init_state`'s `x.device` — no extra plumbing. Graph batching forms per-backend islands
+  (METAL graphed, CPU sequential). **No free-memory query exists in Device/Allocator** (auto
+  device_map splits evenly by layer count instead). Caveat: unrealized weights on a non-default
+  map capture their lazy initializers into the JIT (re-run every step) — force realize for splits.
+- **UPSTREAM BUG (found by T3.1, exists at baseline `af2a43c85`, unfixed):** at `temperature=0`,
+  `generate()` can emit a non-greedy token when `temperature` is a realized buffer (which
+  `_prepare_jit_inputs` forces) and the whole symbolic prefill graph fuses — `Tensor.rand_like`
+  fused into the sampling/argmax chain computes wrong values (`u.realize()` fixes; top-2 logit gap
+  1.5e10 rules out legitimate noise). Reproduces on METAL and CPU; sequence-dependent via
+  `manual_seed`'s lazy-const device seed changing fusion. Note: T1.5's temp-0 RNG removal
+  *sidesteps* this in the greedy path, but the miscomputed fused rand may still corrupt temp>0
+  sampling — needs a minimal upstream repro (scripts were in the T3.1 session scratchpad:
+  `symprobe3.py symcrt`, `exprprobe2.py`; may need regeneration).
 - 2-device allreduce is always NAIVE (full buffer each way) regardless of size — ring only kicks
   in at ndev>2 and >256k elements (`allreduce.py`, `RING=1` default). For Metal+NV pooling this
   is another reason WS3 chose pipeline over tensor-parallel.
