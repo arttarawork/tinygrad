@@ -13,17 +13,24 @@ V_TOKS = UOp.variable("toks", 1, 32)  # 32 is the default chunk_size in generate
 class TestTransformerGenerate(unittest.TestCase):
   def test_warmup(self):
     model, calls = Transformer(TEST_CONFIG), []
-    def generate(tokens, **kwargs):
-      calls.append(tokens)
+    def generate(tokens, temperature=0.0, **kwargs):
+      calls.append((tokens, temperature))
       yield from (1, 2)
     with patch.object(model, "generate", generate): model.warmup()
-    self.assertEqual(calls, [[0], [0]])
+    # warms both the greedy (temperature=0.0) and sampled (temperature>0) jit pairs
+    self.assertEqual(calls, [([0], 0.0), ([0], 0.0), ([0], 1.0), ([0], 1.0)])
 
   def test_warmup_then_generate_with_default_chunk(self):
     # warmup must not capture JIT graphs that generate()'s default chunk_size then rejects
     model = Transformer(TEST_CONFIG)
     model.warmup()
     self.assertIsInstance(next(model.generate([5, 6, 7, 8])), int)
+
+  def test_warmup_captures_sampled_jit(self):
+    # a nonzero-temperature request must not pay a mid-request JIT capture (F4)
+    model = Transformer(TEST_CONFIG)
+    model.warmup()
+    for key, jit in model.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
   def test_first_recurrent_generate_before_state_init(self):
     model = Transformer(TEST_CONFIG)

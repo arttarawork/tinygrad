@@ -489,7 +489,9 @@ class Transformer:
     return model, kv
 
   def warmup(self):
-    for _ in range(2): list(zip(range(2), self.generate([0])))
+    # warm both the greedy and sampled jit pairs, so a request doesn't pay a mid-request capture for whichever it hits first
+    for temperature in (0.0, 1.0):
+      for _ in range(2): list(zip(range(2), self.generate([0], temperature=temperature)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
