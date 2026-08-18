@@ -40,9 +40,10 @@ class TestDeviceMapModel(unittest.TestCase):
     self.assertEqual([b.freqs_cis.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
 
     # the JIT captured the mixed-device trace: only COPY calls touch two devices, compute kernels are single-device
-    self.assertIsNotNone(split.rollout_jit.captured)
+    rollout_jit = split.jit[(False, True)]  # (is_prefill, greedy): generate() defaults to temperature=0
+    self.assertIsNotNone(rollout_jit.captured)
     copies = []
-    for call in split.rollout_jit.captured.linear.src:
+    for call in rollout_jit.captured.linear.src:
       devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
       if call.src[0].op is Ops.COPY: copies.append((devs, call.src[0].arg))
       else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
