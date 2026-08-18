@@ -12,8 +12,9 @@ Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line ref
 ## Machine roles
 - **MacBook M3 Pro 36 GB** (`ENV:MAC`): Metal perf work, mock-NV, METAL+CPU pooling rehearsal.
   Until the eGPU dock (AOOSTAR AG02) arrives, `DOCK`-tagged tasks are blocked.
-- **Bazzite box, RX 9070 XT** (`ENV:AMD`): HCQ testbed via `DEV=AMD` (KFD iface only —
-  never the AM/PCI driver path there; it unbinds amdgpu and kills the display).
+- **Bazzite box, RX 9070 XT** (`ENV:AMD`): descoped 2026-08-18 (AMD is not a target; shared-HCQ
+  validation goes via mock-NV + rented 3090 instead — see TASKS.md T0.2/T2.1). If ever revived:
+  KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
 - Branch `task/T<id>-<slug>` off the baseline `af2a43c85` (== `origin/master`; there is no local

@@ -24,7 +24,7 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 |---|---|
 | `ANY` | pure code; NULL/CPU device is enough (kernel-count and scheduling tests run on `DEV=NULL`) |
 | `MAC` | the MacBook M3 Pro — Metal backend, real perf numbers today |
-| `AMD` | the Bazzite box w/ RX 9070 XT — real-HCQ testbed via `DEV=AMD` (KFD). **Never** use the AM/PCI driver path there: it unbinds `amdgpu` and kills the display. Needs T0.2 verification (RDNA4/gfx1201). |
+| `AMD` | (descoped 2026-08-18 — see T0.2; kept for the footgun note) the Bazzite box w/ RX 9070 XT. **Never** use the AM/PCI driver path there: it unbinds `amdgpu` and kills the display. |
 | `MOCKNV` | NV backend under gpuocelot PTX emulation (`extra/setup_mock_nv_osx.sh`; `MOCKIface` is `NVDevice.ifaces[2]`, `ops_nv.py:583-586`) — functional correctness only, no perf |
 | `CLOUD3090` | optional: a rented Linux 3090 (vast.ai etc.) runs the same NV backend/kernels via `NVKIface` — real sm_86 perf for kernel work before the dock arrives |
 | `DOCK` | blocked on the AG02 + TinyGPU |
@@ -37,10 +37,10 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   Clone on the Mac; run `python -m tinygrad.llm -m qwen3:8b --benchmark --warmup` (and qwen3.6:27b,
   qwen3-30b-a3b) on `DEV=METAL`, with and without `JITBEAM=2`; same GGUFs through `llama-bench` (Metal).
   *Done when:* a committed CSV/table of load / prefill / decode tok/s for ≥3 models × both stacks.
-- **T0.2 — Verify the 9070 XT as an HCQ testbed** `[AMD]` deps: —
-  `DEV=AMD python -m tinygrad.llm -m qwen3:8b --benchmark` on Bazzite via the KFD iface (display-safe).
-  Record whether gfx1201 compiles/runs; if not, note failure mode and fall back to `_mock(KFDIface)`.
-  *Done when:* a short report: works / partially / mock-only, with errors verbatim.
+- **T0.2 — ~~Verify the 9070 XT as an HCQ testbed~~ DESCOPED (2026-08-18)** `[AMD]`
+  AMD is not a target; the box was only a real-HCQ stand-in for validating shared `hcq.py` changes
+  pre-dock. That role is covered better by `CLOUD3090` (same backend as target, NVKIface) and by
+  upstream CI's AMD runners. Revive only if a cheap local HCQ sanity-check ever beats renting.
 - **T0.3 — Bench harness** `[MAC]` deps: T0.1 (WS5.1)
   One script: same GGUF → `tinygrad.llm` + `llama-bench`, emits CSV (model, dev, flags, load s,
   prefill t/s, decode t/s, GB/s from `GlobalCounters`). Validated on Metal now; reused on NV later.
@@ -93,10 +93,11 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 
 ### T2 · Transport & runtime (WS2) — build now, tune on dock
 
-- **T2.1 — Parallelize `_copyout`** `[AMD or MOCKNV]` deps: T0.2 or T0.4 (WS2.2)
+- **T2.1 — Parallelize `_copyout`** `[MOCKNV→CLOUD3090]` deps: T0.4 (WS2.2)
   Mirror `_copyin`'s 32×2 MB round-robin (`hcq.py:559-576`) in `_copyout` (`hcq.py:596-609`).
-  Shared HCQ code — real-hardware validation on the 9070 XT box; NV perf later.
-  *Done when:* D2H bandwidth up on AMD box; `test/device/test_hcq.py` green.
+  Shared HCQ code — write + functional-check under mock; real-hardware D2H bandwidth numbers from
+  a rented 3090 (or post-dock). Upstream CI's AMD runners cover the AMD side of `hcq.py`.
+  *Done when:* D2H bandwidth up on real NV hardware; `test/device/test_hcq.py` green.
 - **T2.2 — Batch PTE writes / defer remote validation reads** `[MOCKNV]` deps: T0.4 (WS2.3)
   `nvdev.py:48-49` writes one 8-byte PTE per socket message; `memory.py:204-213` does blocking
   readback. Add a bulk-write path + skip validation on remote ifaces. Functional under mock; the
@@ -161,7 +162,6 @@ can be built and proven before the dock ships.
 flowchart LR
   subgraph P0["Phase 0 — no dock"]
     T01[T0.1 Metal baselines] --> T03[T0.3 harness]
-    T02[T0.2 AMD testbed check]
     T04[T0.4 mock-NV]
     T03 --> T11[T1.1 fp16 KV]
     T01 --> T12[T1.2 MATVEC cast]
@@ -172,8 +172,7 @@ flowchart LR
     T01 --> T17[T1.7 PCONTIG attn]
     T01 --> T18[T1.8 attn hook]
     T01 --> T19[T1.9 stream load]
-    T02 --> T21[T2.1 copyout ||]
-    T04 --> T21
+    T04 --> T21[T2.1 copyout ||]
     T04 --> T22[T2.2 PTE batch]
     T23[T2.3 remote knobs]
     T18 --> T24[T2.4 cloud-3090 kernels]
@@ -210,7 +209,7 @@ flowchart LR
 ## Parallelization notes
 
 Independent start-now lanes for concurrent agents: **(a)** T0.1→T0.3→T1.1/T1.2 (Mac, perf),
-**(b)** T1.3 gpt-oss (Mac, model code), **(c)** T3.1→T3.2 pooling (any→Mac), **(d)** T0.4→T2.2
-(mock-NV, transport), **(e)** T0.2→T2.1 (AMD box). T1.4-1.6 are small fillers for any idle agent.
+**(b)** T1.3 gpt-oss (Mac, model code), **(c)** T3.1→T3.2 pooling (any→Mac), **(d)** T0.4→T2.1/T2.2
+(mock-NV, transport). T1.4-1.6 are small fillers for any idle agent.
 Merge-order caution: T1.1, T1.3, T2.5, and T3.1 all touch `llm/model.py` — coordinate rebases;
 T1.7 and T1.8 are alternatives racing to the same goal (first one to work wins, keep both branches).

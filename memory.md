@@ -149,6 +149,12 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   added `upstream` = tinygrad/tinygrad; no local `master` branch — task branches come off
   `af2a43c85` directly. `test/test_tiny.py` green on METAL. Launched wave-1 agents
   (T1.2, T1.4, T1.5, T1.6, T3.1) in isolated worktrees; status in TASKS.md.
+- **2026-08-18 (Artur decision): AMD lane descoped.** T0.2 dropped; T2.1 rerouted to
+  MOCKNV→CLOUD3090. Rationale: the 9070 XT box was only ever a real-HCQ stand-in for shared
+  `hcq.py` validation pre-dock; a rented Linux 3090 is the same job on the *target* backend
+  (NVKIface/sm_86) for ~$0.20/hr, and upstream CI's AMD runners cover the AMD side of any
+  `hcq.py` PR. The Bazzite-box footgun note (AM/PCI path kills the display) is retained in
+  CLAUDE.md in case the lane is ever revived.
 
 ## 7. Sources
 
