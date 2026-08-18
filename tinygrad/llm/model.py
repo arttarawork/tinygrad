@@ -357,8 +357,8 @@ def parse_device_map(dm:str|dict[int,str], num_blocks:int) -> list[str]:
   assert all(indexed), f"device_map mixes indexed ('lo[-hi]:device') and plain segments: {dm}"
   out: list[str|None] = [None] * num_blocks
   for rng, dev in segs:
-    lo, _, hi = rng.partition("-")
-    lo, hi = int(lo), int(hi or lo)
+    lo_s, _, hi_s = rng.partition("-")
+    lo, hi = int(lo_s), int(hi_s or lo_s)
     assert 0 <= lo <= hi < num_blocks, f"device_map range {rng} out of bounds for {num_blocks} blocks: {dm}"
     assert all(out[i] is None for i in range(lo, hi+1)), f"device_map range {rng} overlaps a previous range: {dm}"
     for i in range(lo, hi+1): out[i] = dev
