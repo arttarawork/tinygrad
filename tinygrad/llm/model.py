@@ -390,6 +390,9 @@ class Transformer:
     self.jit = {k: TinyJit(self.forward) for k in itertools.product((False, True), repeat=2)}
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
+    # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
+    # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
+    # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
     for block in self.blk: x = block(x.to(block.device), start_pos)
