@@ -60,19 +60,31 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
   def uncast(u:UOp) -> UOp: return u.src[0] if u.op is Ops.CAST else u  # fp16/mixed-precision gemvs wrap the MUL and/or the INDEXes in CAST
+  # GGUF-quantized (Q4_0/Q4_K/Q6_K/...) weights dequant to a MUL of bit-unpack expressions instead of a bare INDEX, each
+  # still loading from the packed buffer via one or more INDEXes; walk its ranges directly instead of requiring one INDEX
+  def mat_ranges(u:UOp) -> dict[UOp, None]|None:
+    if u.op is Ops.INDEX: return u.src[1].get_idx().ranges
+    return u.ranges if any(s.op is Ops.INDEX for s in u.backward_slice) else None
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
-    (mulop:=uncast(k.reduceop.src[0])).op is Ops.MUL and (in0:=uncast(mulop.src[0])).op is Ops.INDEX and (in1:=uncast(mulop.src[1])).op is Ops.INDEX:
-    idx0, idx1 = in0.src[1].get_idx(), in1.src[1].get_idx()
-    if k.ranges_of(AxisType.REDUCE):
-      first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
-      if any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges):
+    (mulop:=uncast(k.reduceop.src[0])).op is Ops.MUL and (in0:=uncast(mulop.src[0])).op is Ops.INDEX and \
+    (idx1:=mat_ranges(uncast(mulop.src[1]))) is not None:
+    idx0 = in0.src[1].get_idx()
+    reduce_rngs = k.ranges_of(AxisType.REDUCE)
+    # GGUF block-quant reduce axes get split (by pm_split_ranges) into block/sub-block/byte sub-ranges to unpack the
+    # weight; the vector operand is only ever indexed by whichever split range is the bare (stride-1) additive term,
+    # so find that one instead of assuming ranges_of(REDUCE)[0] (the outermost, e.g. the block index)
+    reduce_candidates = [r for r in reduce_rngs if r in idx0.split_uop(Ops.ADD)]
+    if len(reduce_candidates) == 1:
+      first_reduce_rng = reduce_candidates[0]
+      group_axis = reduce_rngs.index(first_reduce_rng)
+      if all(r in idx1 for r in idx0.ranges):
         for global_idx in k.axes_of(AxisType.GLOBAL):
           if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
             if DEBUG >= 3:
               print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
             try:
-              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, 0, MV_THREADS_PER_ROW))
+              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.GROUP, group_axis, MV_THREADS_PER_ROW))
             except KernelOptError: pass
             if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.LOCAL, global_idx, MV_BLOCKSIZE))
             if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.UPCAST, global_idx, MV_ROWS_PER_THREAD))

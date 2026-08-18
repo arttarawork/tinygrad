@@ -99,6 +99,52 @@ class TestKernelOpts(unittest.TestCase):
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
+  def test_matvec_heuristic_sees_through_quant_dequant(self):
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    from tinygrad.llm.gguf import ggml_data_to_tensor
+    # GGUF-quantized gemvs dequant the weight operand to a MUL of bit-unpack expressions (multiple INDEXes into one
+    # packed uchar buffer) instead of a bare INDEX; these are the dominant decode kernels for quantized LLMs and
+    # should still get the hand-coded MATVEC opts. ggml_type: (elements/block, bytes/block)
+    ROWS, COLS = 1024, 4096
+    Tensor.manual_seed(1337)
+    for ggml_type, (nelem, nbytes) in {2: (32, 18), 12: (256, 144), 14: (256, 210)}.items():
+      raw = Tensor.randint(ROWS * (COLS // nelem) * nbytes, low=0, high=256, dtype=dtypes.uint8)
+      w = ggml_data_to_tensor(raw, ROWS * COLS, ggml_type).reshape(ROWS, COLS)
+      k = Scheduler((Tensor.empty(1, COLS) @ w.T).schedule_linear().src[-1].src[0], Device[Device.DEFAULT].renderer)
+      k.convert_loop_to_global()
+      self.assertEqual([o.op for o in hand_coded_optimizations(k).applied_opts], [OptOps.GROUP, OptOps.LOCAL, OptOps.UPCAST],
+                        f"ggml_type={ggml_type}")
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
+  def test_matvec_heuristic_quant_dequant_real_pipeline(self):
+    import tinygrad.codegen.opt.heuristic as heuristic_mod
+    from tinygrad.llm.gguf import ggml_data_to_tensor
+    # the AST hand_coded_optimizations sees through .realize() differs from the simplified one above: pm_split_ranges
+    # (in codegen/__init__.py's full_rewrite_to_sink) splits the reduce axis into block/sub-block/byte sub-ranges
+    # before the heuristic ever runs, so the vector operand's reduce range is no longer ranges_of(REDUCE)[0]
+    ROWS, COLS = 32, 1024
+    Tensor.manual_seed(1338)
+    raw = Tensor.randint(ROWS * (COLS // 32) * 18, low=0, high=256, dtype=dtypes.uint8).realize()
+    x = Tensor.rand(1, COLS).realize()
+    w = ggml_data_to_tensor(raw, ROWS * COLS, 2).reshape(ROWS, COLS)  # Q4_0, left unrealized so dequant fuses into the gemv
+
+    seen = []
+    orig = heuristic_mod.hand_coded_optimizations
+    def spy(k):
+      ret = orig(k)
+      seen.append([o.op for o in ret.applied_opts])
+      return ret
+    heuristic_mod.hand_coded_optimizations = spy
+    try:
+      (x @ w.T).realize()
+    finally:
+      heuristic_mod.hand_coded_optimizations = orig
+    self.assertIn([OptOps.GROUP, OptOps.LOCAL, OptOps.UPCAST], seen)
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
   def test_double_reduce(self):
     N = 128
     Tensor.manual_seed(1552)
