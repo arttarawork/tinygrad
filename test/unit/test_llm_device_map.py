@@ -13,6 +13,19 @@ class TestParseDeviceMap(unittest.TestCase):
   def test_dict(self): self.assertEqual(parse_device_map({0: "CPU:0", 1: "CPU:1"}, 2), ["CPU:0", "CPU:1"])
   def test_gap_raises(self):
     with self.assertRaises(AssertionError): parse_device_map("0-1:CPU:0", 4)
+  def test_whitespace_after_comma(self):
+    # a stray space (e.g. "a, b") must not get misdetected as the even-split form and produce garbage devices
+    self.assertEqual(parse_device_map("0-1:CPU:0, 2-3:CPU:1", 4), ["CPU:0", "CPU:0", "CPU:1", "CPU:1"])
+  def test_mixed_form_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("0-1:CPU:0,CPU:1", 4)
+  def test_range_out_of_bounds_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("0-7:CPU:0", 4)
+  def test_overlap_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("0-2:CPU:0,1-3:CPU:1", 4)
+  def test_dict_gap_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map({0: "CPU:0", 2: "CPU:1"}, 3)
+  def test_even_split_too_many_devices_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("CPU:0,CPU:1,CPU:2", 2)
 
 class TestDeviceMapModel(unittest.TestCase):
   def _generate(self, model, prompt, n):

@@ -344,18 +344,26 @@ class GatedDeltaNetBlock(FFNBlock):
 
 def parse_device_map(dm:str|dict[int,str], num_blocks:int) -> list[str]:
   """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}."""
-  if isinstance(dm, dict): return [dm[i] for i in range(num_blocks)]
-  segs = [s.split(":", 1) for s in dm.split(",")]
-  if not all(len(s) == 2 and s[0].replace("-", "").isdigit() for s in segs):
+  if isinstance(dm, dict):
+    assert all(i in dm for i in range(num_blocks)), f"device_map must cover all {num_blocks} blocks: {dm}"
+    return [dm[i] for i in range(num_blocks)]
+  segs = [s.strip().split(":", 1) for s in dm.split(",")]
+  indexed = [len(s) == 2 and s[0].replace("-", "").isdigit() for s in segs]
+  if not any(indexed):
     # no free-memory query exists on Device/Allocator, so auto placement splits evenly by block count
-    devs = dm.split(",")
+    devs = [s.strip() for s in dm.split(",")]
+    assert len(devs) <= num_blocks, f"device_map lists {len(devs)} devices for only {num_blocks} blocks: {dm}"
     return [devs[i * len(devs) // num_blocks] for i in range(num_blocks)]
-  out = [""] * num_blocks
+  assert all(indexed), f"device_map mixes indexed ('lo[-hi]:device') and plain segments: {dm}"
+  out: list[str|None] = [None] * num_blocks
   for rng, dev in segs:
     lo, _, hi = rng.partition("-")
-    for i in range(int(lo), int(hi or lo)+1): out[i] = dev
+    lo, hi = int(lo), int(hi or lo)
+    assert 0 <= lo <= hi < num_blocks, f"device_map range {rng} out of bounds for {num_blocks} blocks: {dm}"
+    assert all(out[i] is None for i in range(lo, hi+1)), f"device_map range {rng} overlaps a previous range: {dm}"
+    for i in range(lo, hi+1): out[i] = dev
   assert all(out), f"device_map must cover all {num_blocks} blocks: {dm}"
-  return out
+  return out  # type: ignore[return-value]
 
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int,str]|None=None):
