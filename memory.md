@@ -87,8 +87,10 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
 
 ### LLM app anatomy (measured on NULL device by the exploration agents)
 - Dense decode = **14 kernels/layer** (5 of them the attention chain: QK^T, softmax max/sum/div,
-  @V). MoE layer = 11 kernels (4 pure routing overhead from `pairwise_topk`, which is an O(E²)
-  compare matrix — fine at E=128 but 3-4 launches).
+  @V). MoE layer = 11 kernels. CORRECTION (2026-08-18, T1.4 control experiment): `pairwise_topk`
+  itself is only **1** of those (the rank reduce — the O(E²) compare/scatter/slice all inline);
+  the other ~3 "routing" kernels are the caller's probs gather + softmax stats. The original
+  "4 pure routing overhead" attribution was wrong.
 - MoE expert gather verified as true indexed load: E=64/k=8 test config reads ~930 KB vs ~6.3 MB
   masked-dense equivalent. The two `.contiguous()` in the expert path are deliberate
   ("moe speedup", commit `7ef901a81`) — don't remove them.

@@ -67,10 +67,15 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   already exists (`gguf.py:105-114`); training-side reference in `examples/mlperf/`. Validate
   gpt-oss-20b MXFP4 (~12 GB, fits the Mac's wired budget) output vs llama.cpp same-seed greedy.
   *Done when:* `-m gpt-oss:20b` generates correct text on Metal; benchmark row added.
-- **T1.4 — Single-kernel MoE top-k** `[ANY]` deps: — (WS1.5)
-  Replace `pairwise_topk`'s 4-kernel O(E²) path (`llm/model.py:35-41`) with fewer launches.
-  Kernel-count regression test on NULL; correctness on olmoe/qwen3-30b-a3b (Metal).
-  *Done when:* MoE layer kernel count drops ≥3; outputs unchanged.
+- **T1.4 — Single-kernel MoE top-k — RESOLVED-AS-MEASURED (2026-08-18): premise was wrong.**
+  `pairwise_topk` already costs exactly **1** kernel/layer in-model (control experiment on NULL:
+  real topk vs free `arange` sel, all gating paths, T=1 and T=8). The scatter+slice+cast lower to
+  an inlined select chain; only the rank reduce realizes, and rangeify's `remove_bufferize`
+  (rangeify.py:258-282) makes 1 the floor (buffer-reading REDUCE can't inline into a consumer
+  reduce). Alternatives (one-hot select, int32 scatter, `Tensor.topk` bitonic) all equal or worse.
+  Landed tests-only (+19): exact tie-break equivalence vs numpy stable argsort + kernel-count pin.
+  The other ~3 routing kernels/layer are the caller's probs path (gather + softmax stats,
+  model.py:124-127) — a different, larger task if ever worth it.
 - **T1.5 — Skip RNG at temperature 0** `[ANY]` deps: — (WS1.5)
   `llm/model.py:358-364`: bypass Gumbel noise when temp==0 without retriggering JIT capture.
   *Done when:* argmax path drops the threefry work; greedy outputs identical.
@@ -208,7 +213,7 @@ flowchart LR
 |---|---|---|---|---|
 | 2026-08-18 | env setup | done | `memory` | `.venv` created; `upstream` remote added; `test/test_tiny.py` green on METAL (19 passed) |
 | 2026-08-18 | T1.2 | **done** | `task/T1.2-matvec-cast` | `1fbbcee83` (+17/−3): hypothesis CONFIRMED; `uncast()` strips one CAST at reduce body + MUL operands. fp16 4096² gemv 56→100 GB/s kernel-side (1.8x, METAL, noisy-machine caveat). test/opt+mypy+ruff green. Upstream-PR-ready. Spawned T1.10: quantized gemvs are a SEPARATE miss (dequant expr operand + block axes `[32,2,16,1024]`). |
-| 2026-08-18 | T1.4 | agent running | `task/T1.4-topk-1kernel` | wave 1 |
+| 2026-08-18 | T1.4 | **done (premise refuted)** | `task/T1.4-topk-1kernel` | `d24bdb713` (+19, tests only): topk is already 1 kernel in-model; 1 is the rangeify floor. Tie-exact + kernel-count tests pin it. 388 tests + mypy + ruff green. Design-doc "4 routing kernels" claim corrected. |
 | 2026-08-18 | T1.5 | **done** | `task/T1.5-temp0-rng` | `f53ceb67f` (+51/−7): greedy uses `temperature=None` sentinel from `generate()`; jits keyed `(is_prefill, greedy)` — no recapture thrash. THREEFRY gone from temp-0 graph (rollout 35→33 kernels/token; RNG was full-vocab). Tests+mypy+ruff green. Note: old temp-0 path broke logit ties randomly; argmax (lowest index) is now the semantics. |
 | 2026-08-18 | T1.6 | **done** | `task/T1.6-jit-input-cache` | `b5ddb2797` (+17/−3, jit.py only): caches per-input `substitute`+`unbind_all` keyed on view structure (interned-UOp identity; unsound-key guard + 32-entry cap). `_prepare_jit_inputs` 51.6→22.6 µs/call (−56%). 126 jit tests + mypy + ruff green. Note: `test/test_jit.py` doesn't exist at baseline — suites are `test/backend/test_jit.py` + `test/unit/test_jit*.py`. |
 | 2026-08-18 | T3.1 | agent running | `task/T3.1-device-map` | wave 1 |
