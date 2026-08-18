@@ -234,8 +234,9 @@ flowchart LR
 | 2026-08-18 | rand-fusion bug | agent running | `task/rand-fusion-bug-repro` | wave 2: minimal upstream repro + root-cause hypothesis (baseline) |
 | 2026-08-18 | T1.3 | agent running | `task/T1.3-gptoss` | wave 2: synthetic-GGUF parity only, real-model validation deferred (disk) |
 | 2026-08-18 | T0.4 | **done — GREEN** | `task/T0.4-mocknv` | `24581b7d5` (MOCKNV_SETUP.md only, no code changes). test_tiny 19 passed under `DEV=MOCK+NV:PTX` (+ test_hcq 29 passed, hevc compile). Recipe corrected in env table above; reproduced from main checkout. **T2.1/T2.2 (transport lane) now unblocked.** |
-| 2026-08-18 | T2.1 | agent running | `task/T2.1-copyout-parallel` | wave 2b (unblocked by T0.4); functional under mock, perf deferred to real NV |
+| 2026-08-18 | T2.1 | **done** | `task/T2.1-copyout-parallel` | `e31bb62d5` (+30/−4): `_copyout` joins the shared 32×2MB round-robin pool; drain-of-N overlaps device filling N+1; full-device sync removed from HW path. New wraparound test mutation-verified (catches 6% corruption when guard removed). Mock-NV 30+19 green; METAL doesn't route through this code. AMD USBIface (1 buffer) degenerates to old behavior. D2H bandwidth numbers deferred to real NV. |
 | 2026-08-18 | T2.2 | agent running | `task/T2.2-pte-batch` | wave 2b (unblocked by T0.4); done-when = socket-message count collapses in counting-iface test |
+| 2026-08-18 | bench prep | done | — | qwen3:8b Q4_K_M (4.7 GB) pre-fetched into `~/Library/Caches/tinygrad/downloads/` via `tinygrad.llm` fetch — T0.1/T0.3 starts warm |
 
 ## Parallelization notes
 
