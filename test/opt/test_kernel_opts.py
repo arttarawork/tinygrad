@@ -86,6 +86,19 @@ class TestKernelOpts(unittest.TestCase):
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
+  def test_matvec_heuristic_sees_through_cast(self):
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    # fp16 and mixed-precision gemvs wrap the INDEX loads in CAST, they should still get the hand-coded MATVEC opts
+    for r in [Tensor.empty(1, 4096) @ Tensor.empty(4096, 4096),
+              Tensor.empty(1, 4096, dtype=dtypes.half) @ Tensor.empty(4096, 4096, dtype=dtypes.half),
+              Tensor.empty(1, 4096) @ Tensor.empty(4096, 4096, dtype=dtypes.half).cast(dtypes.float)]:
+      k = Scheduler(r.schedule_linear().src[-1].src[0], Device[Device.DEFAULT].renderer)
+      k.convert_loop_to_global()
+      self.assertEqual([o.op for o in hand_coded_optimizations(k).applied_opts], [OptOps.GROUP, OptOps.LOCAL, OptOps.UPCAST])
+
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
   def test_double_reduce(self):
     N = 128
     Tensor.manual_seed(1552)

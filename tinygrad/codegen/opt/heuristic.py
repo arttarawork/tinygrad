@@ -1,7 +1,7 @@
 import itertools
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv, DEBUG, prod, NOLOCALS, TC_OPT, TC_SELECT, USE_TC, IMAGE
-from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.uop.ops import Ops, UOp, resolve, AxisType
 from tinygrad.codegen.late.coalesce import image_valid_dims
 from tinygrad.codegen.opt.postrange import Scheduler
 
@@ -59,10 +59,11 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
+  def uncast(u:UOp) -> UOp: return u.src[0] if u.op is Ops.CAST else u  # fp16/mixed-precision gemvs wrap the MUL and/or the INDEXes in CAST
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
-    (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
-    idx0, idx1 = mulop.src[0].src[1].get_idx(), mulop.src[1].src[1].get_idx()
+    (mulop:=uncast(k.reduceop.src[0])).op is Ops.MUL and (in0:=uncast(mulop.src[0])).op is Ops.INDEX and (in1:=uncast(mulop.src[1])).op is Ops.INDEX:
+    idx0, idx1 = in0.src[1].get_idx(), in1.src[1].get_idx()
     if k.ranges_of(AxisType.REDUCE):
       first_reduce_rng = k.ranges_of(AxisType.REDUCE)[0]
       if any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges):
