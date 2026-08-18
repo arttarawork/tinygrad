@@ -351,20 +351,21 @@ class Transformer:
     self.max_context = config.max_context
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # we specialize the JIT for prefill and rollout
-    self.prefill_jit = TinyJit(self.forward)
-    self.rollout_jit = TinyJit(self.forward)
+    # we specialize the JIT for prefill/rollout and sampled/greedy
+    self.jit = {k: TinyJit(self.forward) for k in itertools.product((False, True), repeat=2)}
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    # greedy (temperature is None): plain argmax, no RNG kernels
+    if temperature is None: return logits.argmax(-1, keepdim=True)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
+    return self.jit[(resolve(tokens.shape[1] != 1), temperature is None)](tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
@@ -466,7 +467,7 @@ class Transformer:
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
+    temp = Tensor([temperature]) if temperature > 0 else None
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
