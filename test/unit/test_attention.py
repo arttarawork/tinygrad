@@ -269,5 +269,24 @@ class TestPairwiseTopk(unittest.TestCase):
         self.assertEqual(set(sel.numpy()[b, t].tolist()), expected)
         np.testing.assert_allclose(vals.numpy()[b, t], data[b, t][sel.numpy()[b, t]])
 
+  def test_ties_match_numpy_exactly(self):
+    # tie-break: on equal scores the lower expert index ranks first. output is in ascending rank order.
+    for seed in range(20):
+      rng = np.random.default_rng(seed)
+      for n, k in ((8, 3), (64, 4), (128, 8)):
+        data = (rng.standard_normal((2, 3, n)) * 2).round().astype(np.float32) / 2  # quantized to force ties
+        vals, sel = pairwise_topk(Tensor(data), k)
+        expected = np.argsort(-data, axis=-1, kind='stable')[..., :k][..., ::-1]
+        np.testing.assert_equal(sel.numpy(), expected)
+        np.testing.assert_equal(vals.numpy(), np.take_along_axis(data, expected, -1))
+
+  def test_kernel_count(self):
+    # the routing cost of pairwise_topk is one kernel (the rank reduce): the select chain fuses into consumers like probs/expert gathers
+    from test.helpers import check_schedule
+    Tensor.manual_seed(0)
+    x = Tensor.randn(1, 1, 64).realize()
+    _, sel = pairwise_topk(x, 4)
+    check_schedule([x.gather(-1, sel)], 2)
+
 if __name__ == '__main__':
   unittest.main()
