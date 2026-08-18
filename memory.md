@@ -137,7 +137,20 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   (first run pays beam search; results cache in `~/Library/Caches/tinygrad/cache.db`).
 - Wired-limit bump for pooling experiments: `sudo sysctl iogpu.wired_limit_mb=31744`.
 
-## 6. Sources
+## 6. Session log
+
+- **2026-08-18 (kickoff session):** Spot-checked the load-bearing file:line refs at HEAD
+  (`8f56e0ecd`, == baseline for code): `model.py:27,129` (contiguous), `:35-41` (pairwise_topk),
+  `:144-151` (@function seam), `:200-204` (KV fp32), `:358-364` (Gumbel), `heuristic.py:60-78`
+  (MATVEC MUL(INDEX,INDEX) guard), `jit.py:200-218`, `ops_nv.py:583-586` — **all accurate**.
+  Fixed environment drift the docs assumed away: no bare `python` (Homebrew python3.14, zero test
+  deps) → created `.venv` (numpy, torch 2.9.1, pytest+xdist, hypothesis, z3, gguf, mypy 1.19.1,
+  ruff 0.14.10); remotes were documented backwards → reality is `origin` = arttarawork fork,
+  added `upstream` = tinygrad/tinygrad; no local `master` branch — task branches come off
+  `af2a43c85` directly. `test/test_tiny.py` green on METAL. Launched wave-1 agents
+  (T1.2, T1.4, T1.5, T1.6, T3.1) in isolated worktrees; status in TASKS.md.
+
+## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
 - TinyGPU docs: https://docs.tinygrad.org/tinygpu/  ·  install scripts under `extra/`

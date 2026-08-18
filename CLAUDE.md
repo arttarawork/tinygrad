@@ -16,10 +16,14 @@ Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line ref
   never the AM/PCI driver path there; it unbinds amdgpu and kills the display).
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off `master`; keep `master` clean for upstream sync (remote `origin` =
-  upstream tinygrad, remote `fork` = arttarawork/tinygrad). Rebase docs branch weekly.
-- Tests: `PYTHONPATH=. python -m pytest <area> -x -q -n12`; typecheck `python -m mypy tinygrad/`;
-  lint `python -m ruff check .`
+- Branch `task/T<id>-<slug>` off the baseline `af2a43c85` (== `origin/master`; there is no local
+  `master`). Remotes (verified 2026-08-18): `origin` = arttarawork/tinygrad (the fork),
+  `upstream` = tinygrad/tinygrad. Rebase docs branch weekly.
+- Python: there is **no bare `python`** on this Mac and Homebrew `python3` (3.14) has no test deps.
+  Use the repo venv: `PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q -n12`;
+  typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .`
+  (from a worktree, the venv is at `/Users/artur/Documents/tinygrad/.venv` — `PYTHONPATH=.` makes
+  the worktree's tinygrad win over anything installed).
 - Perf claims need before/after tok/s from the T0.3 harness on named hardware. Upstream PRs:
   one small lever each, hand-verified — upstream has reverted AI-generated slop before.
 - Don't remove the deliberate `.contiguous()` in the MoE expert path (`tinygrad/llm/model.py:27,129`).

@@ -6,8 +6,13 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 
 ## Conventions for agents
 
-- Branch per task: `task/T<id>-<slug>` off `master`. Small commits; one lever per change.
-- Before pushing: `python -m pytest <touched area> -x -q -n12`, `python -m mypy tinygrad/`, `python -m ruff check .`
+- Branch per task: `task/T<id>-<slug>` off baseline `af2a43c85` (== `origin/master`; no local
+  `master` branch exists). Remotes: `origin` = arttarawork/tinygrad fork, `upstream` = tinygrad/tinygrad.
+- Python env (Mac, verified 2026-08-18): no bare `python`; Homebrew python3.14 has no test deps.
+  Use `/Users/artur/Documents/tinygrad/.venv` (numpy, torch, pytest+xdist, hypothesis, z3, gguf,
+  mypy 1.19.1, ruff 0.14.10). From any checkout/worktree: `PYTHONPATH=. <venv>/bin/python -m ...`.
+- Before pushing: `PYTHONPATH=. .venv/bin/python -m pytest <touched area> -x -q -n12`,
+  `.venv/bin/python -m mypy tinygrad/`, `.venv/bin/python -m ruff check .`
 - Perf claims need before/after numbers from the T0.3 harness on named hardware. Upstream-bound
   changes must be small and hand-verified — maintainers have reverted "ai slop" before (see memory.md §4).
 - Don't remove the deliberate `.contiguous()` calls in the MoE expert path (`llm/model.py:27,129`).
@@ -190,6 +195,17 @@ flowchart LR
   T24 --> TD3
   T32 --> TD3
 ```
+
+## Status log
+
+| Date | Task | State | Branch | Notes |
+|---|---|---|---|---|
+| 2026-08-18 | env setup | done | `memory` | `.venv` created; `upstream` remote added; `test/test_tiny.py` green on METAL (19 passed) |
+| 2026-08-18 | T1.2 | agent running | `task/T1.2-matvec-cast` | wave 1 |
+| 2026-08-18 | T1.4 | agent running | `task/T1.4-topk-1kernel` | wave 1 |
+| 2026-08-18 | T1.5 | agent running | `task/T1.5-temp0-rng` | wave 1 |
+| 2026-08-18 | T1.6 | agent running | `task/T1.6-jit-input-cache` | wave 1 |
+| 2026-08-18 | T3.1 | agent running | `task/T3.1-device-map` | wave 1 |
 
 ## Parallelization notes
 
