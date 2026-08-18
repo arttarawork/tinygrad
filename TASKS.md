@@ -227,6 +227,12 @@ flowchart LR
 | 2026-08-18 | T3.1 | **done** | `task/T3.1-device-map` | `59d1eb2dd` (+88/−6): `parse_device_map` (ranges/auto-even/dict) + `--device-map`; placement before `load_state_dict`; `.to()` seam in forward (zero-cost when trivial). Split CPU:0/CPU:1 tokens identical to single-device; KV+freqs follow activations for free. **JIT captures the mixed trace end-to-end** — only COPY spans devices (asserted per captured call). Found upstream fused-rand_like bug (see memory.md §4). Tests+mypy+ruff green. |
 
 | 2026-08-18 | wave-1 integration | **done** | `integration/wave1` | all 5 task branches merged (`2362f8f86`). One conflict (T1.5×T3.1 in `forward`: greedy branch + device hops combined) + one interaction fix (T3.1 test used pre-T1.5 `rollout_jit` name → `jit[(False, True)]`). Combined suite: 2401 passed, mypy + ruff clean. |
+| 2026-08-18 | wave-1 code review | **done — 10 findings** | — | high-effort review of `integration/wave1`: 6 CONFIRMED w/ repros. Theme: device_map + jit-input cache work for pure-attention but **break on recurrent (GatedDeltaNet/qwen3.6) models** — zero recurrent test coverage in the diff. Also: warmup leaves sampled jits cold; parse_device_map unvalidated; uncast single-level; from_gguf positional break; greedy split across layers. |
+| 2026-08-18 | review fixes | agent running | `task/wave1-review-fixes` | wave 2 (off `integration/wave1`); T3.2 queued behind it |
+| 2026-08-18 | T1.10 | agent running | `task/T1.10-matvec-quant` | wave 2 (stacked on `task/T1.2-matvec-cast`) |
+| 2026-08-18 | rand-fusion bug | agent running | `task/rand-fusion-bug-repro` | wave 2: minimal upstream repro + root-cause hypothesis (baseline) |
+| 2026-08-18 | T1.3 | agent running | `task/T1.3-gptoss` | wave 2: synthetic-GGUF parity only, real-model validation deferred (disk) |
+| 2026-08-18 | T0.4 | agent running | `task/T0.4-mocknv` | wave 2: time-boxed; documented dead end is a valid outcome |
 
 ## Parallelization notes
 
