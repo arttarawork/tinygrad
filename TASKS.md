@@ -233,6 +233,8 @@ flowchart LR
 | 2026-08-18 | rand-fusion bug | agent running | `task/rand-fusion-bug-repro` | wave 2: minimal upstream repro + root-cause hypothesis (baseline) |
 | 2026-08-18 | T1.3 | agent running | `task/T1.3-gptoss` | wave 2: synthetic-GGUF parity only, real-model validation deferred (disk) |
 | 2026-08-18 | T0.4 | **done — GREEN** | `task/T0.4-mocknv` | `24581b7d5` (MOCKNV_SETUP.md only, no code changes). test_tiny 19 passed under `DEV=MOCK+NV:PTX` (+ test_hcq 29 passed, hevc compile). Recipe corrected in env table above; reproduced from main checkout. **T2.1/T2.2 (transport lane) now unblocked.** |
+| 2026-08-18 | T2.1 | agent running | `task/T2.1-copyout-parallel` | wave 2b (unblocked by T0.4); functional under mock, perf deferred to real NV |
+| 2026-08-18 | T2.2 | agent running | `task/T2.2-pte-batch` | wave 2b (unblocked by T0.4); done-when = socket-message count collapses in counting-iface test |
 
 ## Parallelization notes
 
