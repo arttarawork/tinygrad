@@ -197,7 +197,20 @@ class CapturedJit(Generic[ReturnType]):
         if b.is_initialized(): b.deallocate()
         if (base:=b._base) is not None and base.allocated_views == 0 and base.is_allocated(): base.deallocate()
 
-def _prepare_jit_inputs(args, kwargs):
+def _input_info(u:UOp, cache:dict) -> tuple[UOp, dict[Variable, int]]:
+  # the substitute/unbind result depends only on the view structure above the base and the base dtype, not on the buffer itself.
+  # cache on that structure so fresh input buffers with repeated views (e.g. each LLM decode step) skip the two graph_rewrites
+  base, v = u.base, u
+  key:tuple|None = (base.dtype,)
+  while key is not None and v is not base:
+    if any(base is s or base in s.backward_slice for s in v.src[1:]): key = None  # base reachable outside the view spine, structure key unsound
+    else: key, v = key+(v.op, v.dtype, v.arg, v.tag)+v.src[1:], v.src[0]
+  if key is None or (ret:=cache.get(key)) is None:
+    ret = u.substitute({base:UOp(Ops.NOOP, base.dtype)}, extra_pm=mop_cleanup).unbind_all()
+    if key is not None and len(cache) < 32: cache[key] = ret  # capped: symbolic binds in the views make per-call-unique keys
+  return ret
+
+def _prepare_jit_inputs(args, kwargs, cache):
   input_tensors: list[tuple[int|str, Tensor]] = [(name,t) for name,t in list(enumerate(args))+sorted(kwargs.items()) if t.__class__ is Tensor]
   names, tensors = [name for name,_ in input_tensors], [t for _,t in input_tensors]
   # extract tensors from containers (shallow, not recursive to avoid grabbing model weights)
@@ -211,7 +224,7 @@ def _prepare_jit_inputs(args, kwargs):
   # collect buffer UOps (including MultiBuffer)
   input_buf_uops: list[UOp] = [u.base for u in input_uops if u.base.realized is not None]
   if len(set(input_buf_uops)) != len(input_buf_uops): raise JitError("duplicate inputs to JIT")
-  inputs = [(*(u.substitute({u.base:UOp(Ops.NOOP, u.base.dtype)}, extra_pm=mop_cleanup).unbind_all()), u.dtype, u.device) for u in input_uops]
+  inputs = [(*_input_info(u, cache), u.dtype, u.device) for u in input_uops]
   _var_vals = merge_dicts([x[1] for x in inputs] + [dict(v.unbind() for v in (args + tuple(kwargs.values())) if isinstance(v, UOp))])
   var_vals = {k.expr:v for k,v in _var_vals.items()}
   expected_input_info = [(x[0], tuple(sorted(x[1].keys(), key=lambda v: v.expr)), x[2], x[3]) for x in inputs]
@@ -224,6 +237,7 @@ class _TinyJit(Generic[ReturnType]):
     self.captured: CapturedJit|None = captured
     self.cnt: int = 2 if self.fxn is None else 0
     self.prune = prune
+    self._input_cache: dict[tuple, tuple[UOp, dict[Variable, int]]] = {}
 
   def add_linear(self, linear:UOp, var_vals:dict[str, int]): self._linears.append(linear)
 
@@ -240,7 +254,7 @@ class _TinyJit(Generic[ReturnType]):
 
   @disable_gc()
   def __call__(self, *args, **kwargs) -> ReturnType:
-    input_buf_uops, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs)
+    input_buf_uops, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs, self._input_cache)
     if not JIT or self.cnt == 0:
       # jit ignore
       assert self.fxn is not None
