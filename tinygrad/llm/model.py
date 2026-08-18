@@ -136,6 +136,11 @@ class FFNBlock:
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
+  @property
+  def device(self) -> str|tuple[str, ...]|None:
+    assert self.attn_norm.weight is not None
+    return self.attn_norm.weight.device
+
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
@@ -337,8 +342,23 @@ class GatedDeltaNetBlock(FFNBlock):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
+def parse_device_map(dm:str|dict[int,str], num_blocks:int) -> list[str]:
+  """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}."""
+  if isinstance(dm, dict): return [dm[i] for i in range(num_blocks)]
+  segs = [s.split(":", 1) for s in dm.split(",")]
+  if not all(len(s) == 2 and s[0].replace("-", "").isdigit() for s in segs):
+    # no free-memory query exists on Device/Allocator, so auto placement splits evenly by block count
+    devs = dm.split(",")
+    return [devs[i * len(devs) // num_blocks] for i in range(num_blocks)]
+  out = [""] * num_blocks
+  for rng, dev in segs:
+    lo, _, hi = rng.partition("-")
+    for i in range(int(lo), int(hi or lo)+1): out[i] = dev
+  assert all(out), f"device_map must cover all {num_blocks} blocks: {dm}"
+  return out
+
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, device_map:str|dict[int,str]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
@@ -349,18 +369,27 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    if device_map is not None:
+      dmap = parse_device_map(device_map, config.num_blocks)
+      for block, dev in zip(self.blk, dmap):
+        for p in nn.state.get_parameters(block): p.to_(dev)
+      # token_embd feeds the first block; output_norm/output consume the last block's activations
+      for p in nn.state.get_parameters(self.token_embd): p.to_(dmap[0])
+      for p in nn.state.get_parameters([self.output_norm, self.output]): p.to_(dmap[-1])
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill/rollout and sampled/greedy
     self.jit = {k: TinyJit(self.forward) for k in itertools.product((False, True), repeat=2)}
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    # activations hop devices at block boundaries (.to is a no-op when the device matches)
+    for block in self.blk: x = block(x.to(block.device), start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
     if temperature is None: return logits.argmax(-1, keepdim=True)
+    temperature = temperature.to(logits.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -368,7 +397,7 @@ class Transformer:
     return self.jit[(resolve(tokens.shape[1] != 1), temperature is None)](tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, device_map:str|dict[int,str]|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
@@ -443,7 +472,7 @@ class Transformer:
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config)
+    model = Transformer(config, device_map)  # pre-placed params make load_state_dict load each weight to its mapped device
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
