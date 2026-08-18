@@ -153,6 +153,9 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
 - From a clone without install: prefix `PYTHONPATH=.`
 - Bench one-liner: `DEV=NV JITBEAM=2 python3 -m tinygrad.llm -m qwen3:8b --benchmark --warmup`
   (first run pays beam search; results cache in `~/Library/Caches/tinygrad/cache.db`).
+- Mock-NV (no hardware): `OCELOT_PATH=.venv/lib/libgpuocelot.dylib DEV=MOCK+NV:PTX` — the DEV
+  string must start with `MOCK`; dylib is CI's prebuilt gpuocelot v0.1.0 (~3 MB, 2 s download),
+  NOT the sudo source-build in `extra/setup_mock_nv_osx.sh`. See MOCKNV_SETUP.md (T0.4 branch).
 - Wired-limit bump for pooling experiments: `sudo sysctl iogpu.wired_limit_mb=31744`.
 
 ## 6. Session log

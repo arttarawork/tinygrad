@@ -30,7 +30,7 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 | `ANY` | pure code; NULL/CPU device is enough (kernel-count and scheduling tests run on `DEV=NULL`) |
 | `MAC` | the MacBook M3 Pro — Metal backend, real perf numbers today |
 | `AMD` | (descoped 2026-08-18 — see T0.2; kept for the footgun note) the Bazzite box w/ RX 9070 XT. **Never** use the AM/PCI driver path there: it unbinds `amdgpu` and kills the display. |
-| `MOCKNV` | NV backend under gpuocelot PTX emulation (`extra/setup_mock_nv_osx.sh`; `MOCKIface` is `NVDevice.ifaces[2]`, `ops_nv.py:583-586`) — functional correctness only, no perf |
+| `MOCKNV` | NV backend under gpuocelot PTX emulation — functional correctness only, no perf. Recipe (T0.4, verified 2026-08-18): `OCELOT_PATH=.venv/lib/libgpuocelot.dylib DEV=MOCK+NV:PTX PYTHONPATH=. .venv/bin/python -m pytest ...` — the `DEV` string must start with `MOCK` (`device.py:376` never falls back to `MOCKIface` otherwise) and the dylib is CI's prebuilt (`github.com/tinygrad/gpuocelot` release v0.1.0, already at `.venv/lib/`). Do NOT use `extra/setup_mock_nv_osx.sh` (heavy source build + sudo to /usr/local/lib; CI doesn't use it either). Details: `MOCKNV_SETUP.md` on `task/T0.4-mocknv`. |
 | `CLOUD3090` | optional: a rented Linux 3090 (vast.ai etc.) runs the same NV backend/kernels via `NVKIface` — real sm_86 perf for kernel work before the dock arrives |
 | `DOCK` | blocked on the AG02 + TinyGPU |
 
@@ -232,7 +232,7 @@ flowchart LR
 | 2026-08-18 | T1.10 | agent running | `task/T1.10-matvec-quant` | wave 2 (stacked on `task/T1.2-matvec-cast`) |
 | 2026-08-18 | rand-fusion bug | agent running | `task/rand-fusion-bug-repro` | wave 2: minimal upstream repro + root-cause hypothesis (baseline) |
 | 2026-08-18 | T1.3 | agent running | `task/T1.3-gptoss` | wave 2: synthetic-GGUF parity only, real-model validation deferred (disk) |
-| 2026-08-18 | T0.4 | agent running | `task/T0.4-mocknv` | wave 2: time-boxed; documented dead end is a valid outcome |
+| 2026-08-18 | T0.4 | **done — GREEN** | `task/T0.4-mocknv` | `24581b7d5` (MOCKNV_SETUP.md only, no code changes). test_tiny 19 passed under `DEV=MOCK+NV:PTX` (+ test_hcq 29 passed, hevc compile). Recipe corrected in env table above; reproduced from main checkout. **T2.1/T2.2 (transport lane) now unblocked.** |
 
 ## Parallelization notes
 
