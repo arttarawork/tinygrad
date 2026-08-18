@@ -1,10 +1,17 @@
 import unittest
 from tinygrad import Tensor, nn
 from tinygrad.uop.ops import Ops
-from tinygrad.llm.model import Transformer, TransformerConfig, parse_device_map
+from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, parse_device_map
 
 TEST_CONFIG = TransformerConfig(num_blocks=4, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2, norm_eps=1e-5, vocab_size=100,
                                 head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
+
+# recurrent (Gated-DeltaNet) blocks build helper tensors themselves (reset flag, conv window) instead of only consuming
+# pre-placed weights, so device_map needs a separate case to exercise that code path (F1/F2/F7)
+SSM_TEST_CONFIG = TransformerConfig(num_blocks=4, dim=32, hidden_dim=64, n_heads=2, n_kv_heads=2, norm_eps=1e-5, vocab_size=100,
+                                    head_dim=16, rope_theta=10000.0, rope_dim=16, v_head_dim=16, max_context=32,
+                                    ssm=SSMConfig(conv_kernel=4, state_size=4, group_count=2, time_step_rank=2, inner_size=8),
+                                    ssm_layers=(True, True, True, True))
 
 class TestParseDeviceMap(unittest.TestCase):
   def test_ranges(self): self.assertEqual(parse_device_map("0-1:CPU:0,2-3:CPU:1", 4), ["CPU:0", "CPU:0", "CPU:1", "CPU:1"])
@@ -61,6 +68,28 @@ class TestDeviceMapModel(unittest.TestCase):
       if call.src[0].op is Ops.COPY: copies.append((devs, call.src[0].arg))
       else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
     self.assertIn(({"CPU", "CPU:1"}, "CPU:1"), copies)  # the block-boundary activation hop
+
+class TestDeviceMapRecurrentModel(unittest.TestCase):
+  def _generate(self, model, prompt, n, temperature=0.0):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt), temperature=temperature)
+    return [next(gen) for _ in range(n)]
+
+  def test_recurrent_split_matches_single_device(self):
+    ref, split = Transformer(SSM_TEST_CONFIG, device_map="CPU:0"), Transformer(SSM_TEST_CONFIG, device_map="0-1:CPU:0,2-3:CPU:1")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    self.assertEqual([b.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
+
+    # identical outputs over prefill + several decode steps, twice (second prompt exercises JIT replay): F1/F2 crash on first forward/decode
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    # nonzero temperature exercises the sampled JIT variant and temp's placement on the last block's device (F7)
+    self._generate(split, [5, 6, 7, 8], 4, temperature=0.8)
+
+    # lazily-created recurrent state followed the activations to the mapped devices (F1)
+    self.assertEqual([b.conv_state.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
+    self.assertEqual([b.recurrent_state.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
 
 if __name__ == '__main__':
   unittest.main()
