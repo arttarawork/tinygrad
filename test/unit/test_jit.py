@@ -1,7 +1,7 @@
 import unittest, numpy as np
 from test.helpers import assert_jit_cache_len
 from tinygrad import Tensor, TinyJit, Context, UOp, dtypes
-from tinygrad.engine.jit import JitError
+from tinygrad.engine.jit import JitError, _input_info
 
 def _simple_test(add, extract=lambda x: x, N=10):
   for _ in range(5):
@@ -422,6 +422,22 @@ class TestJitInsideJit(unittest.TestCase):
     g(Tensor([1])).realize()
     with self.assertRaisesRegex(RuntimeError, "having TinyJit inside another TinyJit is not supported"):
       g(Tensor([1])).realize()
+
+class TestInputInfoCache(unittest.TestCase):
+  def test_bind_carrying_keys_dont_poison_the_cache(self):
+    # simulates chunked-prefill decode: each step slices a fixed buffer with a *different* bound start_pos,
+    # so every slice gets a unique structure key. those must not fill up the (no-eviction) 32-entry cache and
+    # starve the stable, steady-state decode key -- which is what actually benefits from being cached.
+    t = Tensor.zeros(1, 64, dtype=dtypes.int32).contiguous().realize()
+    v_sp, v_nt = UOp.variable("start_pos", 0, 63), UOp.variable("toks", 1, 1)
+    cache: dict = {}
+    for i in range(40): _input_info(t[:, (sp:=v_sp.bind(i)):sp+v_nt.bind(1)].uop, cache)
+    self.assertEqual(len(cache), 0, "bind-carrying (call-unique) keys should never be cached")
+
+    # a decode-shaped input (no bind in its view spine, e.g. the model's own previous output fed back in) must get cached
+    out = Tensor.zeros(1, 1, dtype=dtypes.int32).contiguous().realize()
+    _input_info(out.uop, cache)
+    self.assertEqual(len(cache), 1, "the stable decode-shaped key should get cached")
 
 class TestJitRandom(unittest.TestCase):
   def test_jit_rangeify(self):

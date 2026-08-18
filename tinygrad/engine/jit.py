@@ -207,7 +207,9 @@ def _input_info(u:UOp, cache:dict) -> tuple[UOp, dict[Variable, int]]:
     else: key, v = key+(v.op, v.dtype, v.arg, v.tag)+v.src[1:], v.src[0]
   if key is None or (ret:=cache.get(key)) is None:
     ret = u.substitute({base:UOp(Ops.NOOP, base.dtype)}, extra_pm=mop_cleanup).unbind_all()
-    if key is not None and len(cache) < 32: cache[key] = ret  # capped: symbolic binds in the views make per-call-unique keys
+    # skip caching if the spine bakes in bound values (e.g. a chunked-prefill slice): that key is call-unique and would never
+    # hit again -- caching it just burns a slot in the (no-eviction) cache that a stable, actually-reusable key could use
+    if key is not None and not ret[1] and len(cache) < 32: cache[key] = ret
   return ret
 
 def _prepare_jit_inputs(args, kwargs, cache):
