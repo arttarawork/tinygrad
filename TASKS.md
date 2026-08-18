@@ -13,11 +13,12 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   mypy 1.19.1, ruff 0.14.10). From any checkout/worktree: `PYTHONPATH=. <venv>/bin/python -m ...`.
 - Before pushing: `PYTHONPATH=. .venv/bin/python -m pytest <touched area> -x -q -n12`,
   `.venv/bin/python -m mypy tinygrad/`, `.venv/bin/python -m ruff check .`
-- Mac resource limits (noted 2026-08-18): **~23 GB disk free** — agents must not download multi-GB
-  models; real-model validation happens in dedicated bench sessions. **llama-server keeps ~23 GB
-  wired** (LaunchAgent KeepAlive) — before real-model METAL runs / T0.1 benchmarks, stop it:
-  `launchctl bootout gui/501/com.artur.llama-server` (restart: `launchctl bootstrap gui/501
-  ~/Library/LaunchAgents/com.artur.llama-server.plist`). Tiny random-weight configs are fine anytime.
+- Mac resource limits (updated 2026-08-18, after Artur freed ~157 GB): **~179 GB disk free** —
+  model downloads are now fine (bench GGUFs go through `tinygrad.llm`'s fetch cache; gpt-oss-20b
+  MXFP4 for T1.3 validation OK). **llama-server still keeps ~23 GB wired** (LaunchAgent KeepAlive)
+  — before real-model METAL runs / T0.1 benchmarks, stop it: `launchctl bootout gui/501/com.artur.llama-server`
+  (restart: `launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.artur.llama-server.plist`).
+  Tiny random-weight configs are fine anytime.
 - Perf claims need before/after numbers from the T0.3 harness on named hardware. Upstream-bound
   changes must be small and hand-verified — maintainers have reverted "ai slop" before (see memory.md §4).
 - Don't remove the deliberate `.contiguous()` calls in the MoE expert path (`llm/model.py:27,129`).
