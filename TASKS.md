@@ -202,7 +202,7 @@ flowchart LR
 | 2026-08-18 | env setup | done | `memory` | `.venv` created; `upstream` remote added; `test/test_tiny.py` green on METAL (19 passed) |
 | 2026-08-18 | T1.2 | agent running | `task/T1.2-matvec-cast` | wave 1 |
 | 2026-08-18 | T1.4 | agent running | `task/T1.4-topk-1kernel` | wave 1 |
-| 2026-08-18 | T1.5 | agent running | `task/T1.5-temp0-rng` | wave 1 |
+| 2026-08-18 | T1.5 | **done** | `task/T1.5-temp0-rng` | `f53ceb67f` (+51/−7): greedy uses `temperature=None` sentinel from `generate()`; jits keyed `(is_prefill, greedy)` — no recapture thrash. THREEFRY gone from temp-0 graph (rollout 35→33 kernels/token; RNG was full-vocab). Tests+mypy+ruff green. Note: old temp-0 path broke logit ties randomly; argmax (lowest index) is now the semantics. |
 | 2026-08-18 | T1.6 | agent running | `task/T1.6-jit-input-cache` | wave 1 |
 | 2026-08-18 | T3.1 | agent running | `task/T3.1-device-map` | wave 1 |
 
