@@ -59,7 +59,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
   MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
-  def uncast(u:UOp) -> UOp: return u.src[0] if u.op is Ops.CAST else u  # fp16/mixed-precision gemvs wrap the MUL and/or the INDEXes in CAST
+  def uncast(u:UOp) -> UOp:  # fp16/mixed-precision gemvs wrap the MUL and/or the INDEXes in (possibly nested) CAST
+    while u.op is Ops.CAST: u = u.src[0]
+    return u
   if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
     k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
     (mulop:=uncast(k.reduceop.src[0])).op is Ops.MUL and (in0:=uncast(mulop.src[0])).op is Ops.INDEX and (in1:=uncast(mulop.src[1])).op is Ops.INDEX:
