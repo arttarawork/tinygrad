@@ -86,6 +86,13 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   `extra/models/llama.py:104-119`; `Tensor.custom_kernel` is tested). Prove it with a naive Metal
   custom kernel; the tuned sm_86 kernel is T2.4/TD-side.
   *Done when:* hook merged behind a flag; parity test vs SDPA passes.
+- **T1.10 — MATVEC for quantized (GGUF-fused) gemvs** `[MAC]` deps: T1.2 (WS1.2 follow-up, found 2026-08-18)
+  T1.2 fixed fp16 but confirmed quantized gemvs miss MATVEC for two deeper reasons: the weight
+  operand is a whole dequant expression (e.g. Q4_0: `MUL(INDEX, MUL(CAST(ADD(BITCAST(AND(...)))), ...))`
+  with 3 INDEXes into one uchar buffer), and GGUF block substructure splits the row axis into
+  multiple global axes (`full_shape=[32,2,16,1024]`). These are the dominant decode kernels for
+  Q4_K models. Needs its own pattern match (or BEAM-informed hand-coded opts), not a CAST strip.
+  *Done when:* MATVEC-class opts fire on Q4_0/Q4_K gemvs; measured GB/s uplift on Metal; no test/opt regressions.
 - **T1.9 — Streaming GGUF load** `[MAC]` deps: T0.1 (WS2.3-adjacent)
   Replace whole-file blob (`llm/gguf.py:134`) with per-tensor staging to cut the ~2x transient and
   TB-load cost; keep the io_uring fast path. Helps Metal load times immediately.
@@ -200,7 +207,7 @@ flowchart LR
 | Date | Task | State | Branch | Notes |
 |---|---|---|---|---|
 | 2026-08-18 | env setup | done | `memory` | `.venv` created; `upstream` remote added; `test/test_tiny.py` green on METAL (19 passed) |
-| 2026-08-18 | T1.2 | agent running | `task/T1.2-matvec-cast` | wave 1 |
+| 2026-08-18 | T1.2 | **done** | `task/T1.2-matvec-cast` | `1fbbcee83` (+17/−3): hypothesis CONFIRMED; `uncast()` strips one CAST at reduce body + MUL operands. fp16 4096² gemv 56→100 GB/s kernel-side (1.8x, METAL, noisy-machine caveat). test/opt+mypy+ruff green. Upstream-PR-ready. Spawned T1.10: quantized gemvs are a SEPARATE miss (dequant expr operand + block axes `[32,2,16,1024]`). |
 | 2026-08-18 | T1.4 | agent running | `task/T1.4-topk-1kernel` | wave 1 |
 | 2026-08-18 | T1.5 | **done** | `task/T1.5-temp0-rng` | `f53ceb67f` (+51/−7): greedy uses `temperature=None` sentinel from `generate()`; jits keyed `(is_prefill, greedy)` — no recapture thrash. THREEFRY gone from temp-0 graph (rollout 35→33 kernels/token; RNG was full-vocab). Tests+mypy+ruff green. Note: old temp-0 path broke logit ties randomly; argmax (lowest index) is now the semantics. |
 | 2026-08-18 | T1.6 | agent running | `task/T1.6-jit-input-cache` | wave 1 |
