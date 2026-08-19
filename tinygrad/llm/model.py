@@ -1,6 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
+from typing import Callable
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
@@ -192,6 +193,22 @@ class FFNBlock:
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
+# --- attention-override hook (T1.8) -----------------------------------------------------------
+# Pluggable seam for a fused/tuned attention kernel to replace the standard (multi-kernel) SDPA
+# expression below. Swap this module attribute (e.g. `tinygrad.llm.model.attention_impl = my_fn`)
+# to route TransformerBlock's *standard* attention path through a custom implementation. Two
+# paths intentionally do NOT go through this hook and are unaffected by swapping it:
+#   - the manual attention-sinks softmax (gpt-oss, config.attn_sinks) in TransformerBlock itself
+#   - MLATransformerBlock / GatedDeltaNetBlock, which compute attention inline, not via SDPA
+# Signature matches Tensor.scaled_dot_product_attention's shape contract:
+#   q:(B,H,T,Hd)  k,v:(B,KvH,Tk,Hd)  mask:(1,1,T,Tk)|None  ->  (B,H,T,Hd)
+# A custom impl that only handles some shapes (e.g. decode-only, T==1, unmasked) must fall back
+# to `_sdpa_default` itself for everything else (prefill, sliding-window masks, etc).
+def _sdpa_default(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
+  return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+
+attention_impl: Callable[[Tensor, Tensor, Tensor, Tensor|None], Tensor] = _sdpa_default
+
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
@@ -255,7 +272,7 @@ class TransformerBlock(FFNBlock):
       w = (e / (e.sum(-1, keepdim=True) + (sink - m).exp())).cast(x.dtype)
       attn = (w @ vg.cast(x.dtype)).reshape(B, self.config.n_heads, T, self.config.head_dim)
     else:
-      attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+      attn = attention_impl(q, k, v, mask)                                            # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 

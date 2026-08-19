@@ -1,10 +1,14 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, dtypes, nn
+from tinygrad import Tensor, dtypes, nn, GlobalCounters
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import UOp, KernelInfo, AxisType
+from tinygrad.llm import model
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
+from test.helpers import assert_kernel_count
 
 def apply_rope(x:Tensor, start_pos:int):
   B, H, T, Hd = x.shape
@@ -287,6 +291,147 @@ class TestPairwiseTopk(unittest.TestCase):
     x = Tensor.randn(1, 1, 64).realize()
     _, sel = pairwise_topk(x, 4)
     check_schedule([x.gather(-1, sel)], 2)
+
+def _decode_attn_kernel(O:UOp, Q:UOp, K:UOp, V:UOp) -> UOp:
+  """Naive single-kernel T=1 decode attention (T1.8 proof-of-concept for the attention_impl hook).
+
+  Correct (numerically-stable) softmax, GQA-aware (kv head = query head // (n_heads/n_kv_heads), matching
+  scaled_dot_product_attention's enable_gqa repeat_interleave convention), no tuning. Structure mirrors
+  test/backend/test_custom_kernel.py's simple_qkv_kernel: one shared outer WEAK scope (b, h, dout), with
+  three independent REG-scalar accumulate passes (max, sum-of-exp, weighted-output) nested underneath --
+  REG placeholders are exempt from the codegen's memory-coalescing pass, which is what makes this simple
+  "one register per accumulator" style reliable here (see the KernelInfo(opts_to_apply=()) note below).
+  ponytail: the QK^T dot product is recomputed from scratch in all three passes (3x the FLOPs of a real
+  flash-attention single-pass), and once per dout too (Hd more) -- O(Hd) redundant work vs a tuned kernel
+  that caches per-row scores or does true online-softmax fusion. Upgrade path: T1.7/T1.8-tuned.
+  """
+  B, H, _, Hd = Q.shape
+  KvH, Tk = K.shape[1], K.shape[2]
+  R, scale = H // KvH, Hd ** -0.5
+
+  b, h, dout = UOp.range(B, 0), UOp.range(H, 1), UOp.range(Hd, 2)
+  kvh = h // R
+
+  def qk_dot(j:UOp, slot:int, ready:UOp) -> UOp:
+    d = UOp.range(Hd, 100 + slot, axis_type=AxisType.REDUCE)
+    acc = UOp.placeholder((1,), dtypes.float32, slot, addrspace=AddrSpace.REG)
+    acc = acc.after(ready, j)[0].set(0.0)
+    acc = acc[0].set(acc.after(d)[0] + Q[b, h, 0, d].cast(dtypes.float32) * K[b, kvh, j, d].cast(dtypes.float32), end=d)
+    return acc[0] * scale
+
+  # pass 1: row max (for numerical stability)
+  m = UOp.placeholder((1,), dtypes.float32, 10, addrspace=AddrSpace.REG)
+  m = m.after(b, h, dout)[0].set(float("-inf"))
+  jm = UOp.range(Tk, 3, axis_type=AxisType.REDUCE)
+  m = m[0].set(m.after(jm)[0].maximum(qk_dot(jm, 11, m)), end=jm)
+
+  # pass 2: sum of exp(score - m)
+  l = UOp.placeholder((1,), dtypes.float32, 12, addrspace=AddrSpace.REG)
+  l = l.after(m, dout)[0].set(0.0)
+  jl = UOp.range(Tk, 4, axis_type=AxisType.REDUCE)
+  l = l[0].set(l.after(jl)[0] + (qk_dot(jl, 13, l) - m[0]).exp(), end=jl)
+
+  # pass 3: weighted output for this dout column
+  jo = UOp.range(Tk, 5, axis_type=AxisType.REDUCE)
+  acc_o = UOp.placeholder((1,), dtypes.float32, 14, addrspace=AddrSpace.REG)
+  acc_o = acc_o.after(l, dout)[0].set(0.0)
+  w = (qk_dot(jo, 15, acc_o) - m[0]).exp() / l[0]
+  acc_o = acc_o[0].set(acc_o.after(jo)[0] + w * V[b, kvh, jo, dout].cast(dtypes.float32), end=jo)
+
+  store = O[b, h, 0, dout].store(acc_o[0].cast(O.dtype))
+  # NOTE: opts_to_apply=() is required -- without it the default auto-optimizer breaks the accumulate-loop
+  # ->single-store fusion for anything past the simplest reduce shapes (silently wrong values, or a
+  # "attempting multiple stores" codegen crash in tinygrad/codegen/late/coalesce.py). Sharp edge #1.
+  return store.end(dout, h, b).sink(arg=KernelInfo(name=f"decode_attn_{B}_{H}_{Tk}_{Hd}", opts_to_apply=()))
+
+def custom_decode_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
+  """attention_impl-compatible wrapper around _decode_attn_kernel. Decode-only (T==1) and unmasked --
+  anything else (prefill, sliding-window decode masks) falls back to the default SDPA path untouched."""
+  if mask is not None or q.shape[2] != 1: return model._sdpa_default(q, k, v, mask)
+  O = Tensor.empty(q.shape, dtype=q.dtype, device=q.device)
+  return Tensor.custom_kernel(O, q, k, v, fxn=_decode_attn_kernel)[0]
+
+class TestAttentionHook(unittest.TestCase):
+  """T1.8: the attention_impl override hook + a naive Tensor.custom_kernel decode-attention proof."""
+
+  def setUp(self):
+    self._orig_impl = model.attention_impl
+  def tearDown(self):
+    model.attention_impl = self._orig_impl
+
+  def _qkv(self, B, H, KvH, Tk, Hd, seed, T=1):
+    Tensor.manual_seed(seed)
+    q = Tensor.randn(B, H, T, Hd, dtype=dtypes.float32).contiguous().realize()
+    k = Tensor.randn(B, KvH, Tk, Hd, dtype=dtypes.float32).contiguous().realize()
+    v = Tensor.randn(B, KvH, Tk, Hd, dtype=dtypes.float32).contiguous().realize()
+    return q, k, v
+
+  def test_hook_default_matches_sdpa(self):
+    # the hook's default must be exactly the plain SDPA expression it replaced
+    q, k, v = self._qkv(1, 2, 2, 4, 8, 0)
+    ref = q.scaled_dot_product_attention(k, v, enable_gqa=True)
+    out = model.attention_impl(q, k, v, None)
+    np.testing.assert_allclose(out.numpy(), ref.numpy(), rtol=1e-5, atol=1e-5)
+
+  def test_custom_kernel_parity_no_gqa(self):
+    q, k, v = self._qkv(1, 2, 2, 5, 8, 0)
+    ref = q.scaled_dot_product_attention(k, v, enable_gqa=True).numpy()
+    out = custom_decode_attention(q, k, v, None).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+
+  def test_custom_kernel_parity_gqa(self):
+    for (B, H, KvH, Tk, Hd, seed) in [(2, 4, 2, 7, 8, 1), (1, 8, 2, 3, 16, 2), (3, 6, 1, 11, 4, 3), (1, 4, 1, 1, 8, 4)]:
+      q, k, v = self._qkv(B, H, KvH, Tk, Hd, seed)
+      ref = q.scaled_dot_product_attention(k, v, enable_gqa=True).numpy()
+      out = custom_decode_attention(q, k, v, None).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4, err_msg=f"{B=} {H=} {KvH=} {Tk=} {Hd=}")
+
+  def test_gating_prefill_falls_back(self):
+    # T>1 (prefill/rollout): the decode-only kernel must not engage, output must match default SDPA exactly
+    q, k, v = self._qkv(1, 4, 2, 5, 8, 0, T=3)
+    mask = Tensor.full((1, 1, 3, 5), float("-inf"), dtype=dtypes.float32).triu(3)
+    ref = model._sdpa_default(q, k, v, mask).numpy()
+    out = custom_decode_attention(q, k, v, mask).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-6, atol=1e-6)
+
+  def test_gating_masked_decode_falls_back(self):
+    # T==1 but masked (e.g. a sliding-window decode mask): still not decode-kernel-eligible, falls back
+    q, k, v = self._qkv(1, 4, 2, 5, 8, 0, T=1)
+    mask = Tensor.full((1, 1, 1, 5), float("-inf"), dtype=dtypes.float32).tril(1)
+    ref = model._sdpa_default(q, k, v, mask).numpy()
+    out = custom_decode_attention(q, k, v, mask).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-6, atol=1e-6)
+
+  def test_kernel_count_default_vs_hook(self):
+    q, k, v = self._qkv(2, 4, 2, 6, 8, 0)
+    GlobalCounters.reset()
+    q.scaled_dot_product_attention(k, v, enable_gqa=True).realize()
+    default_count = GlobalCounters.kernel_count  # informational: the ~5-kernel baseline (QK^T, max/sum/div, @V)
+    self.assertGreater(default_count, 1)
+
+    GlobalCounters.reset()
+    custom_decode_attention(q, k, v, None).realize()
+    assert_kernel_count(1)  # the hook + custom kernel collapse the whole attention chain to 1 dispatch
+
+  def test_hook_wired_through_transformer_block_kv_cache(self):
+    # end-to-end: the hook must work when q/k/v are the REAL views TransformerBlock._attention derives
+    # from its growing, in-place-stored KV cache (an AFTER(store)+SHRINK chain, not a fresh tensor).
+    config = TransformerConfig(num_blocks=1, dim=16, hidden_dim=32, n_heads=4, n_kv_heads=2, norm_eps=1e-5,
+                                vocab_size=32, head_dim=8, rope_theta=10000.0, rope_dim=8, v_head_dim=8, max_context=16)
+    block = TransformerBlock(config)
+    Tensor.manual_seed(0)
+    prompt = Tensor.randn(1, 5, config.dim, dtype=dtypes.float32).contiguous().realize()
+    decode_in = Tensor.randn(1, 1, config.dim, dtype=dtypes.float32).contiguous().realize()
+
+    prompt_norm, decode_norm = block.attn_norm(prompt), block.attn_norm(decode_in)
+    block._init_state(prompt_norm)
+    block._attention(prompt_norm, 0).realize()  # prefill: fills cache_kv[0:5]
+    ref = block._attention(decode_norm, 5).realize().numpy()  # decode step through cache-view SDPA
+
+    model.attention_impl = custom_decode_attention
+    out = block._attention(decode_norm, 5).realize().numpy()  # same decode step, hook active
+
+    np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
 
 if __name__ == '__main__':
   unittest.main()
