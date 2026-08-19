@@ -1,0 +1,5 @@
+model,stack,device,flags,load_s,prefill_tps,decode_tps,gbps
+gpt-oss:20b,tinygrad,METAL,PYTHONPATH=. 2026-08-19w4 T4.13-fix,3.499,41.80,10.98,38.17
+gpt-oss:20b,tinygrad,METAL,PYTHONPATH=. 2026-08-19w4 T4.13-fix,2.558,41.80,10.96,38.12
+gpt-oss:20b,tinygrad,METAL,PYTHONPATH=. 2026-08-19w4 T4.13-fix,2.618,41.79,10.97,38.13
+gpt-oss:20b,tinygrad,METAL,JITBEAM=2 IGNORE_BEAM_CACHE=1 PYTHONPATH=. 2026-08-19w4 T4.13-fix,2.487,45.63,15.52,63.26

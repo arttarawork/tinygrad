@@ -595,3 +595,145 @@ environment regression.
   one). Not pushed; not merged into `integration/wave1` or `master`. Scratch scripts used for parts
   B/C (`t410_repro.py`, `gptoss_bytes.py`, `gptoss_perkernel.py`, `append_row.py`) live in the
   session scratchpad, not the repo — none were needed as committed artifacts for this window's asks.
+
+# BENCH WINDOW 2026-08-19w4 — T4.13 real-model confirmation (MXFP4 fusion fix)
+
+Branch `task/bench-window-4` = `integration/wave1` (`87806cd5a`, includes wave 8: T4.13's MXFP4
+dequant fusion fix + regression test, T4.12's chunk_size-keyed prefill JIT) + `task/bench-window-3`
+merged (clean, no conflicts). `llama-server` stopped for the whole window; ~933 MB swap used at
+start (matches prior windows' 933-1213 MB band); strictly sequential. `test/unit/test_llm_gptoss.py`
+(10 tests, includes T4.13's regression test) passes clean before any benchmarking.
+
+## A. Headline: gpt-oss-20b with the MXFP4 fusion fix — METAL, greedy
+
+### (1) Decode + prefill tok/s, `-p 512 -n 128` (bench_llm.py default, matching window 2/3's gpt-oss
+invocation exactly), 3 repeats, no-BEAM
+
+| | load s | prefill tok/s | decode tok/s | decode GB/s |
+|---|---|---|---|---|
+| **pre-fix reference** (bench window 3) | 2.660 | 16.57 | **1.69** | 100.65 |
+| post-fix, run 1 | 3.499 | 41.80 | **10.98** | 38.17 |
+| post-fix, run 2 | 2.558 | 41.80 | **10.96** | 38.12 |
+| post-fix, run 3 | 2.618 | 41.79 | **10.97** | 38.13 |
+| post-fix, mean of 3 | 2.892 | 41.80 | **10.97** | 38.14 |
+
+Spread across the 3 repeats is tight (decode 10.96-10.98, <0.2% relative) — machine idle, unswapped,
+consistent with prior windows' repeat tightness.
+
+- **Decode: 1.69 -> 10.97 tok/s, a 6.49x improvement.** Real and large, but **below the docket's
+  ~20-40 tok/s expectation** — reported as measured, not adjusted to fit. Prefill also moved a lot
+  more than expected for a decode-targeted fix: **16.57 -> 41.80 tok/s, +152%** (2.52x) — plausible
+  since prefill's chunked batches route through the same `weight[sel]` MoE gather the fix targets,
+  just batched over more tokens per gather, so the fusion win applies there too; not something the
+  docket predicted a number for, so no reference to compare against, just noted as a bonus.
+- Decode GB/s: **100.65 -> 38.14, a 2.64x reduction** — smaller drop than the tok/s ratio because
+  decode got faster *and* leaner at once; see (2) for bytes/token directly.
+
+### (2) Bytes/decode-token, `GlobalCounters.global_mem` delta over 12 steady-state tokens (3 primer
+steps discarded first, identical methodology to window 3's Part C(2))
+
+```
+steady-state decode: 12 tokens in 1.048s = 11.447 tok/s
+GlobalCounters.global_mem delta: 41,541,704,592 B = 41.542 GB over 12 tokens
+  = 3.462 GB/token, 39.63 GB/s
+```
+
+| | GB/token | reduction vs pre-fix |
+|---|---|---|
+| pre-fix (window 3, same methodology) | 59.307 | — |
+| post-fix | **3.462** | **17.1x** |
+
+**17.1x, not the ~44x the docket cited as the expectation.** The 44x figure comes from T4.13's own
+commit message, which measured a *single synthetic MoE layer* in isolation (real gpt-oss per-layer
+dims, hand-built config, `2,415,736,112 B/token -> 54,942,080 B/token`) — extrapolating that one
+layer's ratio across all 24 real layers assumes every layer's traffic scales identically and ignores
+non-MoE overhead (attention, embeddings, output head, the model's 24-layer real forward pass
+end-to-end). The real full-model number (this measurement) is a genuinely different, and lower,
+reduction factor than the synthetic single-layer estimate — both are real, they're just not the same
+claim: 44x is "how much this one kernel class shrank in isolation," 17.1x is "how much the whole
+model's per-token traffic shrank." Reporting both, not picking the more flattering one.
+
+### (3) Correctness: greedy 64-token generation, single-chunk prompts, vs `llama-completion --temp 0`
+
+**Prompt 1 — "The capital of France is" (5 tokens, exact wording from window 2's committed table,
+not truncated): EXACT MATCH, all 64 generated tokens byte-identical.** Full text diffed directly
+(`tok.decode(prompt_ids + gen_ids)` vs `llama-completion`'s echoed output, mod its trailing
+newline) — both stacks produce the identical string, including the digression into a Python
+`requests`/`BeautifulSoup` snippet the model goes on. Tokenizer parity also holds (`llama-tokenize
+--ids --no-parse-special` matches tinygrad's `SimpleTokenizer` id-for-id, `[976, 9029, 328, 10128,
+382]`).
+
+**Prompt 2 caveat:** window 2's original second prompt was truncated in the committed notes
+("Explain in one sentence why the sky...", reported as 13 tokens) — the full text was never
+committed, same gap window 3's Part B already flagged for a different prompt. Reconstructed a
+same-family single-chunk prompt instead: **"Explain in one sentence why the sky is blue."**
+(tokenizer-verified 10 raw tokens, `[176289, 306, 1001, 21872, 4436, 290, 17307, 382, 9861, 13]`,
+confirmed identical via `llama-tokenize` — well under the `chunk_size=32` prefill boundary, so this
+is not a byte-identical replay of window 2's literal prompt, and the result below should not be read
+as "window 2's exact prompt 2, re-run."
+
+**Prompt 2 (reconstructed): DIVERGES at generated token 27** (0-indexed 26), verified by tokenizing
+`llama-completion`'s raw completion text with tinygrad's own tokenizer (already shown exact above)
+and diffing id-for-id against tinygrad's `gen_ids`. 26 tokens identical first (`"\n\nThe sky appears
+blue because the Earth's atmosphere scatters sunlight, and blue light is scattered more than other
+colors due to its shorter"`), then tinygrad picks id 79731 (`" wavelength"`, -> "...shorter
+wavelength.") while llama.cpp picks id 11 (`","`, -> "...shorter, smaller waves."). Both
+continuations stay fluent afterward (they even both circle back to near-identical phrasing, "The
+sky\n\nThe sky is the expanse of air and space that surrounds the Earth, appearing blue during the
+day due to the scattering of sunlight by..." — llama.cpp's token stream running exactly one token
+"behind" tinygrad's from the divergence point on, since its 4-token diverging segment vs tinygrad's
+3-token one absorbs the offset) — not garbage, a different-but-comparably-fluent word choice, same
+shape as the FP-drift-near-tied-argmax phenomenon window 3's Part B documented for BEAM and
+multi-chunk-prefill divergences.
+
+**Reported verbatim, per the docket, without rationalizing it away as harmless:** this prompt is
+single-chunk (10 tokens, nowhere near the `chunk_size=32` boundary that was the identified cause of
+every prior divergence in this bench-window series), so the chunked-prefill explanation used for
+every previous divergence does **not** apply here. This is the first divergence observed in this
+series on a prompt that isn't multi-chunk. T4.13's fix changes *where* the dequant fuses into the
+compute graph (materializing a full buffer, pre-fix, vs. fusing directly into `weight[sel]`'s gather,
+post-fix) — that's a different floating-point summation/operation order than before, which is exactly
+the kind of change that can flip an argmax choice once two candidates are close enough, independent
+of chunking. **Not established whether this specific divergence predates T4.13** (no pre-fix run of
+this exact reconstructed prompt was made — doing so would mean checking out pre-fix code, out of
+this window's scope) — flagged as an open question, not resolved here. Verdict: **one of two
+single-chunk controls is exact, the other (a reconstruction, not a literal replay) diverges once**,
+plausibly the same known FP-order-sensitivity phenomenon as every other divergence in this series,
+now observed for the first time outside a chunk-boundary or BEAM-search context — genuinely new
+information, not swept under the "just chunking" explanation that covered every prior case.
+
+### (4) `JITBEAM=2` decode, single run (matching window 3's precedent — BEAM's `IGNORE_BEAM_CACHE=1`
+fresh-search cost isn't cheap enough for repeats)
+
+| | warm s | prefill tok/s | decode tok/s | decode GB/s |
+|---|---|---|---|---|
+| pre-fix (window 3 Part C(4)) | 167.65 | 25.50 | **1.48** (-12.5% vs no-BEAM) | 88.10 |
+| post-fix | 187.89 | 45.63 | **15.52** (+41.5% vs no-BEAM) | 63.26 |
+
+**BEAM flips from hurting decode pre-fix to helping it post-fix**, confirming the docket's
+hypothesis directly. Pre-fix, window 3's Part C(3) attributed the 1.69 tok/s bottleneck to a large
+*elementwise* dequant kernel repeated every step (72 calls/step, ~90% of wall time) — not the kind of
+kernel BEAM's tiling search improves, so BEAM's autotuned variants lost to the defaults. Post-fix,
+the dequant is fused into the `weight[sel]` gather — now a gather/matmul-shaped kernel, exactly what
+BEAM search is built to improve — and it does: +41.5% over no-BEAM here, versus -12.5% pre-fix. Also
+prefill continues climbing under BEAM (45.63 vs no-BEAM's 41.80, +9.2%).
+
+### (5) Memory watch
+
+`vm.swapusage` `used`: 933.19 MB before Docket A, 925.19 MB after (4)'s BEAM run — no growth, within
+noise (actually slightly down). `vm_stat` free+inactive pages stayed in the multi-GB range throughout
+(free alone: 207k pages/16KB = ~3.2 GB at start, 1.06M pages = ~17.4 GB after (4), since gpt-oss's
+process had exited by then and returned memory). No swap growth at any point; no abort triggered.
+
+### Verdict
+
+**T4.13's fix is a large, real, reproducible win** — 6.49x decode tok/s (1.69 -> 10.97), 2.52x
+prefill tok/s (16.57 -> 41.80), 17.1x bytes/decode-token (59.31 GB -> 3.46 GB), and it flips
+`JITBEAM=2` from a decode regression (-12.5%) to a decode win (+41.5%) — all measured on the real
+gpt-oss-20b MXFP4 GGUF end to end, not a synthetic stand-in. Two things reported without softening,
+per the docket: the decode number (10.97 tok/s) undershoots the docket's ~20-40 tok/s expectation and
+the byte reduction (17.1x) undershoots the commit message's 44x (both real numbers, just measuring
+different things than the extrapolation assumed); and one of the two single-chunk correctness
+controls diverges from `llama-completion` at generated token 27, on a prompt that isn't multi-chunk
+— open, not resolved, not the model regressing into garbage output, but a genuine "different bits"
+result worth a follow-up bisection if bit-exact parity becomes a hard requirement.
