@@ -541,3 +541,57 @@ across decode steps for repeated expert selections, or a fused dequant+matmul ke
 materializing the dequantized weight) is real follow-up work — scoping that as a new task, not done
 here. No swap growth across any of C's runs (`vm.swapusage` used ranged 1189-1213 MB throughout,
 same band as parts A/B).
+
+## D. Headline row refresh — qwen3:8b, METAL, stability check
+
+| config | decode tok/s (3 runs) | avg | vs prior reference |
+|---|---|---|---|
+| no-BEAM | 7.39, 7.38, 7.38 | **7.383** | ≈7.38 expected — **matches, no regression** |
+| `JITBEAM=2 IGNORE_BEAM_CACHE=1` | 13.11, 12.12, 12.64 | **12.623** | ≈14.40 expected — **-12.3%, but within known noise band** |
+| `llama-bench -r 3` (reference) | pp512 357.14, tg128 27.09 | — | matches 08-18 (357.14) and 08-19 (356.97) — **stable** |
+
+No-BEAM is rock solid — matches the expected ≈7.38 tok/s to 3 significant figures, confirms nothing
+regressed since the 08-19 morning session. BEAM's average (12.62) undershoots the docket's expected
+≈14.40 by ~12%, but bench-window-2's Part C already characterized this exact noise: its 7 BEAM-prefill
+repeats spanned 11.31-14.40 tok/s decode (`MV=0` control included) and were diagnosed as "anomaly =
+noise, not a regression" (`510af863d`) — this window's 12.11-13.11 range sits inside that established
+band, just toward its lower half. Not treated as a new finding; consistent with prior noise
+characterization, not re-investigated here. `llama-bench`'s reference numbers are essentially
+identical to both prior sessions (357.14/357.14/356.97 pp512, 27.27/27.07/27.09 tg128) — the
+llama.cpp/hardware baseline itself hasn't drifted, so BEAM's variance is JIT-search-side, not an
+environment regression.
+
+## Wrap-up: window 2026-08-19w3
+
+- **Verdicts, in one line each:** A (T4.8) — lean no-go, FAST_ATTN=1 is a wash at standard context
+  and a single-run +2.1% at 4k context, not enough to fund the ~300-550-line investment. B (T4.10) —
+  confirmed closed: chunk_size=64 (single-chunk prefill) diverges from llama.cpp identically to
+  chunk_size=32, ruling out chunking; FP-drift-near-tied-argmax stands, and this also retroactively
+  earns the `memory` branch's `ba068e9ae` TASKS.md update, which had stated the same conclusion
+  slightly ahead of having this specific cross-check. C — not a bytes-methodology artifact (harness
+  was always reading the correct, non-cumulative counter); real bottleneck is ~90% of one decode
+  step's time in two elementwise kernels shaped like MXFP4 expert-weight dequantization, redone every
+  token; `JITBEAM=2` doesn't fix it (helps prefill +54%, hurts decode -12.5%). D — stable: no-BEAM
+  matches exactly, BEAM sits within previously-documented noise, llama-bench reference unchanged.
+- **Reconstructed-prompt caveat (part B):** the original T4.3 33-token divergent prompt was never
+  committed to the repo (ad hoc session). Used a same-family, same-token-count, same-chunk-boundary
+  reconstruction instead, flagged inline in part B. It happened to reproduce the identical divergence
+  position and token IDs as the original — good corroboration, but worth remembering this wasn't a
+  byte-identical replay if anyone re-derives from this note later.
+- **New anomaly this window (part B):** `model.warmup()` always uses `chunk_size=32` internally
+  (no parameter to override it) and the JIT dispatch key doesn't include `chunk_size`/the `v_toks`
+  Variable's max bound — calling `warmup()` then `generate(..., chunk_size=64)` (or any different
+  chunk_size) in the same process raises `tinygrad.engine.jit.JitError: args mismatch in JIT`. Real,
+  reproducible, not filed as a task here (out of this window's scope) — worth a `T4.x` entry: either
+  make `warmup()` accept `chunk_size`, or fold `chunk_size` into the JIT dispatch key so mismatched
+  calls degrade to a recompile instead of a hard crash.
+- **No swap growth** at any point in the window (`vm.swapusage` `used` ranged 1181-1213 MB across all
+  four parts, including gpt-oss-20b's 12 GB GGUF being resident for the whole of B and C) —
+  `llama-server` confirmed stopped throughout, never restarted by this session.
+- No thermal-throttling indicators (BEAM warm-times 167-258s across the window's BEAM runs — the
+  spread tracks IGNORE_BEAM_CACHE's fresh-search variance, not a monotonic slowdown pattern).
+- Branch `task/bench-window-3` = `integration/wave1` (`090489bca`) + `task/bench-window-2` merged
+  clean (`89decdc8c`), plus this session's 4 commits (parts A-D, `c2a5fc466`..`9b87a992f` and this
+  one). Not pushed; not merged into `integration/wave1` or `master`. Scratch scripts used for parts
+  B/C (`t410_repro.py`, `gptoss_bytes.py`, `gptoss_perkernel.py`, `append_row.py`) live in the
+  session scratchpad, not the repo — none were needed as committed artifacts for this window's asks.

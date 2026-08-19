@@ -34,3 +34,10 @@ qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integratio
 qwen3:8b,tinygrad,METAL,"FAST_ATTN=0 2026-08-19w3 task/bench-window-3@integration-wave1, long-context prompt=4096 max-context=8192",2.124,10.449,5.012,42.62
 qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, long-context prompt=4096 max-context=8192",2.420,10.451,5.117,43.51
 gpt-oss:20b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19w3 task/bench-window-3@integration-wave1, T4.11 gpt-oss-20b JITBEAM=2 decode datum",2.635,25.500,1.479,88.10
+qwen3:8b,tinygrad,METAL,"2026-08-19w3 task/bench-window-3@integration-wave1, no-BEAM headline refresh",2.357,14.98,7.39,46.91
+qwen3:8b,tinygrad,METAL,"2026-08-19w3 task/bench-window-3@integration-wave1, no-BEAM headline refresh",2.108,14.98,7.38,46.84
+qwen3:8b,tinygrad,METAL,"2026-08-19w3 task/bench-window-3@integration-wave1, no-BEAM headline refresh",2.109,14.97,7.38,46.80
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19w3 task/bench-window-3@integration-wave1, JITBEAM=2 headline refresh",2.096,48.63,13.11,85.00
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19w3 task/bench-window-3@integration-wave1, JITBEAM=2 headline refresh",2.113,49.03,12.12,79.68
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19w3 task/bench-window-3@integration-wave1, JITBEAM=2 headline refresh",2.111,48.06,12.64,83.50
+qwen3:8b,llamacpp,METAL,-r 3 2026-08-19w3 reference re-check,,357.14,27.09,
