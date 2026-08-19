@@ -30,11 +30,11 @@ def q16(a: np.ndarray) -> np.ndarray:
   """round-trip through float16, like Transformer.from_gguf's default state_dict cast"""
   return a.astype(np.float16).astype(np.float64)
 
-def build_gguf(path: pathlib.Path, rng: np.random.Generator) -> dict:
+def build_gguf(path: pathlib.Path, rng: np.random.Generator, max_ctx: int = MAX_CTX) -> dict:
   """Writes a tiny gpt-oss-arch GGUF and returns the (already fp16-rounded) numpy weights used,
   keyed the same way the reference model below expects them."""
   w = gguf.GGUFWriter(str(path), "gpt-oss")
-  w.add_context_length(MAX_CTX)
+  w.add_context_length(max_ctx)
   w.add_embedding_length(DIM)
   w.add_block_count(N_LAYERS)
   w.add_head_count(N_HEADS)
@@ -227,6 +227,26 @@ class TestGPTOSSGGUF(unittest.TestCase):
     plain = precompute_freqs_cis(8, 16, 10.0, device=None)
     yarn_noop = precompute_freqs_cis(8, 16, 10.0, device=None, yarn_factor=1.0, yarn_orig_ctx=32, yarn_beta_fast=32.0, yarn_beta_slow=1.0)
     np.testing.assert_array_equal(plain.numpy(), yarn_noop.numpy())
+
+  def test_max_context_defaults_to_cap_not_native(self):
+    """T4.6: from_gguf() with no max_context arg must NOT pre-allocate KV for the model's full native
+    context (_init_state sizes the cache off Transformer.max_context) -- it should cap to
+    Transformer.DEFAULT_MAX_CONTEXT instead. A caller that explicitly wants the full native context can
+    still ask for it via max_context=None."""
+    rng = np.random.default_rng(99)
+    with tempfile.TemporaryDirectory() as d:
+      path = pathlib.Path(d) / "tiny-gpt-oss-bigctx.gguf"
+      build_gguf(path, rng, max_ctx=20000)  # native context far bigger than the default cap
+      model, kv = Transformer.from_gguf(path)  # no max_context -- the naive/library-default path
+      self.assertEqual(kv["gpt-oss.context_length"], 20000)
+      self.assertLess(Transformer.DEFAULT_MAX_CONTEXT, 20000)
+      self.assertEqual(model.max_context, Transformer.DEFAULT_MAX_CONTEXT)
+      # explicit escape hatch: max_context=None still bypasses the cap and gets the full native context
+      model_native, _ = Transformer.from_gguf(path, max_context=None)
+      self.assertEqual(model_native.max_context, 20000)
+      # explicit override still wins (and is still min()'d against native)
+      model_explicit, _ = Transformer.from_gguf(path, max_context=64)
+      self.assertEqual(model_explicit.max_context, 64)
 
 # ---------------------------------------------------------------------------------------------
 # Real gpt-oss-20b GGUF, metadata-only validation (no tensor data touched - GGUFReader mmaps the

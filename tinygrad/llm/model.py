@@ -569,8 +569,17 @@ class Transformer:
     assert not stray, f"device_map: param(s) landed on {stray}, outside the configured device_map {sorted(self._placed_devices)} " \
       "(a hand-built tensor is probably missing device=)"
 
+  # T4.6: _init_state pre-allocates the whole KV cache (shape ~ max_context) on the first forward, before a
+  # single token is generated. A caller who doesn't pass max_context used to get the model's NATIVE context
+  # (up to 131072) here -- 2.2-5.3x the model's own weight size in KV cache nobody asked for (T1.9's finding,
+  # measured: llama3.2:1b +4.3GB, qwen3:8b +6.07GB). Default to something sane instead; a caller that really
+  # wants the model's full native context can still ask for it explicitly, either with max_context=<big N>
+  # (min()'d against native below, so overshooting is harmless) or max_context=None (bypasses the cap entirely).
+  DEFAULT_MAX_CONTEXT = 8192
+
   @staticmethod
-  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, *, device_map:str|dict[int|str,str]|None=None,
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=DEFAULT_MAX_CONTEXT, *,
+                device_map:str|dict[int|str,str]|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # gguf_load streams per-tensor (T1.9); no need to force the whole file onto the default device first
     kv, state_dict = gguf_load(gguf)
@@ -699,6 +708,14 @@ class Transformer:
     generate()-caller and test that assumes one .item()/next() per decode step keeps working unchanged. Pass
     drain_every=2..4 from a real serving loop to amortize the sync (streaming still yields one token at a time,
     just in bursts -- see the NOTE below the drain block for EOS handling)."""
+    # T4.6: a prompt that already fills (or overflows) max_context has zero room to generate into. Without this,
+    # `while virtual_len < self.max_context` below never runs and this silently yields nothing (len==max_context),
+    # or the `t = Tensor(...).reshape(1, self.max_context)` a few lines down throws an opaque shape-mismatch
+    # (len>max_context) -- neither names the actual problem. serve.py has its own (HTTP-level) version of this
+    # check before it ever calls generate(); this is the equivalent guard for every other caller (CLI, library).
+    assert len(tokens) < self.max_context, \
+      f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
+      "-- raise it via --max_context (cli.py) or Transformer.from_gguf(max_context=...)"
     if self.has_recurrent_block: chunk_size = 1
     drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)

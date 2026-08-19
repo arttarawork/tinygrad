@@ -32,6 +32,24 @@ class TestTransformerGenerate(unittest.TestCase):
     model.warmup()
     for key, jit in model.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
+  def test_generate_at_boundary_yields_one_token(self):
+    # prompt len == max_context - 1 leaves room for exactly one generated token -- must succeed
+    model = Transformer(TEST_CONFIG)
+    self.assertIsInstance(next(model.generate(list(range(TEST_CONFIG.max_context - 1)))), int)
+
+  def test_generate_prompt_fills_context_raises(self):
+    # T4.6: prompt len == max_context (zero room to generate) must fail loudly, naming max_context,
+    # not silently yield nothing (the old `while virtual_len < max_context` behavior)
+    model = Transformer(TEST_CONFIG)
+    with self.assertRaisesRegex(AssertionError, f"max_context={TEST_CONFIG.max_context}"):
+      next(model.generate(list(range(TEST_CONFIG.max_context))))
+
+  def test_generate_prompt_exceeds_context_raises(self):
+    # past max_context must also raise the same clear assert, not an opaque reshape shape-mismatch
+    model = Transformer(TEST_CONFIG)
+    with self.assertRaisesRegex(AssertionError, f"max_context={TEST_CONFIG.max_context}"):
+      next(model.generate(list(range(TEST_CONFIG.max_context + 5))))
+
   def test_first_recurrent_generate_before_state_init(self):
     model = Transformer(TEST_CONFIG)
     model.has_recurrent_block = True
