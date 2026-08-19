@@ -20,6 +20,14 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
+def _ggml_nbytes(n: int, ggml_type: int) -> int:
+  """Exact on-disk byte length of a GGUF tensor's data blob (mirrors the slicing ggml_data_to_tensor
+  does internally), computed from its element count and type alone -- lets the loader stage just this
+  tensor's byte range instead of the whole file."""
+  if (dtype := _GGML_NATIVE.get(ggml_type)) is not None: return dtype.itemsize * n
+  if (nb := _GGML_QUANT.get(ggml_type)) is not None: return (n // nb[0]) * nb[1]
+  raise ValueError(f"GGML type '{ggml_type}' is not supported!")
+
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
@@ -129,10 +137,13 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
-  # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
-  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
+_HEADER_CHUNK = 16 * 1024 * 1024  # generous prefix for magic+KV+tensor-infos (real headers measured ~6-8MB)
+_STAGE_BATCH = 64 * 1024 * 1024   # merge adjacent tensors into one disk->device copy up to this size, to
+                                   # amortize per-copy dispatch overhead over the many small tensors (norms,
+                                   # biases, small embeddings) real GGUFs have alongside the big matmul weights
+
+def _parse_header(header: Tensor) -> tuple[dict, list, int]:
+  r = io.BufferedReader(TensorIO(header), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
 
@@ -142,10 +153,53 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
     kv_data[k] = readers[typ](r)
 
   t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
-  alignment, pos = kv_data.get("general.alignment", 32), r.tell()
+  return kv_data, t_infos, r.tell()
+
+def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+  # [T1.9] Only a small header prefix gets realized to parse KV metadata + tensor infos -- not the whole
+  # (multi-GB) file. Tensor DATA is staged in bounded batches (_STAGE_BATCH) below instead of one whole-file
+  # blob: no single allocation is ever bigger than one batch, which matters under memory pressure (a
+  # fragmented allocator can satisfy many small requests where one big contiguous one fails -- see commit
+  # message) and keeps per-tensor dequant fusing into its eventual consumer exactly as before.
+  size = tensor.shape[0]
+  chunk = min(size, _HEADER_CHUNK)
+  while True:
+    header = tensor[:chunk].to(None).realize()
+    try:
+      kv_data, t_infos, pos = _parse_header(header)
+      if chunk < size and pos >= chunk: raise ValueError("header may have been truncated by the chunk boundary")
+    except (struct.error, IndexError, ValueError):
+      if chunk >= size: raise
+      chunk = min(size, chunk * 2)
+      continue
+    break
+
+  alignment = kv_data.get("general.alignment", 32)
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH) into one
+  # disk->device copy each, instead of one copy per tensor. Each tensor's dequant graph still starts
+  # from its own VIEW of the (already-realized) batch, so per-tensor fusion is unaffected -- this only
+  # changes how many COPY ops the loader issues, not what ends up resident on device.
+  infos = sorted(((name, dims, typ, off, _ggml_nbytes(prod(dims), typ)) for name, dims, typ, off in t_infos), key=lambda x: x[3])
+
+  def flush(batch: list[tuple[str, tuple[int, ...], int, int, int]]) -> dict[str, Tensor]:
+    lo, hi = batch[0][3], batch[-1][3] + batch[-1][4]
+    # realize the raw (still-quantized) batch bytes right away, same as the pre-T1.9 whole-file realize
+    # did -- this is required regardless (DISK can't run the dequant ALU ops) and keeps the scheduler
+    # from tangling hundreds of small COPYs into the same schedule as the per-tensor dequant graphs below.
+    staged = tensor[data_start + lo:data_start + hi].to(None).realize()
+    return {name: ggml_data_to_tensor(staged[off - lo:off - lo + nbytes], prod(dims), typ).reshape(*reversed(dims))
+            for name, dims, typ, off, nbytes in batch}
+
+  state_dict: dict[str, Tensor] = {}
+  batch: list[tuple[str, tuple[int, ...], int, int, int]] = []
+  for info in infos:
+    if batch and info[3] + info[4] - batch[0][3] > _STAGE_BATCH:
+      state_dict.update(flush(batch))
+      batch = []
+    batch.append(info)
+  if batch: state_dict.update(flush(batch))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
