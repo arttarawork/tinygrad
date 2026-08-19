@@ -1160,6 +1160,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       if not isinstance(d, UOp): return d
       if d.is_bound_var: return d.unbind()[0].replace(op=Ops.PARAM)
       if d.is_variable: return d.replace(op=Ops.PARAM)
+      # compound expression (e.g. a bound start_pos + a constant T, real decode's actual Tk shape): recurse so
+      # any bound-var/Variable node nested inside arithmetic also gets PARAM-ified, not just a bare top-level one.
+      if d.src: return d.replace(src=tuple(to_kernel_param(s) for s in d.src))
       return d
     shape, max_shape = self.shard_shape, self.max_shard_shape
     ret = UOp.placeholder(max_shape, self.dtype, slot, addrspace)

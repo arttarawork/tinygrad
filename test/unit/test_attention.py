@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable
+from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable, TinyJit
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
 from tinygrad.llm import model
@@ -9,7 +9,7 @@ from tinygrad.llm.model import (
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 from tinygrad.llm.attn_kernel import tuned_decode_attention, CHUNK
-from test.helpers import assert_kernel_count
+from test.helpers import assert_kernel_count, assert_jit_cache_len
 
 def apply_rope(x:Tensor, start_pos:int):
   B, H, T, Hd = x.shape
@@ -494,18 +494,44 @@ class TestTunedAttentionKernel(unittest.TestCase):
     out = tuned_decode_attention(q, k, v, mask).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-6, atol=1e-6)
 
-  def test_gating_symbolic_tk_falls_back(self):
-    # HARD LIMITER (see attn_kernel.py docstring): Tensor.custom_kernel hard-asserts on symbolic shapes,
-    # and real JIT decode promotes the growing KV-cache slice length to a symbolic UOp Variable after the
-    # first decode step. Without this fallback, the tuned kernel crashes (AssertionError, verified via a
-    # live model.generate() run) instead of silently degrading -- this is the regression guard for that.
-    q, k_full, v_full = self._qkv(1, 4, 2, 10, 8, 0)
-    tk_var = Variable("Tk", 1, 10).bind(5)
-    k, v = k_full[:, :, :tk_var], v_full[:, :, :tk_var]
-    self.assertFalse(isinstance(k.shape[2], int))  # sanity: this really is the symbolic case
-    ref = q.scaled_dot_product_attention(k_full[:, :, :5].contiguous(), v_full[:, :, :5].contiguous(), enable_gqa=True).numpy()
-    out = tuned_decode_attention(q, k, v, None).numpy()
-    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
+  def test_symbolic_tk_uses_kernel(self):
+    # T1.8c: the old HARD LIMITER (Tensor.custom_kernel hard-asserting on symbolic shapes, forcing this
+    # kernel to fall back to SDPA past the first real decode step) is resolved -- the chunk-round count is
+    # now ceildiv(Tk, CHUNK) fed straight into a REDUCE UOp.range (see attn_kernel.py docstring), so there's
+    # no Python branch on Tk's value left to fail. This replaces the old test_gating_symbolic_tk_falls_back:
+    # the contract inverted -- it must now assert the kernel HANDLES symbolic Tk, not that it declines to.
+    # Covers both an exact-multiple-of-CHUNK bound value and non-multiples (tail-guard exercised).
+    q, k_full, v_full = self._qkv(1, 4, 2, 3 * CHUNK + 5, 8, 0)
+    for n in (1, CHUNK, CHUNK + 1, 2 * CHUNK, 3 * CHUNK + 5):
+      tk_var = Variable("Tk", 1, 3 * CHUNK + 5).bind(n)
+      k, v = k_full[:, :, :tk_var], v_full[:, :, :tk_var]
+      self.assertFalse(isinstance(k.shape[2], int))  # sanity: this really is the symbolic case
+      ref = q.scaled_dot_product_attention(k_full[:, :, :n].contiguous(), v_full[:, :, :n].contiguous(), enable_gqa=True).numpy()
+      out = tuned_decode_attention(q, k, v, None).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4, err_msg=f"{n=}")
+
+  def test_symbolic_tk_jit_replay_one_kernel(self):
+    # mirrors test/backend/test_custom_kernel.py's test_sum_symbolic_reduce_dim_jit: one compiled kernel,
+    # captured once, correctly replayed across many bound Tk values under TinyJit (including a value never
+    # seen during capture) -- the variable identity is the cache key, not the bound value.
+    q, k_full, v_full = self._qkv(1, 4, 2, 3 * CHUNK + 5, 8, 0)
+    def f(q, k, v):
+      return tuned_decode_attention(q, k, v, None).realize()
+    jf = TinyJit(f)
+    for n in (1, CHUNK, 2 * CHUNK, CHUNK + 1, 3 * CHUNK + 5, CHUNK + 1):
+      tk_var = Variable("Tk", 1, 3 * CHUNK + 5).bind(n)
+      k, v = k_full[:, :, :tk_var], v_full[:, :, :tk_var]
+      ref = q.scaled_dot_product_attention(k_full[:, :, :n].contiguous(), v_full[:, :, :n].contiguous(), enable_gqa=True).numpy()
+      out = jf(q, k, v).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4, err_msg=f"{n=}")
+    # 3, not 1: a SHRINK view on a middle axis (k/v sliced to :tk_var out of a larger max-extent buffer,
+    # exactly what the real KV cache slice looks like) isn't a simple stride-offset view -- there are gaps
+    # between (b, kv_head) blocks past Tk -- so custom_kernel's dispatch needs k and v each materialized
+    # into a plain contiguous buffer first. Same cost the naive T1.8 kernel pays (verified directly: T4.7's
+    # placeholder_like machinery, not this kernel's chunking, is what triggers it) and one real decode was
+    # already paying pre-T1.8c on every concrete-Tk step too -- symbolic Tk doesn't add it, just no longer
+    # falls back around it. The number that matters here is "one capture, not one per n" -- assert that.
+    assert_jit_cache_len(jf, 3)
 
   def test_kernel_count_default_vs_tuned(self):
     q, k, v = self._qkv(2, 4, 2, 2 * CHUNK + 3, 8, 0)

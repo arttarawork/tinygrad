@@ -1,7 +1,7 @@
-"""T1.8b: tuned Metal decode-attention kernel, opt-in via FAST_ATTN=1 (see tinygrad/llm/cli.py).
+"""T1.8b/T1.8c: tuned Metal decode-attention kernel, opt-in via FAST_ATTN=1 (see tinygrad/llm/cli.py).
 
 Builds on T1.8's attention_impl hook and naive decode-only custom_kernel proof (tinygrad/llm/model.py,
-test/unit/test_attention.py). Three changes over the naive kernel, in order of measured impact:
+test/unit/test_attention.py). Four changes over the naive kernel, in order of measured impact (T1.8b):
 
   1. online softmax (one pass): m/l/acc are updated together per Tk step instead of three separate
      max/sum/weighted-output passes, so K is read once instead of three times.
@@ -20,26 +20,43 @@ test/unit/test_attention.py). Three changes over the naive kernel, in order of m
      amortizing barrier overhead ~CHUNK-fold. Measured optimum around CHUNK=16-32 on M3 Pro; larger
      chunks cost more LOCAL memory and start hurting occupancy.
 
-ponytail: the CHUNK-sized threadgroup buffer needs Tk to be known at kernel-*build* time (Python-level
-`Tk // CHUNK` / remainder unrolling) -- that's fine because of the FAST_ATTN gate below, not despite it.
+T1.8c: chunking is now entirely kernel-side and symbolic-Tk-safe. The round count is `ceildiv(Tk, CHUNK)`
+(tinygrad.helpers.ceildiv on a UOp: `(Tk + CHUNK - 1) // CHUNK` when Tk isn't a known-positive Python int --
+see its source) fed straight into a REDUCE `UOp.range`, so it's just as valid when Tk is a bound Variable as
+when it's a concrete int -- no Python-level `Tk // CHUNK`/remainder branching at all, unlike T1.8b's
+`n_full = Tk // chunk; if n_full > 0: ...; for j in range(n_full*chunk, Tk): ...` (which needed a concrete
+int and raised "eval failed to be a single number" the moment Tk was a bound Variable -- T4.7's JIT-promoted
+KV-cache length after the first decode step). The last chunking round can run past the true Tk when Tk isn't
+a multiple of CHUNK (always possible now that Tk is dynamic): those positions clamp their K/V read index to
+`Tk - 1` (always a physically valid index into the real, live cache -- see HARD LIMITER below for why an
+*unclamped* out-of-range read would be unsafe) via `(pos < Tk).where(pos, Tk - 1)`, and get masked out of the
+online-softmax update with `valid.where(score, -inf)` instead -- `exp(-inf - m) == 0` drops their
+contribution to both the running sum and the weighted output exactly like a real tail loop would, with no
+separate code path. This is the in-kernel tail guard the old Python tail loop used to provide; there is now
+only one code path, chunked, for every Tk.
 
-HARD LIMITER (found while wiring this up, applies equally to T1.8's original naive kernel): real decode
-runs through `Transformer.generate` -> `TinyJit`, which promotes the growing KV-cache slice length (Tk)
-to a symbolic UOp Variable after the *first* decode step (verified live: `model.generate(...)` on a
-1-token prompt -- decode step 0 is concrete, step 1 is already symbolic and crashes without the gate
-below). `Tensor.custom_kernel` hard-asserts `all_int(self.shape)` (tinygrad/uop/ops.py,
-`placeholder_like`) and refuses any symbolic shape outright. So *no* custom_kernel-based attention_impl
--- tuned or naive -- can run on the real multi-token decode hot path without this gate; it would crash by
-the second generated token. The `isinstance(k.shape[2], int)` check below is therefore not a defensive
-nicety, it's the difference between "opt-in speedup" and "opt-in crash". See NV_LLM_DESIGN.md / TASKS.md
-T1.8b entry for the full writeup: this kernel is measurably faster than the naive one at fixed shapes,
-but with the JIT symbolic promotion in the way, it only actually engages for the first decode step (and
-for any concrete-shape, non-JIT call, e.g. direct prefill-style invocations) -- it's shipped anyway,
-flag-gated, because it's correct and a real improvement over the naive kernel at every shape that CAN
-reach it; unblocking the JIT ceiling itself is future work (T2.4-adjacent), out of scope here.
+HARD LIMITER, now RESOLVED for this kernel (previously the blocker T1.8b hit and T1.8c was scoped to fix):
+real decode runs through `Transformer.generate` -> `TinyJit`, which promotes the growing KV-cache slice
+length (Tk) to a symbolic UOp Variable after the *first* decode step (verified live: `model.generate(...)`
+on a 1-token prompt -- decode step 0 is concrete, step 1 is already symbolic). `Tensor.custom_kernel` used to
+hard-assert `all_int(self.shape)` outright; T4.7 (tinygrad/uop/ops.py `placeholder_like`) taught it to accept
+a bound Variable on a REDUCE-only dim instead, by allocating the underlying buffer at its static max extent
+and SHRINKing to the live (symbolic) extent, converting the bound value to its kernel-side PARAM form. T4.7's
+own tests covered that machinery only via a *directly*-bound-Variable shape (`k_full[:, :, :tk_var]`); real
+decode's actual Tk is a *compound* expression, `start_pos + T` (an ADD of a bound Variable and a constant),
+which `placeholder_like`'s original `to_kernel_param` didn't recurse into -- it left the raw bound-var BUFFER
+node embedded inside the ADD, which downstream codegen (`codegen/late/coalesce.py` memory coalescing) can't
+render ("memory coalescing should be on INDEX, not Ops.BUFFER"), reproduced with a minimal probe mirroring
+model.py's real Tk construction. Found and fixed alongside this task (T4.7-adjacent, not the chunking
+question T1.8c was scoped around): `to_kernel_param` now recurses into any UOp's `.src` when the node itself
+isn't a bound var/Variable, so a bound var nested anywhere inside shape arithmetic gets PARAM-ified, not just
+a bare top-level one. Small (4 lines), root-cause (fixes every compound symbolic-shape expression, not just
+Tk), and necessary: without it, no custom-kernel attention_impl -- tuned or naive -- can reach a *second*
+real decode step at all, chunked or not. See NV_LLM_DESIGN.md / TASKS.md T1.8c entry for the full writeup.
 """
 from tinygrad import Tensor, dtypes
 from tinygrad.dtype import AddrSpace
+from tinygrad.helpers import ceildiv
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
 from tinygrad.llm import model
 
@@ -50,7 +67,7 @@ def _make_tuned_attn_kernel(chunk:int):
   def _tuned_attn_kernel(O:UOp, Q:UOp, K:UOp, V:UOp) -> UOp:
     B, H, _, Hd = Q.shape
     KvH, Tk = K.shape[1], K.shape[2]
-    Hd = int(Hd)  # head_dim is always concrete (unlike Tk, which the FAST_ATTN gate guarantees is concrete too)
+    Hd = int(Hd)  # head_dim is always concrete; only Tk (the KV length) is ever symbolic
     R, scale = H // KvH, Hd ** -0.5
 
     b, h, dout = UOp.range(B, 0), UOp.range(H, 1), UOp.range(Hd, 2, axis_type=AxisType.LOCAL)
@@ -64,54 +81,42 @@ def _make_tuned_attn_kernel(chunk:int):
     acc = acc.after(l)[0].set(0.0)
 
     q_val = Q[b, h, 0, dout].cast(dtypes.float32)
-    n_full = Tk // chunk
 
-    if n_full > 0:
-      local_buf = UOp.placeholder((chunk, Hd), dtypes.float32, 50, addrspace=AddrSpace.LOCAL)
-      r = UOp.range(n_full, 3, axis_type=AxisType.REDUCE)
+    # T1.8c: round count is ceildiv(Tk, chunk) -- symbolic-safe (a UOp expression when Tk is a bound
+    # Variable, a plain int when Tk is concrete) fed directly into a REDUCE range. No Python branch on Tk.
+    n_chunks = ceildiv(Tk, chunk)
+    local_buf = UOp.placeholder((chunk, Hd), dtypes.float32, 50, addrspace=AddrSpace.LOCAL)
+    r = UOp.range(n_chunks, 3, axis_type=AxisType.REDUCE)
 
-      # produce: stage `chunk` positions' Q*K partials (one multiply-add per thread per position)
-      cw = UOp.range(chunk, 101, axis_type=AxisType.LOOP)
-      j_w = r * chunk + cw
-      store_produce = local_buf[cw, dout].after(m, l, acc, r).store(q_val * K[b, kvh, j_w, dout].cast(dtypes.float32))
-      produce_done = store_produce.end(cw)
+    # produce: stage `chunk` positions' Q*K partials (one multiply-add per thread per position). the last
+    # round may run past Tk (whenever Tk isn't a multiple of chunk) -- those lanes clamp their read to
+    # Tk - 1 (always physically valid: the real, live Tk, never an assumed static bound) and get masked out
+    # below instead of skipped, replacing the old Python-unrolled tail loop with one code path.
+    cw = UOp.range(chunk, 101, axis_type=AxisType.LOOP)
+    j_w = r * chunk + cw
+    j_w_safe = (j_w < Tk).where(j_w, Tk - 1)
+    store_produce = local_buf[cw, dout].after(m, l, acc, r).store(q_val * K[b, kvh, j_w_safe, dout].cast(dtypes.float32))
+    produce_done = store_produce.end(cw)
 
-      # consume: `chunk` scores, carrying the online-softmax recurrence forward across rounds
-      cr = UOp.range(chunk, 102, axis_type=AxisType.REDUCE)
-      j_r = r * chunk + cr
-      d2 = UOp.range(Hd, 100, axis_type=AxisType.REDUCE)
-      qk = UOp.placeholder((1,), dtypes.float32, 13, addrspace=AddrSpace.REG)
-      qk = qk.after(produce_done, cr)[0].set(0.0)
-      qk = qk[0].set(qk.after(d2)[0] + local_buf.after(produce_done)[cr, d2], end=d2)
-      score = qk[0] * scale
+    # consume: `chunk` scores, carrying the online-softmax recurrence forward across rounds
+    cr = UOp.range(chunk, 102, axis_type=AxisType.REDUCE)
+    j_r = r * chunk + cr
+    valid_r = j_r < Tk
+    j_r_safe = valid_r.where(j_r, Tk - 1)
+    d2 = UOp.range(Hd, 100, axis_type=AxisType.REDUCE)
+    qk = UOp.placeholder((1,), dtypes.float32, 13, addrspace=AddrSpace.REG)
+    qk = qk.after(produce_done, cr)[0].set(0.0)
+    qk = qk[0].set(qk.after(d2)[0] + local_buf.after(produce_done)[cr, d2], end=d2)
+    # invalid (tail-padding) lanes score -inf: exp(-inf - m_new) == 0, so they can't move m/l/acc at all.
+    score = valid_r.where(qk[0] * scale, float("-inf"))
 
-      m_old, l_old, acc_old = m.after(r, cr)[0], l.after(r, cr)[0], acc.after(r, cr)[0]
-      m_new_val = m_old.maximum(score)
-      corr = (m_old - m_new_val).exp()
-      l_new_val = l_old * corr + (score - m_new_val).exp()
-      acc_new_val = acc_old * corr + (score - m_new_val).exp() * V[b, kvh, j_r, dout].cast(dtypes.float32)
-      grouped = UOp.group(m[0].store(m_new_val), l[0].store(l_new_val), acc[0].store(acc_new_val)).end(cr, r)
-      m, l, acc = m.after(grouped), l.after(grouped), acc.after(grouped)
-
-    # tail: Tk % chunk leftover positions, unrolled at kernel-build time (Tk is a concrete int here --
-    # guaranteed by the FAST_ATTN gate in tuned_decode_attention, which falls back for symbolic Tk). No
-    # cooperative LOCAL-buffer staging here (each thread does its own full Hd contraction, Hd-fold
-    # redundant global reads like the naive kernel) -- not worth the complexity for <= chunk-1 positions.
-    for j in range(n_full * chunk, Tk):
-      j_const = UOp.const(j)
-      dsum = UOp.range(Hd, 200 + j, axis_type=AxisType.REDUCE)
-      qk_t = UOp.placeholder((1,), dtypes.float32, 14, addrspace=AddrSpace.REG)
-      qk_t = qk_t.after(m, l, acc)[0].set(0.0)
-      qk_t = qk_t[0].set(qk_t.after(dsum)[0] + Q[b, h, 0, dsum].cast(dtypes.float32) * K[b, kvh, j_const, dsum].cast(dtypes.float32), end=dsum)
-      score = qk_t[0] * scale
-
-      m_old, l_old, acc_old = m[0], l[0], acc[0]
-      m_new_val = m_old.maximum(score)
-      corr = (m_old - m_new_val).exp()
-      l_new_val = l_old * corr + (score - m_new_val).exp()
-      acc_new_val = acc_old * corr + (score - m_new_val).exp() * V[b, kvh, j_const, dout].cast(dtypes.float32)
-      grouped = UOp.group(m[0].store(m_new_val), l[0].store(l_new_val), acc[0].store(acc_new_val)).end()
-      m, l, acc = m.after(grouped), l.after(grouped), acc.after(grouped)
+    m_old, l_old, acc_old = m.after(r, cr)[0], l.after(r, cr)[0], acc.after(r, cr)[0]
+    m_new_val = m_old.maximum(score)
+    corr = (m_old - m_new_val).exp()
+    l_new_val = l_old * corr + (score - m_new_val).exp()
+    acc_new_val = acc_old * corr + (score - m_new_val).exp() * V[b, kvh, j_r_safe, dout].cast(dtypes.float32)
+    grouped = UOp.group(m[0].store(m_new_val), l[0].store(l_new_val), acc[0].store(acc_new_val)).end(cr, r)
+    m, l, acc = m.after(grouped), l.after(grouped), acc.after(grouped)
 
     out = acc[0] / l[0]
     store = O[b, h, 0, dout].store(out.cast(O.dtype))
@@ -122,10 +127,11 @@ _tuned_kernel_fxn = _make_tuned_attn_kernel(CHUNK)
 
 
 def tuned_decode_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
-  """attention_impl-compatible tuned decode kernel. Falls back to the default SDPA path for anything it
-  doesn't handle: prefill/rollout (T>1), masked decode (e.g. sliding-window), and -- critically -- a
-  symbolic (JIT-promoted) Tk, which Tensor.custom_kernel cannot express at all. See module docstring."""
-  if mask is not None or q.shape[2] != 1 or not isinstance(k.shape[2], int):
+  """attention_impl-compatible tuned decode kernel. Handles decode (T==1) at any Tk, concrete or symbolic
+  (T1.8c). Falls back to the default SDPA path for anything it doesn't handle: prefill/rollout (T>1) and
+  masked decode (e.g. sliding-window) -- those need a real per-query mask, which this decode-only kernel
+  (one query row per (b,h) threadgroup, unconditional over Tk modulo the Tk-tail guard above) doesn't carry."""
+  if mask is not None or q.shape[2] != 1:
     return model._sdpa_default(q, k, v, mask)
   O = Tensor.empty(q.shape, dtype=q.dtype, device=q.device)
   return Tensor.custom_kernel(O, q, k, v, fxn=_tuned_kernel_fxn)[0]
