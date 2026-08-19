@@ -25,3 +25,11 @@ qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/work
 qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 upstream/master@ca86a4270, T4.4 BEAM-prefill repeat3",1.699,47.95,13.01,70.74
 qwen3:8b,tinygrad,METAL,"MV=0 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, T4.4 BEAM-prefill MV=0 control",2.136,47.29,11.31,74.52
 gpt-oss:20b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, T4.3 gpt-oss-20b MXFP4, no-BEAM",2.660,16.57,1.69,100.65
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=0 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=0 standard p512n128",2.426,14.98,7.39,46.89
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=0 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=0 standard p512n128",2.138,14.98,7.37,46.76
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=0 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=0 standard p512n128",2.110,14.97,7.37,46.78
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=1 standard p512n128",2.140,14.98,7.38,46.79
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=1 standard p512n128",2.109,14.98,7.38,46.79
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=1 standard p512n128",2.103,14.98,7.38,46.79
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=0 2026-08-19w3 task/bench-window-3@integration-wave1, long-context prompt=4096 max-context=8192",2.124,10.449,5.012,42.62
+qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, long-context prompt=4096 max-context=8192",2.420,10.451,5.117,43.51

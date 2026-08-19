@@ -331,3 +331,52 @@ consistent with a much larger active-weight footprint per decode step.
   different tips; both safe to `git worktree remove` whenever). Branch `task/bench-window-2` =
   `integration/wave1` (`3e0df0fc7`) + `task/T0.3-bench-harness` merged, plus this session's 4 commits
   (parts A-D). Not pushed; not merged into `integration/wave1` or `master`.
+
+# BENCH WINDOW 2026-08-19w3 — FAST_ATTN tiebreaker, T4.10 disambiguation, gpt-oss bytes, headline refresh
+
+Branch `task/bench-window-3` = `integration/wave1` (`090489bca`, includes T1.8c symbolic-Tk tuned
+attention, T4.11's byte-budget test, T4.7's compound-expr fix) + `task/bench-window-2` merged
+(clean, no conflicts). `llama-server` stopped for the whole window; ~32 GB free at start; strictly
+sequential.
+
+## A. FAST_ATTN tiebreaker (qwen3:8b, METAL, greedy)
+
+`FAST_ATTN=1` swaps `attention_impl` for T1.8b/T1.8c's tuned Metal decode-attention kernel (online
+softmax, LOCAL `dout`, cooperative QK contraction, CHUNK=16 threadgroup staging — see
+`tinygrad/llm/attn_kernel.py`). It only engages on decode (`T==1`, unmasked); qwen3 has no
+sliding-window layers (that's gpt-oss-specific), so with T1.8c's symbolic-Tk fix already merged it
+fires on **every** decode step for this model, not just the first.
+
+**(1) Standard `-p 512 -n 128`, 3 repeats each:**
+
+| flag | decode tok/s (3 runs) | avg | vs FAST_ATTN=0 |
+|---|---|---|---|
+| `FAST_ATTN=0` | 7.39, 7.37, 7.37 | 7.377 | — |
+| `FAST_ATTN=1` | 7.38, 7.38, 7.38 | 7.380 | **+0.05%** (noise) |
+
+Prefill tok/s identical either way (14.97-14.98, expected — the tuned kernel never touches
+prefill/T>1). **Tokens byte-identical across all 6 runs** (same 128-token output list, spot-checked
+in full, not just a hash).
+
+**(2) Long-context: `--max_context 8192`, 4096-token prompt, 128 decode tokens (1 run each —
+single-run, not averaged over repeats like (1)):**
+
+| flag | prefill tok/s | decode tok/s | decode GB/s |
+|---|---|---|---|
+| `FAST_ATTN=0` | 10.449 | 5.012 | 42.62 |
+| `FAST_ATTN=1` | 10.451 | 5.117 | 43.51 |
+
+**+2.09% decode tok/s** at Tk≈4096-4223, tokens again byte-identical (both produced the same
+124-token continuation of the synthetic incrementing prompt). Directionally consistent with the
+docket's hypothesis (attention's share of decode time grows with Tk, favoring the fused kernel) but
+this is a single run per flag, not 3 — noise band not established the way (1)'s was.
+
+**Verdict (T4.8 go/no-go): mixed, lean no-go.** At 8B/Hd=128, FAST_ATTN=1 is a wash at standard
+context (+0.05%, within run-to-run noise) and a modest, single-run +2.1% at 4k-token context —
+nowhere near the kind of win that would justify the ~300-550-line T4.8 Metal-simdgroup investment
+the docket frames this as gating. Contrast with llama3.2:1b's reported -2-3% *regression*: this
+model/head-dim combination at least doesn't lose, but "doesn't lose, and might gain ~2% only once
+context gets long" is a weak basis for the bigger investment. Recommend: **don't fund T4.8** off
+this data alone; if the long-context number is worth pinning down, 3 repeats of (2) would be the
+next cheap step before committing to the larger kernel-rewrite scope — not committed here to keep
+this window sequential and on schedule for parts B-D.
