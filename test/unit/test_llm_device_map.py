@@ -69,6 +69,16 @@ class TestDeviceMapModel(unittest.TestCase):
   def test_split_matches_single_device(self):
     # NOTE: single-device ref uses the trivial map so both models run on CPU regardless of the default device
     ref, split = Transformer(TEST_CONFIG, device_map="CPU:0"), Transformer(TEST_CONFIG, device_map="0-1:CPU:0,2-3:CPU:1")
+    # ref's weights are still lazy Tensor.randn graphs at this point -- force-realize them BEFORE sharing into
+    # split via load_state_dict(realize=False). Without this, split's same-device (Device.DEFAULT) params keep
+    # pointing at ref's still-unrealized weight UOps (see nn/state.py load_state_dict: v.replace(state_dict[k]...)
+    # shares the graph, not a copy), and letting ref's generate()/JIT be the FIRST thing to realize that shared
+    # graph corrupts split's later reuse of it once ref's device_map equals Device.DEFAULT (DEV=CPU here; masked
+    # under METAL default where ref's "CPU:0" map differs from Device.DEFAULT="METAL", so realize_placement's
+    # moved-param filter force-realizes everything for ref there too). Verified empirically: weight VALUES match
+    # bit-for-bit whether or not this is here -- what breaks without it is running ref.generate() (a separate
+    # TinyJit capture) BEFORE split.generate() ever touches the shared unrealized graph.
+    Tensor.realize(*nn.state.get_parameters(ref))
     nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
     split.realize_placement()  # T4.5: force-realize the placement COPYs before any JIT capture sees them
 
@@ -248,7 +258,10 @@ class TestDeviceMapMoEExperts(unittest.TestCase):
 
   def test_experts_split_matches_unsplit_homogeneous(self):
     ref = Transformer(MOE_TEST_CONFIG, device_map="CPU:0")
-    _randomize_experts(ref)
+    _randomize_experts(ref)  # already .realize()s the expert weights it reassigns (see its NOTE 2)
+    # the REST of ref's weights (attn_q, norms, router, ...) are still lazy -- same fix as
+    # TestDeviceMapModel.test_split_matches_single_device, see its comment for why this matters.
+    Tensor.realize(*nn.state.get_parameters(ref))
     split = Transformer(MOE_TEST_CONFIG, device_map="0-1:CPU:0,2-3:CPU:1,experts:CPU:2")
     nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
     split.realize_placement()
