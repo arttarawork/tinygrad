@@ -1,8 +1,10 @@
 import os, struct, unittest
+from types import SimpleNamespace
 from tinygrad.helpers import getenv
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
+from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue
 
 class CountingMMIOInterface:
   """Fake MMIOInterface: one __getitem__/__setitem__ call == one socket-RPC message in the real RemoteMMIOInterface (system.py), so
@@ -103,6 +105,59 @@ class TestNVPTEBatching(unittest.TestCase):
     # AM's PT entry class intentionally has no set_entries: memory.py's map_range falls back to the old per-entry write loop for it,
     # so AM's write/validation semantics are untouched by this change. If this ever fires, that guarantee silently broke.
     assert not hasattr(AMPageTableEntry, 'set_entries')
+
+def fake_iface(is_remote:bool|None):
+  """Minimal stand-in for NVDevice.iface: `is_remote=None` mimics NVKIface/MOCKIface (no dev_impl at all -- Linux driver, mock, always
+  local); True/False mimics PCIIface backed by a Remote/local PCIDevice (dev_impl.vram is the BAR1 MMIOInterface T2.2 tagged)."""
+  return SimpleNamespace() if is_remote is None else SimpleNamespace(dev_impl=SimpleNamespace(vram=SimpleNamespace(is_remote=is_remote)))
+
+class TestNVRemoteSizingSkeleton(unittest.TestCase):
+  """T2.3: NVDevice has zero tuned remote values yet (no dock) -- this only proves the SELECTION works, mirroring AMD's is_usb()-keyed
+  knobs (ops_amd.py:980-994). _LOCAL_SIZING and _REMOTE_SIZING hold identical numbers today; tuning later only edits _REMOTE_SIZING."""
+  def test_no_dev_impl_iface_is_local(self):
+    # NVKIface / MOCKIface (Linux driver, mock-NV): no dev_impl.vram at all -- must resolve to local, never raise.
+    assert NVDevice.is_remote(SimpleNamespace(iface=fake_iface(None))) is False
+
+  def test_local_pcidevice_iface_is_local(self):
+    # PCIIface can back a local (non-Remote) PCIDevice too -- checked on the concrete vram view, not iface type.
+    assert NVDevice.is_remote(SimpleNamespace(iface=fake_iface(False))) is False
+
+  def test_remote_pcidevice_iface_is_remote(self):
+    assert NVDevice.is_remote(SimpleNamespace(iface=fake_iface(True))) is True
+
+  def test_sizing_selection_path_flips_on_remoteness(self):
+    # Mirrors the exact selection NVDevice.__init__ performs. Values are equal right now (asserted below) -- what must hold is the
+    # PATH: a local iface binds the _LOCAL_SIZING object, a remote one binds the distinct _REMOTE_SIZING object, by identity.
+    local_dev, remote_dev = SimpleNamespace(iface=fake_iface(None)), SimpleNamespace(iface=fake_iface(True))
+    local_sizing = NVDevice._REMOTE_SIZING if NVDevice.is_remote(local_dev) else NVDevice._LOCAL_SIZING
+    remote_sizing = NVDevice._REMOTE_SIZING if NVDevice.is_remote(remote_dev) else NVDevice._LOCAL_SIZING
+    assert local_sizing is NVDevice._LOCAL_SIZING and local_sizing is not NVDevice._REMOTE_SIZING
+    assert remote_sizing is NVDevice._REMOTE_SIZING and remote_sizing is not NVDevice._LOCAL_SIZING
+    assert NVDevice._LOCAL_SIZING == NVDevice._REMOTE_SIZING, "values must be identical pre-dock -- a no-op skeleton, not a tuned one"
+    assert NVDevice._LOCAL_SIZING is not NVDevice._REMOTE_SIZING, "but distinct objects, so tuning later is a values-only edit"
+
+class TestNVBindRemoteBatching(unittest.TestCase):
+  """T2.3's one gated exception: NVCommandQueue.bind() writes the queue into a device buffer one 32-bit word at a time. If that
+  buffer is RPC-backed (T2.2's is_remote), that's len(_q) separate socket sendalls -- the same pathology T2.2 batched away for PTE
+  writes. Local (incl. NVK-Linux, where is_remote is always False) keeps the original per-word loop, byte-for-byte."""
+  def _bind_and_count(self, is_remote:bool, n_words:int=200) -> dict:
+    mmio = CountingMMIOInterface(bytearray(n_words * 4), 0, n_words * 4, fmt='B', is_remote=is_remote)
+    hw_page = SimpleNamespace(cpu_view=lambda: mmio, size=n_words * 4)
+    fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=lambda size, options: hw_page, free=lambda *a, **k: None))
+
+    q = NVCommandQueue()
+    q._q = list(range(0xd000, 0xd000 + n_words))
+    q.bind(fake_dev)
+    assert list(q._q[:]) == list(range(0xd000, 0xd000 + n_words)), "bound queue content must be unchanged regardless of write path"
+    return mmio.stats
+
+  def test_local_buffer_keeps_per_word_writes(self):
+    stats = self._bind_and_count(is_remote=False, n_words=200)
+    assert stats['w'] == 200, f"local bind() should cost 200 individual writes (unchanged behavior), got {stats['w']}"
+
+  def test_remote_buffer_collapses_to_one_bulk_write(self):
+    stats = self._bind_and_count(is_remote=True, n_words=200)
+    assert stats['w'] == 1, f"remote bind() should collapse to 1 bulk slice write regardless of queue length, got {stats['w']}"
 
 if __name__ == "__main__":
   unittest.main()
