@@ -432,3 +432,112 @@ argmax") — that commit predates this actual chunk_size=64-vs-llama.cpp cross-c
 T4.10's tinygrad-vs-itself self-comparison to go on at the time), so it was directionally right but
 not yet earned by this specific test; it is now. No swap growth across any of B's runs (`vm.swapusage`
 used stayed at 1213.19 MB throughout, load through llama-completion).
+
+## C. gpt-oss-20b 1.69 tok/s investigation — methodology audit + real bytes/token + kernel attribution
+
+Model stayed loaded/reused across this section's scripts conceptually (same GGUF, same process
+pattern each time — actual runs are separate processes, per-run `load` cost ~2.6-3.3s each, cheap).
+
+### (1) Methodology audit: is the 100.65 GB/s figure a DEBUG=2-cumulative-footprint artifact?
+
+**No — traced both counters and they're different, and the harness only ever touches the correct
+one.** `extra/benchmark_llm.py`'s GB/s comes from `GlobalCounters.global_mem`, reset via
+`GlobalCounters.reset()` immediately before the decode loop (`benchmark_llm.py:31`) and read as a
+delta after it (`:34`) — this is a genuinely per-interval, reset-before-measuring number. The
+artifact T4.11 found (`e114fe1d8`) is a *different* counter: `engine/realize.py`'s `DEBUG>=2` print
+path (line 82) prints `GlobalCounters.mem_used` — the allocator's *current resident footprint*,
+monotonically non-decreasing, never reset — which is what's cumulative. `benchmark_llm.py` never
+reads `mem_used`; the CSV's `gbps` column was never contaminated by that bug. **T4.11's finding was
+correctly scoped to "don't read DEBUG=2's printed mem column as per-step traffic" — it was never a
+claim that `GlobalCounters.global_mem` itself (the harness's actual source) was suspect.**
+
+Second-order caveat, worth keeping in view (also called out directly in T4.11's own test docstring,
+`test/unit/test_llm_gptoss.py:322`): `GlobalCounters.global_mem` is itself a **static AST-shape
+analytic estimate** (`Estimates.mem`, `tinygrad/renderer/__init__.py:11-57` — summed from each
+kernel's `LOAD`/`STORE` `INDEX` max-extents, de-duplicated per buffer, capped at buffer size for
+re-reads), not a live driver/hardware byte counter. Both the harness's number and everything below
+share that same nature — "real" here means "correctly and consistently computed from kernel shapes,"
+not "captured by a memory-bus profiler." No tool in this repo does the latter for METAL.
+
+### (2) Real bytes/decode-token, remeasured on the actual GGUF-loaded model (not T4.11's synthetic stand-in)
+
+T4.11 confirmed the "gathered, not dense" MoE routing at real per-layer dims (2880/2880) but on a
+hand-built shaped config with random weights, not the real MXFP4-quantized 20b GGUF end to end.
+Reran the harness's own methodology (reset, then a `GlobalCounters.global_mem` delta) directly on
+`gpt-oss-20b` MXFP4, over 12 steady-state decode tokens (3 primer steps discarded first, to clear
+the concrete-\>symbolic-Tk JIT re-capture transition T1.8c's docstring describes):
+
+```
+steady-state decode: 12 tokens in 6.852s = 1.751 tok/s
+GlobalCounters.global_mem delta: 711,687,784,272 B = 711.688 GB over 12 tokens
+  = 59.307 GB/token, 103.87 GB/s
+```
+
+**Matches the original single-row measurement closely** (100.65 GB/s / 1.69 tok/s ≈ 59.6 GB/token
+then, vs. 103.87 GB/s / 59.31 GB/token now — same ballpark, small run-to-run variance, not the
+20-30x-different number a methodology artifact would produce). **Verdict: the ~60 GB/token figure is
+real** (in the "consistently, correctly estimated" sense from (1)) **and reproducible, not a
+methodology artifact.** The ~2-3 GB/token analytic expectation (active params ~3.6B @ ~4.25 bit + KV
++ embeddings, per T4.11's own note) undershoots actual traffic by ~20x — that gap is the real thing
+to explain, and (3) below identifies where it comes from.
+
+### (3) Per-kernel time table for one decode step
+
+**First attempt hit a wall worth flagging on its own:** at the default `JIT_BATCH_SIZE=32`,
+`DEBUG=2` on a *replayed* (post-capture) decode step doesn't show individual kernels at all — Metal's
+JIT graphing (`tinygrad/engine/jit.py`'s `JIT GRAPHing batch with N kernels`) folds up to 32 kernels
+into one opaque `batched N` command-buffer dispatch. One real decode step showed **24 such groups**
+(`batched 27`/`batched 28`, alternating — almost certainly gpt-oss's alternating sliding/full
+attention layers — plus one larger `batched 32` at the end, presumably the final layer + output
+head), each a strikingly uniform **~22.85 ms**, totaling ~548 ms of the step's 556.54 ms (~98.5%).
+Informative about *macro* structure (cost is even across layers, no single pathological layer) but
+useless for naming individual kernels.
+
+Reran with `JIT_BATCH_SIZE=1` (attribution only — this changes per-kernel dispatch overhead, not a
+perf number) to force individual kernel names through. Total step time barely moved (555.65 ms vs.
+556.54 ms batched), so the ungraphed run is a fair stand-in for attribution purposes. **Top-3 by
+total time, this step:**
+
+| rank | kernel | total ms | calls | ms/call | share of step |
+|---|---|---|---|---|---|
+| 1 | `E_1036800_8_16_2` | 406.03 | 72 | 5.64 | 73.1% |
+| 2 | `E_86400_32_3` | 91.78 | 72 | 1.27 | 16.5% |
+| 3 | `r_90_32_4_720_4` | 24.64 | 48 | 0.51 | 4.4% |
+
+The top two are **elementwise** kernels (`E_` prefix), 72 calls/step (=3 per layer x 24 layers) —
+shape and prefix are consistent with MXFP4→float **dequantization** of the routed expert weights,
+redone from scratch every decode step. The actual reduce/matmul compute (`r_` prefix, rank 3 and
+below) is a small fraction (~4.4% for the largest one; everything past rank 3 is under 3 ms total).
+**Combined, the two dequant-shaped elementwise kernels eat ~90% of one decode step's wall time.**
+Back-of-envelope cross-check against (2)'s bytes: `E_1036800_8_16_2`'s dims (1,036,800 x 8 x 16 x 2 =
+~265M elements) at fp16 output x 72 calls/step is ~38 GB of estimated store traffic alone — most of
+the measured ~59 GB/token — so the same kernel that dominates *time* is also the leading contributor
+to *bytes*. This is a rough shape-based inference, not a verified attribution (would need instrumenting
+the kernel's actual AST/buffer roles to confirm it's dequant specifically rather than, say, a
+different large elementwise op) but it's a consistent, singular story: **one repeated elementwise
+op — most likely MXFP4 weight dequantization with no cross-token cache — is both the time sink and
+the byte sink**, not two separate problems.
+
+### (4) JITBEAM=2 datum
+
+| | warm s | prefill tok/s | decode tok/s | decode GB/s |
+|---|---|---|---|---|
+| no-BEAM (from part D of the 08-19 window) | 41.77 | 16.57 | 1.69 | 100.65 |
+| `JITBEAM=2 IGNORE_BEAM_CACHE=1` | 167.65 | **25.50** (+54%) | **1.48** (**-12.5%**) | 88.10 |
+
+BEAM helps prefill substantially (larger, more regular batched matmuls — the kind of shape BEAM
+search is good at) but makes decode **worse**, not better — it does not fix whatever the pathological
+kernel is; if anything the autotuned decode-shaped kernels lose to the defaults here, consistent
+with (3)'s finding that decode time is dominated by a small elementwise dequant kernel repeated many
+times rather than a poorly-tiled matmul (the kind of kernel BEAM is built to improve).
+
+### Summary (attribution only, no fix attempted here per the docket's scope)
+
+Not a methodology artifact (1), not a bytes-estimate error (2) — the ~60 GB/token and ~1.7 tok/s are
+both real and mutually consistent. The cause is compute time (and, plausibly, most of the byte
+traffic) spent in per-decode-step MXFP4 dequantization of routed-expert weights with no persistence
+across tokens, not a memory-bandwidth ceiling. `JITBEAM=2` doesn't fix it. A fix (dequant caching
+across decode steps for repeated expert selections, or a fused dequant+matmul kernel that avoids
+materializing the dequantized weight) is real follow-up work — scoping that as a new task, not done
+here. No swap growth across any of C's runs (`vm.swapusage` used ranged 1189-1213 MB throughout,
+same band as parts A/B).

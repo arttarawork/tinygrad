@@ -33,3 +33,4 @@ qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integratio
 qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, FAST_ATTN=1 standard p512n128",2.103,14.98,7.38,46.79
 qwen3:8b,tinygrad,METAL,"FAST_ATTN=0 2026-08-19w3 task/bench-window-3@integration-wave1, long-context prompt=4096 max-context=8192",2.124,10.449,5.012,42.62
 qwen3:8b,tinygrad,METAL,"FAST_ATTN=1 2026-08-19w3 task/bench-window-3@integration-wave1, long-context prompt=4096 max-context=8192",2.420,10.451,5.117,43.51
+gpt-oss:20b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19w3 task/bench-window-3@integration-wave1, T4.11 gpt-oss-20b JITBEAM=2 decode datum",2.635,25.500,1.479,88.10
