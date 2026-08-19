@@ -89,7 +89,7 @@ GGUF-only loader; one generic `Transformer` covering llama/qwen2/3, GLM, OLMoE, 
 - ✅ MoE top-k routing is already minimal — CORRECTED 2026-08-18 (T1.4): `pairwise_topk` realizes exactly 1 kernel/layer (the rank reduce; scatter/slice/cast inline into consumers), which is the rangeify floor. The remaining ~3 small kernels/layer are the caller's probs path (gather + softmax stats, `model.py:124-127`). ~~Full-vocab RNG runs even at temperature 0~~ — fixed on `task/T1.5-temp0-rng`.
 - ✅ **gpt-oss architecture** wired 2026-08-18 (`task/T1.3-gptoss`): sinks, alternating sliding window, YaRN, clamped swiglu; mutation-tested synthetic parity vs numpy. Real-model validation + `tokenizer.ggml.pre` preset check deferred to the bench session.
 - ⚠️ **`tinygrad/llm` has no multi-device support at all** — no shard, no device flag beyond `DEV=`. Sharding exists only in legacy `examples/llama3.py --shard`.
-- Load path: whole GGUF is one H2D blob then per-tensor slices (`gguf.py:134,148`) — ~2x model size transient and the dominant startup cost over TB.
+- Load path: CORRECTED 2026-08-18 (T1.9) — the whole-file blob did NOT cause a 2x transient (dequant stays lazy; mem_used flat at 1x). Now streams in ≤64 MB batches anyway (`task/T1.9-stream-load`), which fixed a real METAL OOM under memory pressure (no more one-contiguous-file-sized allocation). The actual load-adjacent memory hog is **KV pre-allocation at native max_context** in `_init_state` (2.2–5.3x model size at 40k–131k ctx) — tracked as T4.6.
 
 ### 3.6 Multi-device (the pooling question)
 
