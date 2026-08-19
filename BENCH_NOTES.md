@@ -380,3 +380,55 @@ context gets long" is a weak basis for the bigger investment. Recommend: **don't
 this data alone; if the long-context number is worth pinning down, 3 repeats of (2) would be the
 next cheap step before committing to the larger kernel-rewrite scope — not committed here to keep
 this window sequential and on schedule for parts B-D.
+
+## B. T4.10 disambiguation (length vs chunking) — gpt-oss-20b, METAL, greedy
+
+**Prompt caveat up front:** T4.3's original 33-token divergent-case prompt was never committed
+(ad hoc session, not persisted). Reconstructed a same-family, same-token-count prompt instead —
+"Write a short Python function that takes a list of integers and returns the sum of all even
+numbers in the list, including a brief docstring explaining what it does." — verified via
+tinygrad's own `SimpleTokenizer` to be exactly 33 raw tokens (crosses the `chunk_size=32` prefill
+boundary by exactly 1 token, same as the original). This is a reconstruction, not a byte-identical
+replay of T4.3's literal prompt — flagged so the result below isn't overclaimed as "the exact same
+run." (It turned out to reproduce the *same* divergence position and the *same* two token IDs as
+the original T4.3 finding — see below — which is itself informative: whatever's driving this isn't
+sensitive to the specific prompt wording.)
+
+**Anomaly hit before the real test:** `model.warmup()` always internally calls `generate([0], ...)`
+with the default `chunk_size=32` (no `chunk_size` param on `warmup()`). The JIT dispatch key is only
+`(is_prefill, temp_is_None)` — it does **not** include `chunk_size` / the `v_toks` Variable's max
+bound. Calling `warmup()` then `generate(..., chunk_size=64)` in the same process collides: the
+decode JIT entry captured during warmup has `v_toks` bound to max=32; the `chunk_size=64` call's
+`v_toks` (max=64) doesn't match, raising `tinygrad.engine.jit.JitError: args mismatch in JIT`. Real
+bug (a server that varies `chunk_size` across requests in one process would hit this), not part of
+what B is testing — routed around by skipping `model.warmup()` in the repro script (harmless for a
+correctness-only comparison; only costs a slightly slower first token). **Not filed as a task here
+per the docket's "no fixes here" scope — flagged for a future task instead.**
+
+**(1) `chunk_size=32` (default, reproduces the divergence) vs (2) `chunk_size=64` (single prefill
+chunk — the 33-token prompt fits in one chunk, eliminating tinygrad's own chunking as a variable):**
+
+Both produced **byte-identical 64-token generations** (same `gen_ids` list, full diff, not a hash)
+— tinygrad's own output is chunk-size-invariant on this prompt, confirming T4.10's original
+self-comparison finding (`f66fc48a6`) from a second angle.
+
+**vs. `llama-completion -m gpt-oss-20b --temp 0 -n 64 -no-cnv -f <same 33-token prompt>`:** both
+tinygrad runs (chunk_size=32 and 64) diverge from llama.cpp's completion at the **same position**:
+generated token 26 (0-indexed 25) — tinygrad picks id 4251 (`" along"`), llama.cpp picks id 3463
+(`" including"`), verified precisely by tokenizing llama.cpp's raw completion text with tinygrad's
+own tokenizer and diffing id-for-id against `gen_ids` (25 identical tokens first, both fluent,
+on-topic continuations after the divergence — same phenomenon shape as the original T4.3 note).
+
+**Verdict: (2) matches (1), not llama.cpp — CONFIRMED closed, T4.10's FP-drift-near-tie hypothesis
+holds.** Since `chunk_size=64` (no chunking at all — one prefill pass, exactly matching llama.cpp's
+own single-batch prompt eval, `33 tokens` per its own perf log) still diverges from llama.cpp
+identically to `chunk_size=32`, tinygrad's prefill chunking is ruled out as the cause of the
+cross-stack divergence — the divergence must come from somewhere else in tinygrad's forward pass
+(vs. llama.cpp's), consistent with a small floating-point rounding difference propagating through
+attention/KV state until it flips an argmax choice once two candidates are nearly tied, exactly as
+T4.10/T4.3 originally proposed. This also empirically confirms the `memory` branch's `TASKS.md`
+update (`ba068e9ae`, "T4.10 cleared — chunking is invariant, T4.3 divergence is FP drift near tied
+argmax") — that commit predates this actual chunk_size=64-vs-llama.cpp cross-check (it only had
+T4.10's tinygrad-vs-itself self-comparison to go on at the time), so it was directionally right but
+not yet earned by this specific test; it is now. No swap growth across any of B's runs (`vm.swapusage`
+used stayed at 1213.19 MB throughout, load through llama-completion).
