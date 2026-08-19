@@ -241,6 +241,7 @@ flowchart LR
 
 | 2026-08-18 | wave-2 integration | **done** | `integration/wave1` → `8d971f383` | all 8 wave-2 branches merged. Conflicts: heuristic.py (F9 while-uncast × T1.10 mat_ranges — combined) and model.py from_gguf (T1.3 config fields × device_map ctor — combined). Full suite **2420 passed**, mypy + ruff clean, mock-NV 49 passed, external NV/AM 11 passed. |
 | 2026-08-18 | upstream sync | **done** | `integration/wave1` | merged `upstream/master` @ `2cfb421a8` (4 commits past baseline: KernelCountException, casted-const renderer migration, gptoss zero-2, CI deps) — zero conflicts, all gates re-green (2420 + mock-NV 49 + mypy + ruff). Task branches stay based on `af2a43c85`; rebase individually at upstream-PR time. |
+| 2026-08-18 | T0.1+T0.3 | agent running | `task/T0.3-bench-harness` | 20:47: Hermes nightly ended 20:43 (watch fired); llama-server STOPPED via bootout (restore after bench: `launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.artur.llama-server.plist`). Bench plan: llama-bench + tinygrad on upstream `2cfb421a8` vs `integration/wave1` (measures our levers), ±JITBEAM=2, qwen3:8b Q4_K_M, quiet machine. |
 
 ## Parallelization notes
 
