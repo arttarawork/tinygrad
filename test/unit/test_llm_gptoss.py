@@ -222,6 +222,38 @@ class TestGPTOSSGGUF(unittest.TestCase):
     ref = reference_forward(weights, TOKENS)
     np.testing.assert_allclose(logits, ref, rtol=2e-2, atol=2e-2)
 
+  def test_gptoss_chunked_prefill_matches_reference(self):
+    """T4.10: reference_forward computes attention over the whole sequence in one shot (with the
+    window mask applied to the full T_xT_ score matrix) -- the strongest oracle available, independent
+    of tinygrad's own chunking code. Feed the same tokens through model.blk chunk-by-chunk (mirroring
+    what Transformer.generate()'s prefill loop does: each chunk calls every block with start_pos
+    offset, so sliding-window layer 0's KV cache and mask accumulate across chunks) and check the
+    final logits still match -- proves chunked prefill is correct against ground truth, not just
+    self-consistent with tinygrad's own single-chunk path (already covered by the test above)."""
+    rng = np.random.default_rng(1234)
+    with tempfile.TemporaryDirectory() as d:
+      path = pathlib.Path(d) / "tiny-gpt-oss.gguf"
+      weights = build_gguf(path, rng)
+      model, _ = Transformer.from_gguf(path)
+
+      tokens_t = Tensor([TOKENS], dtype="int32")
+      x = model.token_embd(tokens_t).float()
+      # SLIDING_WINDOW=3: chunk sizes below, at, and above the window, with uneven splits, so chunk
+      # boundaries land at every offset relative to the window's own boundary
+      for chunk_sizes in ([2, 2, 2], [1, 2, 3], [4, 2], [3, 1, 1, 1]):
+        for block in model.blk:
+          if hasattr(block, "cache_kv"): del block.cache_kv  # fresh KV cache per chunking scheme
+        start, outs = 0, []
+        for cs in chunk_sizes:
+          x_chunk = x[:, start:start + cs]
+          for block in model.blk: x_chunk = block(x_chunk, start)
+          outs.append(x_chunk)
+          start += cs
+        x_cat = Tensor.cat(*outs, dim=1)
+        logits = model.output(model.output_norm(x_cat)).numpy()[0]
+        ref = reference_forward(weights, TOKENS)
+        np.testing.assert_allclose(logits, ref, rtol=2e-2, atol=2e-2, err_msg=f"{chunk_sizes=}")
+
   def test_yarn_disabled_matches_plain_rope(self):
     """yarn_factor=1.0 (the default for every non-yarn arch) must reduce exactly to the old formula."""
     plain = precompute_freqs_cis(8, 16, 10.0, device=None)
