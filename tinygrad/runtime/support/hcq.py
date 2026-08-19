@@ -12,6 +12,7 @@ from tinygrad.runtime.support.memory import BumpAllocator
 from tinygrad.renderer import Renderer
 
 class MMIOInterface:
+  is_remote = False # True for RemoteMMIOInterface (socket-RPC backed): reads/writes are blocking round trips, not local memory ops.
   def __init__(self, addr:int, nbytes:int, fmt='B'): self.mv, self.addr, self.nbytes, self.fmt = to_mv(addr, nbytes).cast(fmt), addr, nbytes, fmt
   def __len__(self): return self.nbytes // struct.calcsize(self.fmt)
   def __getitem__(self, k): return (self.mv[k] if self.fmt == 'B' else self.mv[k].tolist()) if isinstance(k, slice) else self.mv[k]

@@ -196,21 +196,29 @@ class MemoryManager:
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, create_pts=True)
     for _ in ctx.next(size, paddr=0): return [pt for pt, _, _ in ctx.pt_stack]
 
+  def _should_validate_unmapped(self) -> bool: return True # override to skip the pre-map blocking readback (e.g. on a remote/high-latency iface)
+
   def map_range(self, vaddr:int, size:int, paddrs:list[tuple[int, int]], aspace:AddrSpace, uncached=False, snooped=False, boot=False) -> VirtMapping:
     if getenv("MM_DEBUG", 0): print(f"mm {self.dev.devfmt}: mapping {vaddr=:#x} ({size=:#x})")
 
     assert size == sum(p[1] for p in paddrs), f"Size mismatch {size=} {sum(p[1] for p in paddrs)=}"
 
-    ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
-    for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
-      for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
+    if self._should_validate_unmapped():
+      ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, boot=boot, inspect=True)
+      for _, pt, pte_idx, pte_cnt, _ in ctx.next(size):
+        for pte_off in range(pte_cnt): assert not pt.valid(pte_idx + pte_off), f"PTE already mapped: {pt.entry(pte_idx + pte_off):#x}"
 
     ctx = PageTableTraverseContext(self.dev, self.root_page_table, vaddr, create_pts=True, boot=boot)
     for paddr, psize in paddrs:
       for off, pt, pte_idx, pte_cnt, pte_covers in ctx.next(psize, paddr=paddr):
-        for pte_off in range(pte_cnt):
-          pt.set_entry(pte_idx + pte_off, paddr + off + pte_off * pte_covers, uncached=uncached, aspace=aspace, snooped=snooped,
-                       frag=self._frag_size(ctx.vaddr+off, pte_cnt * pte_covers), valid=True)
+        frag = self._frag_size(ctx.vaddr+off, pte_cnt * pte_covers)
+        # Bulk path: one packed write for the whole contiguous run if the pt type supports it (e.g. NVPageTableEntry), else per-entry writes.
+        if (set_entries:=getattr(pt, 'set_entries', None)) is not None:
+          set_entries(pte_idx, pte_cnt, paddr + off, pte_covers, uncached=uncached, aspace=aspace, snooped=snooped, frag=frag, valid=True)
+        else:
+          for pte_off in range(pte_cnt):
+            pt.set_entry(pte_idx + pte_off, paddr + off + pte_off * pte_covers, uncached=uncached, aspace=aspace, snooped=snooped,
+                         frag=frag, valid=True)
 
     self.on_range_mapped()
     return VirtMapping(vaddr, size, paddrs, aspace=aspace, uncached=uncached, snooped=snooped)
