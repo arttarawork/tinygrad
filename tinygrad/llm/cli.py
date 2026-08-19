@@ -8,6 +8,14 @@ from tinygrad.llm.model import Transformer
 if TYPE_CHECKING:
   import jinja2
 
+# T1.8b: opt-in tuned decode-attention kernel (default off). See tinygrad/llm/attn_kernel.py for what it
+# does and its hard limiter (falls back to the default SDPA path once the JIT promotes the KV-cache slice
+# length to a symbolic shape -- i.e. from the second real decode token onward).
+if getenv("FAST_ATTN"):
+  from tinygrad.llm import model as _llm_model
+  from tinygrad.llm.attn_kernel import tuned_decode_attention
+  _llm_model.attention_impl = tuned_decode_attention
+
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
