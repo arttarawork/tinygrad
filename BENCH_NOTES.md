@@ -737,3 +737,64 @@ different things than the extrapolation assumed); and one of the two single-chun
 controls diverges from `llama-completion` at generated token 27, on a prompt that isn't multi-chunk
 — open, not resolved, not the model regressing into garbage output, but a genuine "different bits"
 result worth a follow-up bisection if bit-exact parity becomes a hard requirement.
+
+## B. Headline stability post-waves-7/8 — qwen3:8b, llama3.2:1b, METAL, greedy
+
+### qwen3:8b no-BEAM, 3 repeats
+
+| run | prefill tok/s | decode tok/s |
+|---|---|---|
+| 1 | 14.98 | 7.39 |
+| 2 | 14.98 | 7.38 |
+| 3 | 14.97 | 7.35 |
+| mean | 14.98 | **7.37** |
+
+**Matches the 7.38 reference — no regression.** T4.12's chunk_size-keyed JIT dispatch and
+T1.8c/T4.7's `ops.py` changes don't move this model's headline number (this run uses a single fixed
+`chunk_size=32` throughout, same as every prior window's invocation, so T4.12's key-widening is a
+no-op here by construction — it only changes behavior when a process mixes chunk sizes, per window
+3's Part B finding).
+
+### qwen3:8b `JITBEAM=2 IGNORE_BEAM_CACHE=1`, single run
+
+**11.64 tok/s decode, 47.29 tok/s prefill.** Below the docket's stated ~12.6-14.4 reference band, but
+inside the *wider* noise band bench-window-2's Part C actually established over 7 repeats
+(11.31-14.40 tok/s) — cited secondhand in window 3 as "~12.6-14.4" but the primary source range is
+wider. Not a new anomaly under the wider band; flagged for precision since the docket's number and
+the original source range don't quite agree.
+
+### `llama-bench -r 3` reference
+
+**pp512 357.11 ± 0.10, tg128 27.07 ± 0.02 tok/s** — matches all three prior sessions (357.14/357.14/
+356.97 pp512; 27.27/27.07/27.09 tg128). Hardware/llama.cpp baseline stable, unchanged by any of this
+window's tinygrad-side work (expected — nothing in wave 8 touches llama.cpp).
+
+### llama3.2:1b greedy — tinygrad self-consistency + a bonus cross-stack note
+
+No window-3-era llama3.2:1b token sequence was ever committed to this file to diff against directly
+(same gap already flagged for two gpt-oss prompts above) — so instead of comparing against a
+nonexistent reference, this window's tinygrad self-output was compared **empirically** against a
+real window-3-era tinygrad checkout: `git archive 090489bca` (the wave1 tip both window 2 and window
+3 branched from, before T4.12/T4.13 existed) into a scratch directory, run via `PYTHONPATH=` pointed
+there instead of code-reading the diff and asserting it doesn't matter.
+
+**Byte-identical.** Prompt `"The capital of France is"` (5 tokens) -> the exact same 64-token
+`gen_ids` and exact same decoded text on both the pre-wave-8 and post-wave-8 (this window's)
+checkouts. Confirms the docket's expectation directly: **T4.13 is scoped to `ggml_type == 39`
+(MXFP4) only** and llama3.2:1b is Q6_K, so its dequant path is untouched; **T4.12** only changes
+which cached JIT graph a call routes to (keyed additionally by `chunk_size`) and this run uses a
+single fixed `chunk_size=32` throughout its one `generate()` call, so the dispatch key it resolves to
+is unaffected either way — both levers are no-ops for this specific test, and the empirical check
+bears that out exactly. Harness numbers for the record: load 0.815s, prefill 61.47 tok/s, decode
+21.72 tok/s, 25.43 GB/s (synthetic-prompt benchmark output token list logged in the commit for any
+future window to diff against — the gap this section opened with).
+
+**Bonus, not part of the docket's ask:** the same prompt run against `llama-completion --temp 0 -n
+64 -no-cnv` on the identical GGUF file diverges from tinygrad after only 2 shared tokens ("Paris."
+-> tinygrad continues "The capital of Germany is Berlin...", llama.cpp continues "The Eiffel Tower is
+located in Paris..." — deterministic on repeat, not sampler noise). Re-ran the identical check on the
+pre-wave-8 checkout: **the divergence is already there**, byte-for-byte the same early split — so
+this is a pre-existing tinygrad-vs-llama.cpp difference on this model/quant, unrelated to T4.12/T4.13
+and not something wave 8 introduced. Not chased further (out of scope for this window — llama3.2:1b
+cross-stack parity was never a stated goal here, gpt-oss's was); noted only so it doesn't get
+mistaken for a new regression if someone re-runs this later.
