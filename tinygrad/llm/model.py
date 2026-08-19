@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
@@ -489,6 +489,15 @@ class Transformer:
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
+    elif device_map is not None:
+      # device_map's cross-device placements MUST realize: load_state_dict's .to(v.device) is otherwise an unrealized COPY that
+      # gets captured into the JIT trace and re-executed (dequant AND copy) every step (measured: 21 spurious COPYs/step on a
+      # 2-block METAL/CPU split test model -> 1 real one, once realized). Only the moved-off-the-GGUF-load-device params pay this:
+      # a COPY is a materialization boundary either way, so it never fused the GGUF dequant into the consuming matmul in the
+      # first place -- same-device params are left alone and keep that fusion (the memory win from never materializing full weights).
+      moved = [s for s in nn.state.get_parameters(model) if s.device != Device.DEFAULT]
+      for s in moved: s.replace(s.contiguous())
+      Tensor.realize(*moved)
     return model, kv
 
   def warmup(self):

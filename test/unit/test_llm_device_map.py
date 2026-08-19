@@ -1,5 +1,5 @@
 import unittest
-from tinygrad import Tensor, nn
+from tinygrad import Tensor, nn, Device
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, parse_device_map
 
@@ -68,6 +68,78 @@ class TestDeviceMapModel(unittest.TestCase):
       if call.src[0].op is Ops.COPY: copies.append((devs, call.src[0].arg))
       else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
     self.assertIn(({"CPU", "CPU:1"}, "CPU:1"), copies)  # the block-boundary activation hop
+
+@unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")
+class TestDeviceMapMetalCPU(unittest.TestCase):
+  """T3.2: the cross-BACKEND rehearsal for Metal+NV pooling. Same shape as TestDeviceMapModel's
+  CPU:0/CPU:1 split, but the seam now crosses an actual backend boundary (METAL<->CPU)."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_split_matches_single_device(self):
+    ref, split = Transformer(TEST_CONFIG, device_map="METAL"), Transformer(TEST_CONFIG, device_map="0-1:METAL,2-3:CPU:0")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+
+    self.assertEqual([b.device for b in split.blk], ["METAL", "METAL", "CPU", "CPU"])
+    self.assertEqual(split.token_embd.weight.device, "METAL")  # consumed before the first block
+    self.assertEqual(split.output.weight.device, "CPU")        # consumed after the last block
+
+    # identical outputs over prefill + several decode steps, twice (second prompt exercises JIT replay)
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    # lazily-created per-block state followed the activations to the mapped devices
+    self.assertEqual([b.cache_kv.device for b in split.blk], ["METAL", "METAL", "CPU", "CPU"])
+    self.assertEqual([b.freqs_cis.device for b in split.blk], ["METAL", "METAL", "CPU", "CPU"])
+
+    # JIT-capture characterization (T3.2 objective 2): the mixed METAL/CPU trace captures end-to-end
+    # (no eager fallback). METAL segments still batch into a graph (CUSTOM_FUNCTION "graph", since
+    # MetalDevice.graph=MetalGraph); CPU segments stay ungraphed/sequential (CPUDevice.graph=None,
+    # from HCQ2Compiled's default). A graph batch can never span devices -- GraphRunner.supports_uop
+    # requires call.src[0].op is Ops.PROGRAM, which a cross-device COPY never satisfies -- so the
+    # boundary hop always lands as a standalone COPY call between the two per-backend islands.
+    rollout_jit = split.jit[(False, True)]
+    self.assertIsNotNone(rollout_jit.captured)
+    copies, graphed_devs, ungraphed_devs = [], set(), set()
+    for call in rollout_jit.captured.linear.src:
+      ast = call.src[0]
+      if ast.op is Ops.COPY:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        copies.append((devs, ast.arg))
+      elif ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph":
+        batch_devs = set()
+        for inner in ast.src[0].src: batch_devs |= set(u.device for u in inner.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        self.assertEqual(len(batch_devs), 1, f"graphed batch spans devices: {batch_devs}")  # graphing never crosses backends
+        graphed_devs |= batch_devs
+      else:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        self.assertLessEqual(len(devs), 1, f"ungraphed compute kernel with mixed-device buffers: {devs}")
+        ungraphed_devs |= devs
+    self.assertIn(({"METAL", "CPU"}, "CPU"), copies)  # the block-boundary activation hop
+    self.assertIn("METAL", graphed_devs)              # METAL kernels got graph-batched
+    self.assertIn("CPU", ungraphed_devs)               # CPU kernels stayed eager/sequential
+
+@unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")
+class TestDeviceMapMetalCPURecurrent(unittest.TestCase):
+  def _generate(self, model, prompt, n, temperature=0.0):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt), temperature=temperature)
+    return [next(gen) for _ in range(n)]
+
+  def test_recurrent_split_matches_single_device(self):
+    ref, split = Transformer(SSM_TEST_CONFIG, device_map="METAL"), Transformer(SSM_TEST_CONFIG, device_map="0-1:METAL,2-3:CPU:0")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    self.assertEqual([b.device for b in split.blk], ["METAL", "METAL", "CPU", "CPU"])
+
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    self._generate(split, [5, 6, 7, 8], 4, temperature=0.8)  # exercise the sampled JIT variant too
+
+    self.assertEqual([b.conv_state.device for b in split.blk], ["METAL", "METAL", "CPU", "CPU"])
+    self.assertEqual([b.recurrent_state.device for b in split.blk], ["METAL", "METAL", "CPU", "CPU"])
 
 class TestDeviceMapRecurrentModel(unittest.TestCase):
   def _generate(self, model, prompt, n, temperature=0.0):
