@@ -2,9 +2,16 @@ from __future__ import annotations
 import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
+from tinygrad.dtype import DType
 from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
+
+def kv_cache_dtype() -> DType:
+  """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
+  the dominant decode-memory cost). KV_F32=1 reverts to dtypes.default_float, e.g. to isolate an accuracy
+  regression. Does NOT apply to GatedDeltaNetBlock's recurrent state -- see its _init_state for why."""
+  return dtypes.default_float if getenv("KV_F32", 0) else dtypes.float16
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -224,9 +231,12 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = assigned_kv[1, :, :, 0:start_pos+T, :]
+    # cast to the cache's dtype at write (a no-op when KV_F32=1); cast back up to the activation dtype at
+    # read, so attention compute always runs at x's precision regardless of what the cache stores
+    assigned_kv = Tensor(self.cache_kv.uop.after(
+      self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)))
+    k = assigned_kv[0, :, :, 0:start_pos+T, :].cast(x.dtype)
+    v = assigned_kv[1, :, :, 0:start_pos+T, :].cast(x.dtype)
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -262,7 +272,7 @@ class TransformerBlock(FFNBlock):
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.default_float, device=x.device)
+                                   dtype=kv_cache_dtype(), device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device,
         yarn_factor=self.config.yarn_factor, yarn_orig_ctx=self.config.yarn_orig_ctx, yarn_beta_fast=self.config.yarn_beta_fast,
         yarn_beta_slow=self.config.yarn_beta_slow, yarn_attn_factor=self.config.yarn_attn_factor)
@@ -298,7 +308,9 @@ class MLATransformerBlock(FFNBlock):
     if not self.config.ssm or not self.config.ssm.kda: k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
+    # cast to the cache's dtype at write, back up to x's dtype at read -- see TransformerBlock._attention
+    k = Tensor(self.cache_k.uop.after(
+      self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.cast(self.cache_k.dtype).uop)))[:, :, 0:start_pos+T, :].cast(x.dtype)
     v = k[..., :self.config.kv_lora_rank]
 
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
@@ -311,7 +323,8 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
+      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim,
+                                  dtype=kv_cache_dtype(), device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
 
 class GatedDeltaNetBlock(FFNBlock):
@@ -398,8 +411,21 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
-      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+      # conv_state only ever holds the last (conv_kernel-1) input rows (already upcast to fp32 on read via
+      # win.dtype in _attention above) and doesn't scale with max_context, but it's free to halve too: an
+      # evidence run (tiny random-weight config, 5 prompts x 64 decode steps, isolated from recurrent_state
+      # by keeping recurrent_state fp32) showed 0/320 greedy-token divergences, max logit delta ~0.003 --
+      # flag-gate it like the KV caches.
+      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, dtype=kv_cache_dtype(), device=x.device).clone()
+      # recurrent_state is NOT flag-gated -- always fp32, unlike the write-once/read-many KV caches above it
+      # is read-modify-written every decode step (decay + delta rule), so fp16 error compounds across the
+      # whole generation instead of staying local to one position. Evidence (same tiny config/harness, fp16
+      # recurrent_state isolated from conv_state -- conv_state fp32): 7/320 greedy tokens flipped (2 of 5
+      # prompts affected) with max logit delta ~2.9 -- vs 0/320 and ~0.003 for every KV-cache-like buffer
+      # above (TransformerBlock.cache_kv, MLATransformerBlock.cache_k, this block's own conv_state). It's
+      # also O(1) in max_context (no memory win from halving it), so there's no upside to offset that risk.
+      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                                          dtype=dtypes.default_float, device=x.device).clone()
 
 def parse_device_map(dm:str|dict[int,str], num_blocks:int) -> list[str]:
   """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}."""
