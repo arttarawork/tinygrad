@@ -102,3 +102,49 @@ other's search).
   fork's wave1/2 task branches. Left in place (not removed) in case follow-up runs want it; it's a
   clean detached checkout with no local changes, safe to `git worktree remove` whenever.
 - Not pushed; not committed to `integration/wave1` or `master`.
+
+# BENCH WINDOW 2026-08-19 — waves 3-5 re-bench, T1.1b, T4.4, T4.3
+
+Date 2026-08-19. Same hardware/protocol as above (`llama-server` stopped for the whole session,
+sequential, nothing in parallel). Branch `task/bench-window-2` = `integration/wave1` (`3e0df0fc7`)
++ `task/T0.3-bench-harness` merged in (clean merge, harness untouched). `integration/wave1` now
+carries waves 1-5: T1.2/T1.10 MATVEC (fp16+quant), T1.5 temp-0 RNG skip, T1.6 jit-input cache,
+T1.1a fp16 KV (default), T1.8b tuned attn, T4.5 force-realize, T2.5 sync-amortize (`drain_every`
+default 1), T1.9 streaming GGUF load, T4.6 KV-prealloc cap (`DEFAULT_MAX_CONTEXT=8192`), T4.2 Q4_K
+2x dequant staging, T2.3 remote-tuning knobs, T1.7 PCONTIG (landed as a dead-end/no-op — see below).
+
+## A. Integrated re-bench (headline)
+
+Same protocol as T0.1: `qwen3:8b` Q4_K_M, METAL, `-p/-n 512/128`, 3 no-BEAM repeats + 1
+`JITBEAM=2 IGNORE_BEAM_CACHE=1` run, plus one llama-bench reference re-check.
+
+| Stack | Config | load s | prefill tok/s | decode tok/s | decode GB/s |
+|---|---|---|---|---|---|
+| llama.cpp (ref, 08-18) | default Metal | n/a | 357.14 ± 0.20 | 27.27 ± 0.03 | n/a |
+| llama.cpp (ref, **08-19 re-check**) | default Metal | n/a | 356.97 ± 0.20 | **27.07 ± 0.03** | n/a |
+| tinygrad upstream (08-18, `2cfb421a8`) | no-BEAM | 1.70–1.78 | 15.89–15.92 | 4.91–4.93 | 26.82–26.90 |
+| tinygrad integration (08-18) | no-BEAM | 1.70–1.75 | 15.82 | 7.27–7.29 | 39.68–39.76 |
+| tinygrad **integration-now (08-19)** | no-BEAM | 2.12–2.44 | **14.97–14.98** | **7.37–7.39** (x̄ 7.38) | **46.76–46.89** |
+| tinygrad upstream (08-18) | BEAM | 1.712 | 46.65 | 12.86 | 70.00 |
+| tinygrad integration (08-18) | BEAM | 1.696 | 43.47 | 14.44 | 78.50 |
+| tinygrad **integration-now (08-19)** | BEAM | 2.133 | **46.01** | **14.40** | **94.09** |
+
+- **Decode vs the 08-18 no-BEAM reference: 7.38 vs 7.28 tok/s, +1.4%** — small but real, and decode
+  GB/s jumped much more (46.8 vs 39.7, +18%): consistent with T4.2's Q4_K gemv finding (414→201 µs,
+  ~2x) — the *bandwidth-reported* work per decode step dropped/changed shape, but wall-clock tok/s
+  barely moved because Q4_K's gemv was ALU-bound, not membw-bound, at that point (T4.2's own note:
+  "now FASTER than Q4_0" but the model's overall decode step is not 100% Q4_K-gemv-dominated —
+  attention + other layers still gate wall time). So waves 3-5 mostly show up as a GB/s accounting
+  change plus a small tok/s gain, not the "should show strongly" 2x some hoped for from T4.2 alone.
+- **BEAM: 14.40 vs 14.44 tok/s — flat**, within noise of the single 08-18 run.
+- **Prefill dropped: 14.98 vs 15.82 tok/s no-BEAM (-5.3%), 46.01 vs 43.47 tok/s BEAM (+5.9%)** — see
+  §C below; the no-BEAM prefill regression is new since 08-18 and is a candidate side effect of one
+  of the wave3-5 levers (T4.6's `DEFAULT_MAX_CONTEXT=8192` changes KV buffer shape/indexing even
+  when the prompt is short; T1.9's streaming load changes how weight tensors land in memory — not
+  bisected further, out of scope for this pass, flagged for a future task).
+- **llama.cpp reference re-check: 27.07 vs 27.27 tok/s (-0.7%), prefill 356.97 vs 357.14 — stable**,
+  confirms the 08-18 reference point and that today's machine state is comparable.
+- Both tinygrad configs still well behind llama.cpp (best result 14.40 tok/s BEAM = 53% of 27.07).
+
+Raw rows appended to `extra/bench_results_2026-08-18.csv` (still the working file — new rows are
+tagged `2026-08-19 task/bench-window-2@integration-wave1-now`).

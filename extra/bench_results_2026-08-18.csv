@@ -8,3 +8,8 @@ qwen3:8b,tinygrad,METAL,"task/T0.3-bench-harness@integration-wave1, no-BEAM",1.7
 qwen3:8b,tinygrad,METAL,"task/T0.3-bench-harness@integration-wave1, no-BEAM",1.704,15.82,7.27,39.68
 qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 task/T0.3-bench-harness@integration-wave1, JITBEAM=2 IGNORE_BEAM_CACHE=1",1.696,43.47,14.44,78.50
 qwen3:8b,tinygrad,METAL,PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench JITBEAM=2 IGNORE_BEAM_CACHE=1 upstream/master@2cfb421a8,1.712,46.65,12.86,70.00
+qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM",2.440,14.98,7.39,46.89
+qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM",2.136,14.97,7.37,46.76
+qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM",2.122,14.98,7.38,46.82
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, JITBEAM=2 IGNORE_BEAM_CACHE=1",2.133,46.01,14.40,94.09
+qwen3:8b,llamacpp,METAL,-r 3 2026-08-19 reference re-check,,356.97,27.07,
