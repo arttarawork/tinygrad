@@ -179,6 +179,23 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   `hcq.py` PR. The Bazzite-box footgun note (AM/PCI path kills the display) is retained in
   CLAUDE.md in case the lane is ever revived.
 
+- **2026-08-18/19 (waves 2-6, ~40 tasks):** full per-task record lives in TASKS.md's Status log —
+  this entry is the durable digest. Landed on `integration/wave1`: MATVEC fp16+quant (Q4_0 4x,
+  Q4_K 2x via d/dmin staging — Q4_K now faster than Q4_0), fp16 KV (SSM recurrent state fp32 by
+  divergence experiment), jit-input cache, temp-0 RNG skip, drain_every, streaming GGUF load,
+  KV-prealloc cap (the REAL load-memory hog — the doc's "2x load transient" was wrong), device_map
+  incl. `experts:<dev>` + realize_placement, gpt-oss arch + gpt-4o tokenizer, copyout pipelining,
+  PTE batching + remote validation skip, NV remote knobs, symbolic custom_kernel, SCACHE key fix
+  (9 ContextVars; PCONTIG tests were self-referential). **Dead ends, proven:** custom_kernel
+  attention pre-T4.7 (symbolic Tk), PCONTIG fusion (numerically wrong), METAL↔CPU zero-copy
+  aliasing (hop cost is SYNC not memcpy — ~750 µs fixed floor is `waitUntilCompleted`), warp
+  reduce as a renderer-local patch (framework-wide gap, ~300-550 lines). **Measured state:**
+  qwen3:8b METAL decode 7.38 no-BEAM / 14.40 BEAM vs llama.cpp 27.07 (beam alone = 2.6x config
+  gap); decode now attention/other-gated, not gemv-gated. Key design rules discovered: GGUF loads
+  on the big-memory device (moving big tensors force-realizes them); 3 copies/MoE-layer not 2;
+  TinyJit bakes cache-buffer identity (growable KV impossible without recapture). gpt-oss decode
+  reads ~25x too many bytes (T4.11, open). PR queue (held): T4.9 → T4.7 → T4.2 → T4.1 pkg.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth

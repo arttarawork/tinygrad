@@ -85,10 +85,10 @@ GGUF-only loader; one generic `Transformer` covering llama/qwen2/3, GLM, OLMoE, 
 - ✅ MoE executes as **true indexed gather** of the k selected experts (3 matmul kernels regardless of expert count, no masked-dense, no weight copy — `model.py:21-27,109-135`). Architecturally right.
 - ✅ Two symbolic `TinyJit`s (prefill/rollout) — one captured graph serves all positions and chunk sizes (`model.py:355-367,464-484`); sampling (Gumbel argmax) stays on device.
 - ✅ **KV cache is fp16 by default** as of 2026-08-18 (`task/T1.1a-fp16-kv`): attention KV, MLA compressed cache, SSM conv window all fp16 (accuracy-verified, 0 token divergence, `KV_F32=1` escape); SSM `recurrent_state` deliberately fp32 (read-modify-write compounds fp16 error — measured 2.93 logit delta; O(1) in context anyway). Decode speedup measurement = T1.1b (next bench window). ⚠️ Activations remain fp32 (`DEFAULT_FLOAT=HALF` experiment still open).
-- ⚠️ **Full device sync + host round trip per token**: `out.item()` (`model.py:482`) triggers device synchronize before a 4-byte copy (`hcq.py:596-597`), plus a small out-of-graph copy (`jit.py:184-188`) and ~0.5 ms/token of uncached Python in `_prepare_jit_inputs` (`jit.py:200-218`).
+- ✅ MOSTLY FIXED (2026-08-18): `_prepare_jit_inputs` Python cost cut 56% (T1.6 structural-key cache); per-token drain batchable via `generate(drain_every=N)` (T2.5, default 1 = old behavior — flip to N≤4 over the TB socket where the round trip is the floor).
 - ✅ MoE top-k routing is already minimal — CORRECTED 2026-08-18 (T1.4): `pairwise_topk` realizes exactly 1 kernel/layer (the rank reduce; scatter/slice/cast inline into consumers), which is the rangeify floor. The remaining ~3 small kernels/layer are the caller's probs path (gather + softmax stats, `model.py:124-127`). ~~Full-vocab RNG runs even at temperature 0~~ — fixed on `task/T1.5-temp0-rng`.
 - ✅ **gpt-oss architecture** wired 2026-08-18 (`task/T1.3-gptoss`): sinks, alternating sliding window, YaRN, clamped swiglu; mutation-tested synthetic parity vs numpy. Real-model validation + `tokenizer.ggml.pre` preset check deferred to the bench session.
-- ⚠️ **`tinygrad/llm` has no multi-device support at all** — no shard, no device flag beyond `DEV=`. Sharding exists only in legacy `examples/llama3.py --shard`.
+- ✅ **Multi-device pipeline split landed** (T3.1-T3.3, 2026-08-18): `--device-map` with per-block ranges + `experts:<dev>` sub-block placement, `Transformer.realize_placement()`, proven cross-backend METAL+CPU on real models (exact tokens). Tensor sharding still only in legacy `examples/llama3.py` — irrelevant to Stage A.
 - Load path: CORRECTED 2026-08-18 (T1.9) — the whole-file blob did NOT cause a 2x transient (dequant stays lazy; mem_used flat at 1x). Now streams in ≤64 MB batches anyway (`task/T1.9-stream-load`), which fixed a real METAL OOM under memory pressure (no more one-contiguous-file-sized allocation). The actual load-adjacent memory hog is **KV pre-allocation at native max_context** in `_init_state` (2.2–5.3x model size at 40k–131k ctx) — tracked as T4.6.
 
 ### 3.6 Multi-device (the pooling question)
@@ -156,7 +156,7 @@ Budgets: NV ~22.5 GB usable; Metal ~27 GB default wired limit (raiseable to ~30�
 | Qwen3-8B | Q4_K ~4.6 GB | NV alone | M1 (fast), the benchmark workhorse |
 | Qwen3.6-27B / Qwen3.8-27B* | Q4 ~16 GB | NV alone (or Metal) | M1–M2 daily driver |
 | Qwen3-30B/3.6-35B-A3B | Q4 ~17–19 GB | either alone | M1; MoE placement testbed |
-| gpt-oss-20b | MXFP4 ~12 GB | NV alone | after WS1.6 |
+| gpt-oss-20b | MXFP4 ~12 GB | NV alone | arch ✅ (T1.3); decode currently 1.69 tok/s — reads ~25x too many bytes, see T4.11 |
 | Qwen3.6-35B-A3B | Q8 ~37 GB | **pooled** | M3 flagship |
 | 70B-class dense | Q4 ~40 GB | pooled | M3 (capacity proof) |
 | gpt-oss-120b | MXFP4 ~60 GB + KV | pooled, stretch | M4 — needs wired-limit push + sub-MXFP4 requant or short context; borderline by ~8–10 GB |
@@ -210,6 +210,10 @@ pooling step. M1/M2's eGPU acceptance numbers remain dock-gated; the transport l
 | `PCONTIG=2` | experimental partial-contiguous fusion (flash-attention path) |
 | `DEBUG=2/3` | kernel trace / heuristic decisions (`MATVEC:` lines) |
 | `VIZ=1` | profiler UI |
+| `KV_F32=1` | revert KV caches to fp32 (fp16 is default since T1.1a; SSM recurrent state always fp32) |
+| `FAST_ATTN=1` | custom decode-attention kernel via the T1.8 hook (default off; fires every token only after T1.8c) |
+| `--device-map` / `experts:<dev>` | per-block + expert placement (T3.1/T3.3); load device must be the big-memory side |
+| `OCELOT_PATH=... DEV=MOCK+NV:PTX` | mock-NV (see TASKS.md env table for the exact recipe) |
 
 ### 7.2 Key-file index
 
