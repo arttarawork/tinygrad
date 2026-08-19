@@ -172,6 +172,13 @@ KV-cache quantization (q8 KV) is the natural follow-on lever once fp16 KV lands.
 
 ## 5. Milestones
 
+**Status 2026-08-18 (pre-dock, all on Metal):** M0's method delivered early — measured table +
+attribution exist (see §1 note); top bottleneck named: attention fusion + prefill kernels (the
+~2x vs llama.cpp), with BEAM config gap quantified at 2.6x. Decode levers landed and measured
+(+48% no-BEAM). WS3 Stage A proven cross-backend (T3.1/T3.2); MoE placement (T3.3) is the next
+pooling step. M1/M2's eGPU acceptance numbers remain dock-gated; the transport levers for them
+(copyout pipelining, PTE batching) are written and mock-validated.
+
 | | Deliverable | Acceptance |
 |---|---|---|
 | **M0** (days) | Baseline truth table + bottleneck attribution | top-3 costs named in ms; MATVEC + BAR hypotheses confirmed/refuted |

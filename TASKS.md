@@ -58,11 +58,16 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 
 ### T1 · Decode-path kernels & dtypes (WS1) — all measurable on Metal today
 
-- **T1.1 — fp16 KV cache + activations** `[MAC]` deps: T0.3 (WS1.1)
-  Experiment `DEFAULT_FLOAT=HALF`; then explicit KV dtype at `llm/model.py:200-204` (default fp16,
-  flag to keep fp32). Perplexity spot-check vs fp32 (few prompts, logprob diff), long-context decode
-  delta on Metal — Metal is bandwidth-bound too, so the win shows up *now*. Watch SSM/MLA blocks.
-  *Done when:* accuracy delta quantified + decode speedup measured; upstream-PR-shaped diff.
+- **T1.1a — fp16 KV cache: implement + accuracy** `[ANY, runnable anytime]` deps: — (WS1.1)
+  Explicit KV dtype at `llm/model.py` `_init_state` (default fp16, `KV_F32=1` escape flag); check
+  every `_init_state` variant (attention, MLA, SSM conv/state — SSM state may need fp32, decide
+  per-block with evidence). Accuracy: greedy-token parity + max logit delta vs fp32 over ≥5 prompts
+  on llama3.2:1b (1 GB, fits anytime) AND a recurrent tiny-config. STOP if any family needs
+  >1-line special-casing — report instead.
+  *Done when:* diff + accuracy table committed; upstream-PR-shaped. Perf is T1.1b, not this task.
+- **T1.1b — fp16 KV: measure decode delta** `[MAC, bench window]` deps: T1.1a, llama-server stopped
+  T0.3 harness, qwen3:8b, fp32-KV vs fp16-KV on integration, no-BEAM + JITBEAM=2, long-context
+  variant (`-p 4096`) where the KV read dominates. *Done when:* CSV rows + delta in BENCH_NOTES.md.
 - **T1.2 — MATVEC heuristic: see through CAST** `[ANY→MAC]` deps: T0.1 (WS1.2)
   Reproduce the miss: `DEBUG=3` on a fp16/Q4 gemv, confirm no `MATVEC:` line (guard at
   `codegen/opt/heuristic.py:60-78` requires `MUL(INDEX,INDEX)`, real ASTs wrap it in CAST).
@@ -130,10 +135,11 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   Same NV backend, real tensor cores: BEAM sweeps on decode gemvs, tuned FA custom kernel for the
   T1.8 hook, MATVEC perf confirmation. Everything transfers to the eGPU minus transport.
   *Done when:* beam cache + FA kernel with measured tok/s vs Metal baseline.
-- **T2.5 — Amortize the per-token sync** `[MAC]` deps: T0.1 (WS2.4)
-  `llm/model.py:478-484`: keep sampled tokens on device, drain every N for streaming; overlap the
-  copyout with the next launch. Benefits Metal now, matters more over the socket later.
-  *Done when:* host-visible stall/token down on Metal; streaming UX unchanged (N≤4).
+- **T2.5 — Amortize the per-token sync** `[MAC]` deps: T0.1 ✅ (WS2.4)
+  `generate()`'s per-token `.item()`: keep sampled tokens on device, drain every N for streaming;
+  overlap the copyout with the next launch. Branch off `integration/wave1` (generate() moved:
+  device-aware `t`/`temp` landed in review-fixes — re-locate the loop before scoping).
+  *Done when:* host-visible stall/token down on Metal (T0.3 harness row); streaming UX unchanged (N≤4).
 
 ### T3 · Pooling groundwork (WS3 Stage A) — the sleeper: fully rehearsable pre-dock
 
@@ -154,17 +160,50 @@ can be built and proven before the dock ships.
   boundary cost/token, and **force realize for split models** (unrealized lazy initializers get
   captured and re-run every step — T3.1 finding).
   *Done when:* qwen3-8b runs layers split METAL/CPU, output correct, boundary cost quantified.
-- **T3.3 — MoE placement policy** `[MAC]` deps: T3.2 (WS3.A)
-  Sub-layer split: attention+norms+KV on device A, routed-expert FFN tensors on device B
-  (olmoe or qwen3-30b-a3b, METAL+CPU). This is the exact shape of the eventual NV+METAL flagship.
-  *Done when:* MoE model runs with experts on the second device; per-token hop cost measured.
+- **T3.3 — MoE placement policy** `[MAC]` deps: T3.2 ✅ (WS3.A)
+  Sub-layer split: attention+norms+KV on device A, routed-expert FFN tensors on device B — extends
+  `device_map` with per-tensor (not just per-block) placement for `ffn_*_exps`. Validate on a tiny
+  MoE config first (exact-output test, both directions); then olmoe Q4 (~4.2 GB, registry —
+  download OK, disk is fine) with experts on CPU and the rest on METAL (fits beside llama-server).
+  Budget hops against T3.2's ~750 µs/copy floor — 2 hops/MoE-layer is the design's expected shape.
+  *Done when:* MoE model runs with experts on the second device, outputs exact, hop count/token
+  measured vs the 2/layer expectation. This is the flagship NV+METAL shape.
 - **T3.4 — Zero-copy bridge spike (Stage B)** `[MAC]` deps: T3.2 (WS3.B)
   Wrap shared host memory across backends: `BufferSpec.external_ptr` on Metal (`ops_metal.py:157`)
   over a CPU/NV-visible buffer; sketch the HCQ-signal↔`MTLSharedEvent` host bridge.
   *Done when:* one boundary copy eliminated in the T3.2 pipeline, measured.
-- **T3.5 — Boundary-copy microbenchmark** `[ANY]` deps: T3.1
-  Tool measuring cross-backend copy latency/bandwidth vs size (the WS3 planning number).
-  *Done when:* table for METAL↔CPU now; rerun on METAL↔NV post-dock.
+- **T3.5 — Boundary-copy microbenchmark — RESOLVED by T3.2 (2026-08-18):** METAL↔CPU table
+  delivered (~750 µs fixed floor <1M elems, bandwidth above). Remaining: rerun on METAL↔NV post-dock.
+
+### T4 · Post-baseline work (added 2026-08-18, after waves 1-2 + measured baselines)
+
+- **T4.1 — Upstream PR prep: MATVEC pair first** `[ANY]` deps: — (WS5/G3)
+  Rebase `task/T1.2-matvec-cast` + `task/T1.10-matvec-quant` (as ONE combined branch off current
+  `upstream/master`), re-run `test/opt/` + mypy + ruff, re-verify the fp16 + Q4_0 gemv wins still
+  hold with a quick METAL microbench, and write the PR description: what/why, the measured numbers
+  (56→100 GB/s fp16, ~4x membw Q4_0/Q6_K, and the +48% no-BEAM decode contribution from the
+  baseline table). **Do NOT push or open the PR — Artur reviews and submits.** *Done when:* a
+  rebased branch + PR-description file are ready for hand-off. (T1.5, T1.6, T2.1, T2.2 follow the
+  same recipe as separate later tasks once this one lands cleanly.)
+- **T4.2 — Q4_K dequant ALU cost** `[MAC]` deps: — (from T1.10's finding)
+  T1.10 measured Q4_K gemvs ALU-bound (4x membw, flat wall-time; Q4_0/Q6_K got ~4x). Profile the
+  Q4_K kernel (DEBUG=2 + generated source), identify the 6-bit sub-scale unpack cost, try ≤2
+  targeted rewrites (e.g. restructure the scale-unpack expression in `llm/gguf.py` Q4_K dequant, or
+  a BEAM comparison to see what search finds). STOP after 2 attempts if wall-time won't move —
+  a written analysis is a valid outcome. Q4_K_M is the most common quant in the wild; this gates
+  its decode win. *Done when:* Q4_K wall-time improves ≥15%, or the blocking analysis is committed.
+- **T4.3 — gpt-oss-20b real-model validation** `[MAC, bench window — llama-server MUST be stopped
+  (12 GB model)]` deps: T1.3 ✅
+  `-m gpt-oss:20b` (GGUF cached): generate vs llama.cpp same-model same-prompt greedy (llama-cli
+  `--temp 0`); token-level comparison over ≥3 prompts crossing the chunk_size=32 prefill boundary
+  (exercises sliding-window × chunked-prefill, T1.3's untested interaction). Add a benchmark row
+  via T0.3 harness while the window is open. *Done when:* parity verdict (exact or divergence
+  documented with position/cause) + bench row committed.
+- **T4.4 — BEAM prefill anomaly** `[MAC]` deps: — *small filler*
+  Baseline table showed integration BEAM prefill 43.47 vs upstream 46.65 tok/s (single runs).
+  3 repeats each side (harness exists); if the gap is real (>spread), bisect which wave lever
+  costs prefill and why (likely MATVEC guard firing on a prefill kernel it shouldn't). STOP after
+  attribution — fix is a follow-up. *Done when:* variance verdict or named culprit in BENCH_NOTES.md.
 
 ## Phase 1 — dock arrives (`DOCK`)
 
@@ -245,8 +284,12 @@ flowchart LR
 
 ## Parallelization notes
 
-Independent start-now lanes for concurrent agents: **(a)** T0.1→T0.3→T1.1/T1.2 (Mac, perf),
-**(b)** T1.3 gpt-oss (Mac, model code), **(c)** T3.1→T3.2 pooling (any→Mac), **(d)** T0.4→T2.1/T2.2
-(mock-NV, transport). T1.4-1.6 are small fillers for any idle agent.
-Merge-order caution: T1.1, T1.3, T2.5, and T3.1 all touch `llm/model.py` — coordinate rebases;
-T1.7 and T1.8 are alternatives racing to the same goal (first one to work wins, keep both branches).
+Wave-3 lanes (updated 2026-08-18; waves 1-2 complete, baselines measured):
+**(a)** T1.8 attn hook → the remaining ~2x vs llama.cpp (T1.7 PCONTIG only as exploration, failure
+analysis is a valid exit); **(b)** T1.1a fp16 KV (anytime) → T1.1b (bench window); **(c)** T3.3 MoE
+placement (the flagship shape); **(d)** T4.1 PR prep + T4.2 Q4_K (independent); **(e)** T1.9 /
+T2.3 / T2.5 / T4.4 fillers. Bench-window tasks (T1.1b, T4.3) need llama-server stopped — batch
+them into one window. Merge caution: T1.1a, T2.5, T3.3 all touch `llm/model.py` (branch off
+`integration/wave1`, coordinate rebases); T1.7/T1.8 race to the same goal, keep both branches.
+Agent policy: one tight objective per agent, Sonnet at max effort, explicit STOP conditions,
+commit early; verify premises with a control experiment before optimizing (see T1.4).
