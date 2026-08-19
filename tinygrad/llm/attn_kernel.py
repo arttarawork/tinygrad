@@ -54,7 +54,7 @@ a bare top-level one. Small (4 lines), root-cause (fixes every compound symbolic
 Tk), and necessary: without it, no custom-kernel attention_impl -- tuned or naive -- can reach a *second*
 real decode step at all, chunked or not. See NV_LLM_DESIGN.md / TASKS.md T1.8c entry for the full writeup.
 """
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, dtypes, Device
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import ceildiv
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
@@ -130,8 +130,15 @@ def tuned_decode_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Te
   """attention_impl-compatible tuned decode kernel. Handles decode (T==1) at any Tk, concrete or symbolic
   (T1.8c). Falls back to the default SDPA path for anything it doesn't handle: prefill/rollout (T>1) and
   masked decode (e.g. sliding-window) -- those need a real per-query mask, which this decode-only kernel
-  (one query row per (b,h) threadgroup, unconditional over Tk modulo the Tk-tail guard above) doesn't carry."""
+  (one query row per (b,h) threadgroup, unconditional over Tk modulo the Tk-tail guard above) doesn't carry --
+  and any device whose renderer can't do LOCAL (dout is AxisType.LOCAL, local_buf is AddrSpace.LOCAL; a
+  renderer with has_local=False, e.g. CPU's Clang/LLVM/X86, has no threadgroup/shared-memory model for this
+  kernel to target at all -- without this gate, codegen's add_gpudims hits the has_threads branch with no
+  GLOBAL/THREAD range to size "core_id" from and crashes with an IndexError on an empty global_shape)."""
   if mask is not None or q.shape[2] != 1:
+    return model._sdpa_default(q, k, v, mask)
+  dev = q.device if isinstance(q.device, str) else q.device[0]
+  if not Device[dev].renderer.has_local:
     return model._sdpa_default(q, k, v, mask)
   O = Tensor.empty(q.shape, dtype=q.dtype, device=q.device)
   return Tensor.custom_kernel(O, q, k, v, fxn=_tuned_kernel_fxn)[0]

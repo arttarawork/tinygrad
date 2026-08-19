@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable, TinyJit
+from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable, TinyJit, Device
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
 from tinygrad.llm import model
@@ -448,6 +448,7 @@ class TestAttentionHook(unittest.TestCase):
 
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
 
+@unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "tuned attention kernel needs LOCAL axis support")
 class TestTunedAttentionKernel(unittest.TestCase):
   """T1.8b: the tuned (LOCAL-cooperative, chunked, online-softmax) decode-attention kernel."""
 
@@ -567,6 +568,21 @@ class TestTunedAttentionKernel(unittest.TestCase):
       out = block._attention(decode_norm, 5).realize().numpy()  # same decode step, tuned kernel active
 
       np.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2, err_msg=f"{kv_dtype=}")
+
+class TestTunedAttentionKernelFallback(unittest.TestCase):
+  """The production guarantee TestTunedAttentionKernel's has_local skip relies on: the wrapper must fall
+  back to SDPA -- not crash -- on a renderer with no LOCAL support. Targets the CPU device explicitly (its
+  ClangRenderer has has_local=False) so this runs and proves the gate under any Device.DEFAULT, including
+  the METAL default this repo normally runs under."""
+  def test_falls_back_on_non_local_device(self):
+    self.assertFalse(Device["CPU"].renderer.has_local, "test assumes CPU's renderer has no LOCAL support")
+    Tensor.manual_seed(0)
+    q = Tensor.randn(1, 4, 1, 8, dtype=dtypes.float32, device="CPU").contiguous().realize()
+    k = Tensor.randn(1, 2, 5, 8, dtype=dtypes.float32, device="CPU").contiguous().realize()
+    v = Tensor.randn(1, 2, 5, 8, dtype=dtypes.float32, device="CPU").contiguous().realize()
+    ref = q.scaled_dot_product_attention(k, v, enable_gqa=True).numpy()
+    out = tuned_decode_attention(q, k, v, None).numpy()  # must fall back to SDPA, not crash in gpudims
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
 
 if __name__ == '__main__':
   unittest.main()
