@@ -137,8 +137,9 @@ def tuned_decode_attention(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Te
   GLOBAL/THREAD range to size "core_id" from and crashes with an IndexError on an empty global_shape)."""
   if mask is not None or q.shape[2] != 1:
     return model._sdpa_default(q, k, v, mask)
-  dev = q.device if isinstance(q.device, str) else q.device[0]
-  if not Device[dev].renderer.has_local:
+  qdev = q.device
+  qdev = qdev if isinstance(qdev, str) else (qdev[0] if qdev is not None else Device.DEFAULT)
+  if not Device[qdev].renderer.has_local:
     return model._sdpa_default(q, k, v, mask)
   O = Tensor.empty(q.shape, dtype=q.dtype, device=q.device)
   return Tensor.custom_kernel(O, q, k, v, fxn=_tuned_kernel_fxn)[0]
