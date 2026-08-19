@@ -116,15 +116,17 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   (METAL graphed, CPU sequential). **No free-memory query exists in Device/Allocator** (auto
   device_map splits evenly by layer count instead). Caveat: unrealized weights on a non-default
   map capture their lazy initializers into the JIT (re-run every step) — force realize for splits.
-- **UPSTREAM BUG (found by T3.1, exists at baseline `af2a43c85`, unfixed):** at `temperature=0`,
-  `generate()` can emit a non-greedy token when `temperature` is a realized buffer (which
-  `_prepare_jit_inputs` forces) and the whole symbolic prefill graph fuses — `Tensor.rand_like`
-  fused into the sampling/argmax chain computes wrong values (`u.realize()` fixes; top-2 logit gap
-  1.5e10 rules out legitimate noise). Reproduces on METAL and CPU; sequence-dependent via
-  `manual_seed`'s lazy-const device seed changing fusion. Note: T1.5's temp-0 RNG removal
-  *sidesteps* this in the greedy path, but the miscomputed fused rand may still corrupt temp>0
-  sampling — needs a minimal upstream repro (scripts were in the T3.1 session scratchpad:
-  `symprobe3.py symcrt`, `exprprobe2.py`; may need regeneration).
+- **Suspected rand_like/fusion bug: NOT REPRODUCED (status downgraded 2026-08-18).** T3.1's agent
+  reported temp=0 `generate()` emitting a non-greedy token (realized temperature + fused symbolic
+  prefill; `u.realize()` "fixed" it), but its repro scripts were lost to a session reset. A
+  dedicated characterization effort (`task/rand-fusion-bug-repro`, `3b3f71331`) could not reproduce
+  it in ~1,270 trials across attention/MoE/SSM configs, METAL+CPU, BEAM=2 — including a bit-exact
+  numpy threefry ground-truth comparison of the *fused* RNG values (80/80 matched to fp32 rounding,
+  temp-independent). Cautionary finding: that effort briefly "confirmed" the bug via a sign error
+  in its own inverse-Gumbel check (100% divergence, entirely self-inflicted) — the original report
+  may be the same species of artifact. Tripwires kept: `extra/rand_fusion_bug_repro.py` +
+  skipped tests in `test/unit/test_rand_fusion_bug.py` + `docs/rand_fusion_bug.md` (all on that
+  branch). Do NOT file upstream; revisit only if a fresh repro appears on a real model.
 - 2-device allreduce is always NAIVE (full buffer each way) regardless of size — ring only kicks
   in at ndev>2 and >256k elements (`allreduce.py`, `RING=1` default). For Metal+NV pooling this
   is another reason WS3 chose pipeline over tensor-parallel.
