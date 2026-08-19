@@ -120,14 +120,21 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       q = (qs:=blocks[:, 8:].reshape((-1, 8, 16))).bitwise_and(0xF).cat(qs.rshift(4), dim=2)
       return (d * scales * iq4_xs_lut[q]).flatten(-2)
     if ggml_type == 39:
+      # e8m0 block scale and the E2M1 4-bit value are computed via ALU bit-ops instead of Tensor-indexed
+      # LUT gathers (the original form: `lut_tensor[codes]`). A gather reads a real buffer through a
+      # REDUCE, and rangeify's remove_bufferize refuses to fuse a bufferize point whose expression
+      # contains a buffer-reading REDUCE (schedule/rangeify.py's buffer_in_reduce check) into ANY
+      # consumer that itself indexes the result -- e.g. MoE's `weight[sel]` expert gather. That forced
+      # the ENTIRE dequantized tensor (every expert, not just the k selected) to materialize every
+      # decode step instead of just the gathered rows (T4.13; T4.2 hit an analogous but cheaper issue
+      # with Q4_K's scale unpack). Both replacements below are bit-exact vs the LUT form (verified for
+      # all 256 e8m0 byte values and all 16 four-bit codes) and touch no buffer but `blocks` itself.
       e = blocks[:, 0].cast(dtypes.uint32)
-      small_bits = Tensor([0x00200000, 0x00400000], dtype=dtypes.uint32, device=t.device)[e.clip(0, 1).cast(dtypes.int32)] # e = 0 or e = 1 case
-      d = (e < 2).where(small_bits, (e - 1) * 0x00800000).bitcast(dtypes.float32).unsqueeze(-1)
-      codes = q_to_uint8(blocks[:, 1:17], 4)
-      fp4_lut = Tensor([0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
-                       -0.0,-1.0,-2.0,-3.0,-4.0,-6.0,-8.0,-12.0],
-                      dtype=dtypes.float32, device=t.device)
-      fp4_val = fp4_lut[codes]
+      d = (e == 0).where(0x00200000, (e == 1).where(0x00400000, (e - 1) * 0x00800000)).bitcast(dtypes.float32).unsqueeze(-1)
+      codes = q_to_uint8(blocks[:, 1:17], 4).cast(dtypes.int32)
+      mant, exp, sign = codes.bitwise_and(1), codes.rshift(1).bitwise_and(3), codes.rshift(3).bitwise_and(1)
+      mag = (exp == 0).where(mant, (2 + mant).lshift((exp - 1).maximum(0)))
+      fp4_val = mag.cast(dtypes.float32) * (1 - 2 * sign.cast(dtypes.float32))
       return (fp4_val * d).flatten(-2)[:n]
     if ggml_type == 41:
       d = blocks[:,:2].bitcast(dtypes.float16)
