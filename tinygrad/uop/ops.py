@@ -94,11 +94,10 @@ def multirange_str(rngs:Iterable[UOp], color=False, pad=None) -> str:
   return ret
 
 def shape_to_shape_arg(arg:tuple[sint, ...]) -> UOp:
-  for x in arg:
-    if isinstance(x, UOp) and not dtypes.is_int(x.dtype): raise RuntimeError(f"shape must be int, got {x.dtype} in {arg}")
-  if len(arg) == 0: return UOp(Ops.STACK)
-  elif len(arg) == 1: return UOp.const(arg[0], dtypes.weakint)
-  else: return UOp(Ops.STACK, src=tuple(UOp.const(x) if isinstance(x, int) else x for x in arg))
+  src = tuple(x if isinstance(x, UOp) else UOp.const(x) for x in arg)
+  for x in src:
+    if not dtypes.is_int(x.dtype): raise RuntimeError(f"shape must be int, got {x.dtype} in {arg}")
+  return src[0] if len(src) == 1 else UOp(Ops.STACK, src=src)
 
 def consumer_map_from_toposort(lst:Iterable[UOp]):
   ret: dict[UOp, dict[UOp, None]] = {}
@@ -615,6 +614,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     # NOTE: it always has to be STACK now, even if they are all the same
     if isinstance(b, tuple): return UOp.stack(*[UOp.const(c, dtype) for c in b])
     return UOp(Ops.CONST, dtype, arg=dtype.const(b), src=())
+  # weak CONST with width on the CAST. TODO: this is the final const
+  @staticmethod
+  def cconst(b:ConstLike, dtype:DType): return UOp(Ops.CAST, dtype, src=(UOp.const(b),), arg=dtype)
   @staticmethod
   def range(end:sint, axis_id, axis_type=AxisType.WEAK, *arg, dtype=dtypes.weakint, src=(), **kwargs):
     return UOp(Ops.RANGE, src=(sint_to_uop(end, dtype),)+src, arg=(axis_id, axis_type)+arg, **kwargs)

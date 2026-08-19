@@ -5,7 +5,7 @@ from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TracingKey,
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_index_dtype, pm_commit_weak, pm_cast_weak
 from tinygrad.uop.render import pyrender
-from tinygrad.uop.spec import type_verify, spec_tensor, spec_program, spec_program_casted_consts
+from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
 from tinygrad.renderer import Renderer, Estimates
 from tinygrad.renderer.isa import ISARenderer, IselContext, PreRegAllocContext
 from tinygrad.dtype import dtypes, AddrSpace
@@ -282,7 +282,7 @@ pm_implicit_barriers = PatternMatcher([
 ])
 
 pm_casted_consts = PatternMatcher([
-  (UPat(Ops.CONST, dtypes.all, name="c"), lambda c: UOp(Ops.CAST, c.dtype, src=(UOp.const(c.val),), arg=c.dtype)),
+  (UPat(Ops.CONST, dtypes.all, name="c"), lambda c: UOp.cconst(c.val, c.dtype)),
 ])
 
 def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
@@ -387,11 +387,12 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   num_params = len([x for x in sink.toposort() if x.op is Ops.PARAM and x.arg.slot != -1])
   sink = graph_rewrite(sink, pm_number_params, ctx=[num_params], name="number params with -1", walk=True)
 
-  # TODO: delete once migration are done
-  if ren.casted_consts: sink = graph_rewrite(sink, pm_casted_consts, name="casted consts", walk=True)
+  # spell every literal as a casted const CAST(dt, CONST(value))
+  # TODO: remove once consts are always weak
+  sink = graph_rewrite(sink, pm_casted_consts, name="casted consts", walk=True)
 
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Output AST")
-  if SPEC: type_verify(sink, spec_program_casted_consts if ren.casted_consts else spec_program)
+  if SPEC: type_verify(sink, spec_program)
 
   # return the rewritten sink
   return sink
