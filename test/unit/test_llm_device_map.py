@@ -13,16 +13,21 @@ SSM_TEST_CONFIG = TransformerConfig(num_blocks=4, dim=32, hidden_dim=64, n_heads
                                     ssm=SSMConfig(conv_kernel=4, state_size=4, group_count=2, time_step_rank=2, inner_size=8),
                                     ssm_layers=(True, True, True, True))
 
+# tiny MoE config (T3.3: sub-block expert placement) -- dim/hidden_dim/num_experts follow test_llm_moe.py's pattern
+MOE_TEST_CONFIG = TransformerConfig(num_blocks=4, dim=16, hidden_dim=32, n_heads=2, n_kv_heads=2, norm_eps=1e-5, vocab_size=100,
+                                    head_dim=8, rope_theta=10000.0, rope_dim=8, v_head_dim=8, max_context=32,
+                                    num_experts=4, num_experts_per_tok=2)
+
 class TestParseDeviceMap(unittest.TestCase):
-  def test_ranges(self): self.assertEqual(parse_device_map("0-1:CPU:0,2-3:CPU:1", 4), ["CPU:0", "CPU:0", "CPU:1", "CPU:1"])
-  def test_single_index(self): self.assertEqual(parse_device_map("0:CPU:1,1-3:CPU:0", 4), ["CPU:1", "CPU:0", "CPU:0", "CPU:0"])
-  def test_even_split(self): self.assertEqual(parse_device_map("CPU:0,CPU:1", 4), ["CPU:0", "CPU:0", "CPU:1", "CPU:1"])
-  def test_dict(self): self.assertEqual(parse_device_map({0: "CPU:0", 1: "CPU:1"}, 2), ["CPU:0", "CPU:1"])
+  def test_ranges(self): self.assertEqual(parse_device_map("0-1:CPU:0,2-3:CPU:1", 4), (["CPU:0", "CPU:0", "CPU:1", "CPU:1"], None))
+  def test_single_index(self): self.assertEqual(parse_device_map("0:CPU:1,1-3:CPU:0", 4), (["CPU:1", "CPU:0", "CPU:0", "CPU:0"], None))
+  def test_even_split(self): self.assertEqual(parse_device_map("CPU:0,CPU:1", 4), (["CPU:0", "CPU:0", "CPU:1", "CPU:1"], None))
+  def test_dict(self): self.assertEqual(parse_device_map({0: "CPU:0", 1: "CPU:1"}, 2), (["CPU:0", "CPU:1"], None))
   def test_gap_raises(self):
     with self.assertRaises(AssertionError): parse_device_map("0-1:CPU:0", 4)
   def test_whitespace_after_comma(self):
     # a stray space (e.g. "a, b") must not get misdetected as the even-split form and produce garbage devices
-    self.assertEqual(parse_device_map("0-1:CPU:0, 2-3:CPU:1", 4), ["CPU:0", "CPU:0", "CPU:1", "CPU:1"])
+    self.assertEqual(parse_device_map("0-1:CPU:0, 2-3:CPU:1", 4), (["CPU:0", "CPU:0", "CPU:1", "CPU:1"], None))
   def test_mixed_form_raises(self):
     with self.assertRaises(AssertionError): parse_device_map("0-1:CPU:0,CPU:1", 4)
   def test_range_out_of_bounds_raises(self):
@@ -33,6 +38,26 @@ class TestParseDeviceMap(unittest.TestCase):
     with self.assertRaises(AssertionError): parse_device_map({0: "CPU:0", 2: "CPU:1"}, 3)
   def test_even_split_too_many_devices_raises(self):
     with self.assertRaises(AssertionError): parse_device_map("CPU:0,CPU:1,CPU:2", 2)
+
+  # --- "experts:<device>" segment (T3.3: sub-block MoE expert placement) ---
+  def test_experts_segment_ranges(self):
+    self.assertEqual(parse_device_map("0-1:CPU:0,2-3:CPU:1,experts:CPU:2", 4), (["CPU:0", "CPU:0", "CPU:1", "CPU:1"], "CPU:2"))
+  def test_experts_segment_even_split(self):
+    self.assertEqual(parse_device_map("CPU:0,experts:CPU:1", 4), (["CPU:0"] * 4, "CPU:1"))
+  def test_experts_segment_first(self):
+    # order shouldn't matter
+    self.assertEqual(parse_device_map("experts:CPU:1,0-3:CPU:0", 4), (["CPU:0"] * 4, "CPU:1"))
+  def test_experts_dict_key(self):
+    self.assertEqual(parse_device_map({0: "CPU:0", 1: "CPU:0", "experts": "CPU:1"}, 2), (["CPU:0", "CPU:0"], "CPU:1"))
+  def test_no_experts_segment_is_none(self):
+    self.assertEqual(parse_device_map("0-3:CPU:0", 4), (["CPU:0"] * 4, None))
+    self.assertEqual(parse_device_map({0: "CPU:0"}, 1), (["CPU:0"], None))
+  def test_experts_only_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("experts:CPU:1", 4)
+  def test_experts_missing_device_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("0-3:CPU:0,experts:", 4)
+  def test_experts_duplicate_raises(self):
+    with self.assertRaises(AssertionError): parse_device_map("0-3:CPU:0,experts:CPU:1,experts:CPU:2", 4)
 
 class TestDeviceMapModel(unittest.TestCase):
   def _generate(self, model, prompt, n):
@@ -162,6 +187,110 @@ class TestDeviceMapRecurrentModel(unittest.TestCase):
     # lazily-created recurrent state followed the activations to the mapped devices (F1)
     self.assertEqual([b.conv_state.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
     self.assertEqual([b.recurrent_state.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
+
+def _force_realize_moved(model):
+  # mirrors from_gguf's device_map force-realize (model.py Transformer.from_gguf, the "moved" branch):
+  # load_state_dict's .to(v.device) is otherwise an unrealized COPY that gets captured into the JIT and
+  # replayed every token (the T3.2 trap). Transformer() + a manual load_state_dict, as these tests do
+  # instead of going through from_gguf, doesn't get this for free -- found while measuring T3.3 hop counts:
+  # without it, EVERY weight tensor's placement COPY shows up in the captured graph, drowning the real
+  # per-token expert hops in load-time noise (confirmed present already, pre-T3.3, on the plain dense
+  # CPU:0/CPU:1 split in TestDeviceMapModel -- harmless for correctness there since its assertions never
+  # check for absence of extra copies, but worth flagging).
+  moved = [s for s in nn.state.get_parameters(model) if s.device != Device.DEFAULT]
+  for s in moved: s.replace(s.contiguous())
+  Tensor.realize(*moved)
+
+def _randomize_experts(model, seed=7):
+  # ExpertWeights.__init__ zero-inits (like all model.py weights); randomize so the placement test is a real
+  # exact-output check, not a trivially-all-zero one (test_llm_moe.py's block-level tests do the same by hand).
+  # NOTE 1: device= must match the already-placed weight's device -- Tensor.randn defaults to Device.DEFAULT,
+  # and a bare re-assignment (unlike .to_()/.replace()) would silently strand the new weight there instead.
+  # NOTE 2: .realize() each one immediately -- 12 sequential Tensor.randn calls (4 blocks x 3 tensors) all
+  # chain lazily onto the global threefry counter; left unrealized, that chain plus device_map's own lazy
+  # placement COPY compounds into a UOp graph deep enough to blow Python's recursion limit inside .key's
+  # hashing the first time generate() forces a realize (RecursionError, not obviously from either cause
+  # alone -- found while building this test, unrelated to the T3.3 hop-placement code itself).
+  Tensor.manual_seed(seed)
+  for block in model.blk:
+    for name in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"):
+      w = getattr(block, name).weight
+      getattr(block, name).weight = Tensor.randn(*w.shape, device=w.device).realize()
+
+class TestDeviceMapMoEExperts(unittest.TestCase):
+  """T3.3: sub-block placement -- attention+norms+KV on the block device, routed-expert weights
+  (ffn_{gate,up,down}_exps) on a separate 'experts:<device>' device, with activations hopping around
+  the three ExpertWeights calls inside the @function-traced block body (not at the block boundary)."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_experts_split_matches_unsplit_homogeneous(self):
+    ref = Transformer(MOE_TEST_CONFIG, device_map="CPU:0")
+    _randomize_experts(ref)
+    split = Transformer(MOE_TEST_CONFIG, device_map="0-1:CPU:0,2-3:CPU:1,experts:CPU:2")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    _force_realize_moved(split)
+
+    # experts landed on the separate device regardless of which block-device range they're in; the router
+    # (ffn_gate_inp) and everything else stayed with the block
+    self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["CPU:2"] * 4)
+    self.assertEqual([b.ffn_up_exps.weight.device for b in split.blk], ["CPU:2"] * 4)
+    self.assertEqual([b.ffn_down_exps.weight.device for b in split.blk], ["CPU:2"] * 4)
+    self.assertEqual([b.ffn_gate_inp.weight.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
+    self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
+
+    # identical outputs over prefill + several decode steps, twice (second prompt exercises JIT replay)
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    # JIT captured the mid-block hop: only COPY calls touch the experts device, compute kernels are single-device
+    rollout_jit = split.jit[(False, True)]
+    self.assertIsNotNone(rollout_jit.captured)
+    expert_copies = []
+    for call in rollout_jit.captured.linear.src:
+      devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+      if call.src[0].op is Ops.COPY:
+        if "CPU:2" in devs: expert_copies.append((devs, call.src[0].arg))
+      else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
+    # per MoE layer: h and sel hop IN (2 copies -- sel must travel with h since self.weight[sel] indexes
+    # the remote weight buffer), x_down hops OUT (1 copy) = 3, not the naively-budgeted 2 (in+out as one
+    # hop each). No extra copies sneak in from the gather/probs path (probs/scores never leave the block
+    # device -- x_down is brought back to it before combining with probs).
+    self.assertEqual(len(expert_copies), 4 * 3, f"expected 3 expert-device copies/layer (h, sel, x_down): {expert_copies}")
+    self.assertEqual(sum(1 for _, dst in expert_copies if dst == "CPU:2"), 4 * 2)  # 2 "in" copies/layer land on CPU:2
+    self.assertEqual(sum(1 for devs, dst in expert_copies if dst != "CPU:2"), 4)   # 1 "out" copy/layer lands back off it
+
+@unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")
+class TestDeviceMapMoEExpertsMetalCPU(unittest.TestCase):
+  """T3.3 cross-backend: experts on CPU, attention+router+everything else on METAL."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_experts_on_cpu_rest_on_metal(self):
+    ref = Transformer(MOE_TEST_CONFIG, device_map="METAL")
+    _randomize_experts(ref)
+    split = Transformer(MOE_TEST_CONFIG, device_map="METAL,experts:CPU")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    _force_realize_moved(split)
+
+    self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["CPU"] * 4)
+    self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["METAL"] * 4)
+
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    rollout_jit = split.jit[(False, True)]
+    self.assertIsNotNone(rollout_jit.captured)
+    expert_copies = 0
+    for call in rollout_jit.captured.linear.src:
+      if call.src[0].op is Ops.COPY:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        if "CPU" in devs and "METAL" in devs: expert_copies += 1
+    self.assertEqual(expert_copies, 4 * 3)  # same 3-copies/layer shape as the homogeneous CPU:0/CPU:2 case
 
 if __name__ == '__main__':
   unittest.main()

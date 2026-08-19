@@ -147,7 +147,8 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
-  parser.add_argument("--device-map", default=None, help='Per-block device placement: "0-15:CPU:0,16-31:CPU:1" or "CPU:0,CPU:1" (even split)')
+  parser.add_argument("--device-map", default=None, help='Per-block device placement: "0-15:CPU:0,16-31:CPU:1" or "CPU:0,CPU:1" (even split); '
+                       'optional "experts:<device>" segment routes MoE routed-expert weights to a separate device')
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
