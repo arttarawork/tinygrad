@@ -403,6 +403,20 @@ class TestAttentionHook(unittest.TestCase):
     out = custom_decode_attention(q, k, v, mask).numpy()
     np.testing.assert_allclose(out, ref, rtol=1e-6, atol=1e-6)
 
+  def test_custom_kernel_symbolic_tk(self):
+    # T4.7: Tensor.custom_kernel now accepts a symbolic (bound Variable) shape on a REDUCE-only dim.
+    # _decode_attn_kernel never branches on Tk in Python (three UOp.range(Tk, ..., REDUCE) passes, no
+    # unrolling), so -- unlike T1.8b's chunked kernel (see TestTunedAttentionKernel.
+    # test_gating_symbolic_tk_falls_back) -- it needs no fallback: it just runs correctly at every Tk.
+    q, k_full, v_full = self._qkv(1, 4, 2, 10, 8, 0)
+    for n in (1, 3, 5, 10):
+      tk_var = Variable("Tk", 1, 10).bind(n)
+      k, v = k_full[:, :, :tk_var], v_full[:, :, :tk_var]
+      self.assertFalse(isinstance(k.shape[2], int))
+      ref = q.scaled_dot_product_attention(k_full[:, :, :n].contiguous(), v_full[:, :, :n].contiguous(), enable_gqa=True).numpy()
+      out = custom_decode_attention(q, k, v, None).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4, err_msg=f"{n=}")
+
   def test_kernel_count_default_vs_hook(self):
     q, k, v = self._qkv(2, 4, 2, 6, 8, 0)
     GlobalCounters.reset()

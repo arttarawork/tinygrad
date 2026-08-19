@@ -1135,7 +1135,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # *** uop high level syntactic sugar ***
 
   @staticmethod
-  def placeholder(shape:tuple[int, ...], dtype:DType, slot:int, addrspace=AddrSpace.GLOBAL, device=None, volatile=False):
+  def placeholder(shape:tuple[sint, ...], dtype:DType, slot:int, addrspace=AddrSpace.GLOBAL, device=None, volatile=False):
     dtype = strong_dtype(dtype)  # storage is never weak: a placeholder commits the width of what's put in it
     if addrspace is AddrSpace.GLOBAL:
       ret = UOp(Ops.PARAM, src=(shape_to_shape_arg((prod(shape),)),), arg=ParamArg(slot, dtype, addrspace=addrspace, device=device,volatile=volatile))
@@ -1146,8 +1146,25 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if len(shape) > 1: ret = ret.reshape(shape)
     return ret
   def placeholder_like(self, slot:int, addrspace=AddrSpace.GLOBAL):
-    assert all_int(self.shape), "no placeholder-like on symbolic shape"
-    return UOp.placeholder(self.max_shard_shape, self.dtype, slot, addrspace)
+    # symbolic dims: mirror what rangeify's debuf() does for ordinary kernels (a custom_kernel body is
+    # hand-built kernel-side IR -- UOp.range etc. -- so it never passes through rangeify itself, and must
+    # reproduce the split by hand). The underlying buffer is declared/allocated at its static max size
+    # (max_shard_shape / vmax) -- real memory has to be sized for the worst case -- then SHRUNK down to the
+    # actual (still-symbolic) per-call extent, so indexing inside the kernel body sees the real dynamic
+    # bound, not vmax. A bound Variable (e.g. a JIT-promoted KV length, .bind()'d after the first decode
+    # step) is unbound and converted to its kernel-side PARAM form (UOp.variable's param=True case) first:
+    # passing it through bound would bake a literal STORE(var, val) into the kernel body (codegen would try
+    # to compile that as a real memory store and fail), and the graph-side BUFFER form can't be rendered
+    # inside kernel IR at all -- only the free Variable, resolved externally via the CALL arg at dispatch.
+    def to_kernel_param(d:sint) -> sint:
+      if not isinstance(d, UOp): return d
+      if d.is_bound_var: return d.unbind()[0].replace(op=Ops.PARAM)
+      if d.is_variable: return d.replace(op=Ops.PARAM)
+      return d
+    shape, max_shape = self.shard_shape, self.max_shard_shape
+    ret = UOp.placeholder(max_shape, self.dtype, slot, addrspace)
+    if shape != max_shape: ret = ret.shrink(tuple((0, to_kernel_param(s)) for s in shape))
+    return ret
 
   # set is store+end+after
   def set(self:UOp, val:UOp|ConstType, end:UOp|tuple[UOp, ...]|list[UOp]=()) -> UOp:
