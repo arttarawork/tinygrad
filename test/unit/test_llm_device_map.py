@@ -186,7 +186,8 @@ class TestDeviceMapMetalCPU(unittest.TestCase):
         self.assertLessEqual(len(devs), 1, f"ungraphed compute kernel with mixed-device buffers: {devs}")
         ungraphed_devs |= devs
     self.assertIn(({"METAL", "CPU"}, "CPU"), copies)  # the block-boundary activation hop
-    self.assertIn("METAL", graphed_devs)              # METAL kernels got graph-batched
+    # paravirtualized Metal (GitHub CI macOS runners) disables MetalGraph entirely -- only assert batching where it exists
+    if Device["METAL"].graph is not None: self.assertIn("METAL", graphed_devs)  # METAL kernels got graph-batched
     self.assertIn("CPU", ungraphed_devs)               # CPU kernels stayed eager/sequential
 
 @unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")

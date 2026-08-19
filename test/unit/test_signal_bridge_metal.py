@@ -28,7 +28,8 @@ Primitives reused, not reinvented (ponytail rung 2 -- nothing here is a new mech
 See SIGNAL_BRIDGE_NOTES.md (repo root) for the capture-op analysis (why this stays eager/out-of-JIT)
 and the measured latency table.
 """
-import ctypes, threading, time, statistics, unittest
+import ctypes, threading, time, statistics, unittest, platform
+if platform.system() != "Darwin": raise unittest.SkipTest("Metal/objc bindings import at module level; macOS only")
 from typing import Any
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.device import Buffer
