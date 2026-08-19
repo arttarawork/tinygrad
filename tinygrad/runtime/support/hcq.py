@@ -12,6 +12,7 @@ from tinygrad.runtime.support.memory import BumpAllocator
 from tinygrad.renderer import Renderer
 
 class MMIOInterface:
+  is_remote = False # True for RemoteMMIOInterface (socket-RPC backed): reads/writes are blocking round trips, not local memory ops.
   def __init__(self, addr:int, nbytes:int, fmt='B'): self.mv, self.addr, self.nbytes, self.fmt = to_mv(addr, nbytes).cast(fmt), addr, nbytes, fmt
   def __len__(self): return self.nbytes // struct.calcsize(self.fmt)
   def __getitem__(self, k): return (self.mv[k] if self.fmt == 'B' else self.mv[k].tolist()) if isinstance(k, slice) else self.mv[k]
@@ -594,19 +595,31 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
         self.b_timeline[batch_info[1]] = self.dev.timeline_value - 1
 
   def _copyout(self, dest:memoryview, src:HCQBuffer):
-    self.dev.synchronize()
     if self.dev.hw_copy_queue_t is None:
+      self.dev.synchronize()
       with cpu_profile(f'{self.dev.device} -> TINY', f"{self.dev.device}:COPY"): ctypes.memmove(from_mv(dest), int(src.va_addr), len(dest))
       return
 
+    # Drain one in-flight chunk: wait for its device write to land, then read it out of the staging buffer into dest.
+    def _drain(buf_idx:int, doff:int, lsize:int):
+      self.dev.timeline_signal.wait(self.b_timeline[buf_idx])
+      dest.cast('B')[doff:doff+lsize] = self.b[buf_idx].cpu_view().view(size=lsize, fmt='B')[:]
+
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,
                      dev_suff="SDMA:0"):
+      pending:list[tuple[int, int, int]] = []
       for i in range(0, dest.nbytes, cp_size:=self.b[0].size):
+        # All staging buffers are in flight: drain the oldest (the one about to be reused) before submitting into it again.
+        if len(pending) == len(self.b): _drain(*pending.pop(0))
+
+        self.b_next = (self.b_next + 1) % len(self.b)
+        lsize = min(cp_size, dest.nbytes - i)
         self.dev.hw_copy_queue_t().wait(self.dev.timeline_signal, self.dev.timeline_value - 1) \
-                                  .copy(self.b[0], src.offset(i), lsize:=min(cp_size, dest.nbytes-i)) \
+                                  .copy(self.b[self.b_next], src.offset(i), lsize) \
                                   .signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
-        self.dev.timeline_signal.wait(self.dev.timeline_value - 1)
-        dest.cast('B')[i:i+lsize] = self.b[0].cpu_view().view(size=lsize, fmt='B')[:]
+        self.b_timeline[self.b_next] = self.dev.timeline_value - 1
+        pending.append((self.b_next, i, lsize))
+      for p in pending: _drain(*p)
 
   def _transfer(self, dest:HCQBuffer, src:HCQBuffer, sz:int, src_dev:HCQDeviceType, dest_dev:HCQDeviceType):
     if src_dev.peer_group != dest_dev.peer_group: return src_dev.rdma_dev().allocator._transfer(dest, src, sz, src_dev, dest_dev)
