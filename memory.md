@@ -218,6 +218,15 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   expression breaks gather fusion — prefer bit-ops for small decode tables. T4.12: prefill jit now
   keyed by chunk_size (resolve() default=True fallback on symbolic ranges was capturing every
   first step as prefill). PR queue now: T4.9 → T4.13 → T4.7+T1.8c-fix → T4.2 → T4.1 pkg.
+- **2026-08-19 (bench window 4 — Phase 0 closes measured):** T4.13 confirmed at real scale:
+  gpt-oss-20b decode **1.69 → 10.97 tok/s (15.52 with BEAM — beam flipped from −12.5% to +41.5%
+  once the pathological kernels died)**, bytes 59.3 → 3.46 GB/token (≈ analytic). Long-context
+  gpt-oss is now attention-COMPUTE-bound on Metal (decode −68.5% at 2k prompt, bytes only +11.6%)
+  — the sm_86 tensor-core case for the dock. Cross-implementation FP drift vs llama.cpp is normal
+  in this stack (llama3.2:1b diverges after 2 tokens PRE-wave-8; a gpt-oss prompt diverges at
+  token 27 post-fix — dequant values bit-exact, fusion reorders accumulation; T4.10 class).
+  Headline stable at 7.37/qwen3:8b. Bench branches (`task/bench-window-{2,3,4}`, T0.3 harness)
+  stay unmerged by convention — CSV + BENCH_NOTES.md live on `task/bench-window-4` tip.
 
 ## 7. Sources
 
