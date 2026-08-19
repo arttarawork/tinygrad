@@ -96,10 +96,16 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 - **T1.6 — Cache `_prepare_jit_inputs`** `[ANY]` deps: — (WS2.4-adjacent)
   `engine/jit.py:200-218` re-derives state dicts every call (~0.5 ms/token host). Memoize safely.
   *Done when:* host time/token measurably down on Metal; JIT tests green.
-- **T1.7 — Fused-attention track A: PCONTIG** `[MAC/ANY]` deps: T0.1 (WS1.4a) — *high effort/risk*
-  Drive `PCONTIG>2` online-softmax (`rangeify.py:264-282`) on decode shapes; try un-skipping
-  `test_softmax_fusion.py` cases; document exactly what breaks if it does.
-  *Done when:* either attention kernel count drops on decode shapes, or a written failure analysis.
+- **T1.7 — Fused-attention track A: PCONTIG** `[MAC/ANY]` — **now the LIVE route** (T1.8b killed
+  track B: custom_kernel can't take symbolic Tk, BEAM can't search it, no warp primitives).
+  Drive `PCONTIG>2` online-softmax (was `rangeify.py:264-282` at baseline — re-locate after the
+  upstream merge) on decode attention shapes; try un-skipping `test_softmax_fusion.py` cases.
+  Two facts to carry in: the JIT makes Tk symbolic after token 1, so the fusion must survive a
+  symbolic reduce range to matter; and the existing 4-kernel chain already runs ~46% of bandwidth
+  at Tk=8k, so the honest prize is ~2x on the attention slice, not 5x.
+  *Done when:* attention kernel count drops on decode shapes with correct output + kernel-time
+  vs the chain measured, OR a written failure analysis naming exactly what breaks in rangeify
+  (which then routes effort to T4.7/T4.8). Exploration task — the analysis exit is respectable.
 - **T1.8 — Fused-attention track B: pluggable custom kernel** `[MAC]` deps: T0.1 (WS1.4b)
   Add a clean attention-override hook in `llm/model.py:196` (pattern: `STUB_ATTENTION`,
   `extra/models/llama.py:104-119`; `Tensor.custom_kernel` is tested). Prove it with a naive Metal
@@ -129,11 +135,12 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   readback. Add a bulk-write path + skip validation on remote ifaces. Functional under mock; the
   latency win is measured post-dock.
   *Done when:* map_range socket-message count collapses (count messages in a fake iface test).
-- **T2.3 — NV remote-tuning skeleton** `[ANY→DOCK]` deps: — (WS2.1)
-  Prep an `is_remote()`-keyed sizing layer for NV mirroring AMD's `is_usb()` knobs
-  (`ops_amd.py:980-994` template): kernargs, sigalloc, ring sizes, `bind()` bulk writes. Values
-  tuned post-dock; structure lands now.
-  *Done when:* knobs exist with defaults = current behavior; no-op on NVK Linux.
+- **T2.3 — NV remote-tuning skeleton** `[MOCKNV]` deps: T0.4 ✅ (WS2.1)
+  Prep a remote-keyed sizing layer for NV mirroring AMD's `is_usb()` knobs (`ops_amd.py:980-994`
+  template): kernargs size, sigalloc, ring sizes, `bind()` bulk writes. Remote detection exists
+  since T2.2 (`is_remote` on the MMIO iface). Values tuned post-dock; structure lands now.
+  *Done when:* knobs exist with defaults = current behavior (mock-NV suites byte-green), one unit
+  test asserting the knob set flips under a remote iface; no behavior change on NVK Linux path.
 - **T2.4 — sm_86 kernel work on a rented 3090** `[CLOUD3090]` deps: T1.8 — *optional accelerator*
   Same NV backend, real tensor cores: BEAM sweeps on decode gemvs, tuned FA custom kernel for the
   T1.8 hook, MATVEC perf confirmation. Everything transfers to the eGPU minus transport.
@@ -171,10 +178,15 @@ can be built and proven before the dock ships.
   Budget hops against T3.2's ~750 µs/copy floor — 2 hops/MoE-layer is the design's expected shape.
   *Done when:* MoE model runs with experts on the second device, outputs exact, hop count/token
   measured vs the 2/layer expectation. This is the flagship NV+METAL shape.
-- **T3.4 — Zero-copy bridge spike (Stage B)** `[MAC]` deps: T3.2 (WS3.B)
-  Wrap shared host memory across backends: `BufferSpec.external_ptr` on Metal (`ops_metal.py:157`)
-  over a CPU/NV-visible buffer; sketch the HCQ-signal↔`MTLSharedEvent` host bridge.
-  *Done when:* one boundary copy eliminated in the T3.2 pipeline, measured.
+- **T3.4 — Zero-copy bridge spike (Stage B)** `[MAC]` deps: T3.2 ✅ (WS3.B)
+  Wrap shared host memory across backends: `BufferSpec.external_ptr` on Metal (`ops_metal.py:157`
+  at baseline — re-locate) over a CPU-visible buffer. The number to beat: T3.2 measured a
+  **~750 µs FIXED cost per boundary copy** (overhead, not bandwidth) — if aliasing removes the
+  copy, the hop cost should collapse toward sync-only. Target: eliminate the block-boundary
+  activation copy in T3.2's METAL+CPU test pipeline, re-measure per-token cost. Also sketch (on
+  paper, in the report) the HCQ-signal↔`MTLSharedEvent` bridge for the eventual NV side.
+  *Done when:* one boundary copy eliminated + before/after per-token cost, OR analysis of why
+  aliasing is unsafe (sync semantics, buffer lifetime, JIT capture) with the smallest viable alternative.
 - **T3.5 — Boundary-copy microbenchmark — RESOLVED by T3.2 (2026-08-18):** METAL↔CPU table
   delivered (~750 µs fixed floor <1M elems, bandwidth above). Remaining: rerun on METAL↔NV post-dock.
 
@@ -207,6 +219,17 @@ can be built and proven before the dock ships.
   3 repeats each side (harness exists); if the gap is real (>spread), bisect which wave lever
   costs prefill and why (likely MATVEC guard firing on a prefill kernel it shouldn't). STOP after
   attribution — fix is a follow-up. *Done when:* variance verdict or named culprit in BENCH_NOTES.md.
+
+- **T4.7 — Upstream enabler: symbolic-shape `custom_kernel`** `[ANY]` deps: — (from T1.8b) — *not yet launched*
+  `Tensor.custom_kernel` asserts `all_int(self.shape)`; the JIT's symbolic Tk therefore locks every
+  custom kernel out of real decode. Investigate what breaks if custom kernels accept bound
+  Variables (range construction? kernel cache key? memory planning?) and land the smallest
+  upstream-shaped fix. Unlocks T1.8b's kernel AND T2.4's sm_86 flash kernel.
+- **T4.8 — Upstream enabler: warp-reduce primitives in Metal renderer** `[MAC]` deps: — (from T1.8b) — *not yet launched*
+  Metal codegen has no `simd_sum`/`simd_shuffle`; threadgroup_barrier+LOCAL is the only cross-lane
+  reduction (measured dominant cost in T1.8b's kernel; caps custom kernels ~5% of bw). Scope what
+  adding a simdgroup reduction primitive to the Metal renderer takes (renderer op, codegen
+  pattern, correctness gating by threadgroup size). Benefits all GROUP reductions, not just attention.
 
 ## Phase 1 — dock arrives (`DOCK`)
 
@@ -291,6 +314,10 @@ flowchart LR
 | 2026-08-18 | T1.9 | **done — premise corrected** | `task/T1.9-stream-load` | `4289d3c8e` (+62/−8): **the "2x load transient" premise was WRONG** — mem_used stays flat at 1x through the old whole-file load (dequant fusion is lazy); the real 2.2-5.3x is **KV pre-alloc at native max_context in `_init_state`** (qwen3:8b +6 GB, llama3.2:1b +4.3 GB @131k ctx) → new task T4.6. The ≤64 MB batched staging still won: METAL llama3.2:1b at native ctx went from reliable OOM (one ~1 GB contiguous alloc) to 2/2 success; fast lane/fusion/device_map all preserved-and-verified. Its reported "pre-existing device_map test failure" does NOT reproduce here (3/3 solo + 25/25 -n12) — environment flake, watch it. |
 | 2026-08-18 | T4.6 (new) | open | — | Lazy/growable KV allocation (or cap default `max_context` at CLI): `_init_state` pre-allocates native-context KV (up to 131k) = 2.2-5.3x model size before the first token. Options: allocate at `min(max_context, requested)`, grow in chunks on demand (watch JIT capture — cache tensor identity is baked into the graph), or just default the CLI to a sane ctx. `[ANY]`, evidence-first: measure which option keeps JIT replay valid. From T1.9's finding. |
 | 2026-08-18 | wave-4 integration | **done** | `integration/wave1` | all 5 wave-4 branches merged, **zero conflicts**. Full suite **2463 passed**, mypy (215 files) + ruff clean, mock-NV green. |
+| 2026-08-18 | T1.7 | agent running | `task/T1.7-pcontig-attn` | wave 5: PCONTIG fusion exploration; symbolic-Tk verdict is the decision-critical output |
+| 2026-08-18 | T4.6 | agent running | `task/T4.6-kv-prealloc` | wave 5: max_context flow map + smallest sound cap; loud boundary failure |
+| 2026-08-18 | T3.4 | agent running | `task/T3.4-zero-copy` | wave 5: external_ptr alias spike vs the 750 µs hop floor; MTLSharedEvent sketch |
+| 2026-08-18 | T2.3 | agent running | `task/T2.3-remote-knobs` | wave 5: no-op remote knob skeleton, selection-path test; values post-dock |
 | 2026-08-18 | T2.5 | **done** | `task/T2.5-sync-amortize` | `2b1470d73` (+129/−9): chained-K landed — decode already chained on-device (`.item()` was pure host bookkeeping); now launches ≤`drain_every` steps then one batched drain. Gotcha found: TinyJit reuses output buffers across replays → deferred tokens need `.clone().realize()` (drain_every=1 stays zero-extra-op). **Default 1** (existing per-call test contracts); N=4 opt-in. Metal llama3.2:1b: ~0.25-0.76 ms/tok saved (~1-2%, compute-dominated) — real payoff is the TB socket round-trip floor later. EOS mid-window: ≤N−1 wasted device steps, yielded sequence unchanged. 83+20 tests, mypy+ruff clean. |
 | 2026-08-18 | T4.5 | **done** | `task/T4.5-force-realize` | `d8f02dd90` (+72/−27): `Transformer.realize_placement()` — one home for the T3.2 force-realize, from_gguf delegates, manual loaders call it post-load; asserts on params stranded outside the map (correctness bug, not a warning). T3.3's test helper deleted; dense split test's captured-copy assertion tightened to EXACTLY one boundary hop (T3.3's 39-copy pollution closed). 79 tests, mypy+ruff clean. Kept fork-side (rejected touching upstream `load_state_dict` — rationale in report). |
 | 2026-08-18 | T3.3 | **done** | `task/T3.3-moe-placement` | `6b942a18d` (+174/−18): `experts:<dev>` device_map segment; router stays with block. Mid-block hops capture/replay fine in JIT (no new mechanism needed). **Hop count = 3 copies/MoE-layer, not 2** (`sel` must travel with `h` for the weight gather) — verified exactly on tiny configs AND olmoe (48 copies = 16×3). olmoe METAL+experts:CPU tokens exact vs all-CPU. **Design rule discovered: the GGUF load device must be the BIG-memory side** — moving the big expert tensors across a boundary force-realizes them at full fp16 (~13 GB for olmoe), defeating fused dequant; move the small attention share instead. 788 unit tests green. Incidental: manual-`load_state_dict` callers miss `from_gguf`'s force-realize fix (captured-COPY trap, pre-existing) — filler task below. |
