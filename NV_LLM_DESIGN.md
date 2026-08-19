@@ -156,7 +156,7 @@ Budgets: NV ~22.5 GB usable; Metal ~27 GB default wired limit (raiseable to ~30�
 | Qwen3-8B | Q4_K ~4.6 GB | NV alone | M1 (fast), the benchmark workhorse |
 | Qwen3.6-27B / Qwen3.8-27B* | Q4 ~16 GB | NV alone (or Metal) | M1–M2 daily driver |
 | Qwen3-30B/3.6-35B-A3B | Q4 ~17–19 GB | either alone | M1; MoE placement testbed |
-| gpt-oss-20b | MXFP4 ~12 GB | NV alone | arch ✅ (T1.3); decode 1.69 tok/s — ROOT-CAUSED (window 3): MXFP4 dequant materializes per token at 20B scale (~90% of decode time, two elementwise kernels); fix = T4.13, expected ~20-40 tok/s |
+| gpt-oss-20b | MXFP4 ~12 GB | NV alone | arch ✅ (T1.3); decode FIXED (T4.13: MXFP4 LUT gathers blocked fusion into the expert gather — replaced with ALU bit-ops, 44x byte cut, bit-exact); real-model confirm next bench window, expect 1.69 → ~20-40 tok/s |
 | Qwen3.6-35B-A3B | Q8 ~37 GB | **pooled** | M3 flagship |
 | 70B-class dense | Q4 ~40 GB | pooled | M3 (capacity proof) |
 | gpt-oss-120b | MXFP4 ~60 GB + KV | pooled, stretch | M4 — needs wired-limit push + sub-MXFP4 requant or short context; borderline by ~8–10 GB |

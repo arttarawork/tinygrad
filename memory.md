@@ -208,6 +208,16 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   JITBEAM makes it worse (−12.5%). New small bug T4.12: warmup() hardcodes chunk_size=32, jit key
   omits it → JitError on generate(chunk_size≠32). Headline stable: 7.38 no-BEAM. Docs current;
   ~48 tasks closed over 7 waves + 3 bench windows.
+- **2026-08-19 (wave 8 — the MXFP4 fix):** T4.13 root-caused and FIXED the gpt-oss 59 GB/token:
+  MXFP4 dequant's LUT gathers (`lut[codes]`) embed a buffer-reading REDUCE that rangeify's
+  `buffer_in_reduce` refuses to fuse into the MoE `weight[sel]` gather → all 32 experts
+  materialized per token. Not scale-dependent (T4.11 missed it via a coverage gap: fp32 weights in
+  its byte test, one-tensor quantization in its GGUF test). Fix: LUTs → ALU bit-ops, bit-exact,
+  **44x byte cut (1.04x analytic)**; real-model tok/s confirm pending next bench window
+  (~1.69 → 20-40 expected). Lesson for the pattern library: an indexed LUT inside a dequant
+  expression breaks gather fusion — prefer bit-ops for small decode tables. T4.12: prefill jit now
+  keyed by chunk_size (resolve() default=True fallback on symbolic ranges was capturing every
+  first step as prefill). PR queue now: T4.9 → T4.13 → T4.7+T1.8c-fix → T4.2 → T4.1 pkg.
 
 ## 7. Sources
 
