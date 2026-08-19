@@ -234,3 +234,100 @@ to test the design doc's candidate hypothesis directly.
   flip the argmax pick early and cascade into a fully different (but equally "valid" per-checkout)
   continuation. Not investigated further — T4.3 below is the real correctness-parity check, on real
   prompts (a synthetic garbage prompt isn't a meaningful place to chase greedy-decode divergence).
+
+## D. T4.3 — gpt-oss-20b real-model validation
+
+`gpt-oss:20b` MXFP4 (12.1 GB GGUF, cached), METAL, `llama-server` stopped. Memory watched throughout
+(`vm_stat`/`sysctl vm.swapusage`) — stayed healthy, no swap growth from any of these runs (see
+Anomalies).
+
+**Tool note:** `llama-cli -no-cnv -p "..."` hung generating unbounded output (ran to 512 KB+ over 2
+min before being killed — likely `-no-cnv` not fully suppressing the interactive read-loop for this
+build, `--no-conversation`'s help text ties "interactive mode" to the same flag but evidently didn't
+disable it here). Switched to `llama-completion` (a llama.cpp binary built specifically for one-shot,
+non-interactive completion; `-i/--interactive` defaults to `false` there) with `-no-cnv < /dev/null`
+for belt-and-suspenders — worked cleanly for all 3 prompts, respected `-n 64` exactly.
+
+### (1) Tokenizer + greedy-generation parity vs llama.cpp
+
+3 prompts, `--temp 0 -n 64` both sides (tinygrad: `Transformer.generate(..., temperature=0.0)`,
+default `chunk_size=32`; llama.cpp: `llama-completion --temp 0 -n 64 -no-cnv`), tokenized
+independently by each stack from the same GGUF:
+
+| # | Prompt (truncated) | tokens | crosses chunk=32 boundary? |
+|---|---|---|---|
+| 1 | "The capital of France is" | 5 | no |
+| 2 | "Explain in one sentence why the sky..." | 13 | no |
+| 3 | "Write a short Python function that takes a list of integers..." | **33** | **yes** (32+1) |
+
+- **Tokenizer parity: EXACT on all 3 prompts.** tinygrad's `SimpleTokenizer` (T1.3's `gpt-4o` preset)
+  produced byte-identical token ID sequences to `llama-tokenize -m <gguf> --ids --no-parse-special`
+  for all three prompts (verified id-by-id, including the 33-token prompt). No divergence to report
+  here — T1.3's tokenizer is a genuine match for gpt-oss's o200k-based vocab.
+- **Generation parity, prompts 1 & 2 (single prefill chunk): EXACT, all 64 generated tokens**,
+  verified by diffing the full concatenated prompt+completion text from `llama-completion` (run with
+  `--display-prompt`, the default) against `tok.decode(prompt_ids + gen_ids)` from tinygrad — the
+  two are byte-identical strings on both prompts (mod a trailing newline llama.cpp's CLI appends).
+- **Generation parity, prompt 3 (crosses the chunk_size=32 boundary): DIVERGES at generated token
+  26** (0-indexed position 25 in the 64-token output; absolute sequence position 58 — i.e. 26 decode
+  steps after the 33-token, 2-chunk prefill finishes). Tokens 1-25 are identical between the two
+  stacks (`"\n\nHere is a short Python function that takes a list of integers and returns the sum of
+  all even numbers in the list,"` — 25 tokens, byte-identical). At token 26, tinygrad picks id 4251
+  (`" along"`, continuing "...list, along with a brief docstring...") while llama.cpp picks id 3463
+  (`" including"`, continuing "...list, including a brief docstring..." — an echo of the prompt's own
+  wording). Both continuations remain fluent, on-topic Python code afterward (tinygrad: `def
+  sum_of_evens(numbers): """Calculate the sum..."""`; llama.cpp: `def sum_of_even_numbers(numbers):
+  """Returns the sum..."""`) — not garbage, just a different (also-reasonable) choice of words.
+  Verified precisely by tokenizing llama.cpp's raw output text with tinygrad's own tokenizer (already
+  shown to match llama.cpp's exactly) and diffing token-by-token against tinygrad's `gen_ids`; did
+  not additionally extract per-step logits (would need instrumenting `Transformer.forward` to return
+  raw logits instead of the post-argmax token — judged not worth the extra surface for what the
+  token-level position already demonstrates).
+- **Verdict: real, position-identified divergence, isolated to the multi-chunk-prefill case.** The
+  two single-chunk prompts are perfect controls: same tokenizer, same model, same greedy decode,
+  zero divergence over 64 tokens each. The only prompt that crosses the `chunk_size=32` prefill
+  boundary (T1.3's noted "untested interaction" between GGUF-quantized gpt-oss and chunked prefill,
+  compounded by the sliding-window layers alternating every other block) is the only one that
+  diverges, and it diverges well after the boundary itself (26 decode steps later) rather than at
+  the boundary — consistent with a small floating-point rounding difference introduced by prefill
+  being split into two forward-pass chunks (vs. llama.cpp's own batching) propagating through
+  attention/KV state until it flips an argmax choice once two candidate continuations have close
+  enough logits. Not a correctness bug in the sense of producing garbage or crashing — a legitimate
+  case of "different valid computation order gives a different but individually coherent output,"
+  the same phenomenon flagged (with less rigor) in Part C's BEAM anomaly note. Flagged for follow-up
+  if bit-exact chunked-prefill parity ever becomes a goal; out of scope to fix here (T4.3 asks for
+  the parity verdict, not a fix).
+
+### (2) Benchmark row
+
+| Model | load s | warm s | prefill tok/s | decode tok/s | decode GB/s |
+|---|---|---|---|---|---|
+| gpt-oss:20b MXFP4, no-BEAM | 2.660 | 41.77 | 16.57 | **1.69** | 100.65 |
+
+Decode is far slower than `qwen3:8b`'s 7.38 tok/s (expected — MXFP4 dequant + a larger active
+parameter set per token than qwen3:8b's dense 8B, and this is the *first* real-model bench-window
+data point for gpt-oss on this harness). GB/s (100.65) is the highest of any row in this session,
+consistent with a much larger active-weight footprint per decode step.
+
+## Wrap-up: anomalies / caveats for the whole 2026-08-19 window
+
+- **`llama-cli -no-cnv` runaway** (part D): hung generating unbounded output past its `-n 64` limit,
+  killed manually after ~2 min / 512 KB+ of output at 100% CPU / ~15 GB RSS. Root-caused to the
+  wrong binary for a one-shot completion (`llama-cli` is REPL-oriented; `-no-cnv` didn't fully
+  suppress its interactive continuation loop on this build) rather than a tinygrad-side or
+  memory-side problem. `llama-completion` (a dedicated one-shot completion binary in the same
+  llama.cpp install) fixed it outright — not filed as a tinygrad issue, just noted here so a future
+  session doesn't repeat the 2-minute detour.
+- **No swap growth observed** across the whole window: `sysctl vm.swapusage`'s `used` figure was
+  identical (798.56 MB) before Part D's gpt-oss-20b load and after all of Part D's runs finished;
+  `vm_stat` free+inactive pages stayed in the multi-GB range throughout, including while the 12 GB
+  gpt-oss GGUF was resident. `llama-server` confirmed stopped before the window and never restarted
+  by this session (restore command in `TASKS.md`/`CLAUDE.md` if the orchestrator hasn't already).
+- No thermal throttling indicators observed (BEAM search wall-times — 221-312s across 7 runs — show
+  no systematic drift that would suggest throttling under sustained load).
+- Worktrees added this session: `../upstream-bench-2` (`upstream/master@ca86a4270`, detached HEAD,
+  clean, no local changes) for part C's upstream comparison — left in place, same rationale as the
+  08-18 session's `../upstream-bench` (now two upstream reference worktrees exist, pinned to
+  different tips; both safe to `git worktree remove` whenever). Branch `task/bench-window-2` =
+  `integration/wave1` (`3e0df0fc7`) + `task/T0.3-bench-harness` merged, plus this session's 4 commits
+  (parts A-D). Not pushed; not merged into `integration/wave1` or `master`.

@@ -24,3 +24,4 @@ qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/work
 qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 upstream/master@ca86a4270, T4.4 BEAM-prefill repeat2",1.711,46.41,13.20,71.88
 qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 upstream/master@ca86a4270, T4.4 BEAM-prefill repeat3",1.699,47.95,13.01,70.74
 qwen3:8b,tinygrad,METAL,"MV=0 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, T4.4 BEAM-prefill MV=0 control",2.136,47.29,11.31,74.52
+gpt-oss:20b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, T4.3 gpt-oss-20b MXFP4, no-BEAM",2.660,16.57,1.69,100.65
