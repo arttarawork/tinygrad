@@ -13,3 +13,8 @@ qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, n
 qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM",2.122,14.98,7.38,46.82
 qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, JITBEAM=2 IGNORE_BEAM_CACHE=1",2.133,46.01,14.40,94.09
 qwen3:8b,llamacpp,METAL,-r 3 2026-08-19 reference re-check,,356.97,27.07,
+qwen3:8b,tinygrad,METAL,"KV_F32=1 2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM, T1.1b KV_F32=1",2.082,14.96,7.35,49.15
+qwen3:8b,tinygrad,METAL,"KV_F32=1 2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM, T1.1b KV_F32=1",2.105,14.97,7.35,49.14
+qwen3:8b,tinygrad,METAL,"KV_F32=1 2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM, T1.1b KV_F32=1",2.109,14.97,7.35,49.15
+qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, T1.1b long-context prompt=4096 max-context=8192, fp16 KV (default)",2.109,10.45,5.11,43.45
+qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, T1.1b long-context prompt=4096 max-context=8192, KV_F32=1",2.126,10.42,5.00,54.65

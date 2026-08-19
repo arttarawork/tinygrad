@@ -148,3 +148,40 @@ Same protocol as T0.1: `qwen3:8b` Q4_K_M, METAL, `-p/-n 512/128`, 3 no-BEAM repe
 
 Raw rows appended to `extra/bench_results_2026-08-18.csv` (still the working file — new rows are
 tagged `2026-08-19 task/bench-window-2@integration-wave1-now`).
+
+## B. T1.1b — fp16 KV decode delta
+
+Default (fp16 KV, T1.1a) vs `KV_F32=1` escape hatch, no-BEAM, `qwen3:8b` Q4_K_M METAL. Short (`-p
+512 -n 128`, 3 repeats each — the "default fp16" repeats are the part-A no-BEAM rows above, same
+config) and one long-context pair (`--max-context 8192 --prompt-tokens 4096 --decode-tokens 128`,
+run directly against `extra/benchmark_llm.py` since `bench_llm.py`'s wrapper doesn't expose
+`--max-context`; single run each side — the point is the qualitative KV-share-of-bytes shift, not
+noise-hunting a 4.5-minute-per-run config).
+
+| Context | KV dtype | decode tok/s | decode GB/s |
+|---|---|---|---|
+| 512+128 (short) | fp16 (default) | 7.35–7.39 (x̄ 7.38) | 46.76–46.89 (x̄ 46.82) |
+| 512+128 (short) | f32 (`KV_F32=1`) | 7.35 (all 3) | 49.14–49.15 |
+| 4096+128 (long) | fp16 (default) | **5.11** | 43.45 |
+| 4096+128 (long) | f32 (`KV_F32=1`) | **5.00** | 54.65 |
+
+- **Short context: no measurable tok/s delta** (7.38 vs 7.35, within the <0.1 tok/s repeat spread)
+  — expected, KV at ≤640 tokens is a rounding error next to the ~5 GB Q4_K weight set re-read every
+  decode step.
+- **Long context: fp16 KV is +2.2% decode tok/s** (5.11 vs 5.00) — small in wall-clock terms, but
+  the *GB/s delta is large and in the opposite direction* (43.45 vs 54.65, f32 reports **+25.8%**
+  more bytes/sec for barely less wall time) — exactly what halving the KV bytes read per step
+  should look like from `GlobalCounters`: f32 KV pushes more bytes through the same wall-clock
+  window while the actual token-per-second win is muted because KV bytes are still a minority share
+  of total per-step traffic at 4096 tokens (attention compute + the weight re-read still dominate;
+  a rough back-of-envelope for qwen3:8b's GQA (n_kv_heads×head_dim) KV state at 4096 tokens ×32
+  layers is on the order of 0.5–1 GB fp16-vs-f32 delta, vs. ~5 GB of weight traffic per step).
+- Net: **T1.1a's fp16-KV default is a real, if modest, win that grows with context** — at 4096
+  tokens it's already visible in both tok/s and GB/s; the design doc's expectation that the win
+  "shows more at long context" is directionally confirmed, but doesn't dominate wall-clock time
+  until KV cache size approaches weight-read size (would need a much longer context or a model
+  with a much smaller weight footprint to see fp16 KV swing tok/s by more than a couple percent).
+- Both long-context rows also show prefill dropping to ~10.4 tok/s from ~15.0 tok/s at 512 tokens
+  (expected — larger attention cost as context grows during prefill), and are consistent with each
+  other within 0.3% (10.45 vs 10.42) — KV dtype doesn't materially affect prefill, as expected
+  (prefill's KV writes, not the growing-context reads that dominate decode).
