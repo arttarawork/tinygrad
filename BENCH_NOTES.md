@@ -798,3 +798,61 @@ this is a pre-existing tinygrad-vs-llama.cpp difference on this model/quant, unr
 and not something wave 8 introduced. Not chased further (out of scope for this window — llama3.2:1b
 cross-stack parity was never a stated goal here, gpt-oss's was); noted only so it doesn't get
 mistaken for a new regression if someone re-runs this later.
+
+## C. Bonus — gpt-oss-20b long-context decode, METAL, greedy, single run
+
+`--max_context 8192`, ~2k-token synthetic prompt (`--prompt-tokens 2048`), 128 decode tokens, direct
+`extra/benchmark_llm.py` invocation (no repeats — bonus section, single run per the docket).
+
+| context | prefill tok/s | decode tok/s | decode GB/s | GB/token |
+|---|---|---|---|---|
+| standard (512-tok prompt, Part A(1) mean) | 41.80 | 10.97 | 38.14 | 3.477 |
+| long (2048-tok prompt, Tk grows to ~2176 over the decode window) | 33.12 | **3.45** | 13.39 | 3.881 |
+
+**Decode tok/s drops 68.5% (10.97 -> 3.45) going from 512- to 2048-token context, while bytes/token
+only grows 11.6% (3.477 -> 3.881 GB).** Those two numbers moving by very different amounts is the
+useful signal: if decode were purely bandwidth-bound, tok/s and bytes/token would move in lockstep
+(more bytes per token = proportionally slower, nothing else). They don't — per-token wall time grew
+3.18x (1/3.45 vs 1/10.97) while per-token bytes grew only 1.12x, meaning roughly two-thirds of the
+extra per-token time at 4x the context comes from something other than memory traffic. The MoE
+dequant-gather cost T4.13 fixed is context-length-*independent* (same expert weight gather every
+token, regardless of Tk), so it can't be the source of this growth — the KV-cache attention read
+(bytes, growing linearly with Tk) explains the 11.6% bytes growth but not the disproportionate time
+growth. The remaining, larger gap looks like attention's own compute (QK^T, softmax over sliding vs.
+full layers, growing with Tk) becoming a real share of decode time at length, now that the dequant
+bottleneck is fixed and no longer dwarfs everything else. Exactly the "attention's share at length"
+data point the docket asked for as the next NV-relevant measurement — not instrumented down to a
+per-kernel breakdown here (that's Part C's own follow-up scope, not redone from scratch this window),
+but the macro signal (time grows much faster than bytes) is the useful takeaway to carry into that
+design doc. No swap growth (925.19 MB steady through this run too).
+
+## Wrap-up: window 2026-08-19w4
+
+- **Verdicts, one line each:** A (T4.13) — confirmed, large real win (6.49x decode, 2.52x prefill,
+  17.1x bytes/token, BEAM flips from hurting to helping decode), with two honestly-reported misses
+  against the docket's expectations (10.97 not ~20-40 tok/s; 17.1x not ~44x) and one open correctness
+  question (a reconstructed single-chunk prompt diverges at token 27, mechanism unresolved). B —
+  stable: qwen3:8b no-BEAM matches exactly, BEAM within the wider previously-established noise band,
+  llama-bench reference unchanged, llama3.2:1b empirically byte-identical pre/post-wave-8 (a real
+  checkout diff, not just code-reading). C — bonus done: long-context decode drops 68.5% while
+  bytes/token only grows 11.6%, pointing at attention's own compute (not bandwidth) as the growing
+  share at length — the next NV-relevant data point, as the docket asked for.
+- **Two things flagged verbatim, not rationalized, per the docket's explicit instruction:** (1)
+  Docket A's decode number (10.97 tok/s) and bytes reduction (17.1x) both undershoot the numbers the
+  docket cited as expectations — real measurements, just of a different thing (whole-model, not
+  T4.13's isolated single-MoE-layer synthetic estimate) than those expectations were built from. (2)
+  The reconstructed single-chunk prompt 2 diverges from `llama-completion` at generated token 27 —
+  the first divergence in this bench-window series that isn't explained by chunked prefill (this
+  prompt never crosses `chunk_size=32`). Whether it predates T4.13 is genuinely unresolved; flagged
+  as open, not swept into the "known FP-drift" bucket without evidence.
+- **No swap growth** at any point in the window (`vm.swapusage` `used` ranged 925.19-933.19 MB across
+  all three parts) — `llama-server` confirmed stopped at the start, never restarted by this session.
+- No thermal-throttling indicators (BEAM warm-times 167.65s pre-fix reference / 187.89s post-fix for
+  gpt-oss, 207.99s for qwen3:8b this window — in the same band as prior windows' BEAM warm-times, no
+  monotonic drift).
+- Branch `task/bench-window-4` = `integration/wave1` (`87806cd5a`) + `task/bench-window-3` merged
+  clean (`c2b33eb07`), plus this session's 3 commits (parts A-C). Not pushed; not merged into
+  `integration/wave1` or `master`. Scratch scripts (`gptoss_bytes.py`, `gptoss_parity.py`,
+  `gptoss_diff.py`, `llama1b_parity.py`/`llama1b_parity_nopath.py`) and the `git archive 090489bca`
+  pre-wave-8 reference checkout used for Part B's llama3.2:1b check live in the session scratchpad,
+  not the repo — same convention as prior windows, none needed as committed artifacts here.
