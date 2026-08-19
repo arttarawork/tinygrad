@@ -4,12 +4,15 @@ Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
 (AOOSTAR AG02) is in the mail — **Phase 0 tasks need no NVIDIA hardware at all.**
 
-> **STATUS 2026-08-19:** Phase 0 is essentially complete — 6 agent waves, ~40 tasks closed
-> (✅/❌/📋 markers below; the **Status log** section is the authoritative per-task record with
-> branches/commits/numbers). Open pre-dock work: **T1.8c, T3.6, T4.11**, the deferred **T4.8**,
-> optional **T2.4**, and the on-hold **PR train** (T4.9 → T4.7 → T4.2 → T4.1 → T1.5/T1.6/T2.1/T2.2;
-> submission gated on Artur, AI disclosure mandatory). Everything else waits on the dock (TD.x).
-> All landed work is merged on `integration/wave1` (includes upstream syncs), gates green.
+> **STATUS 2026-08-19 (post wave 7 + bench window 3):** 7 agent waves + 3 bench windows,
+> ~48 tasks closed (✅/❌/📋 markers below; the **Status log** is the authoritative record).
+> Open pre-dock work: **T4.13** (gpt-oss MXFP4 per-token materialization — biggest remaining
+> Metal lever, expected 1.69→~20-40 tok/s), **T4.12** (warmup×chunk_size JitError), optional
+> **T2.4**, and the on-hold **PR train** (T4.9 → T4.7+T1.8c-fix → T4.2 → T4.1 →
+> T1.5/T1.6/T2.1/T2.2; submission gated on Artur, AI disclosure mandatory). Closed pre-dock:
+> fused attention (T4.8 final no-go — machinery built, waits for sm_86), Stage B bridge (parked
+> for dock). Everything else is dock-gated (TD.x). All landed work merged on `integration/wave1`,
+> gates green. Measured state: qwen3:8b METAL decode 7.38 no-BEAM / ~14 BEAM vs llama.cpp 27.1.
 
 ## Conventions for agents
 
@@ -357,6 +360,8 @@ flowchart LR
 | 2026-08-19 | bench window 3 | **done** | `task/bench-window-3` | 4 commits → `0125a8144`; llama-server RESTORED. **A: T4.8 FINAL NO-GO** — FAST_ATTN wash at p512 (+0.05%), +2.09% single-run at 4k ctx: not fundable. **B: T4.10 CONFIRMED closed** — chunk_size 32 vs 64 byte-identical on real gpt-oss, both diverge from llama.cpp at the same token: FP drift. Found new bug → T4.12. **C: the ~60 GB/token is REAL** (harness GB/s was never the artifact — uses global_mem correctly); per-kernel time (JIT_BATCH_SIZE=1 to see through Metal graph batching): two MXFP4-dequant-shaped ELEMENTWISE kernels eat ~90% of decode (406+92 ms of a ~555 ms step) — **MXFP4 dequant materializes per token at 20B scale** (fuses fine at tiny scale, hence T4.11's non-repro) → T4.13, the biggest remaining Metal lever. JITBEAM=2: −12.5% decode, no rescue. **D: headline stable** (7.383; BEAM 12.62 inside the known noise band). No swap all window. |
 | 2026-08-19 | T4.12 (new) | open | — | `warmup()` hardcodes `chunk_size=32` and the jit dispatch key omits chunk_size → `warmup()` then `generate(chunk_size=64)` raises JitError (prefill capture bakes the v_toks bound). Fix smallest-sound: key the prefill jit by chunk_size (bounded dict, like the (is_prefill,greedy) split) OR pass chunk_size through warmup; either way add the two-chunk-size test. `[ANY]`, tiny models, branch off `integration/wave1`. |
 | 2026-08-19 | T4.13 (new) | open | — | **gpt-oss MXFP4 dequant materializes per decode token at real scale** (attributed in bench window 3: `E_1036800_8_16_2` 406 ms/73% + `E_86400_32_3` 92 ms/16.5% of a decode step; ~59 GB/token confirmed real; fuses correctly at tiny scale per T4.11). Find the scale threshold: grow T4.11's synthetic config (dims/experts) until the E_ kernel appears — the transition names the cause (suspect: MAX_KERNEL_BUFFERS or a bufferize forced by the 32-expert real-dim tensor count; also check the MXFP4 scales expression in `gguf.py:105-114` vs T4.2's staged-Q4_K pattern). Fix ≤2 attempts (a T4.2-style one-time staging of scales is the likely shape — must NOT rematerialize full fp16 weights) else analysis. Expected payoff: 1.69 → ~20-40 tok/s, the biggest remaining Metal lever. Mid-scale configs fit beside llama-server; real-model confirm next window. `[ANY→MAC]`. |
+| 2026-08-19 | T4.13 | agent running | `task/T4.13-mxfp4-fusion` | wave 8: threshold hunt (grow T4.11's config axis-by-axis until the E_ kernel appears) → T4.2-style scales staging fix; real-model confirm next window |
+| 2026-08-19 | T4.12 | agent running | `task/T4.12-warmup-chunk` | wave 8: jit key × chunk_size; repro-first |
 | 2026-08-18 | device_map flake | watching | — | 2 independent agent sightings (T1.9, T4.6: `test_split_matches_single_device`, `test_experts_split_matches_unsplit_homogeneous` fail in THEIR worktrees, verified pre-existing via stash) but **0/2 reproductions on the quiet main checkout** (solo ×3, file -n12, full `-k llm` -n12 all green). Pattern: only under concurrent multi-agent machine load in `.claude/worktrees/*`. If a third sighting lands: dedicate an investigation task (suspects: cross-test state via `manual_seed`/module globals under xdist, or load-dependent scheduling nondeterminism). Do NOT "fix" blind. |
 | 2026-08-18 | T3.4 | **done — hypothesis REFUTED** | `task/T3.4-zero-copy` | `8e70a80a5`, **NOT merged into integration** (working aliasing behind `ZERO_COPY=1` + sync-semantics tests, but zero measured win: alias ≈ copy at every scale). Root cause isolated: **the fixed per-hop cost is SYNCHRONIZATION, not memcpy** — `Device.synchronize()` after any dispatch is a ~150 µs `waitUntilCompleted` full-queue drain both paths pay. Also: Metal `external_ptr` takes an ObjC MTLBuffer id, NOT a raw pointer (CPU-owned pointer → hard crash; only METAL-owns/CPU-borrows works). Branch kept as evidence + the sync-semantics test suite; aliasing machinery not worth carrying. |
 | 2026-08-19 | T3.6 (new) | open | — | **The real Stage B item (replaces aliasing):** async signal bridge. Convert the cross-backend sync from CPU-blocking full-drain to a GPU-side dependency edge: encode `MTLSharedEvent` waitForEvent into the consuming command buffer ahead of submit; a watcher signals it when the producer's HCQ signal word (NV — or CPU HCQ2 for a pre-dock rehearsal) crosses the value. Needs a JIT-capturable foreign-wait op + buffer-lifetime coordination. Full sketch in T3.4's report. Bigger task; matters most post-dock but METAL↔CPU rehearsal is possible now. |
@@ -370,11 +375,9 @@ flowchart LR
 
 ## Parallelization notes
 
-Remaining lanes (updated 2026-08-19; waves 1-6 complete): **(a)** T1.8c → (if it wins) T4.8
-warp-reduce — the reopened custom-attention route; **(b)** T3.6 signal bridge (pooling Stage B);
-**(c)** T4.11 gpt-oss byte-blowup (tiny-scale first); **(d)** next bench window (llama-server
-down): FAST_ATTN full-model after T1.8c, T4.10's length-vs-chunking disambiguation run, gpt-oss
-recheck after T4.11; **(e)** PR train on Artur's go. All branches off `integration/wave1`.
+Remaining lanes (updated 2026-08-19, post window 3): **(a)** T4.13 MXFP4 materialization — the
+one big lever left on Metal; **(b)** T4.12 filler; **(c)** next bench window only needs the T4.13
+real-model confirm; **(d)** PR train on Artur's go. All branches off `integration/wave1`.
 Agent policy: one tight objective per agent, Sonnet at max effort, explicit STOP conditions,
 commit early, RELATIVE paths in worktrees; verify premises with a control experiment before
 optimizing (T1.4/T1.9/T4.10 all refuted their premises — cheapest work of the project).

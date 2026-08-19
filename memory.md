@@ -195,6 +195,19 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   on the big-memory device (moving big tensors force-realizes them); 3 copies/MoE-layer not 2;
   TinyJit bakes cache-buffer identity (growable KV impossible without recapture). gpt-oss decode
   reads ~25x too many bytes (T4.11, open). PR queue (held): T4.9 → T4.7 → T4.2 → T4.1 pkg.
+- **2026-08-19 (wave 7 + bench window 3 — pre-dock endgame):** T1.8c: tuned attention kernel now
+  fires every token (kernel-side ceildiv chunking + tail mask; also fixed T4.7's compound-expr
+  `to_kernel_param` gap — fold into that PR). Bench window 3 verdicts: **T4.8 warp-reduce FINAL
+  NO-GO** (FAST_ATTN a wash on qwen3:8b even at 4k ctx) — fused attention on Metal closed until
+  sm_86; **T3.6 signal bridge refuted pre-dock** (CPU-producer sync nearly free, Python dispatch
+  ~300 µs dominates; capture-op sized 110-160 lines in SIGNAL_BRIDGE_NOTES.md, revisit at TD.3);
+  **T4.10 closed** — gpt-oss divergence is FP drift near a tied argmax, chunking byte-invariant at
+  real scale too; **gpt-oss 1.69 tok/s ROOT-CAUSED**: ~59 GB/token is real — MXFP4 dequant
+  MATERIALIZES per decode token at 20B scale (two elementwise kernels = ~90% of step time; fuses
+  fine at tiny scale, which is why T4.11 couldn't reproduce) → T4.13 (expected ~20-40 tok/s);
+  JITBEAM makes it worse (−12.5%). New small bug T4.12: warmup() hardcodes chunk_size=32, jit key
+  omits it → JitError on generate(chunk_size≠32). Headline stable: 7.38 no-BEAM. Docs current;
+  ~48 tasks closed over 7 waves + 3 bench windows.
 
 ## 7. Sources
 
