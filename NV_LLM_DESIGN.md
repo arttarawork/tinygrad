@@ -24,7 +24,7 @@ Three goals, in priority order:
 - **G2 — Heterogeneous pooling.** Run one model across Metal (~27 GB usable) + NV (24 GB) — ~50 GB of weights — with a per-layer/per-tensor device map, including the MoE placement policy (attention + shared weights + KV on the 3090, routed experts on the Mac).
 - **G3 — Upstreamability.** Every change lands as a small, benchmarked PR that survives tinygrad's review culture; nothing depends on a long-lived fork.
 
-An important honesty note on the baseline: tinygrad's published CI numbers run `JITBEAM=2` (beam-searched kernels); the defaults a fresh user gets are un-beamed (`BEAM=0`, `helpers.py:231`). Some of the public "10x slower" gap may be configuration, not capability. Workstream 0 exists to establish the real gap on this exact hardware before we spend effort.
+An important honesty note on the baseline: tinygrad's published CI numbers run `JITBEAM=2` (beam-searched kernels); the defaults a fresh user gets are un-beamed (`BEAM=0`, `helpers.py:231`). Some of the public "10x slower" gap may be configuration, not capability. **Measured 2026-08-18 on this MacBook (METAL, qwen3:8b Q4_K_M — see `task/T0.3-bench-harness` BENCH_NOTES.md):** llama.cpp decode 27.27 tok/s; tinygrad upstream 4.92 no-BEAM / 12.86 BEAM (so beam alone is a 2.6x config gap); our wave-1/2 levers take it to 7.28 no-BEAM (+48%) / 14.44 BEAM (+12%, 53% of llama.cpp). The remaining ~2x vs llama.cpp is the WS1 fused-attention + further kernel work.
 
 ## 2. Why this is winnable
 
