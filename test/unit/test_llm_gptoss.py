@@ -1,8 +1,8 @@
 import json, math, pathlib, tempfile, time, unittest
 import numpy as np
 import gguf
-from tinygrad import Tensor
-from tinygrad.llm.model import Transformer, precompute_freqs_cis
+from tinygrad import Tensor, GlobalCounters
+from tinygrad.llm.model import Transformer, TransformerConfig, ExpertGating, precompute_freqs_cis
 from tinygrad.llm.cli import SimpleTokenizer
 
 # ---------------------------------------------------------------------------------------------
@@ -279,6 +279,68 @@ class TestGPTOSSGGUF(unittest.TestCase):
       # explicit override still wins (and is still min()'d against native)
       model_explicit, _ = Transformer.from_gguf(path, max_context=64)
       self.assertEqual(model_explicit.max_context, 64)
+
+class TestGPTOSSDecodeByteBudget(unittest.TestCase):
+  """T4.11: the 08-19 bench had gpt-oss-20b MXFP4 decoding at 1.69 tok/s while sustaining 100.65 GB/s
+  on METAL -- ~60 GB read/token, vs an expected ~2-3 GB/token from active-param count (~3.6B @ ~4.25
+  bit + KV + embeddings). Investigation: built a gpt-oss-shaped config matching the real model's MoE
+  routing (32 experts, top-4) plus every gpt-oss-specific mechanism (attention sinks, alternating
+  sliding-window, clamped swiglu, MoE bias), at CPU device, and did per-kernel byte attribution via a
+  patched engine/realize.py track_stats (DEBUG=2's printed 'mem' column is cumulative allocator
+  footprint, not per-kernel bytes -- not useful for this). Finding: NOT reproduced at tiny scale, nor
+  at the real model's actual per-layer dims (dim=2880, hidden=2880, checked separately -- not in this
+  fast CI test). Isolating each mechanism one at a time off a size-matched plain-MoE control showed:
+  ExpertWeights.__call__'s `weight[sel]` still does a true k-of-N indexed gather (measured bytes match
+  the k-experts formula, not the ~8x-larger dense-all-experts read the T1.3 bias-support change could
+  plausibly have broken); attn_sinks adds ~128 B (no multi-pass K/V re-read); the sliding-window mask
+  adds one extra kernel but only ~300 B (scales with position, never with max_context); clamp_swiglu
+  fuses with ZERO added kernels or bytes vs the unclamped control. The real-model blowup is therefore
+  size- or quant-dependent (MXFP4 dequant at 20b scale, cache thrash, mmap amplification), not a bug
+  in this shared decode path -- next bench window chases it on the real model.
+
+  This test locks in "still gathered" as a regression guard: 3x the analytic gathered-MoE estimate is
+  generous enough to absorb ordinary byte-count drift (measured overhead here is ~1.25x) while still
+  catching an actual gather->dense regression (dense would cost ~8x gathered at these dims)."""
+  DIM, HIDDEN = 64, 128
+  N_HEADS, N_KV_HEADS, HEAD_DIM = 8, 2, 8
+  N_EXPERTS, EXPERTS_PER_TOK, NUM_BLOCKS = 32, 4, 2  # 32/top-4 matches real gpt-oss-20b's routing
+  VOCAB, MAX_CTX, SLIDING_WINDOW = 50, 64, 8
+
+  def _cfg(self) -> TransformerConfig:
+    return TransformerConfig(
+      num_blocks=self.NUM_BLOCKS, dim=self.DIM, hidden_dim=self.HIDDEN, n_heads=self.N_HEADS,
+      n_kv_heads=self.N_KV_HEADS, norm_eps=1e-5, vocab_size=self.VOCAB, head_dim=self.HEAD_DIM,
+      rope_theta=10000.0, rope_dim=self.HEAD_DIM, v_head_dim=self.HEAD_DIM, max_context=self.MAX_CTX,
+      num_experts=self.N_EXPERTS, num_experts_per_tok=self.EXPERTS_PER_TOK,
+      expert_gating_func=ExpertGating.SOFTMAX_WEIGHT, moe_bias=True, router_bias=True,
+      attn_sinks=True, attn_out_bias=True, qkv_bias=True,
+      sliding_window=self.SLIDING_WINDOW, sliding_layers=(True, False),
+      clamp_swiglu=True, swiglu_limit=7.0, swiglu_alpha=1.702)
+
+  def test_decode_bytes_stay_near_gathered_not_dense(self):
+    # device_map forces CPU regardless of the runner's Device.DEFAULT -- deterministic byte estimate
+    # (GlobalCounters.global_mem is a static AST-shape estimate, not an actual driver counter, so it's
+    # backend-independent; CPU keeps this test fast and free of a METAL dependency).
+    # realize_placement() is required after a bare Transformer(device_map=...) construction (from_gguf
+    # calls it for you) -- skipping it left every weight an unrealized .to_() COPY, which alone produced
+    # an ~8x read blowup indistinguishable from a real gather->dense regression (caught while building
+    # this test). That's the documented footgun in Transformer.realize_placement's own docstring, not a
+    # bug in the decode path -- call it here like any real device_map caller must.
+    model = Transformer(self._cfg(), device_map="CPU:0")
+    model.realize_placement()
+    gen = model.generate([1, 2, 3, 4, 5], chunk_size=32, temperature=0.0)
+    for _ in range(1 + 5): next(gen)  # prefill + warm the decode jit variant (first decode call captures it)
+    GlobalCounters.reset()
+    next(gen)
+    actual = GlobalCounters.global_mem
+
+    per_expert_elems = 2 * self.HIDDEN * self.DIM + self.DIM * self.HIDDEN  # gate + up + down
+    itemsize = 4  # this config skips GGUF loading, weights stay dtypes.default_float (fp32)
+    gathered = self.NUM_BLOCKS * self.EXPERTS_PER_TOK * per_expert_elems * itemsize
+    dense = self.NUM_BLOCKS * self.N_EXPERTS * per_expert_elems * itemsize
+    self.assertLess(actual, 3 * gathered,
+      f"decode step read {actual} B, expected near the gathered-MoE estimate ({gathered} B) -- looks "
+      f"like ExpertWeights.__call__ degraded toward the dense all-experts read ({dense} B)")
 
 # ---------------------------------------------------------------------------------------------
 # Real gpt-oss-20b GGUF, metadata-only validation (no tensor data touched - GGUFReader mmaps the
