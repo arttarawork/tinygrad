@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import cast, Iterator, Any, Sequence
 import time, random, itertools, math, contextlib, weakref, array
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansilen, all_int, prod, flatten, Context, getenv, to_tuple
+from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansilen, all_int, prod, flatten, Context, getenv, to_tuple, mv_address
 from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, PROFILE, ProfilePointEvent, cpu_events
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
@@ -154,11 +154,52 @@ def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], d
                    for x in call.src[0].toposort())
     for j, per_dev in enumerate(zip(*[cast(MultiBuffer, b).bufs for b in bufs])): yield list(per_dev), {"_device_num": j} if has_dnum else {}
 
+# T3.4 spike: buffers the caller explicitly opted into the zero-copy alias fast path (see
+# tinygrad/llm/model.py's zero_copy_to). Keyed on Buffer *identity*, not a UOp field: UOp.tag is reserved
+# for the scheduler's own assign-ordering bookkeeping (tensor.py's finalize_after iterates it as indices
+# into ctx.uop_list) -- repurposing it as a free-form marker crashes scheduling outright. A blanket
+# device-pair rule (any METAL->CPU copy) isn't safe either: found via the T3.2 parity test, it silently
+# aliased the incidental threefry RNG-counter copy (same device pair) and corrupted sampling, because that
+# copy's destination is a snapshot meant to evolve independently of the source afterward. Only a copy whose
+# caller *knows* it's a pure "latest value, re-written every replay, never diverges downstream" hop (a
+# block-boundary activation) should opt in -- hence marking the specific source Buffer, not the device pair.
+# ponytail: a plain set that never evicts, not a WeakSet -- these buffers are 1:1 with a model's fixed,
+# small set of device_map boundary slots and live for the model's lifetime anyway; a WeakSet dropped
+# entries between JIT replays (nothing else pins a strong ref to the wrapper in the gap between calls),
+# silently falling back to a real (but still correct) copy. Upgrade to a bounded/weak cache if this is ever
+# used somewhere the boundary-buffer count is large or unbounded.
+_zero_copy_sources: set[Buffer] = set()
+def mark_zero_copy_source(buf:Buffer) -> None: _zero_copy_sources.add(buf)
+
+def _zero_copy_eligible(dest_buf:Buffer, src_buf:Buffer) -> bool:
+  # Metal shared-storage buffers are already host memory, so METAL->CPU can alias. Only this direction is
+  # safe: CPU's BufferSpec.external_ptr wraps a raw host address (ops_cpu.py), but Metal's external_ptr
+  # wraps an *existing MTLBuffer objc id* (ops_metal.py:157, `metal.MTLBuffer(options.external_ptr)`) --
+  # pointing it at a raw CPU-owned pointer would message-send on non-object memory.
+  if not getenv("ZERO_COPY", 0) or dest_buf.device.split(":")[0] != "CPU" or src_buf.device.split(":")[0] != "METAL":
+    return False
+  # already aliased on a prior call (JIT replay): this is self-sufficient and doesn't need the registry --
+  # dest.options.external_ptr only ever gets set by the branch below, for exactly this reason.
+  if dest_buf.is_allocated() and dest_buf.options is not None and dest_buf.options.external_ptr is not None: return True
+  return dest_buf._base is None and src_buf in _zero_copy_sources  # views can't take external_ptr, see Buffer.allocate
+
 def exec_copy(ctx:ExecContext, call:UOp, ast:UOp) -> float|None:
   for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
-    dest, src = bufs[0].ensure_allocated(), bufs[1].ensure_allocated()
+    dest_buf, src_buf = bufs[0], bufs[1]
+    zc = _zero_copy_eligible(dest_buf, src_buf)
+    if zc and not dest_buf.is_allocated():
+      src = src_buf.ensure_allocated()
+      assert dest_buf.nbytes == src.nbytes, f"zero-copy alias size mismatch: {dest_buf.nbytes} != {src.nbytes}"
+      assert hasattr(src.allocator, '_as_buffer'), f"zero-copy source allocator ({src.device}) has no _as_buffer"
+      dest = dest_buf.allocate(external_ptr=mv_address(src.allocator._as_buffer(src._buf)))
+    else:
+      dest, src = dest_buf.ensure_allocated(), src_buf.ensure_allocated()
     with track_stats(ctx, call, dest.device, [dest, src], ctx.var_vals):
-      if hasattr(dest.allocator,'_transfer') and dest.allocator.supports_transfer and dest.device.split(":")[0] == src.device.split(":")[0]:
+      if zc:
+        # dest IS src's memory (aliased above, possibly on a prior JIT replay) -- no memcpy, only the ordering
+        # guarantee remains: block until src's producer (the METAL command buffer(s)) has actually completed.
+        src.allocator.dev.synchronize()
+      elif hasattr(dest.allocator,'_transfer') and dest.allocator.supports_transfer and dest.device.split(":")[0] == src.device.split(":")[0]:
         dest.allocator._transfer(dest._buf, src._buf, dest.nbytes, src_dev=src.allocator.dev, dest_dev=dest.allocator.dev)
       elif src.device.startswith("DISK") and getattr(src.allocator.dev, 'fd', None) is not None \
            and hasattr(dest.allocator, 'copy_from_disk') and src.nbytes >= 4096 and dest.allocator.supports_copy_from_disk:

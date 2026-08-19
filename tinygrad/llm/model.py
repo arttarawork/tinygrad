@@ -4,9 +4,38 @@ from dataclasses import dataclass, replace
 from typing import Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
+from tinygrad.device import Buffer
 from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
+from tinygrad.engine.realize import mark_zero_copy_source
+
+def zero_copy_to(x:Tensor, device:str|tuple[str, ...]|None) -> Tensor:
+  """T3.4 spike: the block-boundary activation hop from METAL to CPU can alias host memory instead of
+  copying it (Metal buffers are already host-visible unified memory on Apple Silicon) -- opt-in via
+  ZERO_COPY=1 (default off: identical to plain x.to(device) either way). Registers x's *Buffer* (not the
+  COPY's UOp -- UOp.tag is reserved for the scheduler's own bookkeeping, see engine/realize.py) as
+  alias-eligible before doing an ordinary x.to(device); exec_copy's fast path only aliases a source it
+  recognizes. Deliberately NOT a blanket METAL->CPU rule in exec_copy itself: that broke the (same device
+  pair, incidental) weight-placement copies during realize_placement(), whose destination must evolve
+  independently of the source after the hop -- only a caller who knows a copy is a pure "latest value,
+  re-written every replay, never diverges downstream" hop (this one) should opt in.
+
+  Opportunistic, not guaranteed: forcing x to a clean, directly-addressable base buffer only works when x
+  is already (or trivially becomes) contiguous. The chunked/padded prefill path can hand x here as a
+  genuinely non-contiguous slice of a larger scratch allocation (no single dense memory region to alias --
+  x.uop.buffer raises), in which case this transparently falls back to the ordinary copy. Decode/rollout
+  (the steady-state, per-token hop this spike targets) doesn't hit that path.
+  """
+  if not (getenv("ZERO_COPY", 0) and isinstance(x.device, str) and x.device.split(":")[0] == "METAL"
+          and isinstance(device, str) and device.split(":")[0] == "CPU"):
+    return x.to(device)
+  if x.device == device: return x
+  xr = x.contiguous().realize()  # force a concrete, stable Buffer identity to register as alias-eligible
+  try: buf = cast(Buffer, xr.uop.buffer)
+  except RuntimeError: return x.to(device)  # non-contiguous slice (e.g. chunked prefill) -- can't alias, real copy
+  mark_zero_copy_source(buf)
+  return xr.to(device)
 
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
@@ -530,8 +559,9 @@ class Transformer:
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    # activations hop devices at block boundaries (.to is a no-op when the device matches)
-    for block in self.blk: x = block(x.to(block.device), start_pos)
+    # activations hop devices at block boundaries (.to is a no-op when the device matches). zero_copy_to
+    # is x.to(block.device) unless ZERO_COPY=1 turns the METAL->CPU case into a host-memory alias (T3.4).
+    for block in self.blk: x = block(zero_copy_to(x, block.device), start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
