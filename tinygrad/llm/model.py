@@ -572,7 +572,10 @@ class Transformer:
     params = nn.state.get_parameters(self)
     moved = [p for p in params if p.device != Device.DEFAULT]
     for p in moved: p.replace(p.contiguous())
-    Tensor.realize(*moved)
+    # Tensor.realize(*moved) is `moved[0].realize(*moved[1:])` -- with moved empty (every param's device_map
+    # entry happens to canonicalize to Device.DEFAULT, e.g. device_map="CPU:0" when DEV=CPU) that's a bare
+    # Tensor.realize() call with no `self` bound at all: TypeError, not skip-nothing-to-do. Guard it.
+    if moved: Tensor.realize(*moved)
     # params are always single-device here (llm/model.py never shards a weight) -- cast satisfies canonicalize's str|None signature
     stray = sorted(set(Device.canonicalize(cast(str, p.device)) for p in params) - self._placed_devices)
     assert not stray, f"device_map: param(s) landed on {stray}, outside the configured device_map {sorted(self._placed_devices)} " \
