@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.nn import Linear
@@ -503,6 +503,8 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    # set by the device_map branch below; None means "no device_map", the fast/no-op path for realize_placement()
+    self._placed_devices: frozenset[str]|None = None
     if device_map is not None:
       dmap, experts_dev = parse_device_map(device_map, config.num_blocks)
       for block, dev in zip(self.blk, dmap):
@@ -516,6 +518,8 @@ class Transformer:
         for block in self.blk:
           if hasattr(block, 'ffn_gate_exps'):
             for p in nn.state.get_parameters([block.ffn_gate_exps, block.ffn_up_exps, block.ffn_down_exps]): p.to_(experts_dev)
+      # canonicalized so it compares equal to p.device later (e.g. "CPU:0" -> "CPU") -- realize_placement()'s footgun guard
+      self._placed_devices = frozenset(Device.canonicalize(d) for d in dmap + ([experts_dev] if experts_dev is not None else []))
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill/rollout and sampled/greedy
@@ -538,6 +542,32 @@ class Transformer:
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
     return self.jit[(resolve(tokens.shape[1] != 1), temperature is None)](tokens.contiguous(), start_pos, temperature)
+
+  def realize_placement(self):
+    """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --
+    e.g. `nn.state.load_state_dict(model, state_dict, realize=False); model.realize_placement()` for manual loaders.
+    No-op (single attribute check) when device_map wasn't passed to __init__.
+
+    load_state_dict's assignment is a `.to(param.device)` per tensor; when that device differs from the load
+    source it's an unrealized COPY. Left lazy, that COPY gets captured into the JIT trace and re-executed (dequant
+    AND copy) every token (measured: 21 spurious COPYs/step on a 2-block METAL/CPU split test model -> 1 real one,
+    once realized here). Only the moved-off-Device.DEFAULT params pay this: a COPY is a materialization boundary
+    either way, so it never fused the GGUF dequant into the consuming matmul in the first place -- same-device
+    params are left alone and keep that fusion (the memory win from never materializing full weights).
+
+    Also a footgun guard: a hand-built weight assigned without device= (e.g. Tensor.randn(...), which defaults to
+    Device.DEFAULT) silently strands itself off the map instead of following its block's placement. Assert (not
+    warn) -- this runs once right after load, not in a hot loop, and a silently-stranded weight is a correctness
+    bug (wrong-device compute or a surprise COPY every step), not something to let slide."""
+    if self._placed_devices is None: return
+    params = nn.state.get_parameters(self)
+    moved = [p for p in params if p.device != Device.DEFAULT]
+    for p in moved: p.replace(p.contiguous())
+    Tensor.realize(*moved)
+    # params are always single-device here (llm/model.py never shards a weight) -- cast satisfies canonicalize's str|None signature
+    stray = sorted(set(Device.canonicalize(cast(str, p.device)) for p in params) - self._placed_devices)
+    assert not stray, f"device_map: param(s) landed on {stray}, outside the configured device_map {sorted(self._placed_devices)} " \
+      "(a hand-built tensor is probably missing device=)"
 
   @staticmethod
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, *, device_map:str|dict[int|str,str]|None=None,
@@ -644,15 +674,10 @@ class Transformer:
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
-    elif device_map is not None:
-      # device_map's cross-device placements MUST realize: load_state_dict's .to(v.device) is otherwise an unrealized COPY that
-      # gets captured into the JIT trace and re-executed (dequant AND copy) every step (measured: 21 spurious COPYs/step on a
-      # 2-block METAL/CPU split test model -> 1 real one, once realized). Only the moved-off-the-GGUF-load-device params pay this:
-      # a COPY is a materialization boundary either way, so it never fused the GGUF dequant into the consuming matmul in the
-      # first place -- same-device params are left alone and keep that fusion (the memory win from never materializing full weights).
-      moved = [s for s in nn.state.get_parameters(model) if s.device != Device.DEFAULT]
-      for s in moved: s.replace(s.contiguous())
-      Tensor.realize(*moved)
+    else:
+      # device_map's cross-device placements MUST realize -- see Transformer.realize_placement's docstring.
+      # No-op when device_map is None (nothing moved off Device.DEFAULT to begin with).
+      model.realize_placement()
     return model, kv
 
   def warmup(self):

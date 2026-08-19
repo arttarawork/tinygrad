@@ -70,6 +70,7 @@ class TestDeviceMapModel(unittest.TestCase):
     # NOTE: single-device ref uses the trivial map so both models run on CPU regardless of the default device
     ref, split = Transformer(TEST_CONFIG, device_map="CPU:0"), Transformer(TEST_CONFIG, device_map="0-1:CPU:0,2-3:CPU:1")
     nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()  # T4.5: force-realize the placement COPYs before any JIT capture sees them
 
     # weights landed on the mapped devices ("CPU:0" canonicalizes to "CPU")
     self.assertEqual([b.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
@@ -84,7 +85,10 @@ class TestDeviceMapModel(unittest.TestCase):
     self.assertEqual([b.cache_kv.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
     self.assertEqual([b.freqs_cis.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
 
-    # the JIT captured the mixed-device trace: only COPY calls touch two devices, compute kernels are single-device
+    # the JIT captured the mixed-device trace: only COPY calls touch two devices, compute kernels are single-device.
+    # T4.5 regression: with realize_placement() run before capture, the ONLY copy left in the graph is the real
+    # per-token block-boundary activation hop -- none of the (up to 21, pre-fix) load-time weight-placement copies
+    # leak into the JIT and replay every step.
     rollout_jit = split.jit[(False, True)]  # (is_prefill, greedy): generate() defaults to temperature=0
     self.assertIsNotNone(rollout_jit.captured)
     copies = []
@@ -92,7 +96,36 @@ class TestDeviceMapModel(unittest.TestCase):
       devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
       if call.src[0].op is Ops.COPY: copies.append((devs, call.src[0].arg))
       else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
-    self.assertIn(({"CPU", "CPU:1"}, "CPU:1"), copies)  # the block-boundary activation hop
+    self.assertEqual(copies, [({"CPU", "CPU:1"}, "CPU:1")])  # exactly the block-boundary activation hop, nothing else
+
+class TestRealizePlacement(unittest.TestCase):
+  """T4.5: Transformer.realize_placement() -- the shared home for from_gguf's force-realize fix, now
+  available to manual load_state_dict callers too, plus the stranded-param footgun guard."""
+
+  def test_no_device_map_is_noop(self):
+    # zero overhead / harmless when device_map wasn't given: no _placed_devices to check against, nothing to realize
+    model = Transformer(TEST_CONFIG)
+    self.assertIsNone(model._placed_devices)
+    model.realize_placement()  # must not raise
+
+  def test_stranded_param_raises(self):
+    # the footgun from T3.3's report: a hand-built weight assigned without device= silently lands on
+    # Device.DEFAULT instead of following its block's device_map placement. CPU:97/CPU:98 are indices no
+    # real Device.DEFAULT ever resolves to, so this holds regardless of what backend runs the test.
+    model = Transformer(TEST_CONFIG, device_map="CPU:97,CPU:98")
+    w = model.blk[0].attn_q.weight
+    assert w is not None
+    model.blk[0].attn_q.weight = Tensor.randn(*w.shape)  # BUG: missing device=w.device -> strands on Device.DEFAULT
+    with self.assertRaises(AssertionError):
+      model.realize_placement()
+
+  def test_correctly_placed_param_does_not_raise(self):
+    # the same footgun scenario, done right (device=w.device): must not raise
+    model = Transformer(TEST_CONFIG, device_map="CPU:97,CPU:98")
+    w = model.blk[0].attn_q.weight
+    assert w is not None
+    model.blk[0].attn_q.weight = Tensor.randn(*w.shape, device=w.device)
+    model.realize_placement()  # must not raise
 
 @unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")
 class TestDeviceMapMetalCPU(unittest.TestCase):
@@ -188,19 +221,6 @@ class TestDeviceMapRecurrentModel(unittest.TestCase):
     self.assertEqual([b.conv_state.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
     self.assertEqual([b.recurrent_state.device for b in split.blk], ["CPU", "CPU", "CPU:1", "CPU:1"])
 
-def _force_realize_moved(model):
-  # mirrors from_gguf's device_map force-realize (model.py Transformer.from_gguf, the "moved" branch):
-  # load_state_dict's .to(v.device) is otherwise an unrealized COPY that gets captured into the JIT and
-  # replayed every token (the T3.2 trap). Transformer() + a manual load_state_dict, as these tests do
-  # instead of going through from_gguf, doesn't get this for free -- found while measuring T3.3 hop counts:
-  # without it, EVERY weight tensor's placement COPY shows up in the captured graph, drowning the real
-  # per-token expert hops in load-time noise (confirmed present already, pre-T3.3, on the plain dense
-  # CPU:0/CPU:1 split in TestDeviceMapModel -- harmless for correctness there since its assertions never
-  # check for absence of extra copies, but worth flagging).
-  moved = [s for s in nn.state.get_parameters(model) if s.device != Device.DEFAULT]
-  for s in moved: s.replace(s.contiguous())
-  Tensor.realize(*moved)
-
 def _randomize_experts(model, seed=7):
   # ExpertWeights.__init__ zero-inits (like all model.py weights); randomize so the placement test is a real
   # exact-output check, not a trivially-all-zero one (test_llm_moe.py's block-level tests do the same by hand).
@@ -231,7 +251,7 @@ class TestDeviceMapMoEExperts(unittest.TestCase):
     _randomize_experts(ref)
     split = Transformer(MOE_TEST_CONFIG, device_map="0-1:CPU:0,2-3:CPU:1,experts:CPU:2")
     nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
-    _force_realize_moved(split)
+    split.realize_placement()
 
     # experts landed on the separate device regardless of which block-device range they're in; the router
     # (ffn_gate_inp) and everything else stayed with the block
@@ -275,7 +295,7 @@ class TestDeviceMapMoEExpertsMetalCPU(unittest.TestCase):
     _randomize_experts(ref)
     split = Transformer(MOE_TEST_CONFIG, device_map="METAL,experts:CPU")
     nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
-    _force_realize_moved(split)
+    split.realize_placement()
 
     self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["CPU"] * 4)
     self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["METAL"] * 4)
