@@ -1,7 +1,7 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Callable, cast
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.nn import Linear
@@ -668,8 +668,14 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1):
+    """drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
+    syncing every sampled token. drain_every=1 (default) is byte-identical to the pre-T2.5 behavior -- every
+    generate()-caller and test that assumes one .item()/next() per decode step keeps working unchanged. Pass
+    drain_every=2..4 from a real serving loop to amortize the sync (streaming still yields one token at a time,
+    just in bursts -- see the NOTE below the drain block for EOS handling)."""
     if self.has_recurrent_block: chunk_size = 1
+    drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
@@ -680,15 +686,42 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
-    while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
+    # T2.5: a sampled token already chains device-side -- `out` feeds the next step's input directly (below),
+    # no host round-trip needed for the compute itself. .item() was only ever needed for host bookkeeping/
+    # streaming (tokens list, _cached_tokens, yield). So launch up to `drain_every` decode steps back-to-back
+    # (each still its own realize(), all async-dispatched -- see engine/realize.py's run_linear(wait=False)) and
+    # read them all back with ONE host copy instead of one .item() sync per token. `pending` holds the
+    # not-yet-host-read device tensors; `virtual_len` tracks what len(tokens) *will* be once pending is drained,
+    # so the chunk/prefill arithmetic below is untouched by the deferral -- only the host-visible
+    # append/_cached_tokens/yield timing moves.
+    pending: list[Tensor] = []
+    virtual_len = len(tokens)
+    while virtual_len < self.max_context:
+      n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      # move the sampled token once, back to t's device, so the next step's input matches the JIT's prefill-captured device
+      if start_pos < virtual_len: continue
+      # move the sampled token once, back to t's device, so the next step's input matches the JIT's prefill-captured device.
       if out.device != t.device: out = out.to(t.device).realize()
-      yield tokens[-1]
+      # when draining is deferred (drain_every>1), `out` outlives the JIT replay that produced it -- the JIT reuses its
+      # output buffer across replays (engine/jit.py's memory_plan_rewrite), so a not-yet-drained `out` would silently
+      # alias data the *next* chained step's replay overwrites. Snapshot it into a private buffer to break that alias.
+      # drain_every==1 (the default) drains immediately below, before any further replay can touch the buffer -- no
+      # snapshot needed there, so this stays a pre-T2.5-identical zero-extra-op path.
+      elif drain_every > 1: out = out.clone().realize()
+      pending.append(out)
+      virtual_len += 1
+      # drain once the batch fills, or generation is about to stop (don't strand tokens on-device)
+      if len(pending) >= drain_every or virtual_len >= self.max_context:
+        # NOTE on EOS: the caller checks for a stop token per yielded value (see cli.py/serve.py's is_end loop)
+        # and stops pulling from this generator. Because we yield one token at a time from the drained batch
+        # below, a stop token anywhere in the batch makes the caller break before the extras after it are ever
+        # appended/yielded -- self._cached_tokens and the returned `tokens` list end exactly at what was
+        # actually consumed. The only cost is up to drain_every-1 already-computed, now-wasted device steps.
+        for v in cast(list[list[int]], Tensor.cat(*pending, dim=1).tolist())[0]:
+          tokens.append(int(v))
+          self._cached_tokens = tokens[:-1]
+          yield tokens[-1]
+        pending = []
