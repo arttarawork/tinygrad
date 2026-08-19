@@ -156,6 +156,12 @@ class FFNBlock:
       if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
       if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
+      # routed experts may live on a different device than attention/router (device_map "experts:<dev>"); the
+      # weights never move (placed once at load), only these activations hop, around the three ExpertWeights
+      # calls. sel must travel with h: self.weight[sel] indexes the (now-remote) weight buffer with it, so both
+      # operands of that gather need to be on the same device. .to() is a no-op when already co-located.
+      expert_dev = self.ffn_gate_exps.weight.device
+      h, sel = h.to(expert_dev), sel.to(expert_dev)
       gate, up = self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)
       if self.config.clamp_swiglu:
         # gpt-oss clamped swiglu: gate*sigmoid(alpha*gate) * (up+1), both branches clamped
@@ -163,7 +169,7 @@ class FFNBlock:
         act = gate * (self.config.swiglu_alpha * gate).sigmoid() * (up + 1)
       else:
         act = gate.silu() * up
-      x_down = self.ffn_down_exps(sel, act.contiguous())  # (B, T, k, D)
+      x_down = self.ffn_down_exps(sel, act.contiguous()).to(x.device)  # (B, T, k, D), hop back to the block device
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
@@ -401,18 +407,32 @@ class GatedDeltaNetBlock(FFNBlock):
       self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
       self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
 
-def parse_device_map(dm:str|dict[int,str], num_blocks:int) -> list[str]:
-  """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}."""
+def parse_device_map(dm:str|dict[int|str,str], num_blocks:int) -> tuple[list[str], str|None]:
+  """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}.
+  An optional "experts:<device>" segment (str form) or "experts" key (dict form) routes MoE routed-expert weight
+  tensors (ffn_{gate,up,down}_exps) to a separate device, independent of their block's device. The router
+  (ffn_gate_inp) always stays with its block. Returns (per-block devices, experts device or None)."""
   if isinstance(dm, dict):
-    assert all(i in dm for i in range(num_blocks)), f"device_map must cover all {num_blocks} blocks: {dm}"
-    return [dm[i] for i in range(num_blocks)]
-  segs = [s.strip().split(":", 1) for s in dm.split(",")]
+    experts_dev = dm.get("experts")
+    blocks = {k: v for k, v in dm.items() if k != "experts"}
+    assert all(i in blocks for i in range(num_blocks)), f"device_map must cover all {num_blocks} blocks: {dm}"
+    return [blocks[i] for i in range(num_blocks)], experts_dev
+
+  parts = [s.strip() for s in dm.split(",")]
+  experts_parts = [p for p in parts if p.startswith("experts:")]
+  assert len(experts_parts) <= 1, f"device_map has more than one 'experts:' segment: {dm}"
+  experts_dev = experts_parts[0].split(":", 1)[1] if experts_parts else None
+  assert experts_dev != "", f"device_map 'experts:' segment needs a device: {dm}"
+  block_dm = ",".join(p for p in parts if not p.startswith("experts:"))
+  assert block_dm, f"device_map has no block segments (only 'experts:'): {dm}"
+
+  segs = [s.strip().split(":", 1) for s in block_dm.split(",")]
   indexed = [len(s) == 2 and s[0].replace("-", "").isdigit() for s in segs]
   if not any(indexed):
     # no free-memory query exists on Device/Allocator, so auto placement splits evenly by block count
-    devs = [s.strip() for s in dm.split(",")]
+    devs = [s.strip() for s in block_dm.split(",")]
     assert len(devs) <= num_blocks, f"device_map lists {len(devs)} devices for only {num_blocks} blocks: {dm}"
-    return [devs[i * len(devs) // num_blocks] for i in range(num_blocks)]
+    return [devs[i * len(devs) // num_blocks] for i in range(num_blocks)], experts_dev
   assert all(indexed), f"device_map mixes indexed ('lo[-hi]:device') and plain segments: {dm}"
   out: list[str|None] = [None] * num_blocks
   for rng, dev in segs:
@@ -422,10 +442,10 @@ def parse_device_map(dm:str|dict[int,str], num_blocks:int) -> list[str]:
     assert all(out[i] is None for i in range(lo, hi+1)), f"device_map range {rng} overlaps a previous range: {dm}"
     for i in range(lo, hi+1): out[i] = dev
   assert all(out), f"device_map must cover all {num_blocks} blocks: {dm}"
-  return out  # type: ignore[return-value]
+  return out, experts_dev  # type: ignore[return-value]
 
 class Transformer:
-  def __init__(self, config:TransformerConfig, device_map:str|dict[int,str]|None=None):
+  def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
@@ -441,12 +461,18 @@ class Transformer:
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
     if device_map is not None:
-      dmap = parse_device_map(device_map, config.num_blocks)
+      dmap, experts_dev = parse_device_map(device_map, config.num_blocks)
       for block, dev in zip(self.blk, dmap):
         for p in nn.state.get_parameters(block): p.to_(dev)
       # token_embd feeds the first block; output_norm/output consume the last block's activations
       for p in nn.state.get_parameters(self.token_embd): p.to_(dmap[0])
       for p in nn.state.get_parameters([self.output_norm, self.output]): p.to_(dmap[-1])
+      # routed-expert weights (not the router, which stays with attention) move to a separate device on
+      # top of the per-block placement above -- overrides ffn_{gate,up,down}_exps' dev for every MoE block
+      if experts_dev is not None:
+        for block in self.blk:
+          if hasattr(block, 'ffn_gate_exps'):
+            for p in nn.state.get_parameters([block.ffn_gate_exps, block.ffn_up_exps, block.ffn_down_exps]): p.to_(experts_dev)
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill/rollout and sampled/greedy
@@ -471,7 +497,7 @@ class Transformer:
     return self.jit[(resolve(tokens.shape[1] != 1), temperature is None)](tokens.contiguous(), start_pos, temperature)
 
   @staticmethod
-  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, *, device_map:str|dict[int,str]|None=None,
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None, *, device_map:str|dict[int|str,str]|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
     # TODO: remove the need for copy to default device
     kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
