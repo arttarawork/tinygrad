@@ -1,7 +1,7 @@
 import json, math, pathlib, tempfile, time, unittest
 import numpy as np
 import gguf
-from tinygrad import Tensor, GlobalCounters
+from tinygrad import Tensor, GlobalCounters, Context
 from tinygrad.llm.model import Transformer, TransformerConfig, ExpertGating, precompute_freqs_cis
 from tinygrad.llm.cli import SimpleTokenizer
 
@@ -341,6 +341,109 @@ class TestGPTOSSDecodeByteBudget(unittest.TestCase):
     self.assertLess(actual, 3 * gathered,
       f"decode step read {actual} B, expected near the gathered-MoE estimate ({gathered} B) -- looks "
       f"like ExpertWeights.__call__ degraded toward the dense all-experts read ({dense} B)")
+
+class TestGPTOSSDecodeByteBudgetMXFP4(unittest.TestCase):
+  """T4.13: the byte-budget test above (T4.11) never actually exercises MXFP4 -- its config skips GGUF
+  loading entirely and keeps weights at dtypes.default_float (see its own comment at 'itemsize = 4').
+  That's why it couldn't reproduce the real 20b model's ~59 GB/token: the blowup isn't scale-dependent
+  (expert count, layer count, hidden dim) at all -- it reproduces already at these SAME tiny dims, the
+  moment expert weights actually go through the MXFP4 dequant path (confirmed by a standalone repro:
+  a bare `weight[sel]` gather over an MXFP4-dequanted (32, 64, 128) tensor read ~1.8 MB/token, MORE
+  than a full dense all-experts fp32 materialization, vs ~440 KB for the identical shape in Q4_0).
+
+  Root cause (schedule/rangeify.py): the original MXFP4 dequant (gguf.py, ggml_type==39) computed both
+  the block scale and the E2M1 4-bit value via Tensor-indexed LUT gathers (`lut[codes]`). A gather reads
+  its LUT through a buffer-accessing REDUCE, and remove_bufferize's buffer_in_reduce check refuses to
+  fuse a bufferize point containing a buffer-reading REDUCE into any consumer that itself indexes the
+  result -- which is exactly what MoE's `weight[sel]` expert-selection gather is. Result: the ENTIRE
+  dequantized expert tensor (every expert, not just the k selected) materialized every decode step. Fix:
+  compute both the block scale and the E2M1 value via pure ALU bit-ops (no LUT gather, no extra buffer)
+  -- bit-exact vs the LUT (verified for all 256 e8m0 byte values and all 16 four-bit codes) -- which lets
+  rangeify fuse the dequant into weight[sel]'s gather again, same as every other quant format.
+
+  This test builds a real MXFP4 GGUF (ALL expert tensors quantized, not just one -- the real model's
+  shape) at the T4.11 byte-budget dims and checks decode bytes stay near the gathered-MXFP4 estimate,
+  not the dense (all-experts) one."""
+  DIM, HIDDEN = 64, 128
+  N_HEADS, N_KV_HEADS, HEAD_DIM = 8, 2, 8
+  N_EXPERTS, EXPERTS_PER_TOK, NUM_BLOCKS = 32, 4, 2
+  VOCAB, MAX_CTX = 50, 64
+
+  def _build_gguf(self, path: pathlib.Path, rng: np.random.Generator):
+    w = gguf.GGUFWriter(str(path), "gpt-oss")
+    w.add_context_length(self.MAX_CTX)
+    w.add_embedding_length(self.DIM)
+    w.add_block_count(self.NUM_BLOCKS)
+    w.add_head_count(self.N_HEADS)
+    w.add_head_count_kv(self.N_KV_HEADS)
+    w.add_key_length(self.HEAD_DIM)
+    w.add_value_length(self.HEAD_DIM)
+    w.add_layer_norm_rms_eps(1e-5)
+    w.add_expert_count(self.N_EXPERTS)
+    w.add_expert_used_count(self.EXPERTS_PER_TOK)
+    w.add_expert_feed_forward_length(self.HIDDEN)
+    w.add_rope_freq_base(10000.0)
+    w.add_token_list([f"<t{i}>" for i in range(self.VOCAB)])
+
+    def norm(name, dim): w.add_tensor(name, rng.normal(1.0, 0.1, dim).astype(np.float16))
+    def lin(name, out_f, in_f, bias):
+      w.add_tensor(f"{name}.weight", rng.normal(0, 0.3, (out_f, in_f)).astype(np.float16))
+      if bias: w.add_tensor(f"{name}.bias", rng.normal(0, 0.3, out_f).astype(np.float16))
+
+    for i in range(self.NUM_BLOCKS):
+      p = f"blk.{i}"
+      norm(f"{p}.attn_norm.weight", self.DIM)
+      norm(f"{p}.post_attention_norm.weight", self.DIM)
+      lin(f"{p}.attn_q", self.N_HEADS * self.HEAD_DIM, self.DIM, bias=True)
+      lin(f"{p}.attn_k", self.N_KV_HEADS * self.HEAD_DIM, self.DIM, bias=True)
+      lin(f"{p}.attn_v", self.N_KV_HEADS * self.HEAD_DIM, self.DIM, bias=True)
+      lin(f"{p}.attn_output", self.DIM, self.N_HEADS * self.HEAD_DIM, bias=True)
+      w.add_tensor(f"{p}.attn_sinks.weight", rng.normal(0, 0.5, self.N_HEADS).astype(np.float16))
+      w.add_tensor(f"{p}.ffn_gate_inp.weight", rng.normal(0, 0.05, (self.N_EXPERTS, self.DIM)).astype(np.float16))
+      w.add_tensor(f"{p}.ffn_gate_inp.bias", rng.normal(0, 1, self.N_EXPERTS).astype(np.float16))
+
+      # ALL expert tensors MXFP4 -- the real model's shape (T4.11's builder only quantized one, layer 0's down)
+      for name, out_f, in_f in ((f"{p}.ffn_gate_exps", self.HIDDEN, self.DIM), (f"{p}.ffn_up_exps", self.HIDDEN, self.DIM),
+                                 (f"{p}.ffn_down_exps", self.DIM, self.HIDDEN)):
+        wt = rng.normal(0, 0.3, (self.N_EXPERTS, out_f, in_f)).astype(np.float32)
+        packed = gguf.quantize(wt, gguf.GGMLQuantizationType.MXFP4)
+        w.add_tensor(f"{name}.weight", packed, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+        w.add_tensor(f"{name}.bias", rng.normal(0, 0.3, (self.N_EXPERTS, out_f)).astype(np.float16))
+
+    w.add_tensor("token_embd.weight", rng.normal(0, 0.3, (self.VOCAB, self.DIM)).astype(np.float16))
+    w.add_tensor("output_norm.weight", rng.normal(1.0, 0.1, self.DIM).astype(np.float16))
+    w.add_tensor("output.weight", rng.normal(0, 0.3, (self.VOCAB, self.DIM)).astype(np.float16))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+  @Context(DEV="CPU")  # NOT device_map="CPU:0": device_map moves params off Device.DEFAULT, and
+  # Transformer.realize_placement() force-.contiguous()+realizes every such param at load time
+  # (documented footgun, model.py's realize_placement docstring) -- for GGUF-loaded MXFP4 weights
+  # that defeats dequant fusion before decode ever starts, silently making this test measure an
+  # already-materialized buffer regardless of the dequant bug it exists to catch. Scoping
+  # Device.DEFAULT itself keeps decode's whole path (including load) on one device, matching how
+  # the real gpt-oss bench runs (no device_map at all) and actually exercising the lazy fusion path.
+  def test_decode_bytes_stay_near_gathered_not_dense_mxfp4(self):
+    rng = np.random.default_rng(7)
+    with tempfile.TemporaryDirectory() as d:
+      path = pathlib.Path(d) / "byte-budget-mxfp4.gguf"
+      self._build_gguf(path, rng)
+      model, _ = Transformer.from_gguf(path, max_context=self.MAX_CTX)
+
+    gen = model.generate([1, 2, 3, 4, 5], chunk_size=32, temperature=0.0)
+    for _ in range(1 + 5): next(gen)  # prefill + warm the decode jit variant
+    GlobalCounters.reset()
+    next(gen)
+    actual = GlobalCounters.global_mem
+
+    per_expert_mxfp4_bytes = (2 * self.HIDDEN * self.DIM + self.DIM * self.HIDDEN) // 32 * 17  # gate+up+down, packed
+    gathered = self.NUM_BLOCKS * self.EXPERTS_PER_TOK * per_expert_mxfp4_bytes
+    dense = self.NUM_BLOCKS * self.N_EXPERTS * per_expert_mxfp4_bytes
+    self.assertLess(actual, 3 * gathered,
+      f"decode step read {actual} B, expected near the gathered-MXFP4 estimate ({gathered} B) -- looks "
+      f"like the MXFP4 dequant materialized the full (dense, {dense} B) expert tensor before the gather")
 
 # ---------------------------------------------------------------------------------------------
 # Real gpt-oss-20b GGUF, metadata-only validation (no tensor data touched - GGUFReader mmaps the
