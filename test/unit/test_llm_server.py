@@ -32,6 +32,58 @@ class TestTransformerGenerate(unittest.TestCase):
     model.warmup()
     for key, jit in model.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
+  def test_warmup_then_generate_different_chunk_size(self):
+    # T4.12 regression: warmup() always runs at chunk_size=32 internally; a later generate() at a
+    # DIFFERENT chunk_size used to hit warmup's prefill jit whose captured "toks" Variable was bound
+    # to range 1..32, raising JitError("args mismatch in JIT") on the range-64 slice. Must now work,
+    # and produce the same tokens as an unwarmed model (same weights via a fixed seed; greedy decode
+    # is otherwise deterministic).
+    from dataclasses import replace
+    cfg = replace(TEST_CONFIG, max_context=128)
+    Tensor.manual_seed(1337)
+    warmed = Transformer(cfg)
+    warmed.warmup()
+    out_warmed = [t for _, t in zip(range(5), warmed.generate(list(range(1, 6)), chunk_size=64))]
+
+    Tensor.manual_seed(1337)
+    fresh = Transformer(cfg)  # no warmup() -- baseline
+    out_fresh = [t for _, t in zip(range(5), fresh.generate(list(range(1, 6)), chunk_size=64))]
+
+    self.assertEqual(out_warmed, out_fresh)
+
+  def test_mixed_chunk_size_no_recapture_storm(self):
+    # T4.12: alternating chunk_size (32 -> 64 -> 32) must not grow the jit dict per-call, and a chunk_size
+    # seen before must hit the SAME already-captured jit object, not recapture from scratch.
+    from dataclasses import replace
+    model = Transformer(replace(TEST_CONFIG, max_context=128))
+
+    def run(tokens, chunk_size):
+      gen = model.generate(list(tokens), chunk_size=chunk_size)
+      for _ in range(3): next(gen)
+      model._cached_tokens = []
+
+    run(range(1, 6), 32)
+    run(range(6, 11), 32)  # 2nd use of chunk_size=32 -> captures
+    prefill_32 = model.jit[(True, True, 32)]
+    self.assertIsNotNone(prefill_32.captured)
+
+    run(range(20, 25), 64)  # 1st use of chunk_size=64
+    run(range(25, 30), 32)  # 3rd use of chunk_size=32 -> must reuse, not recapture
+
+    self.assertIs(model.jit[(True, True, 32)], prefill_32)  # same object, no fresh capture
+    # bounded to exactly the variants actually used: prefill@32, decode, prefill@64 -- no per-call growth
+    self.assertEqual(set(model.jit.keys()), {(True, True, 32), (False, True, None), (True, True, 64)})
+
+  def test_recurrent_warmup_unchanged(self):
+    # T4.12: recurrent models force chunk_size=1 in generate() (get_start_pos/generate's ssm branch), so
+    # every call is decode-shaped -- warmup() must keep producing only the 2 decode jit variants, no
+    # prefill/chunk_size proliferation and no double-capture from the new chunk_size keying.
+    model = Transformer(TEST_CONFIG)
+    model.has_recurrent_block = True
+    model.warmup()
+    self.assertEqual(set(model.jit.keys()), {(False, True, None), (False, False, None)})
+    for key, jit in model.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
+
   def test_generate_at_boundary_yields_one_token(self):
     # prompt len == max_context - 1 leaves room for exactly one generated token -- must succeed
     model = Transformer(TEST_CONFIG)

@@ -522,8 +522,9 @@ class Transformer:
       self._placed_devices = frozenset(Device.canonicalize(d) for d in dmap + ([experts_dev] if experts_dev is not None else []))
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # we specialize the JIT for prefill/rollout and sampled/greedy
-    self.jit = {k: TinyJit(self.forward) for k in itertools.product((False, True), repeat=2)}
+    # we specialize the JIT for prefill/rollout and sampled/greedy; prefill also keys on chunk_size (T4.12) --
+    # created lazily in __call__ since chunk_size isn't known until generate() picks one
+    self.jit: dict[tuple[bool, bool, int|None], Callable[..., Tensor]] = {}
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
     # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
@@ -541,7 +542,15 @@ class Transformer:
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
-    return self.jit[(resolve(tokens.shape[1] != 1), temperature is None)](tokens.contiguous(), start_pos, temperature)
+    is_prefill = bool(resolve(tokens.shape[1] != 1))
+    # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
+    # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
+    # generate() at a different chunk_size replay a jit captured with the wrong Variable range -> JitError
+    # ("args mismatch in JIT"). Decode/rollout steps feed a plain (1,1) tensor (no bound Variable, chunk_size-
+    # independent), so only the prefill variants need the extra key; None keeps the rollout jit singular.
+    chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
+    return self.jit.setdefault((is_prefill, temperature is None, chunk_size), TinyJit(self.forward))(
+      tokens.contiguous(), start_pos, temperature)
 
   def realize_placement(self):
     """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --

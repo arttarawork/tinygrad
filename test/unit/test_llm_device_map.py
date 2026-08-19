@@ -89,7 +89,7 @@ class TestDeviceMapModel(unittest.TestCase):
     # T4.5 regression: with realize_placement() run before capture, the ONLY copy left in the graph is the real
     # per-token block-boundary activation hop -- none of the (up to 21, pre-fix) load-time weight-placement copies
     # leak into the JIT and replay every step.
-    rollout_jit = split.jit[(False, True)]  # (is_prefill, greedy): generate() defaults to temperature=0
+    rollout_jit = split.jit[(False, True, None)]  # (is_prefill, greedy, chunk_size-if-prefill): generate() defaults to temperature=0
     self.assertIsNotNone(rollout_jit.captured)
     copies = []
     for call in rollout_jit.captured.linear.src:
@@ -158,7 +158,7 @@ class TestDeviceMapMetalCPU(unittest.TestCase):
     # from HCQ2Compiled's default). A graph batch can never span devices -- GraphRunner.supports_uop
     # requires call.src[0].op is Ops.PROGRAM, which a cross-device COPY never satisfies -- so the
     # boundary hop always lands as a standalone COPY call between the two per-backend islands.
-    rollout_jit = split.jit[(False, True)]
+    rollout_jit = split.jit[(False, True, None)]
     self.assertIsNotNone(rollout_jit.captured)
     copies, graphed_devs, ungraphed_devs = [], set(), set()
     for call in rollout_jit.captured.linear.src:
@@ -266,7 +266,7 @@ class TestDeviceMapMoEExperts(unittest.TestCase):
       self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
 
     # JIT captured the mid-block hop: only COPY calls touch the experts device, compute kernels are single-device
-    rollout_jit = split.jit[(False, True)]
+    rollout_jit = split.jit[(False, True, None)]
     self.assertIsNotNone(rollout_jit.captured)
     expert_copies = []
     for call in rollout_jit.captured.linear.src:
@@ -303,7 +303,7 @@ class TestDeviceMapMoEExpertsMetalCPU(unittest.TestCase):
     for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
       self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
 
-    rollout_jit = split.jit[(False, True)]
+    rollout_jit = split.jit[(False, True, None)]
     self.assertIsNotNone(rollout_jit.captured)
     expert_copies = 0
     for call in rollout_jit.captured.linear.src:
