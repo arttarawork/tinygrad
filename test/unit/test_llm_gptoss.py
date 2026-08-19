@@ -1,8 +1,9 @@
-import math, pathlib, tempfile, unittest
+import json, math, pathlib, tempfile, time, unittest
 import numpy as np
 import gguf
 from tinygrad import Tensor
 from tinygrad.llm.model import Transformer, precompute_freqs_cis
+from tinygrad.llm.cli import SimpleTokenizer
 
 # ---------------------------------------------------------------------------------------------
 # Tiny synthetic gpt-oss GGUF, built with the `gguf` package (no downloads). Exercises every
@@ -226,6 +227,70 @@ class TestGPTOSSGGUF(unittest.TestCase):
     plain = precompute_freqs_cis(8, 16, 10.0, device=None)
     yarn_noop = precompute_freqs_cis(8, 16, 10.0, device=None, yarn_factor=1.0, yarn_orig_ctx=32, yarn_beta_fast=32.0, yarn_beta_slow=1.0)
     np.testing.assert_array_equal(plain.numpy(), yarn_noop.numpy())
+
+# ---------------------------------------------------------------------------------------------
+# Real gpt-oss-20b GGUF, metadata-only validation (no tensor data touched - GGUFReader mmaps the
+# file and we only read the kv/token-list section). Skipped in CI where the file isn't present.
+# Model generation itself is out of scope here (deferred to a bench session).
+# ---------------------------------------------------------------------------------------------
+
+REAL_GPTOSS_GGUF = pathlib.Path("/Users/artur/Library/Caches/tinygrad/downloads/35ff51c27772d214bab0172591e2ade8")
+
+def _read_gguf_kv(path: pathlib.Path) -> dict:
+  # mirrors test/unit/test_gguf.py's own kv-reading pattern, via gguf-py's mmap-based GGUFReader
+  reader = gguf.GGUFReader(str(path))
+  kv: dict = {}
+  for k, f in reader.fields.items():
+    if k.startswith("GGUF."): continue  # file header keys (version, tensor_count, kv_count)
+    is_str = f.types[-1] == gguf.GGUFValueType.STRING
+    def read_val(i, parts=f.parts, is_str=is_str): return bytes(parts[i]).decode("utf-8") if is_str else parts[i][0].item()
+    kv[k] = [read_val(i) for i in f.data] if f.types[0] == gguf.GGUFValueType.ARRAY else read_val(-1)
+  return kv
+
+@unittest.skipUnless(REAL_GPTOSS_GGUF.exists(), "real gpt-oss-20b GGUF not present, skipping metadata validation")
+class TestGPTOSSRealTokenizer(unittest.TestCase):
+  @classmethod
+  def setUpClass(cls):
+    cls.kv = _read_gguf_kv(REAL_GPTOSS_GGUF)
+    cls.tok = SimpleTokenizer.from_gguf_kv(cls.kv)
+
+  def test_arch_and_preset(self):
+    self.assertEqual(self.kv["general.architecture"], "gpt-oss")
+    self.assertEqual(self.kv["tokenizer.ggml.pre"], "gpt-4o")
+    self.assertEqual(self.tok.preset, "gpt-4o")
+
+  def test_roundtrip(self):
+    cases = ["hello world", "Hello, World! 123", "  multiple   spaces  ", "trailing space ", "\ttabs\tand\nnewlines\r\n",
+             "unicode: café 中文 \U0001F600", "CamelCaseWordBoundary", "don't can't I'm we'll",
+             "numbers 1 22 333 4444 55555", "punctuation!!! ...whoa??", ""]
+    for s in cases:
+      self.assertEqual(self.tok.decode(self.tok.encode(s)), s, f"roundtrip failed for {s!r}")
+
+  def test_harmony_special_tokens_resolve_to_single_ids(self):
+    # confirmed present in this file's own token inventory (see the investigative dump in the T1.3 report)
+    for special in ("<|start|>", "<|end|>", "<|message|>", "<|channel|>", "<|return|>"):
+      self.assertIn(special, self.tok._special_tokens, f"{special} missing from this GGUF's token inventory")
+      ids = self.tok.encode(special)
+      self.assertEqual(len(ids), 1, f"{special} should resolve to a single token id, got {ids}")
+      self.assertEqual(self.tok.decode(ids), special)
+
+  def test_chat_template_loads_via_generic_jinja_path(self):
+    # this is the exact loading path from cli.py's main(): if jinja2 is missing, that path silently
+    # falls back to FallbackTemplate (no harmony support there - not cheap to add, see T1.3 report)
+    ct = self.kv.get("tokenizer.chat_template")
+    self.assertIsNotNone(ct)
+    try: import jinja2
+    except ImportError: self.skipTest("jinja2 not installed - the harmony template silently falls back to FallbackTemplate (unsupported)")
+    env = jinja2.Environment()
+    env.filters['tojson'] = lambda obj, **kwargs: json.dumps(obj, **kwargs)
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
+    env.globals['bos_token'] = self.tok.decode([self.tok.bos_id]) if self.tok.bos_id is not None else ""
+    env.globals['eos_token'] = self.tok.decode([self.tok.eos_id])
+    template = env.from_string(ct)  # raises jinja2.TemplateSyntaxError if the template can't even parse
+    out = template.render(messages=[{"role": "user", "content": "hi"}], add_generation_prompt=True)
+    self.assertIsInstance(out, str)
+    self.assertGreater(len(out), 0)
 
 if __name__ == '__main__':
   unittest.main()

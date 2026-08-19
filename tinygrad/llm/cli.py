@@ -12,7 +12,7 @@ class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gpt-4o"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -26,8 +26,20 @@ class SimpleTokenizer:
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    if preset == "gpt-4o":
+      # gpt-4o / o200k pre-tokenizer (used by gpt-oss): case-transition-aware letter runs, via
+      # LLAMA_VOCAB_PRE_TYPE_GPT4O's regex_exprs in llama.cpp's src/llama-vocab.cpp (differs from the
+      # llama3/gpt-2 regex below - no \p{L}/\p{N} support in Python's `re`, so substitute the ucat_range
+      # classes as above; every group is made non-capturing since findall() below needs the whole match).
+      contraction = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+      self._split_to_word = re.compile(
+        f"[^\\r\\n{r_p_N}{r_p_L}]?(?:(?=[{r_p_L}])[^a-z])*(?:(?=[{r_p_L}])[^A-Z])+{contraction}?|"
+        f"[^\\r\\n{r_p_N}{r_p_L}]?(?:(?=[{r_p_L}])[^a-z])+(?:(?=[{r_p_L}])[^A-Z])*{contraction}?|"
+        f"[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    else:
+      self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" +
+        f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|" +
+        f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
