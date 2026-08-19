@@ -1,0 +1,10 @@
+model,stack,device,flags,load_s,prefill_tps,decode_tps,gbps
+qwen3:8b,llamacpp,METAL,"-r 3 llama.cpp reference, default Metal",,357.14,27.27,
+qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench upstream/master@2cfb421a8, no-BEAM",1.778,15.91,4.92,26.86
+qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench upstream/master@2cfb421a8, no-BEAM",1.698,15.92,4.93,26.90
+qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench upstream/master@2cfb421a8, no-BEAM",1.693,15.89,4.91,26.82
+qwen3:8b,tinygrad,METAL,"task/T0.3-bench-harness@integration-wave1, no-BEAM",1.752,15.82,7.28,39.70
+qwen3:8b,tinygrad,METAL,"task/T0.3-bench-harness@integration-wave1, no-BEAM",1.702,15.82,7.29,39.76
+qwen3:8b,tinygrad,METAL,"task/T0.3-bench-harness@integration-wave1, no-BEAM",1.704,15.82,7.27,39.68
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 task/T0.3-bench-harness@integration-wave1, JITBEAM=2 IGNORE_BEAM_CACHE=1",1.696,43.47,14.44,78.50
+qwen3:8b,tinygrad,METAL,PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench JITBEAM=2 IGNORE_BEAM_CACHE=1 upstream/master@2cfb421a8,1.712,46.65,12.86,70.00
