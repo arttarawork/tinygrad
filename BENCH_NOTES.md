@@ -185,3 +185,52 @@ noise-hunting a 4.5-minute-per-run config).
   (expected — larger attention cost as context grows during prefill), and are consistent with each
   other within 0.3% (10.45 vs 10.42) — KV dtype doesn't materially affect prefill, as expected
   (prefill's KV writes, not the growing-context reads that dominate decode).
+
+## C. T4.4 — BEAM prefill anomaly: VERDICT = noise, not a regression
+
+3 `JITBEAM=2 IGNORE_BEAM_CACHE=1` prefill repeats on integration-now (`task/bench-window-2`,
+`e4c8868a0` base) and 3 on `upstream/master` tip (`ca86a4270`, worktree `../upstream-bench-2` =
+`/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2`), plus one `MV=0` control run
+to test the design doc's candidate hypothesis directly.
+
+| Side | prefill tok/s (3 repeats) | mean | decode tok/s (3 repeats) |
+|---|---|---|---|
+| integration-now | 46.01, 47.90, 48.24 | 47.38 | 14.40, 11.98, 13.29 |
+| upstream@ca86a4270 | 47.12, 46.41, 47.95 | 47.16 | 14.07, 13.20, 13.01 |
+| integration-now, `MV=0` control | 47.29 (1 run) | — | 11.31 |
+
+- **The two spreads fully overlap** (integration 46.01–48.24 vs upstream 46.41–47.95) — mean delta
+  is 0.5%, well inside each side's own repeat spread (~4.7% and ~3.3% respectively). The 08-18
+  single-run gap (integration 43.47 vs upstream 46.65, a 6.9% "regression") does not reproduce:
+  today's integration-now floor (46.01) already exceeds that 43.47 figure, and today's upstream
+  ceiling (47.95) is barely above its own 08-18 point estimate. **Verdict: noise** — `JITBEAM=2
+  IGNORE_BEAM_CACHE=1` runs a small, budget-limited, from-scratch search every time, and the spread
+  isn't confined to prefill either: **decode tok/s on the same integration-now runs varies 11.98 to
+  14.40 (20% swing)** across otherwise-identical repeats, so a single-run ±7% prefill delta between
+  two checkouts is well within what this search's own repeat-to-repeat noise produces. No lever
+  bisection needed; closing per T4.4's "if it's within noise, close it as variance" clause.
+- **The design doc's candidate hypothesis (MATVEC guard misfiring on a prefill kernel it shouldn't)
+  is independently ruled out, not just by noise but structurally**: `MV=0` prefill (47.29) lands
+  squarely inside the no-guard-difference spread (46.01–48.24), and this is *provably* a true
+  no-op, not a lucky match — `codegen/opt/postrange.py:339-356`'s `apply_opts` branches on
+  `beam >= 1` *before* it ever reaches the `hand_coded_optimizations` call (`elif not NOOPT and
+  ...: from tinygrad.codegen.opt.heuristic import hand_coded_optimizations`); the `MV` env var is
+  read nowhere except inside that function (`codegen/opt/heuristic.py:70`). Under `JITBEAM=2`,
+  `hand_coded_optimizations` — and therefore the entire MATVEC guard — is never called at all; BEAM
+  search picks its own tiling via `beam_search()` independent of the heuristic. The candidate
+  culprit named in the task doesn't apply to the BEAM code path by construction.
+- Anomaly (noted, not chased): on this synthetic dummy prompt (`benchmark_llm.py`'s
+  `[257] + [1000+i%1000 for i in range(511)]`, not real text), integration-now's BEAM decode output
+  tokens are a plausible-looking numbered list (`[198, 197, 197, 322, 220, 16, 13, 220, 17, ...]`,
+  identical across all integration-now BEAM repeats including the `MV=0` control) while
+  upstream@ca86a4270's BEAM decode output is a different, degenerate repeating 17-token loop
+  (`[11, 345, 0, 50994, 2428, 1110, 72, 55277, 905, 14, 21, 48, 21, 48, ...]`, also identical across
+  all 3 upstream repeats). Each side is internally deterministic/reproducible (temp=0, same output
+  every repeat) but the two sides diverge from each other. Most likely explanation: greedy argmax
+  is a discontinuous function of the logits, and different kernel tilings (integration's heuristic
+  fp16/quant-MATVEC-shaped prefill kernels are bypassed under BEAM too, so this isn't that guard —
+  it's whatever BEAM's own search landed on for each checkout) sum reductions in a different order,
+  giving different rounding; on a degenerate synthetic prompt with likely near-tied logits this can
+  flip the argmax pick early and cascade into a fully different (but equally "valid" per-checkout)
+  continuation. Not investigated further — T4.3 below is the real correctness-parity check, on real
+  prompts (a synthetic garbage prompt isn't a meaningful place to chase greedy-decode divergence).

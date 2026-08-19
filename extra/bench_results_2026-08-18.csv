@@ -18,3 +18,9 @@ qwen3:8b,tinygrad,METAL,"KV_F32=1 2026-08-19 task/bench-window-2@integration-wav
 qwen3:8b,tinygrad,METAL,"KV_F32=1 2026-08-19 task/bench-window-2@integration-wave1-now, no-BEAM, T1.1b KV_F32=1",2.109,14.97,7.35,49.15
 qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, T1.1b long-context prompt=4096 max-context=8192, fp16 KV (default)",2.109,10.45,5.11,43.45
 qwen3:8b,tinygrad,METAL,"2026-08-19 task/bench-window-2@integration-wave1-now, T1.1b long-context prompt=4096 max-context=8192, KV_F32=1",2.126,10.42,5.00,54.65
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, T4.4 BEAM-prefill repeat2",2.090,47.90,11.98,79.16
+qwen3:8b,tinygrad,METAL,"JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, T4.4 BEAM-prefill repeat3",2.115,48.24,13.29,86.53
+qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 upstream/master@ca86a4270, T4.4 BEAM-prefill repeat1",1.802,47.12,14.07,76.60
+qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 upstream/master@ca86a4270, T4.4 BEAM-prefill repeat2",1.711,46.41,13.20,71.88
+qwen3:8b,tinygrad,METAL,"PYTHONPATH=/Users/artur/Documents/tinygrad/.claude/worktrees/upstream-bench-2 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 upstream/master@ca86a4270, T4.4 BEAM-prefill repeat3",1.699,47.95,13.01,70.74
+qwen3:8b,tinygrad,METAL,"MV=0 JITBEAM=2 IGNORE_BEAM_CACHE=1 2026-08-19 task/bench-window-2@integration-wave1-now, T4.4 BEAM-prefill MV=0 control",2.136,47.29,11.31,74.52
