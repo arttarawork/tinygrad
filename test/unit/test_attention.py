@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, dtypes, nn, GlobalCounters
+from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
 from tinygrad.llm import model
@@ -8,6 +8,7 @@ from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
+from tinygrad.llm.attn_kernel import tuned_decode_attention, CHUNK
 from test.helpers import assert_kernel_count
 
 def apply_rope(x:Tensor, start_pos:int):
@@ -432,6 +433,100 @@ class TestAttentionHook(unittest.TestCase):
     out = block._attention(decode_norm, 5).realize().numpy()  # same decode step, hook active
 
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
+
+class TestTunedAttentionKernel(unittest.TestCase):
+  """T1.8b: the tuned (LOCAL-cooperative, chunked, online-softmax) decode-attention kernel."""
+
+  def setUp(self):
+    self._orig_impl = model.attention_impl
+  def tearDown(self):
+    model.attention_impl = self._orig_impl
+
+  def _qkv(self, B, H, KvH, Tk, Hd, seed, T=1, dtype=dtypes.float32):
+    Tensor.manual_seed(seed)
+    q = Tensor.randn(B, H, T, Hd, dtype=dtype).contiguous().realize()
+    k = Tensor.randn(B, KvH, Tk, Hd, dtype=dtype).contiguous().realize()
+    v = Tensor.randn(B, KvH, Tk, Hd, dtype=dtype).contiguous().realize()
+    return q, k, v
+
+  def test_parity_gqa(self):
+    # covers: tail-only (Tk < CHUNK), exact multiple of CHUNK, full chunks + tail, MHA (KvH==H), Tk==1
+    for (B, H, KvH, Tk, Hd, seed) in [
+      (2, 4, 2, 7, 8, 1), (1, 8, 2, 3, 16, 2), (3, 6, 1, 11, 4, 3), (1, 4, 1, 1, 8, 4),
+      (1, 8, 8, CHUNK, 8, 5), (1, 4, 1, 3 * CHUNK, 8, 6), (1, 4, 1, 3 * CHUNK + 5, 8, 7),
+    ]:
+      q, k, v = self._qkv(B, H, KvH, Tk, Hd, seed)
+      ref = q.scaled_dot_product_attention(k, v, enable_gqa=True).numpy()
+      out = tuned_decode_attention(q, k, v, None).numpy()
+      np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4, err_msg=f"{B=} {H=} {KvH=} {Tk=} {Hd=}")
+
+  def test_parity_fp16_qkv(self):
+    q, k, v = self._qkv(1, 8, 2, 2 * CHUNK + 3, 16, 0, dtype=dtypes.float16)
+    ref = q.scaled_dot_product_attention(k, v, enable_gqa=True).numpy()
+    out = tuned_decode_attention(q, k, v, None).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2)
+
+  def test_gating_prefill_falls_back(self):
+    q, k, v = self._qkv(1, 4, 2, 5, 8, 0, T=3)
+    mask = Tensor.full((1, 1, 3, 5), float("-inf"), dtype=dtypes.float32).triu(3)
+    ref = model._sdpa_default(q, k, v, mask).numpy()
+    out = tuned_decode_attention(q, k, v, mask).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-6, atol=1e-6)
+
+  def test_gating_masked_decode_falls_back(self):
+    q, k, v = self._qkv(1, 4, 2, 5, 8, 0, T=1)
+    mask = Tensor.full((1, 1, 1, 5), float("-inf"), dtype=dtypes.float32).tril(1)
+    ref = model._sdpa_default(q, k, v, mask).numpy()
+    out = tuned_decode_attention(q, k, v, mask).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-6, atol=1e-6)
+
+  def test_gating_symbolic_tk_falls_back(self):
+    # HARD LIMITER (see attn_kernel.py docstring): Tensor.custom_kernel hard-asserts on symbolic shapes,
+    # and real JIT decode promotes the growing KV-cache slice length to a symbolic UOp Variable after the
+    # first decode step. Without this fallback, the tuned kernel crashes (AssertionError, verified via a
+    # live model.generate() run) instead of silently degrading -- this is the regression guard for that.
+    q, k_full, v_full = self._qkv(1, 4, 2, 10, 8, 0)
+    tk_var = Variable("Tk", 1, 10).bind(5)
+    k, v = k_full[:, :, :tk_var], v_full[:, :, :tk_var]
+    self.assertFalse(isinstance(k.shape[2], int))  # sanity: this really is the symbolic case
+    ref = q.scaled_dot_product_attention(k_full[:, :, :5].contiguous(), v_full[:, :, :5].contiguous(), enable_gqa=True).numpy()
+    out = tuned_decode_attention(q, k, v, None).numpy()
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
+
+  def test_kernel_count_default_vs_tuned(self):
+    q, k, v = self._qkv(2, 4, 2, 2 * CHUNK + 3, 8, 0)
+    GlobalCounters.reset()
+    q.scaled_dot_product_attention(k, v, enable_gqa=True).realize()
+    self.assertGreater(GlobalCounters.kernel_count, 1)
+
+    GlobalCounters.reset()
+    tuned_decode_attention(q, k, v, None).realize()
+    assert_kernel_count(1)
+
+  def test_hook_wired_through_transformer_block_kv_cache_both_kv_dtypes(self):
+    # end-to-end through TransformerBlock's real (AFTER(store)+SHRINK) cache views, for both KV cache
+    # dtypes T1.1a supports (fp16 default, fp32 via KV_F32=1) -- set directly on cache_kv to avoid
+    # getenv's process-wide caching (see kv_cache_dtype()) rather than relying on the env var.
+    config = TransformerConfig(num_blocks=1, dim=16, hidden_dim=32, n_heads=4, n_kv_heads=2, norm_eps=1e-5,
+                                vocab_size=32, head_dim=8, rope_theta=10000.0, rope_dim=8, v_head_dim=8, max_context=16)
+    for kv_dtype in (dtypes.float16, dtypes.float32):
+      block = TransformerBlock(config)
+      Tensor.manual_seed(0)
+      prompt = Tensor.randn(1, 5, config.dim, dtype=dtypes.float32).contiguous().realize()
+      decode_in = Tensor.randn(1, 1, config.dim, dtype=dtypes.float32).contiguous().realize()
+
+      prompt_norm, decode_norm = block.attn_norm(prompt), block.attn_norm(decode_in)
+      block._init_state(prompt_norm)  # sets freqs_cis; overwrite cache_kv below to force the kv_dtype under test
+      block.cache_kv = Tensor.empty(2, 1, config.n_kv_heads, config.max_context, config.head_dim, dtype=kv_dtype)
+
+      model.attention_impl = model._sdpa_default
+      block._attention(prompt_norm, 0).realize()  # prefill: fills cache_kv[0:5]
+      ref = block._attention(decode_norm, 5).realize().numpy()  # decode step through cache-view SDPA
+
+      model.attention_impl = tuned_decode_attention
+      out = block._attention(decode_norm, 5).realize().numpy()  # same decode step, tuned kernel active
+
+      np.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2, err_msg=f"{kv_dtype=}")
 
 if __name__ == '__main__':
   unittest.main()
