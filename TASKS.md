@@ -4,15 +4,15 @@ Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
 (AOOSTAR AG02) is in the mail — **Phase 0 tasks need no NVIDIA hardware at all.**
 
-> **STATUS 2026-08-19 (post wave 7 + bench window 3):** 7 agent waves + 3 bench windows,
-> ~48 tasks closed (✅/❌/📋 markers below; the **Status log** is the authoritative record).
-> Open pre-dock work: **T4.13** (gpt-oss MXFP4 per-token materialization — biggest remaining
-> Metal lever, expected 1.69→~20-40 tok/s), **T4.12** (warmup×chunk_size JitError), optional
-> **T2.4**, and the on-hold **PR train** (T4.9 → T4.7+T1.8c-fix → T4.2 → T4.1 →
-> T1.5/T1.6/T2.1/T2.2; submission gated on Artur, AI disclosure mandatory). Closed pre-dock:
-> fused attention (T4.8 final no-go — machinery built, waits for sm_86), Stage B bridge (parked
-> for dock). Everything else is dock-gated (TD.x). All landed work merged on `integration/wave1`,
-> gates green. Measured state: qwen3:8b METAL decode 7.38 no-BEAM / ~14 BEAM vs llama.cpp 27.1.
+> **STATUS 2026-08-19 (post wave 8):** 8 agent waves + 3 bench windows, ~50 tasks closed
+> (✅/❌/📋 markers below; the **Status log** is the authoritative record). **All pre-dock code
+> work is DONE.** Remaining before the dock: one bench confirm (gpt-oss with the T4.13 MXFP4
+> fusion fix — expect 1.69 → ~20-40 tok/s), the on-hold **PR train** (T4.9 → T4.13 →
+> T4.7+T1.8c-fix → T4.2 → T4.1 → T1.5/T1.6/T2.1/T2.2; submission gated on Artur, AI disclosure
+> mandatory), and optional T2.4 (rented 3090). Closed pre-dock: fused attention (T4.8 final
+> no-go — machinery built, waits for sm_86), Stage B bridge (parked for TD.3). All landed work
+> merged on `integration/wave1`, gates green. Measured: qwen3:8b METAL decode 7.38 no-BEAM /
+> ~14 BEAM vs llama.cpp 27.1; the remaining single-GPU gap is attention + prefill kernels.
 
 ## Conventions for agents
 
@@ -290,21 +290,15 @@ can be built and proven before the dock ships.
 - **TD.4 — Publish**: upstream PR train (T1.1, T1.2, T1.4-6, T2.1-2 first — smallest, benchmarked);
   demo pooling to exo#1904 + tinygrad Discord. deps: TD.2 numbers.
 
-## Dependency graph (remaining work only — original Phase-0 graph retired 2026-08-19, all nodes resolved; see Status log)
+## Dependency graph (remaining work only — updated 2026-08-19 post wave 8)
 
 ```mermaid
 flowchart LR
-  T47[T4.7 symbolic custom_kernel done] --> T18c[T1.8c symbolic tuned attn]
-  T18c -->|only if it wins| T48[T4.8 warp reduce ~300-550 lines]
-  T34[T3.4 analysis done] --> T36[T3.6 async signal bridge]
-  T411[T4.11 gpt-oss byte blowup]
-  T18c --> BW[next bench window]
-  T411 --> BW
-  BW --> PR[PR train - on Artur's go]
+  BW4[bench window 4: gpt-oss confirm] --> PR[PR train - on Artur's go]
   subgraph DOCK["dock arrives"]
-    TD1[TD.1 first light] --> TD2[TD.2 truth table] --> TD3[TD.3 land+tune] --> TD4[TD.4 publish]
+    TD1[TD.1 first light] --> TD2[TD.2 truth table] --> TD3[TD.3 land+tune, revisit T3.6/T4.8] --> TD4[TD.4 publish + demo]
   end
-  T36 --> TD3
+  BW4 --> TD2
 ```
 
 ## Status log
@@ -376,9 +370,9 @@ flowchart LR
 
 ## Parallelization notes
 
-Remaining lanes (updated 2026-08-19, post window 3): **(a)** T4.13 MXFP4 materialization — the
-one big lever left on Metal; **(b)** T4.12 filler; **(c)** next bench window only needs the T4.13
-real-model confirm; **(d)** PR train on Artur's go. All branches off `integration/wave1`.
+Remaining lanes (updated 2026-08-19, post wave 8): **(a)** bench window 4 — the T4.13 real-model
+confirm (+ post-wave-7/8 headline stability); **(b)** PR train on Artur's go; **(c)** dock (TD.x).
+No launchable code tasks remain pre-dock.
 Agent policy: one tight objective per agent, Sonnet at max effort, explicit STOP conditions,
 commit early, RELATIVE paths in worktrees; verify premises with a control experiment before
 optimizing (T1.4/T1.9/T4.10 all refuted their premises — cheapest work of the project).
