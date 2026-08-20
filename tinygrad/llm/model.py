@@ -348,7 +348,9 @@ class MLATransformerBlock(FFNBlock):
     if not hasattr(self, "cache_k"):
       self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim,
                                   dtype=kv_cache_dtype(), device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device,
+        yarn_factor=self.config.yarn_factor, yarn_orig_ctx=self.config.yarn_orig_ctx, yarn_beta_fast=self.config.yarn_beta_fast,
+        yarn_beta_slow=self.config.yarn_beta_slow, yarn_attn_factor=self.config.yarn_attn_factor)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
