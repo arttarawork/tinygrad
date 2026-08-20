@@ -283,8 +283,24 @@ can be built and proven before the dock ships.
 
 - **TD.1 — TinyGPU first light**: install script, DEXT approval, `DEV=NV` test_tiny; audit
   `is_bar_small()` on the AG02 and where kernargs/cmdq land (design §3.1). deps: dock.
+  **Pre-arrival intel (2026-08-20, github.com/Watcharasorn/mac-tinygpu-5070ti — same AG02 dock,
+  5070 Ti + M4 Pro, WORKING):** preflight before any install (`system_profiler SPPCIDataType`
+  shows 0x10de + a BAR/Memory range, Thunderbolt shows Link Up); power the eGPU before/with the
+  Mac, direct cable, no hub; **no BAR range → STOP, collect debug, try dock/cable/port — do not
+  loop installs, never disable SIP** (BAR-missing is a real M4 failure mode, upstream #16714);
+  driver extension enable + reboot; Docker running before the nvcc helper. Their scripts/ dir is
+  an adaptable preflight/bring-up harness. Our 3090 (sm_86, mature TC path) is better placed than
+  their Blackwell card.
 - **TD.2 — WS0 truth table**: full matrix via T0.3 harness — `DEV=NV{,:NAK}`, `JITBEAM={0,2}`,
   vs Metal + llama.cpp baselines. Names the real top-3 bottlenecks. deps: TD.1, T0.3.
+  **External reference row (Watcharasorn, 5070 Ti/USB4, tinygrad f2c2f44, 2026-07-31):** decode is
+  per-layer round-trip bound — ~26 ms/token floor for 16-layer models regardless of size
+  (llama3.2:1b 37.6 tok/s ≈ olmoe 38.2), ~3.5 ms/layer at 36 layers (qwen3:8b 8.0 tok/s),
+  effective BW capped ~31-38 GB/s on an 896 GB/s card; llama.cpp native CUDA same card:
+  110-130 tok/s. First TD.2 question: why doesn't HCQGraph collapse the per-layer cost over the
+  tunnel — that 3.5 ms/layer is the whole game, and T2.1/T2.2/T2.3 + drain_every>1 are the
+  prepared levers. Their IQ3_XXS 35B blowup (~83 GB/token, upstream #17316) is T4.13's LUT
+  mechanism on IQ quants — a scoped follow-up fix could close that issue.
 - **TD.3 — Land the prepared work on real transport**: tune T2.3 knobs, validate T2.1/T2.2 wins,
   re-measure T1.x on NV, swap T3.2's CPU→NV = actual Metal+NV pooling. deps: listed tasks.
 - **TD.4 — Publish**: upstream PR train (T1.1, T1.2, T1.4-6, T2.1-2 first — smallest, benchmarked);

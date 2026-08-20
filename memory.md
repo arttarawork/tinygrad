@@ -228,6 +228,18 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   Headline stable at 7.37/qwen3:8b. Bench branches (`task/bench-window-{2,3,4}`, T0.3 harness)
   stay unmerged by convention — CSV + BENCH_NOTES.md live on `task/bench-window-4` tip.
 
+- **2026-08-20 (upstream landscape + the Watcharasorn find):** No open upstream PRs touch any of
+  the nine PR-train topics — clear field. Upstream issue **#17316** (open, no maintainer reply)
+  is our exact niche twice over: Qwen3.6-35B IQ3_XXS reading ~83 GB/token = **T4.13's LUT
+  mechanism on IQ quants** (codebook LUT gathers → unfusable REDUCE → all experts materialize;
+  his OLMoE-Q4_K-works contrast confirms it), and his comment thread's layer-count-driven fixed
+  cost = our WS2 transport thesis. Upstream PR **#17446** (open since Aug 7) is a competing
+  gpt-oss arch — ours (T1.3) is more complete; watch for sync conflicts.
+  **github.com/Watcharasorn/mac-tinygpu-5070ti** = a working AG02-dock bring-up runbook
+  (5070 Ti + M4 Pro): preflight criteria, power-ordering, the no-BAR stop rule, and real tunnel
+  numbers (26 ms/token floor, ~3.5 ms/layer, 38 GB/s cap on an 896 GB/s card; llama.cpp native
+  110-130 tok/s) — folded into TD.1/TD.2. He is the prototype audience for the TD.4 demo.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
