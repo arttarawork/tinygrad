@@ -239,6 +239,26 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   (5070 Ti + M4 Pro): preflight criteria, power-ordering, the no-BAR stop rule, and real tunnel
   numbers (26 ms/token floor, ~3.5 ms/layer, 38 GB/s cap on an 896 GB/s card; llama.cpp native
   110-130 tok/s) — folded into TD.1/TD.2. He is the prototype audience for the TD.4 demo.
+- **2026-08-20 (deep upstream sweep — the policy find and six technical cross-references):**
+  **Discussion #14615: a disclosed-AI-assisted PR (tested, 100-run benchmarked, hand-verified)
+  was CLOSED with "do not use ai"** — no maintainer reply in the discussion, no written policy.
+  This is harder than the "ai slop revert" datum: even disclosed + validated AI use was rejected
+  once. PR-train implication (Artur's call): (a) submit anyway with disclosure and exemplary
+  rigor, accepting closure risk; (b) file the FINDINGS as issues with repros instead (SCACHE
+  cross-serve + vacuous PCONTIG tests; the LUT-fusion mechanism on #17316) — high value, less
+  policy exposure, patches stay on the fork for anyone; (c) ask on Discord first.
+  Technical cross-refs: **#13707 (geohot)** wants JIT/schedule-cache consistency asserts and
+  **#12514 (chenyuxyz)** flags SPLIT_REDUCEOP inconsistency — both squarely in T4.9's territory
+  (frame T4.9 as answering maintainer-flagged concerns). **#17617** (Aug 20) requests lazy
+  disk-loading of MoE experts — live demand for our T3.3+T1.9 machinery with a disk tier.
+  **#17074** (lazy reader before view assign reads post-write values) is the engine-level cousin
+  of our CI class-2 shared-unrealized-UOp corruption — upstream-known, open. **#16520** (rand
+  seed reuse — two Tensor.rand get identical values under some realize orders) is the first
+  suspect if the T3.1 rand ghost ever resurfaces. **#16595** (mtl_buffers_in_flight membership
+  check → linear step-time growth) is the same cost family T3.4 measured (synchronize scaling
+  150→1134 µs with in-flight work). **#16894** (Blackwell sm_120 TC nan under HALF+BEAM)
+  validates the 3090/sm_86 choice. **#13263** ("NV,PCI,NAK → WPR2 is not initialized") goes on
+  the TD.1 landmine list.
 
 ## 7. Sources
 
