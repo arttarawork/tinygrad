@@ -269,3 +269,8 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
 - llama.cpp Metal+CUDA RPC benchmarks: https://github.com/kjaiswal/llama-cpp-distributed-benchmarks
 - Qwen 3.8 release coverage: https://the-decoder.com/alibabas-qwen-team-releases-qwen-3-8-models-with-open-weights-under-the-apache-2-0-license/
 - Design doc artifact: https://claude.ai/code/artifact/f430cb11-aade-418c-9a8f-b63dae7b7988
+- PR-train dossier artifact (diffs, STE explanations, commit messages, glossary, 2026-08-19):
+  https://claude.ai/code/artifact/fb3c41a4-acb3-4e9d-98db-d3e622cb3ee5
+- Watcharasorn AG02 bring-up runbook: https://github.com/Watcharasorn/mac-tinygpu-5070ti
+- Upstream cross-refs: #17316 (IQ MoE byte blowup = T4.13 mechanism), #17446 (competing gpt-oss
+  PR), #13707/#12514 (T4.9 framing), #17617 (disk-lazy experts demand), #14615 (AI-PR closure)

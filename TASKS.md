@@ -23,6 +23,11 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   mypy 1.19.1, ruff 0.14.10). From any checkout/worktree: `PYTHONPATH=. <venv>/bin/python -m ...`.
 - Before pushing: `PYTHONPATH=. .venv/bin/python -m pytest <touched area> -x -q -n12`,
   `.venv/bin/python -m mypy tinygrad/`, `.venv/bin/python -m ruff check .`
+- Fork pushes (2026-08-19): use `gh` — `gh auth setup-git` once, then push via explicit HTTPS URL
+  (`git push https://github.com/arttarawork/tinygrad.git <branch>`); SSH works only from Artur's
+  interactive shell. The gh token LACKS `workflow` scope: pushes touching `.github/workflows/`
+  need Artur (or `gh auth refresh -s workflow`). CI logs/reruns: `gh run view --log-failed`,
+  `gh run rerun <id> --failed -R arttarawork/tinygrad`.
 - **Worktree agents: use RELATIVE paths for repo files.** Absolute `/Users/artur/Documents/tinygrad/...`
   paths silently resolve to the shared checkout (different branch!) — a T2.5 agent lost time to a
   phantom "stale file" bug this way. Absolute paths are correct only for the venv and model caches.
