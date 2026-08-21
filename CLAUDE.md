@@ -17,9 +17,11 @@ Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line ref
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off the baseline `af2a43c85` (== `origin/master`; there is no local
-  `master`). Remotes (verified 2026-08-18): `origin` = arttarawork/tinygrad (the fork),
-  `upstream` = tinygrad/tinygrad. Rebase docs branch weekly.
+- Branch `task/T<id>-<slug>` off fork `master` (`457e1a915` since 2026-08-21 = the PR #1 merge:
+  all Phase 0 work + upstream `b8cc74ecf`; there is no local `master` — use `origin/master`).
+  The old baseline `af2a43c85` applies only to the original Phase 0 branches. Remotes: `origin` =
+  arttarawork/tinygrad (the fork), `upstream` = tinygrad/tinygrad. Rebase docs branch weekly and
+  **push `memory` + unmerged evidence branches after each session** (backup; see TASKS.md conventions).
 - Python: there is **no bare `python`** on this Mac and Homebrew `python3` (3.14) has no test deps.
   Use the repo venv: `PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q -n12`;
   typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .`

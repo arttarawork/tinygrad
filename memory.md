@@ -3,7 +3,8 @@
 Companion to `NV_LLM_DESIGN.md` (the design doc, same directory). This file holds the context,
 decision history, external research, and repo findings that the design doc deliberately leaves out.
 Written 2026-08-18 against `tinygrad @ af2a43c85` (v0.13.0-968). Fork: `arttarawork/tinygrad`.
-Published copy of the design doc: https://claude.ai/code/artifact/f430cb11-aade-418c-9a8f-b63dae7b7988
+Published copy of the design doc (2026-08-18 snapshot — SUPERSEDED by the repo copy, which has
+all later corrections; republish before sharing): https://claude.ai/code/artifact/f430cb11-aade-418c-9a8f-b63dae7b7988
 
 ## 1. Who / hardware / why
 
@@ -259,6 +260,19 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   150→1134 µs with in-flight work). **#16894** (Blackwell sm_120 TC nan under HALF+BEAM)
   validates the 3090/sm_86 choice. **#13263** ("NV,PCI,NAK → WPR2 is not initialized") goes on
   the TD.1 landmine list.
+
+- **2026-08-21 (docs review + housekeeping):** Full review of TASKS.md / NV_LLM_DESIGN.md /
+  memory.md / both CLAUDE.md files. Facts overtaken by events, now corrected: **Artur merged
+  PR #1** — fork `master` = `457e1a915` (Phase 0 work + upstream `b8cc74ecf`); task-branch base
+  convention moved to fork `master` (`integration/wave1` retired as a base, content identical);
+  the `memory` branch was 72 commits unpushed (whole project record single-machine) — pushed,
+  along with the 6 unmerged evidence branches; docs-push added to conventions. Also promoted to
+  conventions: DEV=CPU pass on llm work, stagger master/branch pushes; bench choreography now
+  notes the Hermes impact of stopping llama-server. Design doc: §5 re-dated (Phase 0 complete),
+  risks gained #17446 (competing gpt-oss PR) and the #14615 G3-premise doubt. Housekeeping:
+  stale `integration/wave1-local` branch deleted, clean agent worktrees pruned. NOT done
+  (Artur's calls): upstream sync (32 commits past `b8cc74ecf`, incl. an llm kimi fix — due),
+  PR-route decision, design-doc artifact republish.
 
 ## 7. Sources
 

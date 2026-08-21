@@ -4,25 +4,38 @@ Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
 (AOOSTAR AG02) is in the mail — **Phase 0 tasks need no NVIDIA hardware at all.**
 
-> **STATUS 2026-08-19 (post wave 8):** 8 agent waves + 3 bench windows, ~50 tasks closed
+> **STATUS 2026-08-21 (Phase 0 COMPLETE):** 8 agent waves + 4 bench windows, ~55 tasks closed
 > (✅/❌/📋 markers below; the **Status log** is the authoritative record). **All pre-dock code
-> work is DONE.** Remaining before the dock: one bench confirm (gpt-oss with the T4.13 MXFP4
-> fusion fix — expect 1.69 → ~20-40 tok/s), the on-hold **PR train** (T4.9 → T4.13 →
-> T4.7+T1.8c-fix → T4.2 → T4.1 → T1.5/T1.6/T2.1/T2.2; submission gated on Artur, AI disclosure
-> mandatory), and optional T2.4 (rented 3090). Closed pre-dock: fused attention (T4.8 final
-> no-go — machinery built, waits for sm_86), Stage B bridge (parked for TD.3). All landed work
-> merged on `integration/wave1`, gates green. Measured: qwen3:8b METAL decode 7.38 no-BEAM /
-> ~14 BEAM vs llama.cpp 27.1; the remaining single-GPU gap is attention + prefill kernels.
+> work is DONE and measured.** Bench window 4 confirmed T4.13 at real scale: gpt-oss-20b decode
+> 1.69 → **10.97 tok/s no-BEAM / 15.52 BEAM** (bytes 59.3 → 3.46 GB/token); long-context gpt-oss
+> is now attention-COMPUTE-bound on Metal → sm_86 case. Headline: qwen3:8b METAL decode 7.38
+> no-BEAM / 14.40 BEAM vs llama.cpp 27.1. **PR #1 (integration/wave1 → fork master) MERGED** —
+> fork `master` (`457e1a915`) now carries all Phase 0 work on top of upstream `b8cc74ecf`.
+> Remaining: the on-hold **PR train** (T4.9 → T4.13 → T4.7+T1.8c-fix → T4.2 → T4.1 →
+> T1.5/T1.6/T2.1/T2.2; submission gated on Artur's route decision — see memory.md §6 2026-08-20,
+> AI disclosure mandatory), optional T2.4 (rented 3090), and the dock (TD.x). Closed pre-dock:
+> fused attention (T4.8 final no-go — machinery built, waits for sm_86), Stage B bridge (parked
+> for TD.3).
 
 ## Conventions for agents
 
-- Branch per task: `task/T<id>-<slug>` off baseline `af2a43c85` (== `origin/master`; no local
-  `master` branch exists). Remotes: `origin` = arttarawork/tinygrad fork, `upstream` = tinygrad/tinygrad.
+- Branch per task: `task/T<id>-<slug>` **off fork `master`** (`457e1a915` = the PR #1 merge:
+  all Phase 0 work + upstream through `b8cc74ecf`). No local `master` branch exists — use
+  `origin/master`. The old "baseline `af2a43c85`" applies only to the original Phase 0 task
+  branches; `integration/wave1` is retired as a base (its content is fully in `master`).
+  Remotes: `origin` = arttarawork/tinygrad fork, `upstream` = tinygrad/tinygrad.
 - Python env (Mac, verified 2026-08-18): no bare `python`; Homebrew python3.14 has no test deps.
   Use `/Users/artur/Documents/tinygrad/.venv` (numpy, torch, pytest+xdist, hypothesis, z3, gguf,
   mypy 1.19.1, ruff 0.14.10). From any checkout/worktree: `PYTHONPATH=. <venv>/bin/python -m ...`.
 - Before pushing: `PYTHONPATH=. .venv/bin/python -m pytest <touched area> -x -q -n12`,
   `.venv/bin/python -m mypy tinygrad/`, `.venv/bin/python -m ruff check .`
+- **llm-touching work also gets a `DEV=CPU` pass** (CI's Linux default; our METAL-default gates
+  missed 3 real failures on PR #1 this way — see the 2026-08-19 fork-CI row).
+- **Stagger pushes to `master` and feature branches** — concurrent pushes run two full CI
+  matrices at once and starve the fork runners into setup timeouts (post-sync CI lesson).
+- **Push the `memory` docs branch (and any unmerged evidence branch) after each session** —
+  `git push https://github.com/arttarawork/tinygrad.git memory` — the docs and bench CSVs are
+  the un-regenerable part of this project; local-only means one dead laptop loses the record.
 - Fork pushes (2026-08-19): use `gh` — `gh auth setup-git` once, then push via explicit HTTPS URL
   (`git push https://github.com/arttarawork/tinygrad.git <branch>`); SSH works only from Artur's
   interactive shell. The gh token LACKS `workflow` scope: pushes touching `.github/workflows/`
@@ -36,6 +49,9 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
   MXFP4 for T1.3 validation OK). **llama-server still keeps ~23 GB wired** (LaunchAgent KeepAlive)
   — before real-model METAL runs / T0.1 benchmarks, stop it: `launchctl bootout gui/501/com.artur.llama-server`
   (restart: `launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.artur.llama-server.plist`).
+  **Before stopping, check Hermes isn't mid-scheduled-task**: its 9 auxiliary text tasks
+  (compression, triage, …) AND its last-resort fallback provider run on this llama-server —
+  both degrade for the whole bench window (~/CLAUDE.md "Hermes wiring" has the details).
   Tiny random-weight configs are fine anytime.
 - Perf claims need before/after numbers from the T0.3 harness on named hardware. Upstream-bound
   changes must be small and hand-verified — maintainers have reverted "ai slop" before (see memory.md §4).
@@ -308,21 +324,24 @@ can be built and proven before the dock ships.
   mechanism on IQ quants — a scoped follow-up fix could close that issue.
 - **TD.3 — Land the prepared work on real transport**: tune T2.3 knobs, validate T2.1/T2.2 wins,
   re-measure T1.x on NV, swap T3.2's CPU→NV = actual Metal+NV pooling. deps: listed tasks.
-- **TD.4 — Publish**: upstream PR train (T1.1, T1.2, T1.4-6, T2.1-2 first — smallest, benchmarked);
-  demo pooling to exo#1904 + tinygrad Discord. deps: TD.2 numbers.
+- **TD.4 — Publish**: upstream PR train in the current queue order (T4.9 → T4.13 →
+  T4.7+T1.8c-fix → T4.2 → T4.1 → T1.5/T1.6/T2.1/T2.2 — see the status banner; route decision
+  pending, memory.md §6); demo pooling to exo#1904 + tinygrad Discord. deps: TD.2 numbers.
 
-## Dependency graph (remaining work only — updated 2026-08-19 post wave 8)
+## Dependency graph (remaining work only — updated 2026-08-21, Phase 0 complete)
 
 ```mermaid
 flowchart LR
-  BW4[bench window 4: gpt-oss confirm] --> PR[PR train - on Artur's go]
+  ROUTE[Artur: PR-route decision] --> PR[PR train]
   subgraph DOCK["dock arrives"]
     TD1[TD.1 first light] --> TD2[TD.2 truth table] --> TD3[TD.3 land+tune, revisit T3.6/T4.8] --> TD4[TD.4 publish + demo]
   end
-  BW4 --> TD2
 ```
 
 ## Status log
+
+Append-only log: a task can appear twice (an "open" creation row and a later "done" row) and
+rows are not strictly date-sorted — **the latest row for a task wins.**
 
 | Date | Task | State | Branch | Notes |
 |---|---|---|---|---|
@@ -386,19 +405,21 @@ flowchart LR
 | 2026-08-18 | device_map flake | SOLVED (see fork-CI row: DEV=CPU trigger) | — | 2 independent agent sightings (T1.9, T4.6: `test_split_matches_single_device`, `test_experts_split_matches_unsplit_homogeneous` fail in THEIR worktrees, verified pre-existing via stash) but **0/2 reproductions on the quiet main checkout** (solo ×3, file -n12, full `-k llm` -n12 all green). Pattern: only under concurrent multi-agent machine load in `.claude/worktrees/*`. If a third sighting lands: dedicate an investigation task (suspects: cross-test state via `manual_seed`/module globals under xdist, or load-dependent scheduling nondeterminism). Do NOT "fix" blind. |
 | 2026-08-18 | T3.4 | **done — hypothesis REFUTED** | `task/T3.4-zero-copy` | `8e70a80a5`, **NOT merged into integration** (working aliasing behind `ZERO_COPY=1` + sync-semantics tests, but zero measured win: alias ≈ copy at every scale). Root cause isolated: **the fixed per-hop cost is SYNCHRONIZATION, not memcpy** — `Device.synchronize()` after any dispatch is a ~150 µs `waitUntilCompleted` full-queue drain both paths pay. Also: Metal `external_ptr` takes an ObjC MTLBuffer id, NOT a raw pointer (CPU-owned pointer → hard crash; only METAL-owns/CPU-borrows works). Branch kept as evidence + the sync-semantics test suite; aliasing machinery not worth carrying. |
 | 2026-08-19 | T3.6 (new) | open | — | **The real Stage B item (replaces aliasing):** async signal bridge. Convert the cross-backend sync from CPU-blocking full-drain to a GPU-side dependency edge: encode `MTLSharedEvent` waitForEvent into the consuming command buffer ahead of submit; a watcher signals it when the producer's HCQ signal word (NV — or CPU HCQ2 for a pre-dock rehearsal) crosses the value. Needs a JIT-capturable foreign-wait op + buffer-lifetime coordination. Full sketch in T3.4's report. Bigger task; matters most post-dock but METAL↔CPU rehearsal is possible now. |
-| 2026-08-18 | T2.3 | agent running | `task/T2.3-remote-knobs` | wave 5: no-op remote knob skeleton, selection-path test; values post-dock |
 | 2026-08-18 | T2.5 | **done** | `task/T2.5-sync-amortize` | `2b1470d73` (+129/−9): chained-K landed — decode already chained on-device (`.item()` was pure host bookkeeping); now launches ≤`drain_every` steps then one batched drain. Gotcha found: TinyJit reuses output buffers across replays → deferred tokens need `.clone().realize()` (drain_every=1 stays zero-extra-op). **Default 1** (existing per-call test contracts); N=4 opt-in. Metal llama3.2:1b: ~0.25-0.76 ms/tok saved (~1-2%, compute-dominated) — real payoff is the TB socket round-trip floor later. EOS mid-window: ≤N−1 wasted device steps, yielded sequence unchanged. 83+20 tests, mypy+ruff clean. |
 | 2026-08-18 | T4.5 | **done** | `task/T4.5-force-realize` | `d8f02dd90` (+72/−27): `Transformer.realize_placement()` — one home for the T3.2 force-realize, from_gguf delegates, manual loaders call it post-load; asserts on params stranded outside the map (correctness bug, not a warning). T3.3's test helper deleted; dense split test's captured-copy assertion tightened to EXACTLY one boundary hop (T3.3's 39-copy pollution closed). 79 tests, mypy+ruff clean. Kept fork-side (rejected touching upstream `load_state_dict` — rationale in report). |
 | 2026-08-18 | T3.3 | **done** | `task/T3.3-moe-placement` | `6b942a18d` (+174/−18): `experts:<dev>` device_map segment; router stays with block. Mid-block hops capture/replay fine in JIT (no new mechanism needed). **Hop count = 3 copies/MoE-layer, not 2** (`sel` must travel with `h` for the weight gather) — verified exactly on tiny configs AND olmoe (48 copies = 16×3). olmoe METAL+experts:CPU tokens exact vs all-CPU. **Design rule discovered: the GGUF load device must be the BIG-memory side** — moving the big expert tensors across a boundary force-realizes them at full fp16 (~13 GB for olmoe), defeating fused dequant; move the small attention share instead. 788 unit tests green. Incidental: manual-`load_state_dict` callers miss `from_gguf`'s force-realize fix (captured-COPY trap, pre-existing) — filler task below. |
 | 2026-08-18 | T4.5 (new filler) | open | — | Move the T3.2 force-realize fix from `from_gguf` into `load_state_dict`-adjacent code (or a `Transformer` post-load hook) so manual-load callers get it too; also give hand-built weights a device= footgun guard (`Tensor.randn` strands params on `Device.DEFAULT`). Small, `[ANY]`, branch off `integration/wave1`. |
 | 2026-08-18 | T4.1 | **done — ON HOLD per Artur** | `task/T4.1-matvec-pr` | `d6da66dce` (amended) on upstream tip `e37b44d04`. One 29-line heuristic.py commit + 3 tests + PR_MATVEC.md. Re-verified on tip: fp16 gemv ~1.4x (105 vs 75 GB/s), Q4_0 ~4x (42 vs 11 GB/s); MV=0 ≡ unpatched control. **Artur 2026-08-18: no upstream PRs for now; when submitted, AI usage disclosed upfront** — PR text now carries a disclosure section + Co-Authored-By trailer in the suggested commit message. Applies to all future T4.x PR-prep tasks. NOT pushed. |
 | 2026-08-18 | T0.1+T0.3 | **done** | `task/T0.3-bench-harness` | `fb2356ac0`: harness (`extra/bench_llm.py` wrapper + GB/s in `benchmark_llm.py`) + CSV + BENCH_NOTES.md. **METAL qwen3:8b Q4_K_M decode tok/s: llama.cpp 27.27 · upstream no-BEAM 4.92 · integration no-BEAM 7.28 (+48%) · upstream BEAM 12.86 · integration BEAM 14.44 (+12%, 53% of llama.cpp)**. Prefill flat no-BEAM (levers are decode-only); BEAM prefill slightly down on integration (single runs, unchased). llama-server stopped for the window and RESTORED after. |
+| 2026-08-21 | PR #1 merged + docs review | **done** | `memory` | Artur merged PR #1 → fork `master` = `457e1a915` (all Phase 0 work + upstream `b8cc74ecf`); task-branch base convention updated to fork `master`, `integration/wave1` retired as a base. Full docs review pass: banner/mermaid/TD.4/lanes de-staled; DEV=CPU + push-stagger + docs-push lessons promoted to conventions; Hermes note added to bench choreography; design-doc §1/§5/risks refreshed. Backup pushed: `memory` + 6 unmerged evidence branches (`task/bench-window-{2,3,4}`, `task/T0.3-bench-harness`, `task/T3.4-zero-copy`, `task/T4.1-matvec-pr`) to the fork. Upstream drift at review time: 32 commits past `b8cc74ecf` (incl. an llm kimi fix) — sync due, not performed (Artur's call). |
 
 ## Parallelization notes
 
-Remaining lanes (updated 2026-08-19, post wave 8): **(a)** bench window 4 — the T4.13 real-model
-confirm (+ post-wave-7/8 headline stability); **(b)** PR train on Artur's go; **(c)** dock (TD.x).
-No launchable code tasks remain pre-dock.
+Remaining lanes (updated 2026-08-21, Phase 0 complete): **(a)** PR train — blocked on Artur's
+route decision (memory.md §6 2026-08-20); **(b)** dock (TD.x); **(c)** optional T2.4 (rented
+3090). No launchable code tasks remain pre-dock. Upstream sync cadence: weekly (last sync
+`b8cc74ecf`, 2026-08-19); watch upstream #17446 (competing gpt-oss arch — merge would conflict
+with our T1.3 in `llm/model.py`).
 Agent policy: one tight objective per agent, Sonnet at max effort, explicit STOP conditions,
 commit early, RELATIVE paths in worktrees; verify premises with a control experiment before
 optimizing (T1.4/T1.9/T4.10 all refuted their premises — cheapest work of the project).

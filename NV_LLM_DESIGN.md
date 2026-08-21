@@ -4,13 +4,13 @@
 
 | | |
 |---|---|
-| Status | Draft v1 |
+| Status | Living doc (written 2026-08-18; last full review 2026-08-21) |
 | Date | 2026-08-18 |
 | Baseline | `tinygrad/tinygrad` @ `af2a43c85` (v0.13.0-968, master as of today) |
 | Hardware | MacBook Pro M3 Pro 36 GB (Metal, ~150 GB/s) + RTX 3090 24 GB (sm_86, 936 GB/s) in a TB/USB4 eGPU dock via TinyGPU |
 | Goal owner | Artur |
 
-This file is an untracked working copy at the repo root; all `file:line` references are against the baseline commit above.
+This file is tracked on the fork's `memory` branch; all `file:line` references are against the baseline commit above.
 
 ---
 
@@ -24,7 +24,7 @@ Three goals, in priority order:
 - **G2 — Heterogeneous pooling.** Run one model across Metal (~27 GB usable) + NV (24 GB) — ~50 GB of weights — with a per-layer/per-tensor device map, including the MoE placement policy (attention + shared weights + KV on the 3090, routed experts on the Mac).
 - **G3 — Upstreamability.** Every change lands as a small, benchmarked PR that survives tinygrad's review culture; nothing depends on a long-lived fork.
 
-An important honesty note on the baseline: tinygrad's published CI numbers run `JITBEAM=2` (beam-searched kernels); the defaults a fresh user gets are un-beamed (`BEAM=0`, `helpers.py:231`). Some of the public "10x slower" gap may be configuration, not capability. **Measured 2026-08-18 on this MacBook (METAL, qwen3:8b Q4_K_M — see `task/T0.3-bench-harness` BENCH_NOTES.md):** llama.cpp decode 27.27 tok/s; tinygrad upstream 4.92 no-BEAM / 12.86 BEAM (so beam alone is a 2.6x config gap); our wave-1/2 levers take it to 7.28 no-BEAM (+48%) / 14.44 BEAM (+12%, 53% of llama.cpp). The remaining ~2x vs llama.cpp is the WS1 fused-attention + further kernel work.
+An important honesty note on the baseline: tinygrad's published CI numbers run `JITBEAM=2` (beam-searched kernels); the defaults a fresh user gets are un-beamed (`BEAM=0`, `helpers.py:231`). Some of the public "10x slower" gap may be configuration, not capability. **Measured 2026-08-18 on this MacBook (METAL, qwen3:8b Q4_K_M — see `task/T0.3-bench-harness` BENCH_NOTES.md):** llama.cpp decode 27.27 tok/s; tinygrad upstream 4.92 no-BEAM / 12.86 BEAM (so beam alone is a 2.6x config gap); our Phase 0 levers take it to a final stable 7.38 no-BEAM (+50%) / 14.40 BEAM (+12%, 53% of llama.cpp — bench window 4). The remaining ~2x vs llama.cpp is the WS1 fused-attention + further kernel work.
 
 ## 2. Why this is winnable
 
@@ -172,12 +172,16 @@ KV-cache quantization (q8 KV) is the natural follow-on lever once fp16 KV lands.
 
 ## 5. Milestones
 
-**Status 2026-08-18 (pre-dock, all on Metal):** M0's method delivered early — measured table +
+**Status 2026-08-21 (Phase 0 COMPLETE, all on Metal):** M0's method delivered — measured table +
 attribution exist (see §1 note); top bottleneck named: attention fusion + prefill kernels (the
 ~2x vs llama.cpp), with BEAM config gap quantified at 2.6x. Decode levers landed and measured
-(+48% no-BEAM). WS3 Stage A proven cross-backend (T3.1/T3.2); MoE placement (T3.3) is the next
-pooling step. M1/M2's eGPU acceptance numbers remain dock-gated; the transport levers for them
-(copyout pipelining, PTE batching) are written and mock-validated.
+(+50% no-BEAM). WS3 Stage A fully proven cross-backend incl. MoE expert placement (T3.1-T3.3,
+exact tokens on real models). gpt-oss-20b root-caused and fixed (T4.13 MXFP4 fusion: 1.69 →
+10.97 no-BEAM / 15.52 BEAM); its long-context decode is attention-compute-bound on Metal — the
+sm_86 tensor-core case. Fused attention on Metal closed until the dock (machinery built, T4.8
+no-go). M1/M2's eGPU acceptance numbers remain dock-gated; the transport levers for them
+(copyout pipelining, PTE batching, remote knobs) are written and mock-validated. All work merged
+to fork `master` via PR #1; fork CI green (53/53 real checks) + clean ultra-review.
 
 | | Deliverable | Acceptance |
 |---|---|---|
@@ -189,7 +193,8 @@ pooling step. M1/M2's eGPU acceptance numbers remain dock-gated; the transport l
 
 ## 6. Risks
 
-- **Upstream churn.** 880 commits since June; rangeify and hcq2 are moving targets. Mitigation: small patches, rebase weekly, no long-lived fork (G3 is a goal precisely because of this).
+- **Upstream churn.** 880 commits since June; rangeify and hcq2 are moving targets. Mitigation: small patches, rebase weekly, no long-lived fork (G3 is a goal precisely because of this). Specific watch item: upstream PR #17446 (competing gpt-oss arch, open since Aug 7) — if it merges, the next sync conflicts head-on with our T1.3 in `llm/model.py`.
+- **G3's premise is under active doubt.** Upstream Discussion #14615: a disclosed-AI-assisted, tested, benchmarked PR was closed with "do not use ai" — even exemplary disclosure may not survive review. The PR train is held pending Artur's route decision (submit with disclosure / file findings as issues / ask on Discord first) — memory.md §6, 2026-08-20. Until decided, G3's "lands as PRs" framing may become "lands as issues + fork patches".
 - **The DEXT is not ours to change.** TinyGPU.app ships signed from `tinygpu_releases` (pinned commit, `system.py:419-425`); anything requiring DEXT changes (segment limits, resize BAR, bulk-PTE RPC verbs server-side) needs tiny corp buy-in. Everything in WS1/WS2 except possibly bulk-PTE lives on the Python side.
 - **Flash-attention fusion may stay experimental.** `PCONTIG>2` is explicitly unfinished; the custom_kernel fallback de-risks WS1.4.
 - **fp16 KV accuracy** needs validation per family (SSM/MLA blocks may be more sensitive).
