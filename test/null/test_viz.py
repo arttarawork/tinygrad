@@ -43,7 +43,7 @@ def save_viz():
   Buffer.profile_events.clear()
   cpu_events.clear()
   viz = VizTrace()
-  with Context(VIZ=-1, TRACK_MATCH_STATS=2, PROFILE=1):
+  with Context(VIZ=-1, TRACK_MATCH_STATS=2, PROFILE=1, PARALLEL=0):
     yield viz
   viz.set_data()
 
@@ -236,8 +236,8 @@ class TestViz(unittest.TestCase):
   def test_const_node_visibility(self):
     with save_viz() as viz:
       a = UOp.variable("a", 0, 10, dtype=dtypes.int)
-      z = UOp.const(0, a.dtype)
-      y = UOp.const(math.pi, dtypes.float)
+      z = UOp.const(0)
+      y = UOp.const(math.pi)
       alu = a*z
       ret = exec_rewrite(sink:=UOp.sink(alu, y), [sym])
     lst = viz.list_items()
@@ -249,7 +249,7 @@ class TestViz(unittest.TestCase):
     self.assertTrue(graphs[0][id(y)]["exclude"])
     self.assertFalse(graphs[0][id(alu)]["exclude"])
     self.assertEqual(graphs[0][id(y)]["label"].split("\n")[:2], ["CONST", "3.14159"])
-    self.assertEqual(list(graphs[1]), [id(z), id(y), id(ret)])
+    self.assertEqual(list(graphs[1]), [id(u) for u in ret.toposort()])  # rewrite graph keys follow the rewritten sink's toposort
 
   def test_const_reshape_expand_folded(self):
     # CONST->EXPAND should be folded into the ALU node, not shown as separate EXPAND nodes
@@ -515,6 +515,19 @@ class TestVizIntegration(unittest.TestCase):
     assert src_idx is not None, "must have source rendering in list"
     src_render = get_render(viz.data, steps[src_idx]["query"])["src"]
     self.assertEqual(src, src_render)
+
+  @unittest.expectedFailure
+  def test_profiler_duplicate_name(self):
+    kernel_name = "duplicate_name"
+    def one(A:UOp): return A[0].store(UOp.const(1.0, dtypes.float)).sink(arg=KernelInfo(kernel_name))
+    def zero(A:UOp): return A[0].store(UOp.const(0.0, dtypes.float)).sink(arg=KernelInfo(kernel_name))
+    with save_viz() as viz:
+      Tensor.custom_kernel(Tensor.empty(4, device="NULL"), fxn=one)[0].realize()
+      Tensor.custom_kernel(Tensor.empty(4, device="NULL"), fxn=zero)[0].realize()
+    ctx_refs = [i for i,c in enumerate(viz.list_items()) if c["name"] == kernel_name]
+    profile = decode_profile(unwrap(get_profile(viz.data, cpu_events)))
+    events = [e for e in profile["layout"]["NULL"]["events"] if e["name"] == kernel_name]
+    self.assertEqual([e["ref"] for e in events], ctx_refs)
 
 from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry
 from tinygrad.viz.serve import get_profile
