@@ -274,6 +274,20 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   (Artur's calls): upstream sync (32 commits past `b8cc74ecf`, incl. an llm kimi fix — due),
   PR-route decision, design-doc artifact republish.
 
+- **2026-08-21 (upstream sync #3 + regression review):** merged `upstream/master` @ `80bf60d78`
+  (32 commits) onto fork master — zero conflicts, all gates green (unit+opt 882 / backend 1255 /
+  DEV=CPU 97 / mock-NV 49 / mypy+ruff). Notable incoming: kimi `resolve_linear_call` nested-scope
+  fix (same file as T4.9, different region, no interaction), parallel-compile `engine/worker.py`
+  (no T1.6 jit-cache interaction — backend suite green), fused_qkv_rope try 2 + fa changes are
+  AMD `extra/thunder` only, `gptoss: save more` is mlperf-side only. **The find: upstream #17630
+  added `test_chunked_prefill_kv_cache_matches_single_chunk` as `expectedFailure` — a real
+  chunked-prefill KV-cache bug upstream knows about. Our tree passes it, at temp 0 and 1.0.
+  Bisect (bug confirmed at `af2a43c85`): first fixed by T1.5 `f53ceb67f` (temp-0 RNG skip / jit
+  re-key by (is_prefill, greedy)).** This is the strongest PR-train datum yet: an upstream-pinned
+  failing test that a T1.5-carrying PR would flip green — input to the pending route decision.
+  Push handoff: merge touches CI workflow files → Artur pushes `sync/upstream-2026-08-21:master`.
+  Real-model bench check deferred to the next llama-server window.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
@@ -287,4 +301,5 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   https://claude.ai/code/artifact/fb3c41a4-acb3-4e9d-98db-d3e622cb3ee5
 - Watcharasorn AG02 bring-up runbook: https://github.com/Watcharasorn/mac-tinygpu-5070ti
 - Upstream cross-refs: #17316 (IQ MoE byte blowup = T4.13 mechanism), #17446 (competing gpt-oss
-  PR), #13707/#12514 (T4.9 framing), #17617 (disk-lazy experts demand), #14615 (AI-PR closure)
+  PR), #13707/#12514 (T4.9 framing), #17617 (disk-lazy experts demand), #14615 (AI-PR closure),
+  #17630 (chunked-prefill KV bug pinned as expectedFailure — our T1.5 fixes it, bisect-proven)
