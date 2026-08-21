@@ -1,10 +1,18 @@
 from __future__ import annotations
-import enum, functools, itertools, pathlib
+import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
+from typing import Callable, cast
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
+from tinygrad.dtype import DType
 from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
+
+def kv_cache_dtype() -> DType:
+  """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
+  the dominant decode-memory cost). KV_F32=1 reverts to dtypes.default_float, e.g. to isolate an accuracy
+  regression. Does NOT apply to GatedDeltaNetBlock's recurrent state -- see its _init_state for why."""
+  return dtypes.default_float if getenv("KV_F32", 0) else dtypes.float16
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -13,18 +21,34 @@ class ExpertGating(enum.IntEnum):
   SQRT_SOFTPLUS = 4
 
 @functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None) -> Tensor:
-  freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
-  freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
-  return freqs.cos().cat(freqs.sin(), dim=-1).clone(device)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None, yarn_factor: float = 1.0,
+                          yarn_orig_ctx: int = 0, yarn_beta_fast: float = 32.0, yarn_beta_slow: float = 1.0,
+                          yarn_attn_factor: float|None = None) -> Tensor:
+  inv_freq = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
+  attn_scale = 1.0
+  if yarn_factor > 1.0:
+    # YaRN NTK-by-parts frequency interpolation (https://arxiv.org/abs/2309.00071), verified against
+    # transformers' _compute_yarn_parameters (modeling_rope_utils.py): low/high bound the "correction
+    # range" (in rotary-dim index space) where we blend extrapolated (raw) and interpolated (/factor) freqs.
+    def find_dim(num_rot:float) -> float: return (dim * math.log(yarn_orig_ctx / (num_rot * 2 * math.pi))) / (2 * math.log(theta))
+    low = float(max(math.floor(find_dim(yarn_beta_fast)), 0))
+    high = float(min(math.ceil(find_dim(yarn_beta_slow)), dim // 2 - 1))
+    if low == high: high += 0.001
+    extrap_factor = 1.0 - ((Tensor.arange(dim // 2) - low) / (high - low)).clamp(0, 1)
+    inv_freq = inv_freq / yarn_factor * (1 - extrap_factor) + inv_freq * extrap_factor
+    attn_scale = yarn_attn_factor if yarn_attn_factor is not None else (0.1 * math.log(yarn_factor) + 1.0 if yarn_factor > 1 else 1.0)
+  freqs = Tensor.arange(end).unsqueeze(dim=1) * inv_freq.unsqueeze(dim=0)
+  return (freqs.cos() * attn_scale).cat(freqs.sin() * attn_scale, dim=-1).clone(device)
 
 class ExpertWeights:
   """Like Linear but with num_experts dimension. Weight shape: (num_experts, out_features, in_features)."""
-  def __init__(self, num_experts:int, in_features:int, out_features:int):
+  def __init__(self, num_experts:int, in_features:int, out_features:int, bias:bool=False):
     self.weight = Tensor.zeros(num_experts, out_features, in_features)
+    if bias: self.bias = Tensor.zeros(num_experts, out_features)
   def __call__(self, sel:Tensor, x:Tensor) -> Tensor:
     # sel: (B, T, k), x: (B, T, 1, in) or (B, T, k, in) -> output: (B, T, k, out)
-    return (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+    out = (x.unsqueeze(-2) @ self.weight[sel].transpose(-1, -2)).contiguous().squeeze(-2)
+    return out + self.bias[sel] if hasattr(self, 'bias') else out
 
 def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   assert x.shape[-1] % 2 == 0
@@ -80,6 +104,20 @@ class TransformerConfig:
   routed_scaling_factor: float = 1.0
   qkv_bias: bool = False
   expert_bias: bool = False
+  attn_out_bias: bool = False
+  router_bias: bool = False
+  moe_bias: bool = False
+  attn_sinks: bool = False
+  sliding_window: int = 0
+  sliding_layers: tuple[bool, ...] = ()
+  clamp_swiglu: bool = False
+  swiglu_limit: float = 7.0
+  swiglu_alpha: float = 1.702
+  yarn_factor: float = 1.0
+  yarn_orig_ctx: int = 0
+  yarn_beta_fast: float = 32.0
+  yarn_beta_slow: float = 1.0
+  yarn_attn_factor: float|None = None
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -91,11 +129,11 @@ class FFNBlock:
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
-      self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=False)  # router
+      self.ffn_gate_inp = Linear(config.dim, config.num_experts, bias=config.router_bias)  # router
       if config.expert_bias: self.exp_probs_b = {"bias": Tensor.zeros(config.num_experts)}
-      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim)
-      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim)
+      self.ffn_gate_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, bias=config.moe_bias)
+      self.ffn_up_exps = ExpertWeights(config.num_experts, config.dim, config.hidden_dim, bias=config.moe_bias)
+      self.ffn_down_exps = ExpertWeights(config.num_experts, config.hidden_dim, config.dim, bias=config.moe_bias)
       if config.shared_expert_dim > 0:
         self.ffn_gate_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
         self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
@@ -126,7 +164,20 @@ class FFNBlock:
       if gating == ExpertGating.SOFTMAX_WEIGHT: probs = probs.softmax(-1)
       if normalize_topk: probs = probs / probs.sum(axis=-1, keepdim=True)
       probs = probs * self.config.routed_scaling_factor
-      x_down = self.ffn_down_exps(sel, (self.ffn_gate_exps(sel, h).silu() * self.ffn_up_exps(sel, h)).contiguous())  # (B, T, k, D)
+      # routed experts may live on a different device than attention/router (device_map "experts:<dev>"); the
+      # weights never move (placed once at load), only these activations hop, around the three ExpertWeights
+      # calls. sel must travel with h: self.weight[sel] indexes the (now-remote) weight buffer with it, so both
+      # operands of that gather need to be on the same device. .to() is a no-op when already co-located.
+      expert_dev = self.ffn_gate_exps.weight.device
+      h, sel = h.to(expert_dev), sel.to(expert_dev)
+      gate, up = self.ffn_gate_exps(sel, h), self.ffn_up_exps(sel, h)
+      if self.config.clamp_swiglu:
+        # gpt-oss clamped swiglu: gate*sigmoid(alpha*gate) * (up+1), both branches clamped
+        gate, up = gate.clamp(max_=self.config.swiglu_limit), up.clamp(-self.config.swiglu_limit, self.config.swiglu_limit)
+        act = gate * (self.config.swiglu_alpha * gate).sigmoid() * (up + 1)
+      else:
+        act = gate.silu() * up
+      x_down = self.ffn_down_exps(sel, act.contiguous()).to(x.device)  # (B, T, k, D), hop back to the block device
       out = (x_down * probs.unsqueeze(-1)).sum(axis=2)  # (B, T, D)
       if hasattr(self, 'ffn_gate_shexp'):
         shexp = self.ffn_down_shexp(self.ffn_gate_shexp(x).silu().contiguous() * self.ffn_up_shexp(x))
@@ -135,6 +186,11 @@ class FFNBlock:
       return out
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+
+  @property
+  def device(self) -> str|tuple[str, ...]|None:
+    assert self.attn_norm.weight is not None
+    return self.attn_norm.weight.device
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -150,6 +206,22 @@ class FFNBlock:
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
     return _run(x, start_pos)
 
+# --- attention-override hook (T1.8) -----------------------------------------------------------
+# Pluggable seam for a fused/tuned attention kernel to replace the standard (multi-kernel) SDPA
+# expression below. Swap this module attribute (e.g. `tinygrad.llm.model.attention_impl = my_fn`)
+# to route TransformerBlock's *standard* attention path through a custom implementation. Two
+# paths intentionally do NOT go through this hook and are unaffected by swapping it:
+#   - the manual attention-sinks softmax (gpt-oss, config.attn_sinks) in TransformerBlock itself
+#   - MLATransformerBlock / GatedDeltaNetBlock, which compute attention inline, not via SDPA
+# Signature matches Tensor.scaled_dot_product_attention's shape contract:
+#   q:(B,H,T,Hd)  k,v:(B,KvH,Tk,Hd)  mask:(1,1,T,Tk)|None  ->  (B,H,T,Hd)
+# A custom impl that only handles some shapes (e.g. decode-only, T==1, unmasked) must fall back
+# to `_sdpa_default` itself for everything else (prefill, sliding-window masks, etc).
+def _sdpa_default(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
+  return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+
+attention_impl: Callable[[Tensor, Tensor, Tensor, Tensor|None], Tensor] = _sdpa_default
+
 class TransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
     super().__init__(config)
@@ -161,8 +233,9 @@ class TransformerBlock(FFNBlock):
     self.attn_q      = Linear(config.dim, q_proj_out,  bias=config.qkv_bias)
     self.attn_k      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
     self.attn_v      = Linear(config.dim, kv_proj_out, bias=config.qkv_bias)
-    self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=False)
+    self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=config.attn_out_bias)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
+    if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
@@ -181,9 +254,12 @@ class TransformerBlock(FFNBlock):
     k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    assigned_kv = Tensor(self.cache_kv.uop.after(self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).uop)))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :]
-    v = assigned_kv[1, :, :, 0:start_pos+T, :]
+    # cast to the cache's dtype at write (a no-op when KV_F32=1); cast back up to the activation dtype at
+    # read, so attention compute always runs at x's precision regardless of what the cache stores
+    assigned_kv = Tensor(self.cache_kv.uop.after(
+      self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)))
+    k = assigned_kv[0, :, :, 0:start_pos+T, :].cast(x.dtype)
+    v = assigned_kv[1, :, :, 0:start_pos+T, :].cast(x.dtype)
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -191,17 +267,38 @@ class TransformerBlock(FFNBlock):
 
     # NOTE: this mask is causal_lower_right, not the causal_upper_left generated by is_casual = True
     # TODO: this if statement should be removed and it shouldn't generate extra kernels
-    mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
-      if resolve(T != 1) else None
-    attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
+    # sliding-window layers also need a mask at T==1 (decode), to drop cache entries older than the window
+    mask = None
+    if resolve(T != 1) or self.config.sliding_window:
+      mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1)
+      if self.config.sliding_window:
+        mask = mask + Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).tril(start_pos - self.config.sliding_window)
+
+    if hasattr(self, "attn_sinks"):
+      # attention sinks: a learned per-head logit that only contributes to the softmax denominator
+      # (no value contribution), competing with real keys for probability mass. Can't express this via
+      # scaled_dot_product_attention's attn_mask (that only biases real score entries), so do it manually.
+      KV, R = self.config.n_kv_heads, self.config.n_heads // self.config.n_kv_heads
+      qg, kg, vg = q.reshape(B, KV, R, T, self.config.head_dim), k.unsqueeze(2), v.unsqueeze(2)
+      scores = (qg.cast(dtypes.float32) @ kg.cast(dtypes.float32).transpose(-1, -2)) * (1.0 / self.config.head_dim ** 0.5)
+      if mask is not None: scores = scores + mask.unsqueeze(1)
+      sink = self.attn_sinks["weight"].reshape(1, KV, R, 1, 1).cast(dtypes.float32)
+      m = scores.max(-1, keepdim=True).maximum(sink)
+      e = (scores - m).exp()
+      w = (e / (e.sum(-1, keepdim=True) + (sink - m).exp())).cast(x.dtype)
+      attn = (w @ vg.cast(x.dtype)).reshape(B, self.config.n_heads, T, self.config.head_dim)
+    else:
+      attn = attention_impl(q, k, v, mask)                                            # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
       self.cache_kv = Tensor.empty(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.default_float, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+                                   dtype=kv_cache_dtype(), device=x.device)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device,
+        yarn_factor=self.config.yarn_factor, yarn_orig_ctx=self.config.yarn_orig_ctx, yarn_beta_fast=self.config.yarn_beta_fast,
+        yarn_beta_slow=self.config.yarn_beta_slow, yarn_attn_factor=self.config.yarn_attn_factor)
 
 class MLATransformerBlock(FFNBlock):
   def __init__(self, config:TransformerConfig):
@@ -234,7 +331,9 @@ class MLATransformerBlock(FFNBlock):
     if not self.config.ssm or not self.config.ssm.kda: k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
-    k = Tensor(self.cache_k.uop.after(self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.uop)))[:, :, 0:start_pos+T, :]
+    # cast to the cache's dtype at write, back up to x's dtype at read -- see TransformerBlock._attention
+    k = Tensor(self.cache_k.uop.after(
+      self.cache_k[:, :, start_pos:start_pos+T, :].uop.store(k_store.cast(self.cache_k.dtype).uop)))[:, :, 0:start_pos+T, :].cast(x.dtype)
     v = k[..., :self.config.kv_lora_rank]
 
     mask = Tensor.full((1, 1, T, start_pos+T), float("-inf"), dtype=x.dtype, buffer=False).triu(start_pos+1) \
@@ -247,8 +346,11 @@ class MLATransformerBlock(FFNBlock):
 
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_k"):
-      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device)
+      self.cache_k = Tensor.empty(x.shape[0], 1, self.config.max_context, self.config.kv_lora_rank + self.config.rope_dim,
+                                  dtype=kv_cache_dtype(), device=x.device)
+      self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device,
+        yarn_factor=self.config.yarn_factor, yarn_orig_ctx=self.config.yarn_orig_ctx, yarn_beta_fast=self.config.yarn_beta_fast,
+        yarn_beta_slow=self.config.yarn_beta_slow, yarn_attn_factor=self.config.yarn_attn_factor)
 
 class GatedDeltaNetBlock(FFNBlock):
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
@@ -274,7 +376,7 @@ class GatedDeltaNetBlock(FFNBlock):
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
-    initial = Tensor(start_pos).eq(0)
+    initial = Tensor(start_pos, device=x.device).eq(0)
     is_kda = hasattr(self, "ssm_g_a")
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
@@ -292,7 +394,7 @@ class GatedDeltaNetBlock(FFNBlock):
     conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
+    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels, device=x.device).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
     win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
     conv_window = Tensor(win)
@@ -334,43 +436,167 @@ class GatedDeltaNetBlock(FFNBlock):
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
-      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim, device=x.device).clone()
+      # conv_state only ever holds the last (conv_kernel-1) input rows (already upcast to fp32 on read via
+      # win.dtype in _attention above) and doesn't scale with max_context, but it's free to halve too: an
+      # evidence run (tiny random-weight config, 5 prompts x 64 decode steps, isolated from recurrent_state
+      # by keeping recurrent_state fp32) showed 0/320 greedy-token divergences, max logit delta ~0.003 --
+      # flag-gate it like the KV caches.
+      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, dtype=kv_cache_dtype(), device=x.device).clone()
+      # recurrent_state is NOT flag-gated -- always fp32, unlike the write-once/read-many KV caches above it
+      # is read-modify-written every decode step (decay + delta rule), so fp16 error compounds across the
+      # whole generation instead of staying local to one position. Evidence (same tiny config/harness, fp16
+      # recurrent_state isolated from conv_state -- conv_state fp32): 7/320 greedy tokens flipped (2 of 5
+      # prompts affected) with max logit delta ~2.9 -- vs 0/320 and ~0.003 for every KV-cache-like buffer
+      # above (TransformerBlock.cache_kv, MLATransformerBlock.cache_k, this block's own conv_state). It's
+      # also O(1) in max_context (no memory win from halving it), so there's no upside to offset that risk.
+      self.recurrent_state = Tensor.zeros(x.shape[0], self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                                          dtype=dtypes.default_float, device=x.device).clone()
+
+def parse_device_map(dm:str|dict[int|str,str], num_blocks:int) -> tuple[list[str], str|None]:
+  """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}.
+  An optional "experts:<device>" segment (str form) or "experts" key (dict form) routes MoE routed-expert weight
+  tensors (ffn_{gate,up,down}_exps) to a separate device, independent of their block's device. The router
+  (ffn_gate_inp) always stays with its block. Returns (per-block devices, experts device or None)."""
+  if isinstance(dm, dict):
+    experts_dev = dm.get("experts")
+    blocks = {k: v for k, v in dm.items() if k != "experts"}
+    assert all(i in blocks for i in range(num_blocks)), f"device_map must cover all {num_blocks} blocks: {dm}"
+    return [blocks[i] for i in range(num_blocks)], experts_dev
+
+  parts = [s.strip() for s in dm.split(",")]
+  experts_parts = [p for p in parts if p.startswith("experts:")]
+  assert len(experts_parts) <= 1, f"device_map has more than one 'experts:' segment: {dm}"
+  experts_dev = experts_parts[0].split(":", 1)[1] if experts_parts else None
+  assert experts_dev != "", f"device_map 'experts:' segment needs a device: {dm}"
+  block_dm = ",".join(p for p in parts if not p.startswith("experts:"))
+  assert block_dm, f"device_map has no block segments (only 'experts:'): {dm}"
+
+  segs = [s.strip().split(":", 1) for s in block_dm.split(",")]
+  indexed = [len(s) == 2 and s[0].replace("-", "").isdigit() for s in segs]
+  if not any(indexed):
+    # no free-memory query exists on Device/Allocator, so auto placement splits evenly by block count
+    devs = [s.strip() for s in block_dm.split(",")]
+    assert len(devs) <= num_blocks, f"device_map lists {len(devs)} devices for only {num_blocks} blocks: {dm}"
+    return [devs[i * len(devs) // num_blocks] for i in range(num_blocks)], experts_dev
+  assert all(indexed), f"device_map mixes indexed ('lo[-hi]:device') and plain segments: {dm}"
+  out: list[str|None] = [None] * num_blocks
+  for rng, dev in segs:
+    lo_s, _, hi_s = rng.partition("-")
+    lo, hi = int(lo_s), int(hi_s or lo_s)
+    assert 0 <= lo <= hi < num_blocks, f"device_map range {rng} out of bounds for {num_blocks} blocks: {dm}"
+    assert all(out[i] is None for i in range(lo, hi+1)), f"device_map range {rng} overlaps a previous range: {dm}"
+    for i in range(lo, hi+1): out[i] = dev
+  assert all(out), f"device_map must cover all {num_blocks} blocks: {dm}"
+  return out, experts_dev  # type: ignore[return-value]
 
 class Transformer:
-  def __init__(self, config:TransformerConfig):
+  def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
-    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(dense_config if i < config.leading_dense_blocks else config, config.ssm)
-                               if config.ssm and config.ssm_layers[i] else
-                               block_cls(dense_config if i < config.leading_dense_blocks else config) for i in range(config.num_blocks)]
+    def _cfg(i:int) -> TransformerConfig:
+      cfg = dense_config if i < config.leading_dense_blocks else config
+      # sliding_layers marks which layers use the windowed attention span; others get the full-context mask
+      if config.sliding_layers and not config.sliding_layers[i]: cfg = replace(cfg, sliding_window=0)
+      return cfg
+    self.blk:list[FFNBlock] = [GatedDeltaNetBlock(_cfg(i), config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(_cfg(i))
+                               for i in range(config.num_blocks)]
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    # set by the device_map branch below; None means "no device_map", the fast/no-op path for realize_placement()
+    self._placed_devices: frozenset[str]|None = None
+    if device_map is not None:
+      dmap, experts_dev = parse_device_map(device_map, config.num_blocks)
+      for block, dev in zip(self.blk, dmap):
+        for p in nn.state.get_parameters(block): p.to_(dev)
+      # token_embd feeds the first block; output_norm/output consume the last block's activations
+      for p in nn.state.get_parameters(self.token_embd): p.to_(dmap[0])
+      for p in nn.state.get_parameters([self.output_norm, self.output]): p.to_(dmap[-1])
+      # routed-expert weights (not the router, which stays with attention) move to a separate device on
+      # top of the per-block placement above -- overrides ffn_{gate,up,down}_exps' dev for every MoE block
+      if experts_dev is not None:
+        for block in self.blk:
+          if hasattr(block, 'ffn_gate_exps'):
+            for p in nn.state.get_parameters([block.ffn_gate_exps, block.ffn_up_exps, block.ffn_down_exps]): p.to_(experts_dev)
+      # canonicalized so it compares equal to p.device later (e.g. "CPU:0" -> "CPU") -- realize_placement()'s footgun guard
+      self._placed_devices = frozenset(Device.canonicalize(d) for d in dmap + ([experts_dev] if experts_dev is not None else []))
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # we specialize the JIT for prefill and rollout
-    self.prefill_jit = TinyJit(self.forward)
-    self.rollout_jit = TinyJit(self.forward)
+    # we specialize the JIT for prefill/rollout and sampled/greedy; prefill also keys on chunk_size (T4.12) --
+    # created lazily in __call__ since chunk_size isn't known until generate() picks one
+    self.jit: dict[tuple[bool, bool, int|None], Callable[..., Tensor]] = {}
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    x = self.token_embd(tokens).float()                   # (B, T, D)
-    for block in self.blk: x = block(x, start_pos)
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
+    # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
+    # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
+    # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
+    x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    # activations hop devices at block boundaries (.to is a no-op when the device matches)
+    for block in self.blk: x = block(x.to(block.device), start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    # greedy (temperature is None): plain argmax, no RNG kernels
+    if temperature is None: return logits.argmax(-1, keepdim=True)
+    temperature = temperature.to(logits.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
-    return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature)
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
+    is_prefill = bool(resolve(tokens.shape[1] != 1))
+    # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
+    # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
+    # generate() at a different chunk_size replay a jit captured with the wrong Variable range -> JitError
+    # ("args mismatch in JIT"). Decode/rollout steps feed a plain (1,1) tensor (no bound Variable, chunk_size-
+    # independent), so only the prefill variants need the extra key; None keeps the rollout jit singular.
+    chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
+    return self.jit.setdefault((is_prefill, temperature is None, chunk_size), TinyJit(self.forward))(
+      tokens.contiguous(), start_pos, temperature)
+
+  def realize_placement(self):
+    """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --
+    e.g. `nn.state.load_state_dict(model, state_dict, realize=False); model.realize_placement()` for manual loaders.
+    No-op (single attribute check) when device_map wasn't passed to __init__.
+
+    load_state_dict's assignment is a `.to(param.device)` per tensor; when that device differs from the load
+    source it's an unrealized COPY. Left lazy, that COPY gets captured into the JIT trace and re-executed (dequant
+    AND copy) every token (measured: 21 spurious COPYs/step on a 2-block METAL/CPU split test model -> 1 real one,
+    once realized here). Only the moved-off-Device.DEFAULT params pay this: a COPY is a materialization boundary
+    either way, so it never fused the GGUF dequant into the consuming matmul in the first place -- same-device
+    params are left alone and keep that fusion (the memory win from never materializing full weights).
+
+    Also a footgun guard: a hand-built weight assigned without device= (e.g. Tensor.randn(...), which defaults to
+    Device.DEFAULT) silently strands itself off the map instead of following its block's placement. Assert (not
+    warn) -- this runs once right after load, not in a hot loop, and a silently-stranded weight is a correctness
+    bug (wrong-device compute or a surprise COPY every step), not something to let slide."""
+    if self._placed_devices is None: return
+    params = nn.state.get_parameters(self)
+    moved = [p for p in params if p.device != Device.DEFAULT]
+    for p in moved: p.replace(p.contiguous())
+    # Tensor.realize(*moved) is `moved[0].realize(*moved[1:])` -- with moved empty (every param's device_map
+    # entry happens to canonicalize to Device.DEFAULT, e.g. device_map="CPU:0" when DEV=CPU) that's a bare
+    # Tensor.realize() call with no `self` bound at all: TypeError, not skip-nothing-to-do. Guard it.
+    if moved: Tensor.realize(*moved)
+    # params are always single-device here (llm/model.py never shards a weight) -- cast satisfies canonicalize's str|None signature
+    stray = sorted(set(Device.canonicalize(cast(str, p.device)) for p in params) - self._placed_devices)
+    assert not stray, f"device_map: param(s) landed on {stray}, outside the configured device_map {sorted(self._placed_devices)} " \
+      "(a hand-built tensor is probably missing device=)"
+
+  # T4.6: _init_state pre-allocates the whole KV cache (shape ~ max_context) on the first forward, before a
+  # single token is generated. A caller who doesn't pass max_context used to get the model's NATIVE context
+  # (up to 131072) here -- 2.2-5.3x the model's own weight size in KV cache nobody asked for (T1.9's finding,
+  # measured: llama3.2:1b +4.3GB, qwen3:8b +6.07GB). Default to something sane instead; a caller that really
+  # wants the model's full native context can still ask for it explicitly, either with max_context=<big N>
+  # (min()'d against native below, so overshooting is harmless) or max_context=None (bypasses the cap entirely).
+  DEFAULT_MAX_CONTEXT = 8192
 
   @staticmethod
-  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=None,
+  def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=DEFAULT_MAX_CONTEXT, *,
+                device_map:str|dict[int|str,str]|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # TODO: remove the need for copy to default device
-    kv, state_dict = gguf_load(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
+    # gguf_load streams per-tensor (T1.9); no need to force the whole file onto the default device first
+    kv, state_dict = gguf_load(gguf)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}
@@ -398,7 +624,7 @@ class Transformer:
         state_dict[f"blk.{i}.ssm_conv1d.weight"] = state_dict.pop(f"blk.{i}.ssm_conv1d_q.weight").cat(
           state_dict.pop(f"blk.{i}.ssm_conv1d_k.weight"), state_dict.pop(f"blk.{i}.ssm_conv1d_v.weight"), dim=0).squeeze(1).contiguous()
         state_dict[f"blk.{i}.ssm_out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
-    if arch in ('qwen35', 'qwen35moe', 'glm4moe'):
+    if arch in ('qwen35', 'qwen35moe', 'glm4moe', 'gpt-oss'):
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
@@ -417,6 +643,14 @@ class Transformer:
         state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
         state_dict[name] = state_dict[name][:kv_lora_rank].cat(state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2), dim=0)
+
+    ld = kv.get(f'{arch}.leading_dense_block_count', 0)
+    # gpt-oss: llama.cpp doesn't write a per-layer pattern key for this; the alternation (even=sliding,
+    # odd=full, starting at layer 0) is architecture-fixed, same as the HF config's `layer_types` and
+    # examples/mlperf/models/gpt_oss.py's `sliding = i % 2 == 0`. GGUF only carries the window *size*.
+    sliding_layers = tuple(i % 2 == 0 for i in range(kv[f'{arch}.block_count'])) if arch == 'gpt-oss' else ()
+    rope_scaling = kv.get(f'{arch}.rope.scaling.type')
+    yarn_factor = kv[f'{arch}.rope.scaling.factor'] if rope_scaling == 'yarn' else 1.0
     config = TransformerConfig(
       num_blocks=kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0), dim=kv[f'{arch}.embedding_length'],
       hidden_dim=kv.get(f'{arch}.expert_feed_forward_length', kv.get(f'{arch}.feed_forward_length', 0)),
@@ -430,28 +664,49 @@ class Transformer:
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
       norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch in ('qwen3moe', 'qwen35moe', 'kimi-linear')),
-      expert_gating_func=ExpertGating(kv.get(f'{arch}.expert_gating_func', ExpertGating.SOFTMAX)),
+      # gpt-oss routes with softmax computed only over the selected top-k logits (no GGUF key for this; the HF
+      # model has no configurable score_function, it's baked into the arch, same as examples/mlperf/models/gpt_oss.py)
+      expert_gating_func=ExpertGating(
+        kv.get(f'{arch}.expert_gating_func', ExpertGating.SOFTMAX_WEIGHT if arch == 'gpt-oss' else ExpertGating.SOFTMAX)),
       kv_lora_rank=kv_lora_rank, q_lora_rank=kv.get(f'{arch}.attention.q_lora_rank', 0),
-      leading_dense_blocks=kv.get(f'{arch}.leading_dense_block_count', 0),
+      leading_dense_blocks=ld,
       shared_expert_dim=kv.get(
         f'{arch}.expert_shared_feed_forward_length',
         kv.get(f'{arch}.expert_shared_count', 0) * kv.get(f'{arch}.expert_feed_forward_length', 0)),
-      shared_expert_gate=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.ffn_gate_inp_shexp.weight" in state_dict,
-      dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if kv.get(f'{arch}.leading_dense_block_count', 0) else 0,
+      shared_expert_gate=f"blk.{ld}.ffn_gate_inp_shexp.weight" in state_dict,
+      dense_hidden_dim=kv.get(f'{arch}.feed_forward_length', 0) if ld else 0,
       routed_scaling_factor=kv.get(f'{arch}.expert_weights_scale', 1.0), attn_output_gate=arch in ('qwen35', 'qwen35moe'), ssm=ssm,
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
-      expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
-    model = Transformer(config)
+      expert_bias=f"blk.{ld}.exp_probs_b.bias" in state_dict,
+      attn_out_bias='blk.0.attn_output.bias' in state_dict,
+      router_bias=f"blk.{ld}.ffn_gate_inp.bias" in state_dict,
+      moe_bias=f"blk.{ld}.ffn_gate_exps.bias" in state_dict,
+      attn_sinks='blk.0.attn_sinks.weight' in state_dict,
+      sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
+      sliding_layers=sliding_layers,
+      # gpt-oss's clamped-swiglu limit/alpha aren't GGUF metadata either (no config knob upstream); fixed
+      # constants confirmed against the HF gpt-oss config (swiglu_limit=7.0) and examples/mlperf/models/gpt_oss.py
+      clamp_swiglu=arch == 'gpt-oss', swiglu_limit=7.0, swiglu_alpha=1.702,
+      yarn_factor=yarn_factor, yarn_orig_ctx=kv.get(f'{arch}.rope.scaling.original_context_length', 0),
+      yarn_beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0), yarn_beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0),
+      yarn_attn_factor=kv.get(f'{arch}.rope.scaling.yarn_attn_factor'))
+    model = Transformer(config, device_map)  # pre-placed params make load_state_dict load each weight to its mapped device
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())
       Tensor.realize(*params)
+    else:
+      # device_map's cross-device placements MUST realize -- see Transformer.realize_placement's docstring.
+      # No-op when device_map is None (nothing moved off Device.DEFAULT to begin with).
+      model.realize_placement()
     return model, kv
 
   def warmup(self):
-    for _ in range(2): list(zip(range(2), self.generate([0])))
+    # warm both the greedy and sampled jit pairs, so a request doesn't pay a mid-request capture for whichever it hits first
+    for temperature in (0.0, 1.0):
+      for _ in range(2): list(zip(range(2), self.generate([0], temperature=temperature)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -461,24 +716,68 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1):
+    """drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
+    syncing every sampled token. drain_every=1 (default) is byte-identical to the pre-T2.5 behavior -- every
+    generate()-caller and test that assumes one .item()/next() per decode step keeps working unchanged. Pass
+    drain_every=2..4 from a real serving loop to amortize the sync (streaming still yields one token at a time,
+    just in bursts -- see the NOTE below the drain block for EOS handling)."""
+    # T4.6: a prompt that already fills (or overflows) max_context has zero room to generate into. Without this,
+    # `while virtual_len < self.max_context` below never runs and this silently yields nothing (len==max_context),
+    # or the `t = Tensor(...).reshape(1, self.max_context)` a few lines down throws an opaque shape-mismatch
+    # (len>max_context) -- neither names the actual problem. serve.py has its own (HTTP-level) version of this
+    # check before it ever calls generate(); this is the equivalent guard for every other caller (CLI, library).
+    assert len(tokens) < self.max_context, \
+      f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
+      "-- raise it via --max_context (cli.py) or Transformer.from_gguf(max_context=...)"
     if self.has_recurrent_block: chunk_size = 1
+    drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
-    temp = Tensor([temperature])
+    # create helper tensors on the block devices that consume them, so device_map'd models don't replay a cross-device copy every step
+    temp = Tensor([temperature], device=self.blk[-1].device) if temperature > 0 else None
     # assign all input tokens once, then slice from start_pos for the model call
-    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32").reshape(1, self.max_context)
+    t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32", device=self.blk[0].device).reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
-    while len(tokens) < self.max_context:
-      n_toks = min(chunk_size, len(tokens) - start_pos)
+    # T2.5: a sampled token already chains device-side -- `out` feeds the next step's input directly (below),
+    # no host round-trip needed for the compute itself. .item() was only ever needed for host bookkeeping/
+    # streaming (tokens list, _cached_tokens, yield). So launch up to `drain_every` decode steps back-to-back
+    # (each still its own realize(), all async-dispatched -- see engine/realize.py's run_linear(wait=False)) and
+    # read them all back with ONE host copy instead of one .item() sync per token. `pending` holds the
+    # not-yet-host-read device tensors; `virtual_len` tracks what len(tokens) *will* be once pending is drained,
+    # so the chunk/prefill arithmetic below is untouched by the deferral -- only the host-visible
+    # append/_cached_tokens/yield timing moves.
+    pending: list[Tensor] = []
+    virtual_len = len(tokens)
+    while virtual_len < self.max_context:
+      n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
-      if start_pos < len(tokens): continue
-      tokens.append(int(out.item()))
-      self._cached_tokens = tokens[:-1]
-      yield tokens[-1]
+      if start_pos < virtual_len: continue
+      # move the sampled token once, back to t's device, so the next step's input matches the JIT's prefill-captured device.
+      if out.device != t.device: out = out.to(t.device).realize()
+      # when draining is deferred (drain_every>1), `out` outlives the JIT replay that produced it -- the JIT reuses its
+      # output buffer across replays (engine/jit.py's memory_plan_rewrite), so a not-yet-drained `out` would silently
+      # alias data the *next* chained step's replay overwrites. Snapshot it into a private buffer to break that alias.
+      # drain_every==1 (the default) drains immediately below, before any further replay can touch the buffer -- no
+      # snapshot needed there, so this stays a pre-T2.5-identical zero-extra-op path.
+      elif drain_every > 1: out = out.clone().realize()
+      pending.append(out)
+      virtual_len += 1
+      # drain once the batch fills, or generation is about to stop (don't strand tokens on-device)
+      if len(pending) >= drain_every or virtual_len >= self.max_context:
+        # NOTE on EOS: the caller checks for a stop token per yielded value (see cli.py/serve.py's is_end loop)
+        # and stops pulling from this generator. Because we yield one token at a time from the drained batch
+        # below, a stop token anywhere in the batch makes the caller break before the extras after it are ever
+        # appended/yielded -- self._cached_tokens and the returned `tokens` list end exactly at what was
+        # actually consumed. The only cost is up to drain_every-1 already-computed, now-wasted device steps.
+        for v in cast(list[list[int]], Tensor.cat(*pending, dim=1).tolist())[0]:
+          tokens.append(int(v))
+          self._cached_tokens = tokens[:-1]
+          yield tokens[-1]
+        pending = []

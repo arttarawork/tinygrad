@@ -106,7 +106,14 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     self.binded_device = dev
     self.hw_page = dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True))
     hw_view = self.hw_page.cpu_view().view(fmt='I')
-    for i, value in enumerate(self._q): hw_view[i] = value
+    if hw_view.is_remote:
+      # RPC-backed buffer (T2.2's MMIOInterface.is_remote, set on RemoteMMIOInterface): one bulk slice write beats len(self._q) separate
+      # socket sendalls -- per-word here would be the exact pathology T2.2 fixed for PTE writes (nvdev.py's set_entries). Checked on the
+      # concrete view, not device type, since PCIIfaceBase can back either a local or a Remote PCIDevice. Local/NVK-Linux path (is_remote
+      # always False there) keeps the original per-word loop, untouched.
+      hw_view[:] = array.array('I', self._q)
+    else:
+      for i, value in enumerate(self._q): hw_view[i] = value
 
     # From now on, the queue is on the device for faster submission.
     self._q = hw_view
@@ -587,8 +594,24 @@ class NVDevice(HCQCompiled[NVSignal]):
 
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
 
+  # Remote-keyed sizing skeleton (T2.3): mirrors AMD's is_usb() knobs (ops_amd.py:980-994 -- kernargs_size, sigalloc_size, ring sizes all
+  # shrink over USB). Both dicts hold the SAME values today: no real Thunderbolt latency numbers exist pre-dock, so this only wires up the
+  # local/remote SELECTION -- tuning _REMOTE_SIZING later is a values-only change, not a new code path. Local and NVK-Linux always pick
+  # _LOCAL_SIZING (is_remote() is False for NVKIface/MOCKIface), so their behavior is provably unchanged.
+  _LOCAL_SIZING  = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
+                     "cmdq_size": 0x200000}
+  _REMOTE_SIZING = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
+                     "cmdq_size": 0x200000}
+
+  def is_remote(self) -> bool:
+    # True only behind PCIIface's RemotePCIDevice (macOS TinyGPU over Thunderbolt/TCP): checked on the concrete BAR1 MMIOInterface
+    # (T2.2's is_remote flag), not iface type, since PCIIfaceBase can run against either a local or a Remote PCIDevice. NVKIface/MOCKIface
+    # (Linux driver, mock) have no dev_impl.vram and are always local.
+    return getattr(getattr(getattr(self.iface, 'dev_impl', None), 'vram', None), 'is_remote', False)
+
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
+    self.sizing = self._REMOTE_SIZING if self.is_remote() else self._LOCAL_SIZING
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -610,17 +633,19 @@ class NVDevice(HCQCompiled[NVSignal]):
     channel_params = nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
     self.channel_group = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, channel_params)
 
-    self.gpfifo_area = self.iface.alloc(0x300000, contiguous=True, cpu_access=True, force_devmem=True,
+    self.gpfifo_area = self.iface.alloc(self.sizing['gpfifo_area_size'], contiguous=True, cpu_access=True, force_devmem=True,
       map_flags=(nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23))
 
     ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
     ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
 
-    self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
-    self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
+    self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=self.sizing['gpfifo_entries'],
+      compute=True)
+    self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=self.sizing['gpfifo_entries'],
+      compute=False)
     self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
 
-    self.cmdq_page:HCQBuffer = self.iface.alloc(0x200000, cpu_access=True)
+    self.cmdq_page:HCQBuffer = self.iface.alloc(self.sizing['cmdq_size'], cpu_access=True)
     self.cmdq_allocator = BumpAllocator(size=self.cmdq_page.size, base=int(self.cmdq_page.va_addr), wrap=True)
     self.cmdq = self.cmdq_page.cpu_view().view(fmt='I')
 
@@ -632,7 +657,7 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
 
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], NVProgram, NVSignal, NVComputeQueue,
-                     NVCopyQueue, arch=self.arch)
+                     NVCopyQueue, kernargs_size=self.sizing['kernargs_size'], sigalloc_size=self.sizing['sigalloc_size'], arch=self.arch)
 
     self.pma_enabled = PMA.value > 0 and PROFILE >= 1
     if self.pma_enabled: self._prof_init()

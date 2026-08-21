@@ -2,6 +2,7 @@ import unittest
 import functools
 from tinygrad import Tensor, Variable, UOp, function
 from tinygrad.uop.ops import KernelInfo
+from tinygrad.helpers import Context
 from tinygrad.schedule import schedule_cache
 
 def custom_add_kernel(A:UOp, B:UOp, num:int=0) -> UOp:
@@ -27,6 +28,26 @@ class TestScheduleCache(unittest.TestCase):
     t2 = (x + Tensor(v.bind(10))).sum()
     self.assertEqual(t2.item(), 110.0)
     self.assertEqual(len(schedule_cache), cache_size_after_first)
+
+  def test_pcontig_not_cross_served(self):
+    # T4.9: SCACHE used to key on structural graph hash alone, so scheduling the *same* tensor
+    # expression under two different PCONTIG settings in one process would serve the first PCONTIG
+    # value's cached (fused-or-not) schedule to the second call, silently making PCONTIG-vs-baseline
+    # comparisons vacuous (see PCONTIG_ATTN_NOTES.md). Build a fresh, identical (structurally) tensor
+    # graph for each setting -- rebuilt each time so neither call mutates a shared tensor's .uop.
+    schedule_cache.clear()
+    def build() -> Tensor:
+      a, c = Tensor.empty(4, 2, 16, 8), Tensor.empty(4, 2, 8, 8)
+      return a.softmax(-1) @ c
+
+    with Context(PCONTIG=0): linear_off, _ = build().linear_with_vars()
+    with Context(PCONTIG=2): linear_on, _ = build().linear_with_vars()
+
+    # each PCONTIG setting must land in its own cache slot, never share one
+    self.assertEqual(len(schedule_cache), 2)
+    # PCONTIG=2 fuses this softmax@matmul shape into fewer kernels than the PCONTIG=0 baseline;
+    # if the cache had cross-served, these would be equal (both from whichever ran first)
+    self.assertNotEqual(len(linear_off.src), len(linear_on.src))
 
   def test_custom_kernel(self):
     for i in range(4):

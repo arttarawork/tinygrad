@@ -248,6 +248,20 @@ class TestHCQ(unittest.TestCase):
       mv_buf1 = buf1.as_memoryview()
       assert libc.memcmp(mv_address(mv_buf1), buf2._buf.va_addr, sz) == 0
 
+  def test_copyout_multi_chunk(self):
+    if TestHCQ.d0.hw_copy_queue_t is None: self.skipTest("device does not support copy queue")
+
+    # Bigger than the D2H staging pool (32 x 2MB = 64MB) to force staging-buffer reuse in the pipelined
+    # _copyout path, plus a partial final chunk. Random (not periodic) content so a chunk swap/misorder
+    # can't hide behind a repeating pattern.
+    sz = (66 << 20) + 12345
+    src = np.random.default_rng(42).integers(0, 256, size=sz, dtype=np.uint8)
+    buf = Buffer(Device.DEFAULT, sz, dtypes.uint8, options=BufferSpec(nolru=True)).ensure_allocated()
+    buf.copy_from(Buffer("PYTHON", sz, dtypes.uint8, opaque=memoryview(bytearray(src.tobytes()))))
+
+    readback = np.frombuffer(buf.as_memoryview(), dtype=np.uint8)
+    np.testing.assert_array_equal(readback, src)
+
   def test_update_copy(self):
     if TestHCQ.d0.hw_copy_queue_t is None: self.skipTest("device does not support copy queue")
 

@@ -1,10 +1,10 @@
 import unittest
-from tinygrad import Tensor, UOp, GlobalCounters, Context, Device
+from tinygrad import Tensor, UOp, GlobalCounters, Context, Device, Variable, TinyJit
 import numpy as np
 from tinygrad.dtype import AddrSpace, dtypes, Invalid
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops
 from tinygrad.renderer.ptx import PTXRenderer
-from test.helpers import assert_kernel_count, KernelCountException
+from test.helpers import assert_kernel_count, KernelCountException, assert_jit_cache_len
 
 # **** kernels ****
 
@@ -201,6 +201,35 @@ class TestCustomKernel(unittest.TestCase):
     tst = Tensor.empty(1, dtype=a.dtype)
     b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
     self.assertEqual(b.item(), 15)
+
+  def test_sum_symbolic_reduce_dim(self):
+    # T4.7: a REDUCE-only dim can be symbolic (a bound Variable, e.g. a JIT-promoted growing-cache
+    # length) as long as the custom kernel's own Python control flow never branches on its value --
+    # custom_sum here is unmodified from test_sum above, just called with a symbolic-length input.
+    a_full = Tensor([1.0, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    for n in range(1, 11):
+      tk = Variable("Tk", 1, 10).bind(n)
+      a = a_full[:tk]
+      tst = Tensor.empty(1)
+      b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
+      self.assertEqual(b.item(), sum(range(1, n+1)), f"n={n}")
+
+  def test_sum_symbolic_reduce_dim_jit(self):
+    # same kernel under TinyJit: correctness across many bound values (including replay at a value
+    # never seen during capture) from a SINGLE compiled kernel -- the variable identity, not the
+    # bound value, is the cache key, exactly like a normal (non-custom) symbolic kernel.
+    Tensor.manual_seed(0)
+    a_full = Tensor.rand(10).realize()
+    a_np = a_full.numpy()
+    def f(a):
+      tst = Tensor.empty(1)
+      return Tensor.custom_kernel(tst, a, fxn=custom_sum)[0].realize()
+    jf = TinyJit(f)
+    for n in (1, 2, 3, 4, 5, 3, 7, 1, 10):
+      tk = Variable("Tk", 1, 10).bind(n)
+      out = jf(a_full[:tk]).item()
+      np.testing.assert_allclose(out, a_np[:n].sum(), atol=1e-5, rtol=1e-5, err_msg=f"n={n}")
+    assert_jit_cache_len(jf, 1)
 
   def test_slice_sum(self):
     A = Tensor.randn(16, 16).contiguous()

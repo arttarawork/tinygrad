@@ -3,6 +3,7 @@ from collections import deque
 from tinygrad.uop.ops import UOp, Ops, UOpMetaClass, rewrite_group, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, spec_tensor
 from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, pluralize, SCACHE, BASEDIR, partition, dedup
+from tinygrad.helpers import PCONTIG, SPLIT_REDUCEOP, MAX_KERNEL_BUFFERS, FLOAT16, OPENPILOT_HACKS, IMAGE, RING, ALL2ALL, ALLREDUCE_CAST
 
 # **** schedule linearizer
 
@@ -109,11 +110,18 @@ pm_resolve_linear_call = PatternMatcher([
 ])+pm_flatten_linear
 
 schedule_cache: dict[bytes, UOp] = {}
+# ContextVars read by get_kernel_graph/create_schedule that can change the linear schedule produced for
+# the same input graph (PCONTIG confirmed wrong-numerics-if-omitted, see PCONTIG_ATTN_NOTES.md; others
+# audited by grepping schedule/{rangeify,indexing,multi,allreduce}.py + uop/symbolic.py for getenv/
+# ContextVar reads reachable from get_kernel_graph). function.key is a structural hash of the pre-schedule
+# Tensor-level graph only, so any of these must be folded into the cache key or SCACHE (default on) can
+# serve a schedule computed under a different setting for an identical-looking key.
+SCHEDULE_AFFECTING_CTXVARS = (PCONTIG, SPLIT_REDUCEOP, MAX_KERNEL_BUFFERS, FLOAT16, OPENPILOT_HACKS, IMAGE, RING, ALL2ALL, ALLREDUCE_CAST)
 # ctx is just for DEBUG on inner
 def lower_sink_to_linear(function:UOp) -> UOp|None:
   st = time.perf_counter()
   if isinstance(function.arg, KernelInfo): return None
-  cache_key = function.key
+  cache_key = function.key + str(tuple(c.value for c in SCHEDULE_AFFECTING_CTXVARS)).encode()
   if not SCACHE or (sc_ret:=schedule_cache.get(cache_key, None)) is None:
     if SPEC: type_verify(function, spec_tensor)
     # support recursive CALLs

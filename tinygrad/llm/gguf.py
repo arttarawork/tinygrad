@@ -20,6 +20,14 @@ _GGML_NATIVE = {0: dtypes.float32, 1: dtypes.float16, 24: dtypes.int8, 25: dtype
 _GGML_QUANT = {2:(32,18), 3:(32,20), 6:(32,22), 7:(32,24), 8:(32,34),
                12:(256,144), 13:(256,176), 14:(256,210), 18:(256,98), 21:(256,110), 22:(256,82), 23:(256,136), 39:(32,17), 41:(128,18)}
 
+def _ggml_nbytes(n: int, ggml_type: int) -> int:
+  """Exact on-disk byte length of a GGUF tensor's data blob (mirrors the slicing ggml_data_to_tensor
+  does internally), computed from its element count and type alone -- lets the loader stage just this
+  tensor's byte range instead of the whole file."""
+  if (dtype := _GGML_NATIVE.get(ggml_type)) is not None: return dtype.itemsize * n
+  if (nb := _GGML_QUANT.get(ggml_type)) is not None: return (n // nb[0]) * nb[1]
+  raise ValueError(f"GGML type '{ggml_type}' is not supported!")
+
 def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   """
   Converts ggml tensor data to a tinygrad tensor.
@@ -61,10 +69,19 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       s = blocks[:,4:16]  # 12 bytes: 6-bit scales[0-3], 6-bit mins[0-3], high bits[4-7]
       sc = s[:,0:4].bitwise_and(63).cat(s[:,8:12].bitwise_and(0xF).bitwise_or(s[:,0:4].rshift(6).lshift(4)), dim=-1)
       mn = s[:,4:8].bitwise_and(63).cat(s[:,8:12].rshift(4).bitwise_or(s[:,4:8].rshift(6).lshift(4)), dim=-1)
+      # stage the per-(block,sub-block) d*scale / dmin*min products as their own small contiguous tensor (8
+      # values/block, reused by 32 weights each) instead of leaving them fused into the consuming matmul: without
+      # this, rangeify doesn't hoist the fp16->fp32 d/dmin unpack out of the reduce's innermost per-weight loop
+      # (confirmed via the generated METAL source - unlike sc/mn, which correctly do get hoisted to the sub-block
+      # loop), so it gets redone once per output weight (32x/block) instead of once per block. Realizing here trades
+      # that for one cheap extra kernel (reads ~same 12+4 scale bytes/block, writes 2 floats/sub-block) that only
+      # runs once at weight-load time, since the result is reused unchanged across every subsequent decode token.
+      # Q4_K 4096x4096 gemv on METAL: ~410us -> ~205us kernel time (bit-exact vs the fused form; T4.2).
+      dsc, dminmn = (d * sc.unsqueeze(-1)).contiguous(), (dmin * mn.unsqueeze(-1)).contiguous()
       qs_off = 48 if ggml_type == 13 else 16
       q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
       if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16
-      return (d * sc.unsqueeze(-1) * q - dmin * mn.unsqueeze(-1)).flatten(-2)
+      return (dsc * q - dminmn).flatten(-2)
     if ggml_type == 14:
       xl, xh = q_to_uint8(blocks[:,:128].reshape((-1, 2, 64)), 4), q_to_uint8(blocks[:,128:192].reshape((-1, 2, 32)), 2).lshift(4)
       scales = blocks[:,192:208].bitcast(dtypes.int8).unsqueeze(-1).expand((-1, 16, 16)).reshape((-1, 256))
@@ -103,14 +120,21 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       q = (qs:=blocks[:, 8:].reshape((-1, 8, 16))).bitwise_and(0xF).cat(qs.rshift(4), dim=2)
       return (d * scales * iq4_xs_lut[q]).flatten(-2)
     if ggml_type == 39:
+      # e8m0 block scale and the E2M1 4-bit value are computed via ALU bit-ops instead of Tensor-indexed
+      # LUT gathers (the original form: `lut_tensor[codes]`). A gather reads a real buffer through a
+      # REDUCE, and rangeify's remove_bufferize refuses to fuse a bufferize point whose expression
+      # contains a buffer-reading REDUCE (schedule/rangeify.py's buffer_in_reduce check) into ANY
+      # consumer that itself indexes the result -- e.g. MoE's `weight[sel]` expert gather. That forced
+      # the ENTIRE dequantized tensor (every expert, not just the k selected) to materialize every
+      # decode step instead of just the gathered rows (T4.13; T4.2 hit an analogous but cheaper issue
+      # with Q4_K's scale unpack). Both replacements below are bit-exact vs the LUT form (verified for
+      # all 256 e8m0 byte values and all 16 four-bit codes) and touch no buffer but `blocks` itself.
       e = blocks[:, 0].cast(dtypes.uint32)
-      small_bits = Tensor([0x00200000, 0x00400000], dtype=dtypes.uint32, device=t.device)[e.clip(0, 1).cast(dtypes.int32)] # e = 0 or e = 1 case
-      d = (e < 2).where(small_bits, (e - 1) * 0x00800000).bitcast(dtypes.float32).unsqueeze(-1)
-      codes = q_to_uint8(blocks[:, 1:17], 4)
-      fp4_lut = Tensor([0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
-                       -0.0,-1.0,-2.0,-3.0,-4.0,-6.0,-8.0,-12.0],
-                      dtype=dtypes.float32, device=t.device)
-      fp4_val = fp4_lut[codes]
+      d = (e == 0).where(0x00200000, (e == 1).where(0x00400000, (e - 1) * 0x00800000)).bitcast(dtypes.float32).unsqueeze(-1)
+      codes = q_to_uint8(blocks[:, 1:17], 4).cast(dtypes.int32)
+      mant, exp, sign = codes.bitwise_and(1), codes.rshift(1).bitwise_and(3), codes.rshift(3).bitwise_and(1)
+      mag = (exp == 0).where(mant, (2 + mant).lshift((exp - 1).maximum(0)))
+      fp4_val = mag.cast(dtypes.float32) * (1 - 2 * sign.cast(dtypes.float32))
       return (fp4_val * d).flatten(-2)[:n]
     if ggml_type == 41:
       d = blocks[:,:2].bitcast(dtypes.float16)
@@ -129,10 +153,13 @@ readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_
     [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
-  # TODO: remove the need for copy to default device
-  tensor = tensor.to(None).realize()
-  r = io.BufferedReader(TensorIO(tensor), 1_000_000)
+_HEADER_CHUNK = 16 * 1024 * 1024  # generous prefix for magic+KV+tensor-infos (real headers measured ~6-8MB)
+_STAGE_BATCH = 64 * 1024 * 1024   # merge adjacent tensors into one disk->device copy up to this size, to
+                                   # amortize per-copy dispatch overhead over the many small tensors (norms,
+                                   # biases, small embeddings) real GGUFs have alongside the big matmul weights
+
+def _parse_header(header: Tensor) -> tuple[dict, list, int]:
+  r = io.BufferedReader(TensorIO(header), 1_000_000)
   magic, version, n_tensors, n_kv = r.read(4), read_int32(r), read_int64(r), read_int64(r)
   if magic != b"GGUF" or version not in [2, 3]: raise ValueError("Invalid GGUF format!")
 
@@ -142,10 +169,53 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
     kv_data[k] = readers[typ](r)
 
   t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
-  alignment, pos = kv_data.get("general.alignment", 32), r.tell()
+  return kv_data, t_infos, r.tell()
+
+def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+  # [T1.9] Only a small header prefix gets realized to parse KV metadata + tensor infos -- not the whole
+  # (multi-GB) file. Tensor DATA is staged in bounded batches (_STAGE_BATCH) below instead of one whole-file
+  # blob: no single allocation is ever bigger than one batch, which matters under memory pressure (a
+  # fragmented allocator can satisfy many small requests where one big contiguous one fails -- see commit
+  # message) and keeps per-tensor dequant fusing into its eventual consumer exactly as before.
+  size = tensor.shape[0]
+  chunk = min(size, _HEADER_CHUNK)
+  while True:
+    header = tensor[:chunk].to(None).realize()
+    try:
+      kv_data, t_infos, pos = _parse_header(header)
+      if chunk < size and pos >= chunk: raise ValueError("header may have been truncated by the chunk boundary")
+    except (struct.error, IndexError, ValueError):
+      if chunk >= size: raise
+      chunk = min(size, chunk * 2)
+      continue
+    break
+
+  alignment = kv_data.get("general.alignment", 32)
   data_start = round_up(pos, alignment)
 
-  state_dict = {name: ggml_data_to_tensor(tensor[data_start + off:], prod(dims), typ).reshape(*reversed(dims)) for name, dims, typ, off in t_infos}
+  # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH) into one
+  # disk->device copy each, instead of one copy per tensor. Each tensor's dequant graph still starts
+  # from its own VIEW of the (already-realized) batch, so per-tensor fusion is unaffected -- this only
+  # changes how many COPY ops the loader issues, not what ends up resident on device.
+  infos = sorted(((name, dims, typ, off, _ggml_nbytes(prod(dims), typ)) for name, dims, typ, off in t_infos), key=lambda x: x[3])
+
+  def flush(batch: list[tuple[str, tuple[int, ...], int, int, int]]) -> dict[str, Tensor]:
+    lo, hi = batch[0][3], batch[-1][3] + batch[-1][4]
+    # realize the raw (still-quantized) batch bytes right away, same as the pre-T1.9 whole-file realize
+    # did -- this is required regardless (DISK can't run the dequant ALU ops) and keeps the scheduler
+    # from tangling hundreds of small COPYs into the same schedule as the per-tensor dequant graphs below.
+    staged = tensor[data_start + lo:data_start + hi].to(None).realize()
+    return {name: ggml_data_to_tensor(staged[off - lo:off - lo + nbytes], prod(dims), typ).reshape(*reversed(dims))
+            for name, dims, typ, off, nbytes in batch}
+
+  state_dict: dict[str, Tensor] = {}
+  batch: list[tuple[str, tuple[int, ...], int, int, int]] = []
+  for info in infos:
+    if batch and info[3] + info[4] - batch[0][3] > _STAGE_BATCH:
+      state_dict.update(flush(batch))
+      batch = []
+    batch.append(info)
+  if batch: state_dict.update(flush(batch))
   return kv_data, state_dict
 
 def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:

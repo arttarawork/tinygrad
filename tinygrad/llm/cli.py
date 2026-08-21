@@ -8,11 +8,19 @@ from tinygrad.llm.model import Transformer
 if TYPE_CHECKING:
   import jinja2
 
+# T1.8b: opt-in tuned decode-attention kernel (default off). See tinygrad/llm/attn_kernel.py for what it
+# does and its hard limiter (falls back to the default SDPA path once the JIT promotes the KV-cache slice
+# length to a symbolic shape -- i.e. from the second real decode token onward).
+if getenv("FAST_ATTN"):
+  from tinygrad.llm import model as _llm_model
+  from tinygrad.llm.attn_kernel import tuned_decode_attention
+  _llm_model.attention_impl = tuned_decode_attention
+
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gpt-4o"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
     # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
     bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
@@ -26,8 +34,20 @@ class SimpleTokenizer:
       runs = [list(g) for _, g in itertools.groupby(cps, lambda e: e[1]-e[0])]
       return "".join(re.escape(chr(g[0][1])) + (f"-{re.escape(chr(g[-1][1]))}" if len(g) > 1 else "") for g in runs)
     r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    if preset == "gpt-4o":
+      # gpt-4o / o200k pre-tokenizer (used by gpt-oss): case-transition-aware letter runs, via
+      # LLAMA_VOCAB_PRE_TYPE_GPT4O's regex_exprs in llama.cpp's src/llama-vocab.cpp (differs from the
+      # llama3/gpt-2 regex below - no \p{L}/\p{N} support in Python's `re`, so substitute the ucat_range
+      # classes as above; every group is made non-capturing since findall() below needs the whole match).
+      contraction = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+      self._split_to_word = re.compile(
+        f"[^\\r\\n{r_p_N}{r_p_L}]?(?:(?=[{r_p_L}])[^a-z])*(?:(?=[{r_p_L}])[^A-Z])+{contraction}?|"
+        f"[^\\r\\n{r_p_N}{r_p_L}]?(?:(?=[{r_p_L}])[^a-z])+(?:(?=[{r_p_L}])[^A-Z])*{contraction}?|"
+        f"[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n/]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    else:
+      self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" +
+        f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|" +
+        f"[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
     self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
@@ -89,6 +109,8 @@ models = {
   "qwen3.6:27b": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf",
   "qwen3.6:35b-a3b": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
+  "gpt-oss:20b": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf",
+  "gpt-oss:120b": "https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/main/gpt-oss-120b-MXFP4.gguf",
   "moonlight": "https://huggingface.co/gabriellarson/Moonlight-16B-A3B-Instruct-GGUF/resolve/main/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
   "glm-4.7-flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
 }
@@ -133,13 +155,15 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--model", "-m", default=list(models.keys())[0], help=f"Model choice ({', '.join(models.keys())}) or path to a local GGUF file")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
+  parser.add_argument("--device-map", default=None, help='Per-block device placement: "0-15:CPU:0,16-31:CPU:1" or "CPU:0,CPU:1" (even split); '
+                       'optional "experts:<device>" segment routes MoE routed-expert weights to a separate device')
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
 
   # load the model
-  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context)
+  model, kv = Transformer.from_gguf(fetch(models.get(args.model, args.model)), args.max_context, device_map=args.device_map)
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "

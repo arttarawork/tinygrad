@@ -69,3 +69,22 @@ class TestMLA(unittest.TestCase):
     self.assertNotIn('blk.0.ffn_gate_inp_shexp.weight', nn.state.get_state_dict(model))
     out = model.blk[0]._feed_forward(Tensor.randn(1, 4, model.blk[0].config.dim))
     self.assertEqual(out.shape, (1, 4, model.blk[0].config.dim))
+
+class TestMLAYarn(unittest.TestCase):
+  # ultrareview finding: MLATransformerBlock._init_state dropped the yarn kwargs, silently giving
+  # yarn-configured MLA models (DeepSeek-V2/V3 family) unscaled rope past their original context
+  def test_init_state_forwards_yarn_kwargs(self):
+    cfg = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=4, n_kv_heads=1, norm_eps=1e-5, vocab_size=100,
+      head_dim=16, rope_theta=10000.0, rope_dim=8, max_context=32, kv_lora_rank=16, v_head_dim=8,
+      yarn_factor=4.0, yarn_orig_ctx=8, yarn_beta_fast=32.0, yarn_beta_slow=1.0)
+    block = MLATransformerBlock(cfg)
+    block._init_state(Tensor.randn(1, 4, cfg.dim))
+    expected = precompute_freqs_cis(cfg.rope_dim, cfg.max_context, cfg.rope_theta, yarn_factor=cfg.yarn_factor,
+      yarn_orig_ctx=cfg.yarn_orig_ctx, yarn_beta_fast=cfg.yarn_beta_fast, yarn_beta_slow=cfg.yarn_beta_slow,
+      yarn_attn_factor=cfg.yarn_attn_factor)
+    plain = precompute_freqs_cis(cfg.rope_dim, cfg.max_context, cfg.rope_theta)
+    np.testing.assert_allclose(block.freqs_cis.numpy(), expected.numpy(), rtol=1e-6)
+    self.assertFalse(np.allclose(block.freqs_cis.numpy(), plain.numpy()), "yarn kwargs were dropped: freqs match plain rope")
+
+if __name__ == '__main__':
+  unittest.main()

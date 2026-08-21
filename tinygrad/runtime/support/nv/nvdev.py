@@ -1,5 +1,5 @@
 from __future__ import annotations
-import time, functools, tinygrad.runtime.autogen.nv_regs
+import array, time, functools, tinygrad.runtime.autogen.nv_regs
 from tinygrad.helpers import getenv, DEBUG, getbits, round_up
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
@@ -35,18 +35,29 @@ class NVPageTableEntry:
 
   def _is_dual_pde(self) -> bool: return self.lv == self.nvdev.mm.level_cnt - 2
 
-  def set_entry(self, entry_id:int, paddr:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False, frag=0, valid=True):
+  def _encode(self, paddr:int, table:bool, uncached:bool, aspace:AddrSpace, snooped:bool, frag:int, valid:bool) -> int:
     if not table:
-      x = self.nvdev.pte_t.encode(valid=valid, address_sys=paddr >> 12, aperture=2 if aspace is AddrSpace.SYS else 0, kind=6,
+      return self.nvdev.pte_t.encode(valid=valid, address_sys=paddr >> 12, aperture=2 if aspace is AddrSpace.SYS else 0, kind=6,
         **({'pcf': int(uncached)} if self.nvdev.mmu_ver == 3 else {'vol': uncached}))
-    else:
-      pde = self.nvdev.dual_pde_t if self._is_dual_pde() else self.nvdev.pde_t
-      small, sys = ("_small" if self._is_dual_pde() else ""), "" if self.nvdev.mmu_ver == 3 else "_sys"
-      x = pde.encode(is_pte=False, **{f'aperture{small}': 1 if valid else 0, f'address{small}{sys}': paddr >> 12},
-        **({f'pcf{small}': 0b10} if self.nvdev.mmu_ver == 3 else {'no_ats': 1}))
+    pde = self.nvdev.dual_pde_t if self._is_dual_pde() else self.nvdev.pde_t
+    small, sys = ("_small" if self._is_dual_pde() else ""), "" if self.nvdev.mmu_ver == 3 else "_sys"
+    return pde.encode(is_pte=False, **{f'aperture{small}': 1 if valid else 0, f'address{small}{sys}': paddr >> 12},
+      **({f'pcf{small}': 0b10} if self.nvdev.mmu_ver == 3 else {'no_ats': 1}))
 
+  def set_entry(self, entry_id:int, paddr:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False, frag=0, valid=True):
+    x = self._encode(paddr, table, uncached, aspace, snooped, frag, valid)
     if self._is_dual_pde(): self.entries[2*entry_id], self.entries[2*entry_id+1] = x & 0xffffffffffffffff, x >> 64
     else: self.entries[entry_id] = x
+
+  def set_entries(self, entry_id:int, count:int, paddr:int, pte_covers:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False,
+                   frag=0, valid=True):
+    # Batched set_entry for `count` physically-contiguous PTEs (stride pte_covers): one packed slice write instead of `count` single writes.
+    # Collapses per-page socket messages when self.entries is a RemoteMMIOInterface (Thunderbolt/TCP RPC transport).
+    xs = [self._encode(paddr + i * pte_covers, table, uncached, aspace, snooped, frag, valid) for i in range(count)]
+    if self._is_dual_pde():
+      self.entries[2*entry_id:2*(entry_id+count)] = array.array('Q', [w for x in xs for w in (x & 0xffffffffffffffff, x >> 64)])
+    else:
+      self.entries[entry_id:entry_id+count] = array.array('Q', xs)
 
   def entry(self, entry_id:int) -> int:
     return (self.entries[2*entry_id+1]<<64) | self.entries[2*entry_id] if self._is_dual_pde() else self.entries[entry_id]
@@ -70,6 +81,11 @@ class NVMemoryManager(MemoryManager):
   va_allocator = TLSFAllocator((1 << 44), base=0x1000000000) # global for all devices.
 
   def on_range_mapped(self): self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
+
+  # ponytail: skips double-map detection over a remote (socket-RPC) iface to avoid a blocking read per PTE — a real corner cut, not just
+  # latency, since a double-map bug would go undetected there. Local NV and AMD (MemoryManager default) always validate. Force it back on
+  # with NV_VALIDATE_REMOTE=1 if you suspect a double-map bug while debugging over the wire.
+  def _should_validate_unmapped(self) -> bool: return bool(getenv("NV_VALIDATE_REMOTE", 0)) or not getattr(self.dev.vram, 'is_remote', False)
 
 class NVDev:
   def __init__(self, pci_dev:PCIDevice):
