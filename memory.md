@@ -288,6 +288,23 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   Push handoff: merge touches CI workflow files → Artur pushes `sync/upstream-2026-08-21:master`.
   Real-model bench check deferred to the next llama-server window.
 
+- **2026-08-23 (upstream watch, 33 commits since sync #3 — not yet merged):** **geohot shipped
+  fp16 KV upstream (`477b57380`, one line: `dtypes.half` hardcoded in `TransformerBlock._init_state`
+  only)** — partial T1.1a preemption. Ours is the superset (MLA + SSM-conv fp16, recurrent-state
+  fp32 by divergence evidence, `KV_F32` escape); next sync has a guaranteed small conflict in that
+  hunk — resolution: keep ours. A T1.1a PR would now be "extend fp16 KV to MLA/SSM correctly."
+  Transport lane heating up: USB-AMD copyin pipelined (`756e82e05` 2.6x, `3082956a1` async
+  arm/drain, 323 MB/s) — same playbook as our T2.1, no file overlap (ops_amd/usb.py, not hcq.py);
+  prior art for post-dock tuning. `4fd4eafb2` (nv: hevc) touches ops_nv.py + support/memory.py —
+  T2.2's neighborhood, check hunks at sync; it also edits benchmark.yml and `298748ebd` edits CI →
+  **next sync push needs Artur again** (workflow scope). Non-events: mxfp4-gemm cleanup deletes an
+  extra/ file (no T4.13 contact); gptoss fused-ce is mlperf-side; weak-const test churn continues.
+  **New open-PR watch list:** **#17493 "clean slate rangeify rewrite"** — the big one: T4.13's
+  fusion fix, T1.4's 1-kernel floor, and T4.9's xfailed PCONTIG tests all sit on rangeify
+  behavior; if it merges, re-validate all three and sync immediately. #17478 "hcq2: default"
+  (the WS2.5 follow-upstream trigger approaching; NV still not on hcq2). #17567 llama BEAM nan
+  fix (we bench with JITBEAM). #17446 (gptoss) unchanged-open; #17316/#17617 still open, no reply.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
