@@ -305,6 +305,14 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   (the WS2.5 follow-upstream trigger approaching; NV still not on hcq2). #17567 llama BEAM nan
   fix (we bench with JITBEAM). #17446 (gptoss) unchanged-open; #17316/#17617 still open, no reply.
 
+- **2026-08-23/24 (THE DOCK IS HERE):** AG02 + RTX 3090 arrived — Phase 1 begins. TD.1
+  briefing delivered (connection specifics + preflight now in TASKS.md TD.1: USB4-not-OCuLink,
+  both power leads, dock-powered-first, any of the Mac's three TB4 ports, system_profiler
+  preflight before ANY install, the no-BAR stop rule). Next concrete step: Artur connects,
+  we run preflight, then setup_tinygpu_osx.sh → DEXT approval → reboot → DEV=NV test_tiny
+  (NAK lane if Docker is a hassle). Artur held the upstream sync (weekly cadence stands;
+  33 commits pending incl. the fp16-KV one-liner conflict).
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth

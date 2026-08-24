@@ -2,7 +2,9 @@
 
 Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md` — read both first).
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
-(AOOSTAR AG02) is in the mail — **Phase 0 tasks need no NVIDIA hardware at all.**
+(AOOSTAR AG02) was in the mail — **Phase 0 tasks need no NVIDIA hardware at all.**
+**Dock + RTX 3090 ARRIVED 2026-08-23 — `DOCK`-tagged tasks are UNBLOCKED; TD.1 in progress**
+(physical connect + preflight next; connection specifics in TD.1 below).
 
 > **STATUS 2026-08-21 (Phase 0 COMPLETE):** 8 agent waves + 4 bench windows, ~55 tasks closed
 > (✅/❌/📋 markers below; the **Status log** is the authoritative record). **All pre-dock code
@@ -68,7 +70,7 @@ Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, whil
 | `AMD` | (descoped 2026-08-18 — see T0.2; kept for the footgun note) the Bazzite box w/ RX 9070 XT. **Never** use the AM/PCI driver path there: it unbinds `amdgpu` and kills the display. |
 | `MOCKNV` | NV backend under gpuocelot PTX emulation — functional correctness only, no perf. Recipe (T0.4, verified 2026-08-18): `OCELOT_PATH=.venv/lib/libgpuocelot.dylib DEV=MOCK+NV:PTX PYTHONPATH=. .venv/bin/python -m pytest ...` — the `DEV` string must start with `MOCK` (`device.py:376` never falls back to `MOCKIface` otherwise) and the dylib is CI's prebuilt (`github.com/tinygrad/gpuocelot` release v0.1.0, already at `.venv/lib/`). Do NOT use `extra/setup_mock_nv_osx.sh` (heavy source build + sudo to /usr/local/lib; CI doesn't use it either). Details: `MOCKNV_SETUP.md` on `task/T0.4-mocknv`. |
 | `CLOUD3090` | optional: a rented Linux 3090 (vast.ai etc.) runs the same NV backend/kernels via `NVKIface` — real sm_86 perf for kernel work before the dock arrives |
-| `DOCK` | blocked on the AG02 + TinyGPU |
+| `DOCK` | AG02 + 3090 arrived 2026-08-23; live once TD.1 first light passes |
 
 ## Phase 0 — no dock required
 
@@ -313,6 +315,16 @@ can be built and proven before the dock ships.
   driver extension enable + reboot; Docker running before the nvcc helper. Their scripts/ dir is
   an adaptable preflight/bring-up harness. Our 3090 (sm_86, mature TC path) is better placed than
   their Blackwell card.
+  **Connection specifics (dock in hand, 2026-08-23):** use the AG02's **USB4 port, NOT OCuLink**
+  (Macs can't do OCuLink) with the dock's own shipped USB4 cable; connect **both** PCIe power
+  leads to the 3090 (350W — FE takes the 12-pin adapter, AIB 2×8-pin; half-powered cards
+  enumerate flaky). Mac side: all three USB-C ports on the M3 Pro MBP are full TB4/USB4 with
+  their own bus — any port works; keep a USB-C charger on a different port (or use MagSafe).
+  Power dock first, then cable straight to the Mac. Exact preflight (BEFORE any install):
+  `system_profiler SPPCIDataType` → want NVIDIA `0x10de` WITH a Memory/BAR range;
+  `system_profiler SPThunderboltUSB4DataType` → dock present, Link Up. First-light sequence
+  after clean preflight: `extra/setup_tinygpu_osx.sh` → approve DEXT in System Settings →
+  reboot → `DEV=NV` (or Docker-free `DEV=NV:NAK`) on `test/test_tiny.py`.
 - **TD.2 — WS0 truth table**: full matrix via T0.3 harness — `DEV=NV{,:NAK}`, `JITBEAM={0,2}`,
   vs Metal + llama.cpp baselines. Names the real top-3 bottlenecks. deps: TD.1, T0.3.
   **External reference row (Watcharasorn, 5070 Ti/USB4, tinygrad f2c2f44, 2026-07-31):** decode is
