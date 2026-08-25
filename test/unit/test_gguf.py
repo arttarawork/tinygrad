@@ -3,6 +3,7 @@ from tinygrad import dtypes, Tensor, fetch, Device
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
 from tinygrad.runtime.autogen import ggml_common as _ggml
+from tinygrad.uop.ops import Ops
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGMLQuantizationType, GGML_QUANT_SIZES, dequantize, quantize
 from gguf.quants import IQ2_S, IQ3_S, IQ3_XXS
@@ -153,6 +154,54 @@ class TestGGUF(unittest.TestCase):
       (d / "test-00002-of-00002.gguf").unlink()
       with self.assertRaises(FileNotFoundError):
         gguf_load(d / "test-00001-of-00002.gguf")
+
+  def test_device_map_places_blob_on_target_before_dequant(self):
+    """T4.21: gguf_load(path, device_map=...) stages each tensor's raw (still-quantized) blob directly
+    on ITS mapped device, with the dequant built lazily on top of that -- so a moved tensor's top-level
+    op is NOT a COPY (Transformer.realize_placement, llm/model.py, only force-realizes params whose
+    top-level op IS one -- that's what keeps a device_map'd param's residency at its quantized share
+    instead of the full dequantized size; see realize_placement's docstring). Covers block ranges,
+    token_embd/output_norm's block-0/block-(-1) convention, the 'experts:' override, and an MTP-style
+    block beyond num_blocks (nextn_predict_layers) falling back to the last device instead of raising."""
+    with tempfile.TemporaryDirectory() as d:
+      rng = np.random.default_rng(0)
+      def q8(): return quantize(rng.random(32).astype(np.float32), GGMLQuantizationType.Q8_0).tobytes()
+      tensors = [("token_embd.weight", (32,), GGMLQuantizationType.Q8_0.value, q8()),
+                 ("output_norm.weight", (32,), GGMLQuantizationType.Q8_0.value, q8())]
+      for i in range(4):
+        tensors.append((f"blk.{i}.attn_q.weight", (32,), GGMLQuantizationType.Q8_0.value, q8()))
+        tensors.append((f"blk.{i}.ffn_gate_exps.weight", (32,), GGMLQuantizationType.Q8_0.value, q8()))
+      # MTP-style nextn block: block_count=5 (4 real blocks + 1 nextn), same as qwen3.6's unreferenced blk.40
+      tensors.append(("blk.4.attn_q.weight", (32,), GGMLQuantizationType.Q8_0.value, q8()))
+      kvs = [("general.architecture", "llama"), ("llama.block_count", 5), ("llama.nextn_predict_layers", 1)]
+      fp = pathlib.Path(d) / "tiny.gguf"
+      fp.write_bytes(self._build_gguf(tensors, kvs))
+
+      kv, sd = gguf_load(fp, device_map="0-1:CPU:0,2-3:CPU:1,experts:CPU:2")
+
+      # "CPU:0" canonicalizes to "CPU" (index 0 is the implicit default), same convention noted in test_llm_device_map.py
+      self.assertEqual([sd[f"blk.{i}.attn_q.weight"].device for i in range(4)], ["CPU", "CPU", "CPU:1", "CPU:1"])
+      self.assertEqual([sd[f"blk.{i}.ffn_gate_exps.weight"].device for i in range(4)], ["CPU:2"] * 4)  # experts: override
+      self.assertEqual(sd["token_embd.weight"].device, "CPU")     # dmap[0]
+      self.assertEqual(sd["output_norm.weight"].device, "CPU:1")  # dmap[-1]
+      self.assertEqual(sd["blk.4.attn_q.weight"].device, "CPU:1")  # beyond num_blocks (MTP nextn) -> dmap[-1], not a crash
+
+      # the whole point: dequant sits ON the target device already, so there's no COPY left for
+      # realize_placement to need to force-realize (it would otherwise materialize the full dequant).
+      for name in ("blk.2.attn_q.weight", "blk.2.ffn_gate_exps.weight", "token_embd.weight"):
+        self.assertIsNot(sd[name].uop.op, Ops.COPY, f"{name} still has a COPY above its dequant")
+
+  def test_device_map_malformed_kv_falls_back_to_default(self):
+    """A GGUF missing general.architecture/block_count (e.g. a later multi-part-split file -- only split
+    0 is guaranteed the full tensor listing/metadata) can't resolve a per-tensor device: gguf_load must
+    not KeyError, just fall back to the pre-T4.21 Device.DEFAULT staging for it."""
+    with tempfile.TemporaryDirectory() as d:
+      rng = np.random.default_rng(0)
+      data = quantize(rng.random(32).astype(np.float32), GGMLQuantizationType.Q8_0).tobytes()
+      fp = pathlib.Path(d) / "tiny.gguf"
+      fp.write_bytes(self._build_gguf([("blk.0.attn_q.weight", (32,), GGMLQuantizationType.Q8_0.value, data)], []))
+      kv, sd = gguf_load(fp, device_map="0:CPU:0")  # no KeyError despite missing KV
+      self.assertEqual(sd["blk.0.attn_q.weight"].device, Device.DEFAULT)
 
   def _test_dequantization(self, qtype: GGMLQuantizationType):
     block_size, type_size = GGML_QUANT_SIZES[qtype]

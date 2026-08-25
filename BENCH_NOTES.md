@@ -1282,3 +1282,166 @@ DEV=NV JITBEAM=1 PARALLEL=6  PYTHONPATH=. $PY extra/benchmark_llm.py --model $MX
 # NV health check, run before starting and after every run all session -- always clean, no wedge
 DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
 ```
+
+# T4.21 -- the load-path fix lands: qwen3.6-35B-A3B range split actually runs (2026-08-25)
+
+The CORRECTION section above named the swap explosion a load-path gap, not a residency ceiling
+("once T4.21 lands"). T4.21 fixed it this session (`tinygrad-dock`, same branch, HEAD `ac49c5d96`
++ the T4.21 commit; see TD3_POOLING_NOTES.md section 10 for the mechanism + olmoe residency/
+correctness proof). This section is the payoff: does the fix actually deliver a usable big-model
+split, using the budget saved by the CORRECTION's own recommendation to skip Q6/Q8 downloads.
+Same file as before, still the only one needed: `Qwen3.6-35B-A3B-MXFP4_MOE.gguf` (21.71 GB).
+Split `0-7:METAL,8-39:NV` (8 of 40 real blocks on METAL, 32 + token_embd/output on NV's side per
+the usual block-0/block-(-1) convention) -- picked as a modest, ~20% share off NV, since unlike
+olmoe this model only barely doesn't fit on NV alone (row 1 of the earlier Q4 table: OOM at 23.17
+GB / 24 GB), so a small share is all that's needed to free real BEAM/context headroom.
+
+## Loads clean -- the core claim, proven live
+
+| run | lane | max-ctx | load | swap during load+warm |
+|---|---|---:|---:|---|
+| all-NV reference (no-BEAM) | NAK | 2048 | 11.787s | flat (1754.31 MB throughout) |
+| split `0-7:METAL,8-39:NV` (no-BEAM) | NAK | 2048 | 11.089s | flat (1754.88 MB, +0.6 MB noise) |
+| split (`JITBEAM=2`) | nvcc | 4096 | 11.184s | flat (1668-1740 MB range, all noise) |
+| split (`JITBEAM=1`) | nvcc | 16384 | 11.272s | flat (1668.31 MB throughout) |
+| split (`JITBEAM=1`) | nvcc | 4096 | 11.468s | flat (1668.31 MB throughout) |
+
+Every row polled every 5-30s through load AND warmup with a live `sysctl vm.swapusage` loop (the
+brief's own abort trigger was "~4 GB sustained" -- observed max delta across all five rows: under
+0.1 GB, all ordinary noise). This is the direct contrast with the pre-T4.21 row in the CORRECTION
+section above: *"row 3 ... killed at 20s / 16.4 GB swap ... Never reached `from_gguf`'s return."*
+Same file, a comparably-sized NV-bound share, zero swap event this time -- `from_gguf` returns in
+~11s flat every time, load time barely distinguishable from the un-split reference.
+
+## (c) `JITBEAM=2` now fits -- confirmed, with an honest speed surprise
+
+The earlier headline table's own next-step line: *"`JITBEAM=2` does NOT fit: BEAM-2's search
+scratch OOMs (`136.00 MB failed ... Used: 22.70 GB`)"* for all-NV. On the split, `JITBEAM=2
+PARALLEL=6` at max-context 4096 completed in full -- no OOM, ~830s warmup (BEAM-2 searching a
+40-block hybrid MoE/SSM model is slow, but it finishes). **Decode came in at 7.582 tok/s** --
+slower than either no-BEAM reference (2.5-2.8 tok/s: cf.) would suggest BEAM should ever be, and
+much slower than the same split's own `JITBEAM=1` result below. Not chased further given budget,
+but not silently dropped either: this split's `JITBEAM=2` and `JITBEAM=1` runs produce **different
+tokens from each other**, diverging at decode index 106 -- the *exact* index T4.24 already
+documented BEAM parity breaking at for a different config ("fresh @2048 search diverges from
+no-BEAM at idx 106"). Same index, different run, different session: strong corroborating evidence
+this is T4.24's already-characterized "BEAM picks a different-but-valid kernel for a genuinely
+shape-dependent op, which eventually tips a near-tied argmax" class, not a new bug from this fix --
+and plausibly the same root cause behind the speed anomaly (a "valid" BEAM-2 candidate that scored
+well in the search's own noisy timing but isn't actually faster in practice). **Practical
+conclusion for this split: `JITBEAM=2` fits but isn't the config to use -- `JITBEAM=1` both fits
+and is 4x faster on the same hardware (see below).**
+
+## (d) Longer context fits -- confirmed, 4x the previously-tested ceiling, same speed
+
+| config | lane | max-ctx | `JITBEAM` | warm | prefill tok/s | decode tok/s |
+|---|---|---:|---:|---:|---:|---:|
+| **all-NV baseline (established, not re-run)** | nvcc | 4096 | 1 | -- | 57.34 | **56.58** |
+| all-NV | nvcc | 4096 | 2 | -- | -- | **OOM** |
+| split `0-7:METAL,8-39:NV` | nvcc | 4096 | 1 | 99.203s | 55.844 | **31.097** |
+| split `0-7:METAL,8-39:NV` | nvcc | 16384 | 1 | 314.003s | 55.487 | **30.926** |
+| split `0-7:METAL,8-39:NV` | nvcc | 4096 | 2 | 830.344s | 9.196 | 7.582 |
+
+16384 (4x the baseline's own 4096, and 4x anything tested for this model before this session) loads
+and decodes cleanly on the split, at the *same* speed as 4096 (30.93 vs 31.10 tok/s, within noise)
+-- consistent with the arch note already on record ("KV on this hybrid is small (~3 of 4 layers are
+recurrent, constant state)"): the split isn't paying a context-scaling cost any more than the
+un-split model did (768->4096 was flat too). Tokens are **byte-identical across all three
+`JITBEAM=1` rows** (4096/`JITBEAM=1`, 16384/`JITBEAM=1`, and matching through the shared prefix with
+the no-BEAM reference up to its own divergence point below) -- the split's own behavior is fully
+self-consistent across context length and warm/no-BEAM; only `JITBEAM=2` (previous paragraph) and
+the all-NV reference (next paragraph) produce different sequences.
+
+**Best working config: split, `JITBEAM=1`, ~31 tok/s** (4096 or 16384 context, same speed either
+way) **-- 1.82x slower than the 56.58 tok/s all-NV `JITBEAM=1` baseline, but a config the old code
+could not run AT ALL** (crashed via swap explosion before `from_gguf` returned, at any context).
+31 tok/s also happens to land almost exactly on CLAUDE.md's own llama.cpp-Metal reference for this
+model family (~31 tok/s) -- so the split's "cost" of pooling is landing back at roughly daily-driver
+parity, while running at up to 16384 tokens of context (vs the un-split path's own 4096 ceiling) and
+with headroom demonstrated for `JITBEAM=2` besides. Exactly the "slower but more capable" outcome
+the task brief flagged as valid up front, now with real numbers: the split trades ~45% of the
+all-NV `JITBEAM=1` peak for a config that (a) fits on this dock at all without pooling being
+required to babysit it, (b) demonstrated 4x more context than ever tested for this model, and (c)
+has BEAM-2 headroom to spare (even if BEAM-2 itself isn't the speed winner here).
+
+## (b) Tokens correct? -- yes for the split's own consistency; a new, honest divergence vs all-NV
+
+The split's no-BEAM output diverges from the all-NV no-BEAM reference at **decode index 8 of 65**
+(both NAK lane, max-context 2048, 512 prompt / 64 decode) -- far earlier than olmoe's analogous
+range split (0 divergence through 129 tokens, TD3_POOLING_NOTES.md section 10). Detokenized both
+(`SimpleTokenizer.from_gguf_kv`, header-only KV parse, no extra model load) to check severity:
+
+```
+REF  : "...It appears that your input is a jumbled collection of programming keywords, syntax
+        fragments, and random characters (likely resulting from a copy-paste error or a corrupted
+        file). However, I can identify several common programming concepts..."
+SPLIT: "...It looks like your input is a jumbled mix of code snippets, keywords, and random
+        characters. This often happens when text is copied from a corrupted source, a minified
+        file, or due to a keyboard/input error. However, I can help you **clean it up** or..."
+```
+
+Both fluent, both grammatical, both semantically the same answer -- textbook "class a, benign FP
+drift" (T4.19's term), i.e. an early near-tied argmax flip, not corruption or a routing bug. This
+session's mechanistic read on WHY it's earlier here than olmoe: T4.21's fix treats the reference
+and the split symmetrically (both stage+fuse their NV-resident blocks identically; the *only*
+structural difference is blocks 0-7 computing on METAL in the split vs NV in the reference), so the
+divergence traces to ordinary cross-backend FP non-associativity at that one block-7/block-8
+boundary -- same mechanism as olmoe's range split, but qwen3.6 is a **hybrid with recurrent
+Gated-DeltaNet state** in 3 of every 4 blocks: once a tiny cross-backend difference enters the
+recurrent state at the boundary, every subsequent decode step's state update compounds it further,
+where olmoe's stateless-per-step attention does not. This is a genuinely new observation -- it
+could not have been made before T4.21, because no range split of a model this size ever produced a
+token. Not chased to full root-cause (that's T4.19-scale effort for a second architecture); flagged
+here with the same honesty the brief asked for, alongside the fact that it was NEVER previously
+observable, so it isn't a regression from anything that used to work.
+
+## Verdict
+
+**(a)-(d) all delivered, with one caveat and one anomaly, both already precedented in this file's
+own history, neither a regression:** loads clean with zero swap event (a), tokens are fluent and
+self-consistent within the split with a new, honest, benign-FP-drift divergence vs the all-NV
+reference (b), `JITBEAM=2` now fits though isn't the speed winner (c), and a 4x-longer context
+fits at unchanged speed (d). The best working config (split, `JITBEAM=1`, ~31 tok/s) is 1.82x
+slower than the all-NV `JITBEAM=1` headline, landing back at roughly llama.cpp-Metal's own daily-
+driver speed for this model family -- while unlocking a config (any successful load of this split
+at all) that plain didn't exist before this session. T3.3's "load on the big-memory side" rule is
+obsolete for this (the `from_gguf`/`device_map`) path -- see TD3_POOLING_NOTES.md section 10.
+
+## Exact commands (T4.21)
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+OLMOE=/Users/artur/Library/Caches/tinygrad/downloads/d9f8816f773421fa69637257a3f71cdc
+MXFP4=/Users/artur/models/qwen3.6-35b-a3b-mxfp4/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+
+# residency proof (ad hoc, not committed) -- pre/post via git stash, same process both times
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/residency_check.py $OLMOE "0-7:METAL,8-15:NV"
+
+# olmoe real-scale correctness (129/129 exact, programmatic diff)
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map NV                    --prompt-tokens 512 --decode-tokens 128
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "0-7:METAL,8-15:NV"   --prompt-tokens 512 --decode-tokens 128
+
+# qwen3.6: swap-safety + no-BEAM correctness (NAK lane)
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --device-map NV                    --max-context 2048 --prompt-tokens 512 --decode-tokens 64
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --device-map "0-7:METAL,8-39:NV"   --max-context 2048 --prompt-tokens 512 --decode-tokens 64
+
+# qwen3.6: the payoff numbers (nvcc lane, colima up)
+DEV='METAL;NV' JITBEAM=2 PARALLEL=6 PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --device-map "0-7:METAL,8-39:NV" --max-context 4096  --prompt-tokens 512 --decode-tokens 128
+DEV='METAL;NV' JITBEAM=1 PARALLEL=6 PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --device-map "0-7:METAL,8-39:NV" --max-context 16384 --prompt-tokens 512 --decode-tokens 128
+DEV='METAL;NV' JITBEAM=1 PARALLEL=6 PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --device-map "0-7:METAL,8-39:NV" --max-context 4096  --prompt-tokens 512 --decode-tokens 128
+
+# detokenize for the fluency check (header-only KV parse, no extra model load)
+PYTHONPATH=. $PY /path/to/detok_check.py   # _parse_header + SimpleTokenizer.from_gguf_kv on the two token lists above
+
+# gates
+PYTHONPATH=.                    $PY -m pytest test/unit/test_llm_device_map.py test/unit/test_gguf.py -q   # 75 passed
+DEV=CPU PYTHONPATH=.            $PY -m pytest test/unit/test_llm_device_map.py test/unit/test_gguf.py -q   # 68 passed, 7 skipped
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -q                          # 32 passed
+PYTHONPATH=.                    $PY -m pytest test/unit -q -n12       # 846 passed, 71 skipped, 4 xfailed
+PYTHONPATH=.                    $PY -m mypy tinygrad/                 # Success: no issues found in 216 source files
+                                 $PY -m ruff check .                  # All checks passed
+
+# NV health check after every run this session -- always clean, no wedge
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+```

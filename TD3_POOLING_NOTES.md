@@ -770,6 +770,115 @@ PYTHONPATH=.        $PY -m mypy tinygrad/                                       
 $PY -m ruff check test/unit/test_llm_device_map.py                                 # All checks passed
 ```
 
+### 10. T4.21: the load-path fix -- big-model range splits no longer materialize the moved share at fp16
+
+The CORRECTION/qwen3.6 sections above root-caused the swap explosion to a **load-path gap**, not a
+residency ceiling: `gguf_load` always staged a tensor's raw quantized blob on `Device.DEFAULT`, so
+`ggml_data_to_tensor`'s dequant chain was built there too; when `device_map` then moved a param to a
+different device, `load_state_dict`'s `.to(param.device)` (`nn/state.py:214`) wrapped that WHOLE dequant
+chain in a COPY -- the COPY sat above the dequant, so `Transformer.realize_placement()`'s force-realize
+(needed to stop the COPY being recaptured+re-paid every JIT-replayed token, T3.2/T4.5) materialized the
+FULL dequantized size (fp16) on the LOAD device before a single byte reached the target. Fine for T3.3's
+small moved share; for ~half a big model, fatal (measured: 16.4 GB swap in 20s, row 3 above).
+
+**Fix, two parts, both required** (a loader-only fix alone was insufficient -- see below):
+
+1. **`tinygrad/llm/gguf.py`** (`_gguf_parse`/`gguf_load`, +~55 lines): when `device_map` is passed, resolve
+   each raw GGUF tensor NAME to a target device (mirroring `Transformer.__init__`'s block/`experts:`
+   placement, via `parse_device_map` -- imported locally inside `_gguf_parse` to avoid a cycle with
+   `model.py`, which imports `gguf_load` at module scope) and stage that tensor's blob **directly on its
+   target device**, before `ggml_data_to_tensor` builds the dequant on top. The per-batch merge-adjacent-
+   tensors optimization (`_STAGE_BATCH`) now also breaks a batch at a device boundary, so a batch shared by
+   two differently-placed tensors doesn't force them onto the same device. `num_blocks` is computed from
+   `kv_data` using the exact same formula `from_gguf` uses (block_count minus any MTP nextn layers); a
+   tensor whose block index falls outside that range (qwen3.6's unreferenced MTP block) falls back to the
+   last device, same convention as `output`/`output_norm`. A GGUF missing the KV needed to resolve this
+   (e.g. a later multi-part-split file, which isn't guaranteed the full metadata) falls back to the
+   pre-T4.21 `Device.DEFAULT` staging for that call instead of raising. Net effect: `load_state_dict`'s
+   later `.to(param.device)` is a no-op for these tensors (source and target already match) -- no COPY node
+   exists in the graph at all.
+
+2. **`tinygrad/llm/model.py`** (`realize_placement`, ~10 line change): turns out (1) alone is NOT enough --
+   `realize_placement()` still unconditionally forced `.contiguous()+.realize()` on every param with
+   `device != Device.DEFAULT`, and forcing a realize on a lazy dequant chain necessarily materializes its
+   FULL output (there's no partial-materialize for an elementwise dequant) -- so even with the blob already
+   local, the moved param would still eagerly expand to fp16, just on the correct device instead of the
+   wrong one (confirmed empirically below: NV residency was still ~fp16-sized, 6.92 GB, with (1) alone).
+   The fix: only force-realize a moved param whose **top-level op is still `Ops.COPY`**
+   (`p.uop.op is Ops.COPY`) -- `load_state_dict`'s assignment (`nn/state.py:214`) is a bare `.to()` with
+   nothing layered after it, so a genuine cross-device transfer of arbitrary upstream compute is ALWAYS the
+   outermost op right after load; if it isn't there (T4.21's loader already placed the blob correctly), the
+   dequant sits directly over an already-resident buffer with nothing to realize early -- exactly as safe
+   and as memory-cheap to leave lazy/fused as a same-device param already was. Verified this doesn't touch
+   any EXISTING test's behavior: every synthetic (non-GGUF) test in `test_llm_device_map.py` builds its
+   "moved" params via `nn.state.load_state_dict(split, nn.state.get_state_dict(ref), ...)` where `ref`'s
+   values (realized or not) sit on a device that genuinely differs from `split`'s target -- `.to()` always
+   inserts a real COPY there, so `p.uop.op is Ops.COPY` holds and the old force-realize behavior is
+   unchanged for all of them (confirmed: same 32/32 pass, including the T4.5 hop-count regression tests,
+   which measure ACTIVATION copies inside `_feed_forward`, unrelated to this weight-loading path).
+
+**Residency proof** (olmoe Q4_K_M, 4.2135 GB file, `DEV='METAL;NV:NAK'`, `device_map="0-7:METAL,8-15:NV"`,
+`GlobalCounters.mem_used_per_device` read immediately after `from_gguf` returns -- no forward pass, so this
+is pure weight residency):
+
+| | METAL (unmoved, `Device.DEFAULT`) | NV (moved) | TOTAL |
+|---|---:|---:|---:|
+| PRE-fix (`git stash`) | 2.1126 GB | **6.9192 GB** | 9.0317 GB |
+| POST-fix | 2.0915 GB | **2.1202 GB** | 4.2117 GB |
+
+NV's residency drops from 3.3x its quantized share (fp16, matching the diagnosis exactly) to matching it
+almost exactly; TOTAL drops from 2.1x the file size to ~1.00x. This is the core proof T4.21 exists to
+produce. (1) alone, tested in isolation before adding (2), gave NV = 6.9192 GB -- identical to pre-fix,
+confirming (2) was the part actually doing the residency work; (1) is still necessary because it's what
+gives `realize_placement()` a clean top-level-op signal to check, and what stops the LOAD device from
+transiently spiking (see qwen3.6 swap log below -- (1) is what a UOp-rewrite-of-the-COPY-alone would have
+had to reproduce anyway).
+
+**olmoe correctness -- two layers:**
+- New, committed, fast unit tests (`test/unit/test_gguf.py`,
+  `TestGGUF.test_device_map_places_blob_on_target_before_dequant` /
+  `test_device_map_malformed_kv_falls_back_to_default`, using the file's existing `_build_gguf` synthetic-
+  GGUF helper -- no download, no real model): block ranges, `token_embd`/`output_norm`'s
+  block-0/block-(-1) convention, the `experts:` override, an MTP-style out-of-range block index falling
+  back instead of raising, and the malformed-KV graceful fallback -- all assert both final `.device` AND
+  `p.uop.op is not Ops.COPY` (the actual mechanism, not just where it ends up).
+- Real-scale, ad hoc (not committed, same convention as this file's other big-model checks):
+  `extra/benchmark_llm.py --device-map "0-7:METAL,8-15:NV"` vs `--device-map NV`, `DEV='METAL;NV:NAK'`,
+  512 prompt / 128 decode tokens (the exact §3-bonus depth) -- **129/129 tokens byte-identical**
+  (programmatic diff, 0 mismatches), reproducing §3's own pre-fix-loader finding now on the post-fix
+  loader: the range-split mechanism itself was never in question, only its memory behavior at scale.
+
+**T3.3's "load on the big-memory side" rule -- obsolete for the `from_gguf`/`device_map` path.** That rule
+existed only because a moved param unconditionally materialized at fp16, so which side happened to be the
+transient LOAD device determined where a memory spike landed. Post-T4.21, a `gguf_load`-sourced moved
+param's blob is staged and (if still needed) realized directly on ITS OWN target device -- there is no
+cross-device fp16 detour left for "load device" to describe. **Not obsolete for the generic/manual-loader
+path** `realize_placement()` still serves (its own docstring's `nn.state.load_state_dict(...,
+realize=False); model.realize_placement()` example) -- a hand-built or non-GGUF state_dict can still
+produce a genuine COPY-over-arbitrary-compute, and T3.3's asymmetry could still apply there if the moved
+share is large. One known, small, NOT fixed-by-T4.21 corner even on the `from_gguf` path: a TIED embedding
+(`output.weight` aliased to `token_embd.weight` when the GGUF has no separate `output.weight` tensor,
+`model.py:605`) is assigned in `model.py` *after* `gguf_load` returns, so the loader never sees a raw
+`output.weight` tensor to place directly -- if `device_map`'s first-block device differs from its
+last-block device, that ONE tensor still takes the pre-T4.21 COPY-after-dequant path. Bounded by
+`vocab_size x dim` (a few hundred MB at most, not the multi-GB-scale bug this fixes), and not hit by either
+model tested this session (checked directly: both olmoe and qwen3.6-mxfp4 have a separate `output.weight`
+tensor on disk, not tied) -- noted for completeness, not chased.
+
+**qwen3.6-35B-A3B payoff run:** see BENCH_NOTES.md's new "T4.21" section for the full numbers (loads
+without the swap explosion, `JITBEAM=2` now fits, 4x longer context fits, decode tok/s vs the 56.58
+baseline, and an honest correctness caveat).
+
+```bash
+# gates (all green)
+PYTHONPATH=.                       $PY -m pytest test/unit/test_llm_device_map.py test/unit/test_gguf.py -q   # 75 passed
+DEV=CPU PYTHONPATH=.               $PY -m pytest test/unit/test_llm_device_map.py test/unit/test_gguf.py -q   # 68 passed, 7 skipped
+DEV='METAL;NV:NAK' PYTHONPATH=.    $PY -m pytest test/unit/test_llm_device_map.py -q                          # 32 passed
+PYTHONPATH=.                       $PY -m pytest test/unit -q -n12          # 846 passed, 71 skipped, 4 xfailed (was 844 pre-T4.21)
+PYTHONPATH=.                       $PY -m mypy tinygrad/                    # Success: no issues found in 216 source files
+                                    $PY -m ruff check .                     # All checks passed
+```
+
 ---
 
 ## Exact commands

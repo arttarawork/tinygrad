@@ -171,7 +171,7 @@ def _parse_header(header: Tensor) -> tuple[dict, list, int]:
   t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
   return kv_data, t_infos, r.tell()
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_parse(tensor: Tensor, device_map:str|dict[int|str,str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   # [T1.9] Only a small header prefix gets realized to parse KV metadata + tensor infos -- not the whole
   # (multi-GB) file. Tensor DATA is staged in bounded batches (_STAGE_BATCH) below instead of one whole-file
   # blob: no single allocation is ever bigger than one batch, which matters under memory pressure (a
@@ -193,10 +193,46 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment = kv_data.get("general.alignment", 32)
   data_start = round_up(pos, alignment)
 
-  # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH) into one
-  # disk->device copy each, instead of one copy per tensor. Each tensor's dequant graph still starts
-  # from its own VIEW of the (already-realized) batch, so per-tensor fusion is unaffected -- this only
-  # changes how many COPY ops the loader issues, not what ends up resident on device.
+  # [T4.21] When a device_map is given, stage each tensor's raw (still-quantized) blob straight onto ITS
+  # placed device instead of always Device.DEFAULT, so the dequant expression built on top of it runs where
+  # the bytes already live -- no COPY sits above the dequant. Left as the pre-T4.21 Device.DEFAULT-only
+  # behavior (dev_for=None) when device_map is None, so single-device loads are untouched.
+  #
+  # Transformer.realize_placement() (llm/model.py) force-realizes params moved off Device.DEFAULT, once,
+  # right after load, to stop the JIT from recapturing a dequant+COPY every token (see its docstring). Before
+  # this fix, "moved off Device.DEFAULT" meant the COPY wrapped the *finished* dequant (built on the load
+  # device, at fp16), so realizing it force-materialized the full fp16 size on the LOAD device before the
+  # bytes ever reached the target -- fine for T3.3's small moved share, a multi-GB swap spike for a big-model
+  # range split. Building the dequant ON the target device from the start (this function) means that same
+  # forced realize now just computes it locally there -- cheap, and exactly the residency T1.9 intended.
+  #
+  # Mirrors the block/experts placement Transformer.__init__ computes from the same parse_device_map() output
+  # (model.py) -- by GGUF tensor name here, since this runs before any Transformer/nn.Module exists to read
+  # placement back off of. Imported locally: model.py imports gguf_load at module scope, so a top-level
+  # import here would cycle; by the time anything actually calls gguf_load, model.py is fully initialized.
+  dev_for: Callable[[str], str]|None = None
+  if device_map is not None:
+    from tinygrad.llm.model import parse_device_map
+    arch = kv_data.get('general.architecture')
+    # num_blocks must match from_gguf's own formula exactly (real blocks, MTP nextn excluded). A later
+    # multi-part-split file may carry partial/no KV (only split 0 is guaranteed the full tensor listing) --
+    # fall back to Device.DEFAULT staging for it rather than KeyError on a rare, untested combination.
+    num_blocks = kv_data[f'{arch}.block_count'] - kv_data.get(f'{arch}.nextn_predict_layers', 0) if arch is not None \
+      and f'{arch}.block_count' in kv_data else None
+    if num_blocks is not None:
+      dmap, experts_dev = parse_device_map(device_map, num_blocks)
+      def _dev_for(name: str) -> str:
+        if not name.startswith("blk."): return dmap[0] if name == "token_embd.weight" else dmap[-1]
+        if experts_dev is not None and any(f".ffn_{w}_exps." in name for w in ("gate", "up", "down")): return experts_dev
+        idx = int(name.split(".", 2)[1])
+        return dmap[idx] if idx < len(dmap) else dmap[-1]  # e.g. qwen3.6's unreferenced MTP nextn block
+      dev_for = _dev_for
+
+  # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH, and -- when
+  # device_map is active -- sharing a target device) into one disk->device copy each, instead of one copy
+  # per tensor. Each tensor's dequant graph still starts from its own VIEW of the (already-realized) batch,
+  # so per-tensor fusion is unaffected -- this only changes how many COPY ops the loader issues and which
+  # device(s) they land on, not the fusion itself.
   infos = sorted(((name, dims, typ, off, _ggml_nbytes(prod(dims), typ)) for name, dims, typ, off in t_infos), key=lambda x: x[3])
 
   def flush(batch: list[tuple[str, tuple[int, ...], int, int, int]]) -> dict[str, Tensor]:
@@ -204,14 +240,14 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
     # realize the raw (still-quantized) batch bytes right away, same as the pre-T1.9 whole-file realize
     # did -- this is required regardless (DISK can't run the dequant ALU ops) and keeps the scheduler
     # from tangling hundreds of small COPYs into the same schedule as the per-tensor dequant graphs below.
-    staged = tensor[data_start + lo:data_start + hi].to(None).realize()
+    staged = tensor[data_start + lo:data_start + hi].to(dev_for(batch[0][0]) if dev_for else None).realize()
     return {name: ggml_data_to_tensor(staged[off - lo:off - lo + nbytes], prod(dims), typ).reshape(*reversed(dims))
             for name, dims, typ, off, nbytes in batch}
 
   state_dict: dict[str, Tensor] = {}
   batch: list[tuple[str, tuple[int, ...], int, int, int]] = []
   for info in infos:
-    if batch and info[3] + info[4] - batch[0][3] > _STAGE_BATCH:
+    if batch and (info[3] + info[4] - batch[0][3] > _STAGE_BATCH or (dev_for is not None and dev_for(info[0]) != dev_for(batch[0][0]))):
       state_dict.update(flush(batch))
       batch = []
     batch.append(info)
@@ -224,7 +260,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, device_map:str|dict[int|str,str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -238,9 +274,12 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
+
+  `device_map` (same syntax as `tinygrad.llm.model.Transformer`/`parse_device_map`) places each tensor's raw
+  blob directly on its mapped device instead of `Device.DEFAULT` -- see the T4.21 comment in `_gguf_parse`.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), device_map)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), device_map)[1])
   return kv, sd
