@@ -1011,3 +1011,28 @@ T4.22 lands. The IQ path reads ~20x more bytes per token.
 sequential state updates, so a decode step issues far more small kernels than a pure-attention
 model of similar size — consistent with the low achieved bandwidth at no-BEAM on both lanes.
 Whether BEAM closes that (as it did 2.5-4.6x elsewhere) is the headline run's question.
+
+**HEADLINE (2026-08-25): qwen3.6-35B-A3B MXFP4_MOE, `DEV=NV` (nvcc lane), `JITBEAM=1 PARALLEL=6`**
+
+| max-context | prefill tok/s | decode tok/s | GB/s |
+|---:|---:|---:|---:|
+| 768 | 57.20 | **56.45** | 222.7 |
+| 4096 | 57.34 | **56.58** | 225.5 |
+
+**1.8x llama.cpp-Metal's ~31 tok/s on the same machine, same model family.** Speed is flat
+768→4096 ⇒ `JITBEAM=1` (not the reduced context) was what fit; KV on this hybrid is small
+(~3 of 4 layers are recurrent, constant state). Tokens match the no-BEAM nvcc run.
+
+**`JITBEAM=2` does NOT fit**: BEAM-2's search scratch OOMs (`136.00 MB failed ... Used: 22.70 GB`)
+with a 21.71 GB model on 24 GB. So on this card the model size sets the BEAM budget:
+- no-BEAM: 7.07 tok/s
+- JITBEAM=1: 56.58 tok/s (8.0x)
+- JITBEAM=2: OOM (unmeasured; every smaller model gained further from 1→2)
+
+**Third argument for pooling (T4.21), the strongest one yet:** pooling isn't only about
+running quants bigger than one device — splitting a big model frees VRAM headroom for *BEAM
+itself* and for long-context KV. A pooled qwen3.6 would get JITBEAM=2 room AND daily-driver
+context (llama.cpp serves this model at 131k; we measured to 4096).
+
+Open follow-up (not chased): find the max context that still fits at JITBEAM=1, and whether
+JITBEAM=2 fits a smaller MXFP4-class file.
