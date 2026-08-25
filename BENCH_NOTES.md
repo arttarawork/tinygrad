@@ -441,3 +441,141 @@ gemv kernel-selection gap) are the more likely remaining floors, both structural
 issues that a working tensor-core lane doesn't by itself fix. Not re-measured in this session
 (out of scope, measurement only) — flagged for whichever task picks up T2.4 or the fused-attention
 work next.
+
+# Transport validation (T2.1/T2.2, real hardware) — 2026-08-25
+
+Closes the two Phase-0 measurement debts explicitly deferred to real NV hardware: T2.1's `_copyout`
+pipelining (`e31bb62d5`, done-when "D2H bandwidth up on real NV hardware") and T2.2's batched-PTE-write
++ skip-remote-validation levers (`1b8eabe52`, done-when "map_range socket-message count collapses").
+Both changes are already merged into fork master and were only functionally verified under mock-NV
+before this session — this section supplies the missing real-hardware numbers.
+
+**Environment:** worktree `tinygrad-dock`, branch `task/TD.3-pooling` @ `935e19b04` (clean at start and
+end — see restore verification below). `DEV=NV:NAK` (Mesa NAK compiler, Docker-free; colima confirmed
+stopped throughout, `bare DEV=NV` not used). Real hardware: RTX 3090 (EVGA, `10de:2204`) behind an
+AOOSTAR AG02 eGPU dock over USB4 (PCIe Gen4 x4 tunnel), small-BAR device (BAR1 = 256 MiB) reached via
+the socket-RPC `RemotePCIDevice`/`RemoteMMIOInterface` transport in `system.py` (macOS has no native
+NV kernel driver tinygrad can hook directly, unlike the Linux AM path). `llama-server` (Metal,
+`com.artur.llama-server`) was running throughout on the M3 Pro — confirmed healthy before and after,
+untouched by these benches since it never uses the NV tunnel. venv:
+`/Users/artur/Documents/tinygrad/.venv/bin/python`, `PYTHONPATH=.`. Swap held flat at ~1.03 GB used
+across the whole session (no regression from these microbenches; largest single host allocation was
+1 GiB, transient).
+
+## Method
+
+Both benches call the exact `HCQAllocator`/`NVPageTableEntry` methods the two commits changed directly
+(`_copyin`/`_copyout`, `set_entries`/`set_entry`), rather than going through `Tensor`/UOp scheduling —
+this times the transport primitives themselves with no kernel-launch or graph overhead in the way. Ad
+hoc scripts (not committed, scratchpad-only): `bench_t21_copyout.py`, `bench_t22_map.py`. Each run did
+one random-data correctness round-trip before any timed loop (mismatched output would have made the
+bandwidth numbers meaningless — both passed every time). One untimed warmup call preceded every timed
+series (T2.1: one warmup `_copyout`; T2.2: three 64 MiB alloc/free cycles, since a totally virgin VA
+range short-circuits `map_range`'s validation walk cheaply and real address spaces are never virgin
+past the first allocation — see the `1b8eabe52` test's own comment to that effect). 5 repetitions per
+condition, median reported (spread was tight throughout, <2% typically) alongside min/max.
+
+**T2.1 A/B:** `git revert --no-commit e31bb62d5` applied cleanly onto HEAD (`Auto-merging
+tinygrad/runtime/support/hcq.py`, no conflicts) — verified the staged diff was the exact inverse of
+the original commit (single `self.b[0]` staging buffer, blocking `self.dev.synchronize()`/per-chunk
+`timeline_signal.wait` with no overlap) before benching it. Restored via
+`git checkout HEAD -- tinygrad/runtime/support/hcq.py test/device/test_hcq.py`;
+`git status --porcelain` and `git diff --stat HEAD` were both empty afterward — tree is byte-identical
+to HEAD, revert was never committed.
+
+**T2.2 A/B:** both levers are independently switchable without touching the source tree, so all four
+combinations were measured: `NV_VALIDATE_REMOTE=1` (env var already wired by `1b8eabe52`) restores the
+old per-page validation readback; a same-process monkeypatch (`NVPageTableEntry.set_entries = None`,
+scratchpad script only, no source edit) makes `memory.py`'s `getattr(pt, 'set_entries', None)` miss and
+fall back to the old one-write-per-PTE `set_entry` loop. A lightweight call-counting wrapper (also
+scratchpad-only) around `entry()`/`set_entry()`/`set_entries()` recorded real RPC-call counts alongside
+the timings, since each call is one blocking socket round trip over the RemoteMMIOInterface transport.
+
+## A. T2.1 — `_copyout` D2H bandwidth
+
+| Size | D2H post-T2.1 (current) | D2H pre-T2.1 (reverted) | Speedup |
+|---:|---:|---:|---:|
+| 1 MiB | 2.920 GB/s (0.359 ms) | 2.922 GB/s (0.359 ms) | 1.00x |
+| 16 MiB | 3.376 GB/s (4.969 ms) | 3.067 GB/s (5.470 ms) | 1.10x |
+| 64 MiB | 3.417 GB/s (19.637 ms) | 3.064 GB/s (21.905 ms) | 1.12x |
+| 256 MiB | 3.427 GB/s (78.321 ms) | 3.066 GB/s (87.558 ms) | 1.12x |
+| 1024 MiB | 3.430 GB/s (313.017 ms) | 3.062 GB/s (350.676 ms) | 1.12x |
+
+All medians of 5; spread was <0.1% of the median at every size in every condition (tightest signal of
+the whole session — a real, low-noise transport effect, not measurement jitter). 1 MiB shows ~0 delta
+by construction: it's smaller than one staging-pool chunk (2 MiB), so the loop body runs exactly once
+regardless of code version — there's nothing to pipeline. From 16 MiB up (2+ chunks in flight), the
+gain is immediate and flat at **+10-12%**, converging to **+12.0%** at 1 GiB.
+
+H2D context (`_copyin`, unchanged by T2.1, same in both trees — measured on the current tree only,
+after fixing an early methodology bug: `_copyin` only blocks on staging-buffer-slot *reuse*, not the
+final chunk's DMA completion, so a transfer that fits inside the 32x2 MiB pool without ever needing to
+reuse a slot measured a nonsensical ~36 GB/s "enqueue time" until `dev.synchronize()` was added inside
+the timed region):
+
+| Size | H2D bandwidth |
+|---:|---:|
+| 64 MiB | 3.316 GB/s (20.236 ms) |
+| 1024 MiB | 3.327 GB/s (322.713 ms) |
+
+H2D and D2H converge to the same ~3.3-3.4 GB/s ceiling in both directions — consistent with the shared
+PCIe Gen4 x4-over-USB4 tunnel being the practical bandwidth floor referenced in the task brief ("a few
+GB/s"), not either copy path's own implementation.
+
+**Verdict A:** T2.1 delivered on its real-hardware done-when. Parallelizing `_copyout` across the
+staging pool (instead of one buffer with a full blocking sync per 2 MiB chunk) is a genuine, highly
+reproducible **+12% D2H bandwidth** win at transfer sizes large enough to pipeline (16 MiB+), holding
+flat from 16 MiB through 1 GiB. The win is smaller than copyin/copyout's *local*-transport counterparts
+would suggest (no multi-x jump) because the per-chunk DMA itself (~570-680 us for 2 MiB at ~3.4 GB/s)
+already dominates over the host-side readout and submission work that pipelining overlaps — over this
+tunnel, bandwidth is transport-bound, not host-serialization-bound, so pipelining recovers the
+serialization tax (the ~12%) but can't exceed the tunnel's own ceiling. Still a clean, real win exactly
+where the commit predicted one.
+
+## B. T2.2 — PTE-write batching / remote-validation skip
+
+1 GiB VRAM buffer allocate+map, 5x median (`Buffer(..., BufferSpec(nolru=True)).ensure_allocated()` —
+plain VRAM alloc, no `cpu_access`/`host`, so it runs through `NVMemoryManager.valloc` -> `map_range`,
+exactly the path `1b8eabe52` touched). Three 64 MiB warmup alloc/free cycles preceded every condition.
+
+| Condition | Validation | Leaf-PTE writes | median map time (1 GiB) | vs current |
+|---|---|---|---:|---:|
+| current (HEAD, both levers on) | skipped (`is_remote`) | batched (`set_entries`) | **1.159 ms** | baseline |
+| `NV_VALIDATE_REMOTE=1` | restored (per-page readback) | batched | 1.552 ms | +33.9% |
+| `set_entries` disabled (monkeypatch) | skipped | unbatched (`set_entry` x1/page) | 2.534 ms | +118.6% |
+| both reverted (full pre-T2.2 behavior) | restored | unbatched | 2.910 ms | +151.1% |
+
+Diagnostic RPC-call counts (summed over the 5 timed reps, via a call-counting wrapper around
+`NVPageTableEntry.entry`/`set_entry`/`set_entries` — each call is one blocking socket round trip):
+
+| Condition | `entry()` reads (validation + tree-walk) | leaf-PTE write calls |
+|---|---:|---:|
+| current | 19530 (3906/rep) | 10 (2 `set_entries` calls/rep) |
+| `NV_VALIDATE_REMOTE=1` | 19680 (+150 total / +30 per rep) | 10 (unchanged) |
+| no-batch | 19530 (unchanged) | 5140 (1028 `set_entry` calls/rep) |
+| both reverted | 19680 | 5140 |
+
+Each 1 GiB allocation resolved into two contiguous ~512 MiB physical runs, each represented as 256
+leaf PTEs at the 2 MiB page-table level (`pte_covers=2097152`, confirmed by instrumenting the actual
+`(count, pte_covers, lv)` arguments live) rather than one PTE at a coarser level — so the write path
+really does have 256-wide contiguous runs to batch on this hardware, not just in the `1b8eabe52` unit
+test's synthetic 256-page case. Batching collapses those into 2 RPC writes/rep instead of 512
+(`1028` includes 516/rep of intermediate page-table-creation writes that both old and new code share
+unchanged — `level_down()`'s PDE writes aren't touched by this lever, so they appear in both columns).
+The validation reads add only +30/rep in call count on this mostly-fresh VA range (the walk
+short-circuits early once it finds a not-yet-populated ancestor) but still cost +33.9% wall time —
+consistent with each of those extra calls being a full blocking RPC round trip, not a cheap local read.
+
+**Verdict B:** T2.2 delivered on its real-hardware done-when, and by more than the message-count unit
+test alone would suggest. Combined, both levers cut 1 GiB map time from **2.910 ms to 1.159 ms — a
+2.51x speedup (-60.2% wall time)**. The two levers are close to additive (25.3% saved by skipping
+validation alone + 54.3% saved by batching writes alone ≈ 60.2% combined, so little interaction) but
+uneven in size: write-batching is the larger of the two contributors here (54.3% vs 25.3%), because
+this allocation pattern genuinely produces wide (256-entry) contiguous PTE runs on real VRAM, not the
+degenerate 1-PTE-per-run case a naive reading of the physical allocator's tiered `palloc_ranges`
+(512 MiB/2 MiB/4 KiB, each exactly matching a huge-page-eligible level) might predict. Both figures are
+on the same order as T2.1's transport win but reached through eliminating blocking RPC round trips
+rather than pipelining DMA — the map path is latency-bound (many small blocking messages), the copy
+path is bandwidth-bound (one large DMA), and each commit targeted the lever that actually matched its
+bottleneck.
+
