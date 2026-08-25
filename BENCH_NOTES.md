@@ -977,3 +977,37 @@ Consequently Q6_K_XL (~29 GB) pooled ~18/11 and Q8_0 (~37.4 GB) pooled ~20/17 re
 **once T4.21 lands** (place the blob *read* per-device so quantized bytes copy and dequant
 fuses on the target, instead of realizing moved params at fp16). The olmoe range-split bonus
 results in this section are unaffected and stand.
+
+### qwen3.6-35B-A3B on the dock — main-session runs (2026-08-25, supersedes the section above)
+
+Context: the "71 GB fp16-resident" analysis above is falsified (see CORRECTION). Residency ≈
+quantized file size, so the real question is which *file* fits 24 GB and which quant FORMATS
+tinygrad decodes efficiently. All runs `--max-context 2048 --prompt-tokens 512
+--decode-tokens 128`, llama-server stopped, colima up.
+
+| file | GB | lane | flags | decode tok/s | GB/s | verdict |
+|---|---:|---|---|---:|---:|---|
+| UD-Q4_K_XL (local, MTP) | 22.85 | NV:NAK | — | — | — | OOM, `Used: 23.17 GB` |
+| UD-Q4_K_M (registry) | 22.13 | NV:NAK | — | — | — | OOM, `Used: 23.73 GB`; also OOMs at max-context 1024 ⇒ working set is context-INdependent (~1.6 GB) |
+| UD-Q3_K_XL | 16.85 | NV:NAK | — | 1.86 | 164.1 | fits; **~88 GB/token — IQ dequant materializing (T4.22 = upstream #17316 reproduced)** |
+| MXFP4_MOE | 21.71 | NV:NAK | — | 2.50 | 11.2 | fits; ~4.5 GB/token (bytes HEALTHY — T4.13 fusion works) but 1% of card bw ⇒ kernel/latency-bound |
+| MXFP4_MOE | 21.71 | NV (nvcc) | — | **7.07** | 31.6 | 2.8x the NAK lane, same file — the usual lane gap |
+| MXFP4_MOE | 21.71 | NV (nvcc) | JITBEAM=2 PARALLEL=6 | *(see next commit)* | | headline run |
+
+Reference: llama.cpp Metal on this Mac runs UD-Q4_K_XL at ~31 tok/s (Artur's daily driver).
+
+**File-composition matters more than the quant NAME.** Tensor-type histograms (parsed from the
+GGUF headers directly):
+- `UD-Q3_K_XL`: IQ3_XXS 20.94B + IQ4_XS 10.20B elements — i.e. **31 of 35B elements are IQ**,
+  despite the "Q3_K" name. Unsloth "UD" = dynamic IQ mixes.
+- `MXFP4_MOE`: MXFP4 (ggml type **39**) 20.94B (the 78 expert tensors) + Q5_K 10.20B (attention)
+  + Q8_0 2.42B — i.e. **exactly the two formats this fork already fixed** (T4.13 MXFP4 LUT→ALU,
+  T4.2 Q5_K/Q4_K scale staging). tinygrad reads type 39 (`gguf.py:21,122`).
+
+**Practical rule for this fork: prefer MXFP4/K-quant files over Unsloth UD-/IQ mixes** until
+T4.22 lands. The IQ path reads ~20x more bytes per token.
+
+**Arch note (first DeltaNet-on-NV data):** 3 of every 4 layers are recurrent GatedDeltaNet with
+sequential state updates, so a decode step issues far more small kernels than a pure-attention
+model of similar size — consistent with the low achieved bandwidth at no-BEAM on both lanes.
+Whether BEAM closes that (as it did 2.5-4.6x elsewhere) is the headline run's question.
