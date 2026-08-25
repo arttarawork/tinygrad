@@ -28,14 +28,15 @@ def append_csv(path:str, row:dict):
     w.writerow(row)
 
 def run_tinygrad(gguf:str, model_name:str, device:str, env_extra:dict, flags_tag:str,
-                  prompt_tokens:int, decode_tokens:int, python:str) -> dict:
+                  prompt_tokens:int, decode_tokens:int, python:str, device_map:str|None=None) -> dict:
   env = os.environ.copy()
   env["DEV"] = device
   env.update(env_extra)
   cmd = [python, str(HERE / "benchmark_llm.py"), "--model", gguf,
          "--prompt-tokens", str(prompt_tokens), "--decode-tokens", str(decode_tokens)]
+  if device_map: cmd += ["--device-map", device_map]
   print(f"+ DEV={device} {' '.join(f'{k}={v}' for k,v in env_extra.items())} {' '.join(cmd)}", file=sys.stderr)
-  proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=1800)
+  proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=2700)  # 45 min: matches TD.3 bench-row skip budget
   if proc.returncode != 0:
     print(proc.stdout, file=sys.stderr); print(proc.stderr, file=sys.stderr)
     raise RuntimeError(f"benchmark_llm.py failed (exit {proc.returncode})")
@@ -45,7 +46,7 @@ def run_tinygrad(gguf:str, model_name:str, device:str, env_extra:dict, flags_tag
   prefill_tps = float(re.search(r"^prefill ([\d.]+) tok/s", text, re.M).group(1))
   m = re.search(r"^decode ([\d.]+) tok/s ([\d.]+) GB/s", text, re.M)
   decode_tps, gbps = float(m.group(1)), float(m.group(2))
-  flags = " ".join(f"{k}={v}" for k, v in env_extra.items()) + (f" {flags_tag}" if flags_tag else "")
+  flags = " ".join(f"{k}={v}" for k, v in env_extra.items()) + (f" device_map={device_map}" if device_map else "") + (f" {flags_tag}" if flags_tag else "")
   return dict(model=model_name, stack="tinygrad", device=device, flags=flags.strip(),
               load_s=f"{load_s:.3f}", prefill_tps=f"{prefill_tps:.2f}", decode_tps=f"{decode_tps:.2f}", gbps=f"{gbps:.2f}")
 
@@ -71,6 +72,7 @@ def main():
   p.add_argument("stack", choices=["tinygrad", "llamacpp"])
   p.add_argument("--model", "-m", required=True, help="model name from tinygrad.llm.cli.models, or a local GGUF path")
   p.add_argument("--device", default="METAL", help="DEV for the tinygrad stack (default: %(default)s)")
+  p.add_argument("--device-map", default=None, help="--device-map passthrough to benchmark_llm.py (TD.3 pooling)")
   p.add_argument("--env", action="append", default=[], metavar="K=V", help="extra env var for the tinygrad stack (repeatable)")
   p.add_argument("--tag", default="", help="free-text note appended to the flags column (e.g. a branch/commit)")
   p.add_argument("--prompt-tokens", type=int, default=512, help="tinygrad stack prefill length (default: %(default)s)")
@@ -89,7 +91,7 @@ def main():
 
   for i in range(args.repeat if args.stack == "tinygrad" else 1):
     if args.stack == "tinygrad":
-      row = run_tinygrad(gguf, args.model, args.device, env_extra, args.tag, args.prompt_tokens, args.decode_tokens, args.python)
+      row = run_tinygrad(gguf, args.model, args.device, env_extra, args.tag, args.prompt_tokens, args.decode_tokens, args.python, args.device_map)
     else:
       row = run_llamacpp(gguf, args.model, args.n_prompt, args.n_gen, args.llama_bench_repetitions, args.llama_bench, args.tag)
     print(row)

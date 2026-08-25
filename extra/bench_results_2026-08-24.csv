@@ -11,3 +11,9 @@ qwen3:8b,tinygrad,NV,,6.771,22.58,9.99,63.37
 qwen3:8b,tinygrad,NV,JITBEAM=2 PARALLEL=6,6.473,118.88,46.87,287.79
 gpt-oss:20b,tinygrad,NV,,8.648,111.69,18.77,65.28
 gpt-oss:20b,tinygrad,NV,JITBEAM=2 PARALLEL=6,8.653,207.62,60.85,243.20
+olmoe,tinygrad,METAL,TD.3-beam row1 all-METAL no-BEAM,1.395,160.95,28.21,45.65
+olmoe,tinygrad,METAL,JITBEAM=2 PARALLEL=6 TD.3-beam row2 all-METAL JITBEAM=2 PARALLEL=6,1.138,220.14,63.81,74.26
+olmoe,tinygrad,NV,TD.3-beam row3 all-NV no-BEAM,5.788,228.85,44.82,72.55
+olmoe,tinygrad,NV,JITBEAM=2 PARALLEL=6 TD.3-beam row4 all-NV JITBEAM=2 PARALLEL=6,5.717,670.77,115.51,117.07
+olmoe,tinygrad,NV,"device_map=METAL,experts:NV TD.3-beam row5 split METAL,experts:NV no-BEAM",8.601,192.41,41.26,135.05
+olmoe,tinygrad,NV,"JITBEAM=2 PARALLEL=6 device_map=METAL,experts:NV TD.3-beam row6 split METAL,experts:NV JITBEAM=2 PARALLEL=6 HEADLINE",8.120,208.06,43.84,64.41

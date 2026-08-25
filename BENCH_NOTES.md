@@ -579,3 +579,157 @@ rather than pipelining DMA — the map path is latency-bound (many small blockin
 path is bandwidth-bound (one large DMA), and each commit targeted the lever that actually matched its
 bottleneck.
 
+# BEAM'd pooling (TD.3 final rows) — 2026-08-25
+
+Final TD.3 perf rows: BEAM'd MoE pooling on the dock, **nvcc lane** (plain `DEV=NV` strings, no
+`:NAK` — the Docker NVRTC compile-server, `PARALLEL=6` on every JITBEAM run per the colima-
+oversubscription lesson in the TD.2c section above). Model: olmoe (same cached GGUF as §7/§8 above,
+`allenai/OLMoE-1B-7B-0924-Instruct-GGUF` Q4_K_M, 16 blocks/64 experts/8-active, already resident at
+`~/Library/Caches/tinygrad/downloads/d9f8816f773421fa69637257a3f71cdc`). Harness: `extra/bench_llm.py`
++ `extra/benchmark_llm.py`, `--prompt-tokens 512 --decode-tokens 128` (the T0.3/TD.2 convention, a
+real step up from §7/§8's `16/64` correctness-phase config). Worktree `tinygrad-dock`, branch
+`task/TD.3-pooling`, HEAD `74a0e861b` at session start. venv
+`/Users/artur/Documents/tinygrad/.venv/bin/python`, `PYTHONPATH=.`. `llama-server` stopped, colima
+running (8 vCPU/6 GiB) with the nvcc compile-server image (`ghcr.io/tinygrad/cuda-arm64:v2.3`)
+already pulled. Swap held flat at **947.75 MB used throughout the entire session** (checked before,
+during, and after every row) — no regression, well under the 2.5 GB watch threshold.
+
+**Harness change (2 small additions to `extra/bench_llm.py`, +6/−4 lines):** the script had no
+`--device-map` passthrough (only `extra/benchmark_llm.py` got one, back in the dense-pooling
+session) — added the same passthrough here (`--device-map` arg → forwarded to
+`benchmark_llm.py`'s existing flag, recorded in the CSV `flags` column as `device_map=...`), mirroring
+the established precedent instead of hand-rolling a separate script. Also bumped the internal
+`subprocess.run(..., timeout=...)` from 1800s to 2700s to match this task's own 45-minute per-row
+skip budget — the old 30-minute cap would have hard-killed row 4 below (which took 1232s to warm,
+comfortably under 45 min but over 30). `extra/` is excluded from ruff and `follow_imports=skip` in
+mypy (see T0.3 section above), so no separate lint/type gate; the real check is the six rows below
+actually running end-to-end through it.
+
+## Rows
+
+| # | Config | load s | warm s | prefill tok/s | decode tok/s | GB/s |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | all-METAL, no-BEAM | 1.395 | 26.035 | 160.95 | **28.21** | 45.65 |
+| 2 | all-METAL, `JITBEAM=2 PARALLEL=6` | 1.138 | 240.915 | 220.14 | **63.81** | 74.26 |
+| 3 | all-NV, no-BEAM | 5.788 | 30.815 | 228.85 | **44.82** | 72.55 |
+| 4 | all-NV, `JITBEAM=2 PARALLEL=6` | 5.717 | 1232.461 | 670.77 | **115.51** | 117.07 |
+| 5 | split `METAL,experts:NV`, no-BEAM | 8.601 | 19.102 | 192.41 | **41.26** | 135.05 |
+| 6 | split `METAL,experts:NV`, `JITBEAM=2 PARALLEL=6` **(HEADLINE)** | 8.120 | 311.665 | 208.06 | **43.84** | 64.41 |
+
+Rows 1-2: `DEV` unset (Device.DEFAULT=METAL on this Mac). Rows 3-6: `DEV=NV` (nvcc/docker lane, load
+device = NV throughout, including the split — correct per §7/§5's load-direction rule: experts are
+the bulk of a MoE model's weights, so the GGUF load device must be NV or the cross-device `.to()` in
+`load_state_dict` force-realizes ~13 GB of expert weights at full fp16 on the wrong side first).
+Exact commands (row 6 shown; others swap the config flags):
+```
+PYTHONPATH=. .venv/bin/python extra/bench_llm.py tinygrad --model olmoe --device NV \
+  --device-map "METAL,experts:NV" --env JITBEAM=2 --env PARALLEL=6 \
+  --prompt-tokens 512 --decode-tokens 128 --csv extra/bench_results_2026-08-24.csv
+```
+CSV rows appended to `extra/bench_results_2026-08-24.csv` (`model=olmoe`, `stack=tinygrad`, `device`
+= the `DEV` value, `flags` carries `device_map=...`/`JITBEAM=2 PARALLEL=6` as applicable).
+
+## Parity spot-check (requested): split `JITBEAM=2` vs split `JITBEAM=0` — PASS
+
+Byte-identical, **129/129 tokens** (1 prefill + 128 decode; programmatic list-equality on rows 5 vs
+6's captured `output [...]` lists, same methodology as every prior parity check in this file). BEAM's
+kernel selection does not change the split's own output at this depth, on this lane.
+
+## Correctness caveat found along the way (not requested, but load-bearing — flagged, not chased)
+
+Rows 1-4 (all four single-device configs: METAL no-BEAM/BEAM, NV no-BEAM/BEAM) are **byte-identical
+to each other**, all 129/129 tokens — verified programmatically, not eyeballed. But **both split rows
+(5 and 6) diverge from that shared reference at decode index 60** (`ref=1232` vs `split=11723`) and
+fall into a different repetition loop from there (the synthetic prompt drives every config into a
+repetitive attractor by this depth — expected per §1's dense finding — the split just lands in a
+*different* one). This is a real, structural difference from §7/§8's "byte-identical" correctness
+claim for the same model/placement — but that claim was proven at a **16-prompt/64-decode** horizon;
+this session's **512-prompt/128-decode** convention is 4x deeper on the prefill side and reaches
+further into decode, and real cross-backend FP non-associativity (different reduction order between
+METAL's and NV's kernels for the identical math) evidently accumulates enough by token ~60 to flip an
+argmax on this model. Not a crash, not garbage output (both trajectories are locally coherent,
+repetition-loop text) — so it does **not** trip this task's STOP condition ("both split rows fail
+*structurally*"), and the specifically-requested parity check (BEAM vs no-BEAM, both split) still
+holds because that comparison never leaves the split's own device placement. Recorded here as a
+**scope note for whoever next relies on "the split is exactly correct" at bench-harness depth**: it
+is, for the requested BEAM-vs-no-BEAM comparison; it is *not*, cross-device, past ~60 decode tokens on
+this lane. Not investigated further (out of scope for a perf-rows task; §6/§7's own precedent is to
+flag cross-backend FP drift and move on once no crash is involved).
+
+## Interpretation
+
+**1. Does BEAM change the split-vs-all-NV verdict? Yes — it reverses it, hard, and this nvcc-lane
+baseline pair is itself new.** No-BEAM, fresh nvcc-lane baseline: split (41.26) is already slightly
+*behind* all-NV (44.82) — **0.92x**, not the NAK-lane's dramatic 3.2x-ahead (41.14 vs 12.87, §8). That
+headline 3.2x was real but rode on NAK's tensor-core-less all-NV floor (12.87); nvcc's all-NV no-BEAM
+floor is 3.5x higher (44.82) on the same hardware, so the split's no-BEAM lead evaporates before BEAM
+even enters the picture. Once BEAM is added, the gap doesn't just persist, it **widens sharply**: BEAM
+lifts all-NV **2.58x** (44.82→115.51) but the split only **1.06x** (41.26→43.84), so BEAM'd split
+lands at **0.38x** of BEAM'd all-NV — worse, proportionally, than the no-BEAM comparison. BEAM's big
+win lives almost entirely on the all-NV side.
+
+**2. Where does BEAM'd split land vs BEAM'd all-METAL and BEAM'd all-NV — is heterogeneous still the
+win once both sides get good kernels? No — it's the worst of the three, and by a wide margin.**
+Full ranking flips between conditions:
+- no-BEAM: NV (44.82) > split (41.26) > METAL (28.21) — split 2nd, close to 1st (0.92x).
+- BEAM: **NV (115.51) > METAL (63.81) > split (43.84)** — split dead last, not close (0.38x of NV,
+  **0.69x of plain BEAM'd all-METAL** — the split loses even to the single Mac-only device once METAL
+  gets its own BEAM kernels).
+The likely mechanism (consistent with §8's own framing, not re-verified this session): the
+`METAL,experts:NV` placement keeps *all* attention/router/lm_head compute on METAL and sends *only*
+the expert FFN GEMVs to NV. BEAM's biggest wins on this hardware come from tensor-core scheduling of
+exactly the kernel shapes the split never lets NV touch (attention, the big vocab-sized lm_head
+matmul — the same kernels TD.2's takeaways 2/3 named as where NV+BEAM's advantage over NAK is
+largest). The split's NV side only ever gets the comparatively small, already-memory-bound-and-hard-
+to-improve expert GEMVs, so BEAM has little left to find there, while METAL's own BEAM win (2.26x,
+row 1→2) is diluted in the split because the split's METAL share excludes the expert-FFN kernels that
+plausibly drove much of *that* number too. Net: **placing only the experts on NV captures NV's raw
+bandwidth for the expert weights, but forfeits essentially all of NV's BEAM/tensor-core advantage** —
+which is the larger of the two effects on this hardware once both sides can search.
+
+**3. BEAM warmup wall time for the split (mixed-device search through docker).** Row 6: **311.7s**.
+Far closer to all-METAL's pure-native BEAM cost (240.9s, row 2 — **1.29x**) than to all-NV's
+pure-docker BEAM cost (1232.5s, row 4 — the split is **3.96x cheaper**, using just **25.3%** of
+all-NV's warmup time). Consistent with the same mechanism as finding 2: the split only needs to BEAM-
+search the small set of expert-GEMV kernel shapes through the slow docker round-trip; every
+attention/router/lm_head kernel search happens on METAL's cheap native path. Heterogeneous placement's
+BEAM compile cost scales with *how much of the model* is delegated to the slow-to-compile side, not
+with whether that side is touched at all.
+
+**2-vs-3 hops/layer (§8 flag):** no `DEBUG=2` capture was taken this session (all six rows ran in
+plain benchmark mode) — per the brief, not chased with an extra experiment. Still open.
+
+## Stretch row: gpt-oss:20b split `METAL,experts:NV`, no-BEAM — blocked, exactly as predicted
+
+Single attempt (per the brief: no retry, no BEAM variant on a crash):
+```
+DEV=NV PYTHONPATH=. .venv/bin/python extra/bench_llm.py tinygrad --model gpt-oss:20b --device NV \
+  --device-map "METAL,experts:NV" --prompt-tokens 512 --decode-tokens 128
+```
+Load succeeded (12.098s) but `model.warmup()`'s JIT capture crashed:
+```
+RuntimeError: RPC failed: unknown error
+  ops_nv.py:371 NVDevice._alloc -> system.py:449 alloc_sysmem -> system.py:389 _rpc
+  (called from graph/hcq.py:32 HCQGraph.__init__'s kernargs_bufs allocation)
+```
+This is the exact ceiling the brief called in advance: gpt-oss:20b's 24 layers (vs olmoe's 16) push
+past the TinyGPU sysmem slot ceiling (§7/§8: ~128-130 concurrent `alloc_sysmem` calls) even after
+T4.18's fix — because T4.18 only slab-pooled `hw_page` (ops_nv.py); `kernargs_bufs`
+(`graph/hcq.py:32`, ~34% of the dominant allocator class, one fresh RPC per graph island) was
+explicitly left unfixed, with §8's own note: "revisit only if a bigger model or longer run pushes
+past that new headroom." gpt-oss:20b is that bigger model. Call-site attribution came for free from
+the traceback itself (`kernargs_bufs`, not `hw_page`) — no extra instrumentation run, per "record...
+if cheap." **Row marked `blocked: T4.18 ceiling (kernargs pooling needed)`.** Not retried (one clean,
+deterministic, mechanistically-understood crash matching a pre-registered prediction — nothing to
+gain from a second identical attempt). No BEAM variant attempted. Cleaned up per the brief's standing
+authorization: `pkill -f "TinyGPU.*server"` after the crash (client auto-respawns on next use).
+
+## Environment / stability
+
+Swap: flat 947.75 MB used across the entire session (pre-row-1 through post-stretch-crash) — no
+growth, no watch-threshold trip. GPU: one process at a time throughout, sequential rows, foreground/
+blocking per-row execution (a row exceeding the harness's synchronous cap — row 4, 1232s warm — was
+tracked to completion via an in-shell `until`-loop against its own output file rather than left to run
+unobserved). `pkill -f "TinyGPU.*server"` used once, after the stretch-row ceiling crash, per the
+brief's standing authorization.
+
