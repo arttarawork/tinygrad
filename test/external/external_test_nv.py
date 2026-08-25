@@ -193,6 +193,32 @@ class TestNVBindHwPageSlab(unittest.TestCase):
   def test_local_binds_allocate_per_bind(self):
     assert (n:=self._bind_n(is_remote=False, n_binds=32)) == 32, f"local bind() must keep one alloc per bind (unchanged), got {n}"
 
+class TestNVKernargsPoolSlab(unittest.TestCase):
+  """T4.20: HCQGraph.__init__ (graph/hcq.py:32) allocates one kernargs buffer per graph island per device,
+  freed in __del__ -- but T4.18 already proved a remote sysmem free is a client-side no-op (no unmap verb),
+  so every island permanently burns one of the ~128 sysmem slots. A many-island graph (an experts: split
+  measured ~85 islands) can exhaust them. Pool kernargs the same way T4.18 pooled hw_page: one never-freed
+  slab, bump-suballocated; local/NVK keeps one alloc per island, byte-for-byte."""
+  def _alloc_free_n(self, is_remote:bool, n:int=40, size:int=256) -> int:
+    allocs = []
+    def fake_alloc(sz, options):
+      allocs.append(sz)
+      page:SimpleNamespace = SimpleNamespace(size=sz, base=None)
+      page.offset = lambda off, osz, page=page: SimpleNamespace(size=osz, base=page)
+      return page
+    fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=fake_alloc, _alloc=fake_alloc, _free=lambda *a, **k: None),
+                               is_remote=lambda: is_remote, _kernargs_slab=None, _kernargs_bump=None)
+    bufs = [NVDevice.alloc_kernargs(fake_dev, size) for _ in range(n)]
+    for b in bufs: NVDevice.free_kernargs(fake_dev, b)
+    return len(allocs)
+
+  def test_remote_kernargs_share_one_slab(self):
+    # pre-T4.20 this was 40 allocations = 40 permanently-held sysmem slots (freeing them is a remote no-op)
+    assert (n:=self._alloc_free_n(is_remote=True, n=40)) == 1, f"40 remote kernargs allocs should consume ONE slab allocation, got {n}"
+
+  def test_local_kernargs_allocate_per_call(self):
+    assert (n:=self._alloc_free_n(is_remote=False, n=40)) == 40, f"local kernargs alloc must keep one alloc per call (unchanged), got {n}"
+
 class TestNVFaultRecoveryHint(unittest.TestCase):
   """T4.23: an NV device fault (is_err_state) is genuinely GSP/hardware-reported (support/nv/ip.py sets it only from real
   NV_VGPU_MSG_EVENT_OS_ERROR_LOG/MMU_FAULT_QUEUED messages) and NV never sets can_recover (hcq.py) -- there is no safe

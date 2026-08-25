@@ -879,6 +879,110 @@ PYTHONPATH=.                       $PY -m mypy tinygrad/                    # Su
                                     $PY -m ruff check .                     # All checks passed
 ```
 
+### 11. T4.20: re-scope with gpt-oss + T4.21 -- range split doesn't need the fix; shipped it anyway (cheap, proven, protects the shapes that still do)
+
+**Step 1 (decisive): does gpt-oss:20b range-split clean now?** Yes. `--device-map "0-11:METAL,12-23:NV"`
+(gpt-oss:20b is 24 blocks), no-BEAM, `DEV=NV:NAK`, 16 prompt/64 decode tokens: **completes end-to-end**,
+output byte-identical to an all-NV reference (`[13, 220, 16, 13, 220, ...]` x64, 0 mismatches -- greedy
+decode repeating on the harness's synthetic random-token prompt, same degenerate-but-correct shape T4.18/
+T4.19 saw on olmoe). Confirms T4.21's structural prediction directly: a range split has ~1 device boundary
+per forward pass, not one per MoE layer.
+
+**Island/allocation count** (same call-site-attributed technique as T4.18: a scratch `sitecustomize.py`,
+not committed, monkeypatching `APLRemotePCIDevice.alloc_sysmem`/`PCIIfaceBase.free`, run against a freshly
+`pkill`ed server): **48 total `alloc_sysmem` calls** for the whole run (load+warmup+prefill+64 decode),
+none freed (T4.18's root cause -- remote sysmem free is a no-op -- applies here too, so total==peak):
+
+| call site | count | class |
+|---|---|---|
+| `support/hcq.py:535` (`HCQCompiled.__init__`, via `ops_nv.py:691`) | 32 | one-time device bring-up (signal pool / kernargs arena, per device) |
+| `support/nv/nvdev.py:168` (via `support/nv/ip.py`, 8 distinct sites) | 8 | one-time GSP boot -- matches T4.18's olmoe count exactly |
+| `graph/hcq.py:32` (`HCQGraph.__init__`'s kernargs_bufs, via `engine/realize.py:136`) | **4** | **the metric of interest -- graph islands needing kernargs** |
+| `ops_nv.py:130` (T4.18's hw_page slab, one-time, via `graph/hcq.py:217`) | 1 | hw_page (already pooled) |
+| `ops_nv.py:680` (cmdq_page) + `support/hcq.py:451,417` | 3 | misc one-time bring-up |
+
+Bring-up (32+8+3=43) matches T4.18's olmoe bring-up bucket exactly (43, model-independent, as expected).
+**4 kernargs allocations** for a range split vs. olmoe's **experts:** split needing ~85 islands (and 64
+kernargs alone even after T4.18's hw_page fix, per §8) -- a ~16-20x reduction, and 48 total vs. the
+~128-130 ceiling leaves 80+ slots of headroom. This is with gpt-oss's real 24-layer MoE architecture, not
+a synthetic stand-in.
+
+**Verdict: T4.20 downgrades from blocker to robustness for the shape the project actually wants.** T4.21
+already made range split the recommended shape for big models; this session confirms it's also the
+ceiling-safe shape for MoE-with-real-experts (gpt-oss), independent of model size. Compounding this,
+TASKS.md's same-day TD.3-beam-rows finding is that `experts:` splits are now *also* the wrong shape on
+performance grounds under BEAM (dead last: 43.8 vs all-NV's 115.5, all-METAL's 63.8 -- BEAM's tensor-core
+win lands on attention, which `experts:` leaves on METAL) -- so the many-island pathology's one known
+real-world trigger is a shape with no remaining reason to use it either way.
+
+**Shipped the fix anyway** (recommendation: worth it). Reasoning: the design was already fully understood
+(mirrors T4.18's `hw_page` slab almost exactly, same file), small (32 lines across the two runtime files,
+well under the 80-line budget), provably zero-risk to AMD/QCOM/local-NV (duck-typed dispatch -- see below),
+and it closes a crash class that is cheap to reopen (a finer-grained future split, a deeper MoE, or a
+3rd pooled device would all raise the island count again) but expensive to re-diagnose from scratch (this
+is the second time this exact ceiling has needed a from-first-principles characterization session). A
+"trigger condition to revisit" would have been the alternative if the fix were bigger or riskier than this
+one turned out to be -- it wasn't, so ship it. Trigger condition to *un*-ship or revisit, if it's ever a
+maintenance burden: no backend besides NV has grown a remote transport with this ceiling in the time since
+T4.18 shipped its sibling fix, and none is expected.
+
+**The fix** (`tinygrad/runtime/ops_nv.py` +24, `tinygrad/runtime/graph/hcq.py` +8/-2, `test/external/
+external_test_nv.py` +26 -- two files, 32 lines of runtime code): `NVDevice` gets `alloc_kernargs`/
+`free_kernargs`, byte-for-byte the same lazily-allocated/never-freed/bump-suballocated-with-fallback shape
+as T4.18's `_hwq_slab`/`_hwq_bump`, but a **separate** slab (`_kernargs_slab`/`_kernargs_bump`) -- kernargs
+sizes are variable (unlike hw_page's fixed 16KB), so sharing one slab between the two classes would let
+one's usage skew the other's already-measured headroom. `graph/hcq.py:32`'s alloc and its `__del__`'s free
+each become a 2-branch duck-typed dispatch (`getattr(d, 'alloc_kernargs'/'free_kernargs', None)`) that
+defers to the device when it offers a pool, else takes the *exact original* `d.allocator._alloc`/`_free`
+call -- AMD/QCOM (no such attributes) and local/NVK NV (guarded by `is_remote()` inside `alloc_kernargs`
+itself) are provably byte-identical: `getattr(..., None)` is `None` for them, so the `else` branch runs,
+unchanged. The stable-address requirement `graph/hcq.py:32`'s comment worried about (a live graph's
+kernargs must not move under a future replay) falls out for free from `wrap=False`: a bump allocator that
+never wraps never reuses a slice's address, and T4.18 already proved a remote sysmem free was a no-op on
+every side (no unmap verb) -- so "never free" isn't a new risk, it's naming what was already true.
+
+**Proof the fix is real, two levels:**
+- *Synthetic, proven failing pre-fix* (`TestNVKernargsPoolSlab`, mirrors `TestNVBindHwPageSlab`'s
+  counting-fake exactly): 40 calls to `NVDevice.alloc_kernargs`/`free_kernargs` against a fake remote
+  device collapse to **1** real allocator call (was an `AttributeError` before the fix existed, confirmed
+  by `git stash`-ing only the two runtime files and re-running -- the test file itself was not stashed);
+  the local/non-remote path still makes 40 (unchanged). 18/18 in the file post-fix.
+- *Real hardware, both directions*: pre-fix (stashed the runtime-file diff, kept the test), gpt-oss:20b
+  **`--device-map "METAL,experts:NV"`** (the exact stretch shape TASKS.md's TD.3-beam-rows entry names as
+  blocked) reproduces the crash **at `graph/hcq.py:32` itself**, `RuntimeError: RPC failed: unknown error`
+  -- the same signature the task brief names, at the same line T4.18 left alone. Restored the fix, reran
+  unchanged: **completes end-to-end**, `load 8.260s, warm 29.225s, prefill 43.923 tok/s, decode 18.454
+  tok/s`, output byte-identical to the range-split run and the all-NV reference (64/64 tokens). The
+  range-split run itself was also rerun post-fix as a regression check: still byte-identical, tok/s
+  unchanged within noise (49.7/9.8 vs pre-fix 48.9/9.9) -- the pool is exercised (4 kernargs allocs now
+  share 1 slab alloc instead of 4) and costs nothing observable.
+
+**Gates, all green:**
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+GPTOSS=/Users/artur/Library/Caches/tinygrad/downloads/35ff51c27772d214bab0172591e2ade8
+
+# step 1: re-scope check + regression check post-fix (byte-identical to each other and to all-NV)
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $GPTOSS --device-map "0-11:METAL,12-23:NV" --prompt-tokens 16 --decode-tokens 64
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $GPTOSS --device-map NV --prompt-tokens 16 --decode-tokens 64
+
+# the fix, proven on the real crash shape (pre-fix crashes at graph/hcq.py:32; post-fix completes)
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $GPTOSS --device-map "METAL,experts:NV" --prompt-tokens 16 --decode-tokens 64
+
+# unit-level proof (proven failing pre-fix by stashing only the two runtime files, not the test)
+PYTHONPATH=. $PY -m pytest test/external/external_test_nv.py -v -k KernargsPool   # 2 passed
+PYTHONPATH=. $PY -m pytest test/external/external_test_nv.py -v                   # 18 passed
+
+# gates
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -q   # 32 passed
+PYTHONPATH=.        $PY -m pytest test/unit -q -n12                                # 846 passed, 71 skipped, 4 xfailed (unchanged vs T4.21)
+PYTHONPATH=.        $PY -m mypy tinygrad/                                          # Success: no issues found in 216 source files
+                    $PY -m ruff check tinygrad/runtime/ops_nv.py tinygrad/runtime/graph/hcq.py test/external/external_test_nv.py  # All checks passed
+OCELOT_PATH=/Users/artur/Documents/tinygrad/.venv/lib/libgpuocelot.dylib DEV=MOCK+NV:PTX PYTHONPATH=. \
+  $PY -m pytest test/test_tiny.py test/device/test_hcq.py -q   # 49 passed, 6 skipped, 14 subtests passed
+```
+
 ---
 
 ## Exact commands

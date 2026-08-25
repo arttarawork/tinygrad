@@ -635,11 +635,35 @@ class NVDevice(HCQCompiled[NVSignal]):
   _hwq_slab: HCQBuffer|None = None
   _hwq_bump: BumpAllocator|None = None
 
+  # T4.20: same shape, for HCQGraph.__init__'s per-graph-island kernargs_bufs (graph/hcq.py:32) -- the
+  # other ~34% of T4.18's sysmem-ceiling class, deliberately left alone there. Separate slab from hw_page's
+  # (variable-sized allocations, vs. hw_page's fixed 16KB) so neither's measured headroom skews the other's.
+  _kernargs_slab: HCQBuffer|None = None
+  _kernargs_bump: BumpAllocator|None = None
+
   def is_remote(self) -> bool:
     # True only behind PCIIface's RemotePCIDevice (macOS TinyGPU over Thunderbolt/TCP): checked on the concrete BAR1 MMIOInterface
     # (T2.2's is_remote flag), not iface type, since PCIIfaceBase can run against either a local or a Remote PCIDevice. NVKIface/MOCKIface
     # (Linux driver, mock) have no dev_impl.vram and are always local.
     return getattr(getattr(getattr(self.iface, 'dev_impl', None), 'vram', None), 'is_remote', False)
+
+  def alloc_kernargs(self, size:int) -> HCQBuffer:
+    # T4.20: graph/hcq.py's HCQGraph is cross-backend (AMD/QCOM use it too) and needs a stable address for
+    # a graph's kernargs across every future replay -- this never-freed bump slab (wrap=False) gives that
+    # for free: a slice's address never moves, and per T4.18, a remote sysmem free was already a no-op (no
+    # unmap verb), so "never free" costs nothing real freeing wasn't already failing to deliver.
+    sz = max(size, 1)
+    if not self.is_remote(): return self.allocator._alloc(sz, BufferSpec(cpu_access=True))
+    if self._kernargs_slab is None:
+      self._kernargs_slab, self._kernargs_bump = self.allocator.alloc(4 << 20, BufferSpec(cpu_access=True)), BumpAllocator(4 << 20, wrap=False)
+    slab, bump = unwrap(self._kernargs_slab), unwrap(self._kernargs_bump)
+    try: return slab.offset(bump.alloc(sz, 16), sz)
+    except RuntimeError: return self.allocator._alloc(sz, BufferSpec(cpu_access=True))  # slab exhausted: fall back to a real alloc
+
+  def free_kernargs(self, buf:HCQBuffer) -> None:
+    # Mirrors NVCommandQueue.__del__'s hw_page check: a slab-derived slice shares the slab's lifetime and
+    # must never be individually freed; a real (non-slab) allocation still needs releasing, as before.
+    if not (self.is_remote() and buf.base is self._kernargs_slab): self.allocator._free(buf, BufferSpec(cpu_access=True))
 
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
