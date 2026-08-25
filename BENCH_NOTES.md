@@ -733,3 +733,216 @@ tracked to completion via an in-shell `until`-loop against its own output file r
 unobserved). `pkill -f "TinyGPU.*server"` used once, after the stretch-row ceiling crash, per the
 brief's standing authorization.
 
+---
+
+# qwen3.6-35B-A3B (dock big-quant pooling) — 2026-08-25
+
+Goal per the env brief: find out whether METAL+NV pooling earns its keep on a model too big for the
+3090 alone, using qwen3next's hybrid GatedDeltaNet+attention MoE arch (`arch=qwen35moe`, registry
+`qwen3.6:35b-a3b`). Worktree `tinygrad-dock`, branch `task/TD.3-pooling`, HEAD `bdff8099c` (unchanged
+all session — no code touched). venv `/Users/artur/Documents/tinygrad/.venv/bin/python`, `PYTHONPATH=.`.
+Local file: `/Users/artur/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (22.85 GB,
+MTP variant, read-only, untouched). llama-server stopped, colima running throughout.
+
+## 0. Headline finding (established before spending any GPU time on Q6/Q8): tinygrad's GGUF loader
+dequantizes every quant to the *same* fp16 resident size — the Q6/Q8 "bigger quant" premise doesn't
+transfer from llama.cpp to tinygrad
+
+`tinygrad/llm/model.py:602`: `state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v ...}` — by
+default, **every** GGUF tensor is fully dequantized to fp16 at load/first-use, regardless of its
+on-disk quant type (Q4_K, Q6_K, Q8_0, ...). Grepped the whole tree for any quantized-weight-resident
+compute path (`QuantizedLinear`, int4/int8 matmul, W8A16, etc.) — none exists; GGUF quantization in
+tinygrad is purely a smaller-download decode format, not a resident-memory format, unlike llama.cpp
+(which keeps weights quantized in VRAM/RAM and computes with quantized kernels — the reason its Q4
+file runs in ~22 GB per CLAUDE.md's own numbers).
+
+Verified directly on the **already-local** Q4_K_XL file (no download needed) with a small script that
+calls tinygrad's own `_parse_header` (`tinygrad/llm/gguf.py`) to read just the KV metadata + tensor
+list — no tensor data staged, safe/cheap:
+
+```
+architecture: qwen35moe, block_count=41 (40 real + 1 MTP nextn, nextn_predict_layers=1),
+embedding_length=2048, expert_count=256, expert_feed_forward_length=512, full_attention_interval=4
+n_tensors=753, total elements = 35,505,251,456 (matches the "35B total" branding)
+total fp16-resident bytes  = 71,010,502,912  (71.01 GB)   <- what tinygrad needs on-device
+total on-disk bytes (Q4_K_XL) = 22,842,671,616 (22.84 GB)  <- matches the actual 22.85 GB file almost exactly
+per-block fp16 bytes: ~1.685 GB, uniform across all 41 blocks (no dense/leading blocks — MoE every layer)
+```
+
+**35.5B total elements × 2 bytes (fp16) = 71.01 GB, independent of which quant file is downloaded** —
+Q4/Q6/Q8/UD-whatever all have the *same* element count (only bytes-per-element-on-disk differs), so
+they'd all dequantize to the identical 71.01 GB resident footprint. Hardware pooled ceiling: NV = 24 GB
+(RTX 3090, confirmed via `system_profiler`), Mac = 36 GiB physical (`sysctl hw.memsize` =
+38,654,705,664 B exactly) minus colima's fixed 6 GiB reservation. **71 GB exceeds even the full
+METAL+NV pool (≤~56 GB best case) by ~15-27%, for every quant level** — this is an architecture/quant-
+independent capacity mismatch, not a "Q4 barely fits, Q6/Q8 need pooling" story. Downloading Q6 (~29
+GB) and Q8 (~37 GB) would reproduce the *identical* wall after spending 20-60+ minutes of the session's
+3.5h budget on bandwidth alone — **skipped deliberately**, see §2. This is the session's central,
+load-bearing result and reframes every verdict below.
+
+## 1. Q4 attempts on the real model (all failed at the capacity wall, exactly as predicted by §0 —
+this is the requested "clean OOM/alloc failure IS a RESULT" datum, now root-caused precisely)
+
+| # | Config | DEV | outcome |
+|---|---|---|---|
+| 1 | all-NV, no-BEAM | `NV` | `from_gguf` **succeeded** (load 12.087s). OOM during `model.warmup()`'s first forward pass: `MemoryError: Allocation of 32.00 MB failed on NV. Used: 23.17 GB` — ~13-14 of 41 blocks' weight materialized (23.17/1.685≈13.75) before the 24 GB ceiling hit. Device then entered a persistent fault state (`is_err_state` → `RuntimeError: Device fault detected`, thrown by every subsequent buffer-free during interpreter exit) — required `pkill -f "TinyGPU.*server"` before NV could be used again (standing authorization used, twice this session). |
+| 2 | all-METAL, no-BEAM | (unset) | `from_gguf` succeeded (load 7.465s). Real, accelerating swap thrash during warmup, watched live: 0.94→1.83 GB (20s)→2.72 GB (40s)→5.50 GB (60s, accelerating ~45→139 MB/s) — killed by a swap watchdog at the 5 GB mark, well past the brief's own 3 GB stop-signal. Swap drained cleanly afterward (no lasting damage). |
+| 3 | pooled range-split, `0-10:NV,11-39:METAL` (NV≤20GB target: 11 blocks×1.685GB≈18.5GB+token_embd) | `METAL;NV` (load device=METAL, the bulk side, per the load-direction rule) | **Never reached `from_gguf`'s return** — killed at 20s / 16.4 GB swap, *faster and worse* than row 2. Root cause: `Transformer.realize_placement()` (`model.py:557-584`, called inside `from_gguf`) force-realizes **the entire cross-device chunk in one batched `Tensor.realize(*moved)` call** right after load, by design (its own docstring: avoids re-paying dequant+copy every token) — for a small split this is invisible, but for an ~18.5 GB NV-bound chunk it means the *load device* (METAL) must transiently hold that whole chunk's fp16 dequant simultaneously with its own share's staging, front-loading a huge spike instead of the gradual per-block growth row 2 showed. |
+| 3b | pooled range-split, `0-1:NV,2-39:METAL` (tiny 2-block/~3.4GB NV chunk, to try to separate the *structural* hybrid-split question from the capacity question) | `METAL;NV` | Also killed before `from_gguf` returned (15s / 5.3 GB) — but this reading is **confounded**: row 3's swap (3.3 GB) hadn't fully drained yet when this started. Inconclusive on its own for isolating "does the tiny chunk load cleanly" — see §1 note below for how the mechanism question actually got answered instead. |
+
+**No structural hybrid-split failure was observed at any point** (no SSM-state/mask/device-mismatch
+error, no assertion) — every single failure across all 4 attempts was a clean, well-characterized
+memory-pressure signature (`MemoryError` or measured swap growth). Per the brief's own STOP condition
+("if the layer-range split structurally fails ... STOP — that's a finding"), there was nothing to
+repro-and-stop for; the uniform observed behavior across single-device *and* pooled attempts is
+"mechanism correct, capacity insufficient," which is itself the finding. NV was verified healthy
+(`Tensor([...]).sum().item()`) after every respawn; no lasting wedge.
+
+## 2. Why Q6/Q8 were not downloaded
+
+§0's arithmetic is exact and quant-independent (element count, not byte-per-element, drives resident
+size), and row 1 empirically confirms the scale (real OOM at 23.17 GB, consistent with a ~71 GB total).
+Q6 (~29 GB) and Q8 (~37 GB) would dequantize to the *identical* 71.01 GB and hit the *identical* wall —
+downloading 66 GB combined to re-observe an already-proven-certain outcome would spend a large fraction
+of the 3.5h budget for zero new fit-related information. (A bigger quant *would* still be a legitimate
+thing to test for dequant **fidelity** — Q8's dequant is closer to the source weights than Q4's — but
+that's an output-quality question, not what this pooling-perf task is measuring, and it doesn't change
+anything in §0-1.) This is a deliberate scope call, not an oversight; happy to run the Q6/Q8 download-
+and-OOM anyway if a literal per-quant datapoint is wanted despite the predicted-identical result.
+
+## 3. Bonus, using the budget saved by §2: does the per-layer RANGE split actually deliver on its
+"avoids the kernargs-island ceiling" premise? (tested on olmoe, which fits either device alone, so
+there's no capacity confound)
+
+The env brief's own framing (from `BENCH_NOTES.md`'s "BEAM'd pooling" section, read before starting)
+says the per-layer RANGE split — not the `experts:` split — is "the right split for perf" because
+attention lands on both devices with ~1 boundary, avoiding the ~85-island kernargs ceiling the
+`experts:` split hits under BEAM. That section only ever tested the `experts:` split on a real MoE
+model; the RANGE split was never tried on MoE before. Since qwen3.6 can't complete a single row, this
+was cheap (already-cached model, ~2 rows, no download) and directly load-bearing for the "is the range
+split actually the right lever" thesis this whole task rests on — done as a validation the write-up
+above can build on, not a departure from scope. Same model/config as the section above: olmoe
+(`allenai/OLMoE-1B-7B-0924-Instruct-GGUF` Q4_K_M, 16 blocks, cached), `--prompt-tokens 512
+--decode-tokens 128`, nvcc lane (`DEV='METAL;NV'`, colima already up for it), device_map
+`0-7:METAL,8-15:NV` (even 8/8 split, METAL-first/NV-tail).
+
+| # | Config | warm s | decode tok/s | tokens vs all-NV reference |
+|---|---|---:|---:|---|
+| 1 | all-METAL, no-BEAM (prior session) | 26.035 | 28.21 | (reference-equal, prior session) |
+| 2 | all-METAL, BEAM | 240.915 | 63.81 | " |
+| 3 | all-NV, no-BEAM (re-run fresh this session for an exact diff) | 28.603 | 44.96 | reference |
+| 4 | all-NV, BEAM (prior session) | 1232.461 | 115.51 | " |
+| 5 | `experts:NV` split, no-BEAM (prior session) | 19.102 | 41.26 | **diverges at decode idx 60** (ref=1232, split=11723) |
+| 6 | `experts:NV` split, BEAM (prior session) | 311.665 | 43.84 | same divergence |
+| **7** | **RANGE split `0-7:METAL,8-15:NV`, no-BEAM (new)** | **26.774** | **35.31** | **129/129 byte-identical to row 3** (programmatic diff, 0 mismatches, incl. index 60 = 1232 matching) |
+| **8** | **RANGE split `0-7:METAL,8-15:NV`, BEAM (new)** | **460.942** | **69.78** | **129/129 byte-identical to row 3** (programmatic diff, 0 mismatches) |
+
+**The range split works, is exact, and wins once BEAM enters — reversing the `experts:` split's own
+verdict from the prior session.** No-BEAM: range split (35.31) sits between all-METAL (28.21) and
+all-NV/experts-split (44.96/41.26) — a real but modest 1.25x over all-METAL alone. **Once BEAM is
+added, the range split (69.78) beats BEAM'd all-METAL (63.81, 1.09x) and beats BEAM'd `experts:NV`
+(43.84, 1.59x)** — it's the clear best *heterogeneous* option, exactly the opposite of the `experts:`
+split's finding ("split dead last... loses even to the single Mac-only device"). Consistent with the
+brief's mechanism: the range split lets BEAM tensor-core-tune attention/lm_head kernels on **both**
+devices (whichever landed on NV's half), where the `experts:` split forfeits that by confining NV to
+only expert GEMVs. Warmup cost (460.9s) lands closer to `experts:`'s 311.7s than to all-NV's 1232.5s —
+still cheap relative to searching the whole model on NV.
+
+**Correctness bonus, directly relevant to T4.19 (divergence-at-depth):** the `experts:` split diverges
+from the shared METAL/NV reference at decode index 60 (documented in the prior session, 3 cross-device
+copies × 16 layers = 48 boundary crossings/token). The range split — same model, same 512/128 depth,
+same hardware — stayed **exactly** on the reference through all 128 decode tokens, in both no-BEAM and
+BEAM'd form (verified programmatically, not eyeballed: `range_split == all_nv` → `True`, 0/129
+mismatches, both rows). One clean, mechanistically-plausible explanation: fewer cross-device boundary
+crossings (~1 total vs. 48/token) means far fewer opportunities for cross-backend FP non-associativity
+to compound into an argmax flip. Not proof this holds at every depth/model, but it's a real, directly
+relevant data point for T4.19 obtained "for free" from validating the range-split thesis.
+
+No `HCQGraph`/kernargs-ceiling crash (the T4.18/T4.20 failure mode) appeared in either range-split row,
+including the BEAM'd one (the condition under which the `experts:` split's 85-island count was
+originally characterized) — consistent with, though not a direct island-count measurement of, the
+brief's "~2 islands" prediction for a ~1-boundary split. CSV rows appended to the new
+`extra/bench_results_2026-08-25.csv` (rows 7-8 above; rows 1-6 are the prior session's, in
+`extra/bench_results_2026-08-24.csv`, unchanged).
+
+## Verdicts
+
+**(a) DeltaNet-on-NV first impression — no structural red flag, but no speed number either.** Row 1
+got a real, non-tiny hybrid DeltaNet+attention forward pass partway across NV (~13-14 of 41 blocks,
+spanning multiple SSM blocks and at least 3 full-attention blocks per `full_attention_interval=4`)
+before hitting the capacity wall — with a clean `MemoryError`, not a kernel-compile/launch/correctness
+error. That's real but limited signal: nothing here suggests DeltaNet-on-NV is structurally broken or
+unusually slow to compile, but no tok/s or completed-generation correctness check was obtainable this
+session for the real model — capacity, not speed or correctness, was the blocker every time.
+
+**(b) Does per-layer pooling deliver a usable big-quant daily driver here? No — and no quant level
+would change that.** qwen3.6-35B-A3B needs ~71 GB resident under tinygrad regardless of which GGUF you
+download (§0); this dock's best-case pooled ceiling is ~50-56 GB (NV's 24 GB proven hard limit + the
+Mac's 36 GiB minus colima's 6 GiB reservation, itself optimistic given how fast METAL alone reached
+real thrashing in row 2). No split boundary fixes this — moving the line only changes *which* side
+overflows, not whether one does (row 3's NV-first split moved the failure earlier and worse, via
+`realize_placement`'s eager whole-chunk realize, rather than avoiding it). There is currently no
+tinygrad tok/s number to set against the llama.cpp ~31 tok/s reference for this model, and the reason
+isn't a performance gap — it's a resident-memory-architecture gap (llama.cpp computes on quantized
+weights in ~22 GB; tinygrad has no quantized-weight-resident compute path and needs ~71 GB for the
+identical architecture). §3's olmoe result says the *mechanism* pooling relies on (the per-layer RANGE
+split, BEAM'd) is sound and even wins over other heterogeneous options once a model actually fits — the
+gap here is capacity, not the split design.
+
+**(c) MTP-file compatibility — works.** The MTP GGUF (`nextn_predict_layers=1`) loaded structurally
+cleanly every time `from_gguf` got to run (rows 1-2, both printed `load Xs`): `num_blocks = 41 - 1 =
+40` computed correctly (`model.py:655`), the extra MTP nextn block (`blk.40`, confirmed present via the
+GGUF tensor dump, same ~1.69 GB size as any other block) is simply never referenced by the 40-block
+`Transformer` and consumes no memory in the real run. No MTP-specific error at any point.
+
+**(d) Divergence-at-depth (T4.19) — not measurable on the target model (no row produced a single
+decode token), but the olmoe bonus (§3) contributes a real data point anyway:** 1-boundary range splits
+showed zero divergence through 128 decode tokens where a 48-hop/token `experts:` split had already
+diverged by token 60, on the same model/hardware/depth. Suggestive that boundary-crossing *count*, not
+just cross-backend FP non-associativity existing at all, governs how soon a split's trajectory peels
+away from the reference — worth keeping in mind for whoever next picks up T4.19 properly.
+
+## Swap / stability log
+
+Baseline ~0.94 GB (matches prior sessions). Peaks this session, all self-induced by the qwen3.6 rows
+and all recovered/drained without intervention beyond the planned kill: row 2 (all-METAL) 0.94→5.50 GB
+over 60s (watchdog kill); row 3 (pooled, big NV chunk) →16.4 GB over just 20s (watchdog kill, the
+`realize_placement` front-load); row 3b confounded by row 3's not-yet-drained swap. Each kill's swap
+drained back toward baseline afterward (no monotonic growth, no lasting regression) — consistent with
+this being in-progress OOM-avoidance-via-paging that was pre-empted, not a leak. The olmoe bonus rows
+(§3) ran clean, no swap concern (small model). NV required `pkill -f "TinyGPU.*server"` + a trivial
+health check twice this session (after row 1's OOM-induced device fault, and defensively after row
+3/3b's kills) — both times confirmed healthy before the next GPU-touching run, no lasting wedge.
+
+## Exact commands
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+Q4=/Users/artur/models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+OLMOE=/Users/artur/Library/Caches/tinygrad/downloads/d9f8816f773421fa69637257a3f71cdc
+
+# GGUF metadata / resident-size analysis (§0) -- ad hoc script, not committed, no tensor data staged
+PYTHONPATH=. $PY /path/to/gguf_meta.py $Q4
+
+# row 1: Q4 all-NV, no-BEAM -- OOMs at Used: 23.17 GB during warmup
+DEV=NV PYTHONPATH=. $PY extra/benchmark_llm.py --model $Q4 --device-map NV --prompt-tokens 512 --decode-tokens 128
+pkill -f "TinyGPU.*server"   # required after the OOM's device fault, before any further NV use
+
+# row 2: Q4 all-METAL, no-BEAM -- real swap thrash, watched live, killed at 5GB (see BENCH_NOTES prose for the watchdog shape)
+PYTHONPATH=. $PY extra/benchmark_llm.py --model $Q4 --device-map METAL --prompt-tokens 512 --decode-tokens 128
+
+# row 3 / 3b: Q4 pooled range-split -- both killed by the same swap watchdog before `from_gguf` returned
+DEV='METAL;NV' PYTHONPATH=. $PY extra/benchmark_llm.py --model $Q4 --device-map "0-10:NV,11-39:METAL" --prompt-tokens 512 --decode-tokens 128
+DEV='METAL;NV' PYTHONPATH=. $PY extra/benchmark_llm.py --model $Q4 --device-map "0-1:NV,2-39:METAL"   --prompt-tokens 512 --decode-tokens 128
+
+# NV health check, used after both respawns
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+
+# section 3 bonus: olmoe RANGE split (not experts:), no-BEAM then BEAM'd
+DEV='METAL;NV' PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "0-7:METAL,8-15:NV" --prompt-tokens 512 --decode-tokens 128
+DEV='METAL;NV' JITBEAM=2 PARALLEL=6 PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "0-7:METAL,8-15:NV" --prompt-tokens 512 --decode-tokens 128
+# fresh all-NV reference re-run this session, for an exact programmatic diff against the two rows above
+DEV=NV PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map NV --prompt-tokens 512 --decode-tokens 128
+```
+
