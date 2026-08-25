@@ -410,6 +410,133 @@ unit tests, clear "got X of Y" error text) — same bar as T4.14, ready. It is a
 real bug class (T4.14-sibling short-read *and* a status-before-fd ordering bug), independently worth
 shipping even though it wasn't sufficient to unblock olmoe's graphed run end-to-end.
 
+### 8. T4.18: sysmem-ceiling characterization + fix — graphed olmoe split now completes
+
+Characterized §7's ~128-130 ceiling with call-site-attributed client-side instrumentation: a temporary
+`sitecustomize.py` (not committed; on `PYTHONPATH`, auto-imported at interpreter start) monkeypatching
+`APLRemotePCIDevice.alloc_sysmem` and `PCIIfaceBase.free` to log every call with a `traceback`-derived
+call site, a monotonic id, and size. Run on (a) the tiny graphed MoE split (passes) and (b) real olmoe's
+graphed split (crashes), each against a freshly `pkill`ed/respawned TinyGPU.app server for a clean count.
+
+**Ranked table at the real-olmoe crash point** (128 cumulative `alloc_sysmem` calls succeed, ALL still
+live — zero had been freed yet — before the 129th/130th fail exactly as §7 documented):
+
+| rank | call site | count | share |
+|---|---|---|---|
+| 1 (tie) | `graph/hcq.py:32` `HCQGraph.__init__`'s per-graph-island `kernargs_bufs` | 43 | 34% |
+| 1 (tie) | `ops_nv.py:107` `NVCommandQueue.bind()`'s per-queue `hw_page` | 42 | 33% |
+| 3 | one-time device bring-up (32×2MB copy-staging pool 32 + GSP boot 8 + cmdq_page/signal-pool/persistent-kernargs-arena 3), model-independent | 43 | 34% |
+
+**Dominant class**: the two `HCQGraph.__init__`-time allocators (85/128 = 66%), NOT the load path — GGUF
+dequant loading (~12s of the run, in between id 43 and id 44) issues **zero** new sysmem allocations;
+every load-time host-visible buffer is already served by an existing pool (the 32×2MB copy-staging
+ring, the 16MB persistent kernargs arena, or the cmdq page). The real driver: a METAL+NV MoE graph
+alternates devices at every layer boundary (3 cross-device copies/layer, §3), and `engine/jit.py`'s
+`graph_split_rewrite` flushes a new graph island whenever consecutive ops can't share a device set —
+confirmed live with `JIT_BATCH_SIZE=4096` (128× the default): island sizes stayed at 5–27 kernels,
+unchanged, proving the split is device-alternation-driven, not size-cap-driven (`JIT_BATCH_SIZE` doubles
+per flush, so a size-cap-bound split would have grown islands fast; it didn't). Real olmoe's per-layer
+METAL↔NV↔METAL structure needs ~85 islands across warmup's 4 forward passes; TD.2a measured only ~4
+islands/token for dense llama3.2:1b. Each island permanently owns one `kernargs_bufs` plus one-or-more
+`hw_page`, each a fresh `has_fd` RPC.
+
+**Are they still needed at crash time — and does "freed" mean anything here?** In this run, yes: every
+live allocation is a currently-referenced graph island (nothing had been superseded yet). But a second
+finding from the same instrumentation matters more. In a longer tiny-model run where JIT graphs DO get
+replaced (the pytest suite, multiple prompts/steps), 71/115 of these same-class allocations do show
+`freed == total` — yet serving them from the ordinary `LRUAllocator` cache once freed (see "first
+attempt" below) produced **zero reduction** in subsequent `alloc_sysmem` calls. Root cause: `RemoteCmd`
+(`system.py`) has **no unmap/free verb at all** — the server's slot table can only grow for the life of
+the process regardless of what the client does, and `PCIIfaceBase.free()`'s only destructive branches
+are gated on `is_local()` (false for the remote/APL transport) or `AddrSpace.PHYS` (sysmem uses
+`AddrSpace.SYS`), so freeing a remote sysmem `HCQBuffer` is *already* a no-op today on every side (server
+slot, and even the client's own dup'd fd + mmap). A fix that waits for a free to reuse a slot cannot
+work — confirmed by shipping exactly that version first and re-running the crash repro unchanged.
+
+**Fix (shipped, `tinygrad/runtime/ops_nv.py`, +27/−2 lines, one file)**: since a sysmem slot can never be
+returned once granted, the only lever is issuing fewer `alloc_sysmem` calls in the first place. Every
+observed `hw_page` this session was exactly 16384 B, so `NVCommandQueue.bind()` now serves it from a
+single lazily-allocated, never-freed 4MB slab (`NVDevice._hwq_slab`), bump-suballocated
+(`tinygrad.runtime.support.memory.BumpAllocator`, `wrap=False`) instead of a fresh RPC per bind() — same
+one-alloc-many-small-pieces shape as the existing 32×2MB copy pool — falling back to a real allocation
+if the slab (sized for ~256 islands) is ever exhausted. Guarded entirely by `dev.is_remote()`, mirroring
+`bind()`'s existing `is_remote`-checked bulk-write optimization two lines below and T2.2/T2.3's
+precedent — the local/NVK path takes the original, untouched branch. `__del__` skips freeing
+slab-derived slices (identified by `hw_page.base is dev._hwq_slab`; a shared slice must never be
+individually released) but frees real fallback-path allocations exactly as before. Only `hw_page` was
+touched — `kernargs_bufs` (the other ~34%) lives in the cross-backend `graph/hcq.py` and was
+deliberately left alone (see "not fixed" below); fixing `hw_page` alone was sufficient (verified below).
+
+**Verified**:
+- Real olmoe graphed split (`DEV=NV:NAK`, `--device-map "METAL,experts:NV"`, default JIT) **completes
+  end-to-end** for the first time: `load 8.016s, warm 17.871s, prefill 111.080 tok/s, decode 41.142
+  tok/s`, 64-token output **byte-identical** to a fresh all-NV reference run in the same session and to
+  §2's documented all-METAL/all-NV table (`[604, 253, 4376, 273, 253, 31142, ...]`, all 64 tokens match).
+- Peak outstanding `alloc_sysmem` calls for this now-*complete* run: **108**, down from the **128** that
+  used to crash a much shorter (warmup-only, partial) run — `hw_page` collapsed from 42 calls to 1 (the
+  slab itself, 4,194,304 B); `kernargs_bufs` alone (still unfixed) grew to 64 for the full run but no
+  longer combines with `hw_page` to cross the ceiling.
+- Split decode tok/s (41.142) beats the all-NV reference (12.870, matching the previously-documented
+  12.894) — MoE's non-expert compute (attention, router, lm_head) runs natively on METAL while only the
+  expert GEMVs pay the NV eGPU cost, so this isn't the "split adds boundary overhead vs. best single
+  device" shape T0.3/TD.3's dense methodology assumed; there's no positive delta here to decompose into
+  a boundary-cost estimate. §4's ~65–90 µs/hop floor and ~3.1–4.3 ms/token prediction stand as the best
+  available boundary-cost figure. A live decode-shape capture this session did show cross-device copies
+  repeating every layer (64 KB METAL←NV + 8 KB NV←METAL), comfortably inside the flat-floor regime — but
+  only 2 hops/layer were visible at decode batch=1, not the tiny model's 3 (§3), and re-deriving the
+  exact real-olmoe hop count/direction breakdown was not completed this session. Flagged as a minor open
+  item (possible scheduler-level fusion of the h/sel input copies at this batch size), not a correctness
+  concern — §3's code-path argument for the copy mechanism doesn't depend on the count matching exactly.
+- Gates: `test/unit/test_llm_device_map.py` 31/31 (`DEV='METAL;NV:NAK'`), full `test/unit -q -n12` 844
+  passed / 70 skipped / 4 xfailed (same DEV; the one failure seen without it is the known
+  docker/NAK-compiler-lane requirement, not a regression), mypy (`Success: no issues found in 216 source
+  files`), ruff (`All checks passed!`) all green.
+
+**Not fixed (documented, not attempted)**: `kernargs_bufs` (`graph/hcq.py:32,316`) is the other ~34% of
+the dominant class with the identical pathology (fresh `_alloc`/`_free` per graph island, bypassing even
+the ordinary LRU cache) — but it lives in `HCQGraph`, shared by NV/AMD/QCOM, and a safe version of the
+same slab trick there needs a generic (non-NV-specific) remote-detection hook plus care that a graph's
+kernargs stay at a *stable* address for the life of every future replay (a *wrapping* bump allocator,
+like the existing per-device eager-mode kernargs arena, would silently corrupt a still-live graph's
+arguments once it wraps — exactly the allocator-redesign risk the task's STOP condition calls out). Left
+alone because fixing `hw_page` alone already dropped the full-run peak to 108 (comfortably under
+~128–130); revisit only if a bigger model or longer run pushes past that new headroom.
+
+**First attempt (shipped, then reverted after disproving it)**: before finding the slab fix, tried the
+much smaller "drop `nolru=True` so `hw_page` recycles through the ordinary `LRUAllocator` cache on the
+remote path" (`nolru=not dev.is_remote()`, 2-line diff). mypy/ruff clean, tiny-test still byte-exact —
+but re-running the real-olmoe crash repro reproduced the **identical** crash at the **identical**
+allocation, peak count unchanged. Root cause (above): nothing is freed until process exit, so a cache
+keyed on "wait for a free" never gets a hit while the run is still alive. Reverted in favor of the slab,
+which doesn't depend on freeing anything.
+
+### Exact commands (T4.18)
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+OLMOE=/Users/artur/Library/Caches/tinygrad/downloads/d9f8816f773421fa69637257a3f71cdc
+
+# characterization: temporary sitecustomize.py (not committed) on PYTHONPATH auto-installs hooks on
+# APLRemotePCIDevice.alloc_sysmem / PCIIfaceBase.free with traceback-attributed call sites
+pkill -f "TinyGPU.*server"   # clean slot count before each ceiling-crossing run
+T4_18_TAG=<name> T4_18_TRACE_DIR=<dir> DEV=NV:NAK PYTHONPATH=<dir>:. $PY extra/benchmark_llm.py \
+  --model $OLMOE --device-map "METAL,experts:NV" --prompt-tokens 16 --decode-tokens 64
+
+# post-fix verification (no instrumentation needed)
+pkill -f "TinyGPU.*server"
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "METAL,experts:NV" \
+  --prompt-tokens 16 --decode-tokens 64   # now completes: load/warm/prefill/decode all print, exact tokens
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map NV \
+  --prompt-tokens 16 --decode-tokens 64   # all-NV reference for the tok/s comparison
+
+# gates
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -v   # 31 passed
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit -q -n12   # 844 passed, 70 skipped, 4 xfailed
+PYTHONPATH=. $PY -m mypy tinygrad/                                # Success: no issues found in 216 source files
+$PY -m ruff check tinygrad/                                       # All checks passed
+```
+
 ### Exact commands (MoE)
 
 ```bash
