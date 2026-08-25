@@ -11,8 +11,8 @@ Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line ref
 
 ## Machine roles
 - **MacBook M3 Pro 36 GB** (`ENV:MAC`): Metal perf work, mock-NV, METAL+CPU pooling rehearsal.
-  The eGPU dock (AOOSTAR AG02) + RTX 3090 arrived 2026-08-23 — `DOCK`-tagged tasks are
-  unblocked; TD.1 bring-up is the gate (procedure + preflight in TASKS.md TD.1).
+  The eGPU dock (AOOSTAR AG02) + RTX 3090 is LIVE (TD.1 first light passed 2026-08-24 on
+  `DEV=NV:NAK`, worktree `/Users/artur/Documents/tinygrad-dock` @ fork master). TD.2 next.
 - **Bazzite box, RX 9070 XT** (`ENV:AMD`): descoped 2026-08-18 (AMD is not a target; shared-HCQ
   validation goes via mock-NV + rented 3090 instead — see TASKS.md T0.2/T2.1). If ever revived:
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
@@ -31,3 +31,6 @@ Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line ref
 - Perf claims need before/after tok/s from the T0.3 harness on named hardware. Upstream PRs:
   one small lever each, hand-verified — upstream has reverted AI-generated slop before.
 - Don't remove the deliberate `.contiguous()` in the MoE expert path (`tinygrad/llm/model.py:27,129`).
+- Subagents: when work breaks into discrete, well-defined ("Sonnet-proof") subtasks, hand them to
+  **Sonnet 5 at max effort** (`model: "sonnet"`, request max reasoning in the prompt) — one tight
+  objective, explicit done-when + STOP conditions. Don't spawn inherited-Fable agents for these.

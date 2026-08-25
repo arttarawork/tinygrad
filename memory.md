@@ -313,6 +313,19 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   (NAK lane if Docker is a hassle). Artur held the upstream sync (weekly cadence stands;
   33 commits pending incl. the fp16-KV one-liner conflict).
 
+- **2026-08-24 (FIRST LIGHT — TD.1 done):** full detail in the TASKS.md status row; the
+  transferable lessons: (1) the AG02 can silently link as **USB3 fallback** (ASM246X shows as a
+  plain USB device, no PCIe tunnel) — replug after dock power-up + approve macOS's accessory
+  prompt; check `ioreg` for `IOThunderboltSwitchUSB4` before debugging anything else. (2) DEXT
+  approval on Sequoia lives in General → Login Items & Extensions → Driver Extensions, and
+  activation needed **no reboot**. (3) No `nvcc` on Mac: the **NAK lane is the frictionless one**
+  (`pip install tinymesa==25.2.7.2`, `DEV=NV:NAK`); Docker/nvcc lane still untested. (4) The
+  small-BAR question is settled: BAR1=256 MiB, cmdq streams from host RAM (SYS aspace,
+  uncached+snooped), P2P refused — T2.x knob tuning and TD.2's tunnel-latency questions start
+  from that reality. Worktree `tinygrad-dock` @ fork master `b37d80fc9` is the bring-up tree.
+  Also this session: Artur's subagent policy (Sonnet 5 max-effort for Sonnet-proof subtasks)
+  promoted into the repo CLAUDE.md conventions.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
