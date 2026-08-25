@@ -1,0 +1,8 @@
+model,stack,device,flags,load_s,prefill_tps,decode_tps,gbps
+llama3.2:1b,tinygrad,NV:NAK,,5.007,55.31,7.13,8.35
+llama3.2:1b,tinygrad,NV:NAK,JITBEAM=2,4.909,341.01,96.06,112.48
+llama3.2:1b,tinygrad,NV,PARALLEL=2,4.924,142.52,28.16,32.97
+qwen3:8b,tinygrad,NV:NAK,,6.536,16.51,3.72,23.63
+qwen3:8b,tinygrad,NV:NAK,JITBEAM=2,6.491,66.66,31.44,197.01
+gpt-oss:20b,tinygrad,NV:NAK,,8.608,78.69,7.42,25.80
+gpt-oss:20b,tinygrad,NV:NAK,JITBEAM=2,8.625,117.29,26.81,105.33
