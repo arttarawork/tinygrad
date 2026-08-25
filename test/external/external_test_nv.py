@@ -143,7 +143,10 @@ class TestNVBindRemoteBatching(unittest.TestCase):
   def _bind_and_count(self, is_remote:bool, n_words:int=200) -> dict:
     mmio = CountingMMIOInterface(bytearray(n_words * 4), 0, n_words * 4, fmt='B', is_remote=is_remote)
     hw_page = SimpleNamespace(cpu_view=lambda: mmio, size=n_words * 4)
-    fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=lambda size, options: hw_page, free=lambda *a, **k: None))
+    # is_remote() False models the pre-T4.18 hw_page path: these tests parameterize the BUFFER VIEW's
+    # is_remote (T2.2/T2.3's write batching), which is orthogonal to T4.18's device-level slab.
+    fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=lambda size, options: hw_page, free=lambda *a, **k: None),
+                               is_remote=lambda: False)
 
     q = NVCommandQueue()
     q._q = list(range(0xd000, 0xd000 + n_words))
@@ -158,6 +161,37 @@ class TestNVBindRemoteBatching(unittest.TestCase):
   def test_remote_buffer_collapses_to_one_bulk_write(self):
     stats = self._bind_and_count(is_remote=True, n_words=200)
     assert stats['w'] == 1, f"remote bind() should collapse to 1 bulk slice write regardless of queue length, got {stats['w']}"
+
+class TestNVBindHwPageSlab(unittest.TestCase):
+  """T4.18: on the remote/APL transport the wire protocol has no unmap verb, so every bind()'s hw_page permanently consumes one of
+  ~128 sysmem slots -- a cross-device MoE graph (~85 islands) exhausts them mid-capture. Remote bind() must therefore suballocate
+  from ONE slab instead of allocating per bind; local/NVK keeps one alloc per bind, byte-for-byte."""
+  def _bind_n(self, is_remote:bool, n_binds:int=32, n_words:int=64) -> int:
+    allocs = []
+    def fake_alloc(size, options):
+      allocs.append(size)
+      buf = bytearray(size)
+      page:SimpleNamespace = SimpleNamespace(size=size, base=None,
+        cpu_view=lambda buf=buf: CountingMMIOInterface(buf, 0, len(buf), fmt='B', is_remote=is_remote))
+      # .base mirrors HCQBuffer.offset()'s parent link -- bind()'s __del__ uses it to skip freeing slab suballocations
+      page.offset = lambda off, sz, buf=buf, page=page: SimpleNamespace(size=sz, base=page,
+        cpu_view=lambda: CountingMMIOInterface(buf, off, sz, fmt='B', is_remote=is_remote))
+      return page
+    fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=fake_alloc, free=lambda *a, **k: None),
+                               is_remote=lambda: is_remote, _hwq_slab=None, _hwq_bump=None)
+    for _ in range(n_binds):
+      q = NVCommandQueue()
+      q._q = list(range(0xd000, 0xd000 + n_words))
+      q.bind(fake_dev)
+      assert list(q._q[:]) == list(range(0xd000, 0xd000 + n_words)), "bound queue content must survive slab suballocation"
+    return len(allocs)
+
+  def test_remote_binds_share_one_slab(self):
+    # pre-T4.18 this was 32 allocations = 32 permanently-held sysmem slots
+    assert (n:=self._bind_n(is_remote=True, n_binds=32)) == 1, f"32 remote binds should consume ONE slab allocation, got {n}"
+
+  def test_local_binds_allocate_per_bind(self):
+    assert (n:=self._bind_n(is_remote=False, n_binds=32)) == 32, f"local bind() must keep one alloc per bind (unchanged), got {n}"
 
 class TestNVFaultRecoveryHint(unittest.TestCase):
   """T4.23: an NV device fault (is_err_state) is genuinely GSP/hardware-reported (support/nv/ip.py sets it only from real
