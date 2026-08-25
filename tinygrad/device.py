@@ -300,6 +300,14 @@ class DepsTracker:
 
 class CompileError(Exception): pass
 
+def _read_exactly(f, n:int) -> bytes:
+  # raw pipes (bufsize=0) can short-read below n on a single call; loop until n bytes or EOF
+  buf = b""
+  while len(buf) < n:
+    if not (chunk := f.read(n - len(buf))): raise CompileError(f"compile server EOF: got {len(buf)} of {n} bytes")
+    buf += chunk
+  return buf
+
 class Compiler:
   def __init__(self, cachekey:str|None=None): self.cachekey = cachekey if CCACHE else None
   def compile(self, src:str) -> bytes: return src.encode()   # NOTE: empty compiler is the default
@@ -315,7 +323,8 @@ class Compiler:
     return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
     unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    sz = struct.unpack("I", _read_exactly(unwrap(proc.stdout), 4))[0]
+    if (lib:=_read_exactly(unwrap(proc.stdout), sz)): return lib
     raise CompileError("Compilation Error")
 
 
