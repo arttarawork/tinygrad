@@ -190,6 +190,58 @@ class TestDeviceMapMetalCPU(unittest.TestCase):
     if Device["METAL"].graph is not None: self.assertIn("METAL", graphed_devs)  # METAL kernels got graph-batched
     self.assertIn("CPU", ungraphed_devs)               # CPU kernels stayed eager/sequential
 
+@unittest.skipUnless(Device.DEFAULT == "METAL" and "NV" in Device.get_available_devices(), "Metal default + a real NV device required to run")
+class TestDeviceMapMetalNV(unittest.TestCase):
+  """TD.3: the real Metal+NV pooling rehearsal (dock hardware) -- same shape as TestDeviceMapMetalCPU,
+  but the second backend is an actual RTX 3090 over the USB4/Thunderbolt eGPU tunnel instead of CPU.
+  Unlike CPU (never graphs), NV is HCQ-based and graph-batches too -- both islands should."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_split_matches_single_device(self):
+    ref, split = Transformer(TEST_CONFIG, device_map="METAL"), Transformer(TEST_CONFIG, device_map="0-1:METAL,2-3:NV")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    self.assertEqual([b.device for b in split.blk], ["METAL", "METAL", "NV", "NV"])
+    self.assertEqual(split.token_embd.weight.device, "METAL")  # consumed before the first block
+    self.assertEqual(split.output.weight.device, "NV")         # consumed after the last block
+
+    # identical outputs over prefill + several decode steps, twice (second prompt exercises JIT replay)
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    # lazily-created per-block state followed the activations to the mapped devices
+    self.assertEqual([b.cache_kv.device for b in split.blk], ["METAL", "METAL", "NV", "NV"])
+    self.assertEqual([b.freqs_cis.device for b in split.blk], ["METAL", "METAL", "NV", "NV"])
+
+    # JIT-capture characterization (TD.3 objective 4): the mixed METAL/NV trace captures end-to-end,
+    # same as METAL/CPU (T3.2). Unlike CPU, NV is HCQ-based (Device["NV"].graph is HCQGraph) so BOTH
+    # islands should graph-batch -- there is no "ungraphed backend" here the way CPU was.
+    rollout_jit = split.jit[(False, True, None)]
+    self.assertIsNotNone(rollout_jit.captured)
+    copies, graphed_devs, ungraphed_devs = [], set(), set()
+    for call in rollout_jit.captured.linear.src:
+      ast = call.src[0]
+      if ast.op is Ops.COPY:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        copies.append((devs, ast.arg))
+      elif ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph":
+        batch_devs = set()
+        for inner in ast.src[0].src: batch_devs |= set(u.device for u in inner.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        self.assertEqual(len(batch_devs), 1, f"graphed batch spans devices: {batch_devs}")  # graphing never crosses backends
+        graphed_devs |= batch_devs
+      else:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        self.assertLessEqual(len(devs), 1, f"ungraphed compute kernel with mixed-device buffers: {devs}")
+        ungraphed_devs |= devs
+    self.assertIn(({"METAL", "NV"}, "NV"), copies)  # the block-boundary activation hop, dst follows the map (NV is last)
+    if Device["METAL"].graph is not None: self.assertIn("METAL", graphed_devs)  # METAL kernels got graph-batched
+    if Device["NV"].graph is not None: self.assertIn("NV", graphed_devs)        # NV kernels got graph-batched too (HCQGraph)
+    self.assertEqual(ungraphed_devs, set())  # neither island is CPU-style ungraphed here
+
 @unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")
 class TestDeviceMapMetalCPURecurrent(unittest.TestCase):
   def _generate(self, model, prompt, n, temperature=0.0):
