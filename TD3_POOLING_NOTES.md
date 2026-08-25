@@ -355,6 +355,61 @@ protocol surgery (a different subsystem from `model.py`, and a different bug fro
 a MoE-placement-verification task's scope. Documented here as a candidate follow-up: harden
 `RemotePCIDevice._rpc`'s `has_fd` branch with the same retry discipline `_recvall` already has.
 
+### 7. T4.17 follow-up: has_fd fix shipped + tested — but the real mechanism was NOT fragmentation, and a deeper, genuinely server-side ceiling now blocks full completion
+
+Repro re-confirmed 1/1 at HEAD (`b3e64e734`) before any change, exact same `IndexError: list index out
+of range` at `system.py:379`. Fixed `RemotePCIDevice._rpc`'s `has_fd` branch (`system.py`, +8 net lines,
+one commit) and added 4 regression tests (`test/null/test_device.py::TestRemotePCIDeviceRPC`, real
+AF_UNIX `socketpair`, no GPU) — all 4 fail against pre-fix code, all 4 pass post-fix. Full details: this
+session's `T4.17: ...` commit.
+
+**§6's "fragmentation" hypothesis was wrong** (it was explicitly hedged "consistent with, not proven
+as" — this session proves what actually happens). Instrumenting `recvmsg()` directly on the real olmoe
+repro shows **zero fragmentation at any point**: 128 consecutive `has_fd` calls each return the full
+17-byte header + fd in a single `recvmsg()` call, then the 129th (and, via `LRUAllocator`'s catch-evict-
+retry, the 130th) each return a **complete, well-formed 17-byte header with `status=1` (failure),
+zero-length error body, and no cmsg** — a legitimate error reply, which correctly carries no fd. The
+crash's real cause: the `has_fd` branch unpacked a fd unconditionally, before ever checking the status
+byte, so a real RPC failure crashed exactly like a dropped fd would (same `IndexError`, same line —
+indistinguishable from the outside, which is why §6 misattributed it). Fix does two things in the same
+code region: (1) `_recvmsg_all()` loops `recvmsg()` until 17 bytes are collected, capturing the fd from
+whichever fragment carries it (mirrors `_recvall`; this part *does* fix a real, separate short-read
+hazard, verified by the fragmented-reply tests even though it wasn't what olmoe hit); (2) `_rpc()` now
+checks the status byte first (existing `"RPC failed: ..."` path) and only requires a fd for a
+*successful* `has_fd` call, raising a distinct, clear error otherwise.
+
+**End-to-end verdict**: re-ran the exact §6 command post-fix (fresh `TinyGPU.app` server via
+`pkill -f TinyGPU` + respawn, to rule out state accumulated across this session's several crashed runs
+— result identical on a cold server, so not stale state). The documented crash is gone — no more
+`IndexError`. But the graphed split still cannot complete: it now fails cleanly with
+`RuntimeError: RPC failed: unknown error`, deterministic across 3 runs (2 warm-server, 1 cold-server),
+always at the exact same allocation (`NVComputeQueue.bind`'s 104 B `hw_page`, ~4.89 GB already resident
+on NV). This is a **new, separate, genuinely server-side finding**: `TinyGPU.app` (closed binary, not
+in this repo, cannot be changed here — same constraint the task's STOP condition anticipated) refuses a
+`has_fd` sysmem allocation once ~128-130 are concurrently outstanding. No previously-tested model came
+close to that count — dense llama3.2:1b and the tiny synthetic MoE config both use far fewer live
+sysmem mappings than real olmoe's many small per-expert tensors (64 experts x 3 tensors x 16 layers).
+The exact server-side resource being exhausted is unknown (closed binary; 128 is a suspicious
+round-number ceiling, consistent with a fixed-size table, but that's inference, not proof).
+
+**Consequently, still blocked** (same bottom line as §2/§3/§4 before this session, now for a precise,
+provably-server-side reason instead of a hedged guess): tokens-byte-match against the eager/all-device
+references, end-to-end split tok/s vs. all-NV tok/s, and a live 48-copy count at olmoe scale all require
+the graphed split to run past its first JIT capture, which it still cannot do. §4's ~3.1-4.3 ms/token
+boundary-cost figure remains a grounded prediction, not a direct measurement. Swap stayed ~1.0-1.1 GB
+across every run this session (fix work + repro + verification), no regression.
+
+**Gates**: 4 new tests + full `test/null/test_device.py` (19 passed, 7 skipped, `-n12`) + real-hardware
+`test/unit/test_llm_device_map.py` (31/31, `DEV='METAL;NV:NAK'`, deliberately run *without* `-n12` —
+real shared NV device, parallel workers would contend for the GPU) + mypy (`Success: no issues found in
+216 source files`) + ruff (`All checks passed!`) all green.
+
+**PR-readiness**: the `system.py` commit is small (+8 net lines, one code region), hand-verifiable, one
+lever, matches T4.14's fix shape and test style closely (loop-until-n helper, real-transport fake-server
+unit tests, clear "got X of Y" error text) — same bar as T4.14, ready. It is a genuine, tested fix for a
+real bug class (T4.14-sibling short-read *and* a status-before-fd ordering bug), independently worth
+shipping even though it wasn't sufficient to unblock olmoe's graphed run end-to-end.
+
 ### Exact commands (MoE)
 
 ```bash
@@ -375,6 +430,13 @@ JIT=0 DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device
 # boundary-cost measurement (objective 4) -- ad hoc script, not committed, same pattern as TD.3's capture-check
 DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/moe_hop_cost.py   # builds tiny MOE_TEST_CONFIG w/ device_map="METAL,experts:NV",
                                                                  # warms up, wraps one steady-state decode step in Context(DEBUG=2)
+
+# T4.17 follow-up (S7): fix verification + the new, deeper server-side ceiling
+PYTHONPATH=. $PY -m pytest test/null/test_device.py -v -k RemotePCIDeviceRPC   # 4 new tests, real AF_UNIX socketpair
+pkill -f TinyGPU && rm -f /var/folders/*/T/tinygpu.sock   # cold-restart the server to rule out state from earlier crashed runs
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "METAL,experts:NV" --prompt-tokens 16 --decode-tokens 64
+  # post-fix: no more IndexError -- now a clean "RuntimeError: RPC failed: unknown error" at the same
+  # NVComputeQueue.bind allocation, deterministic on both warm and cold server (new S7 finding)
 
 # gates
 DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -v   # 31 passed
