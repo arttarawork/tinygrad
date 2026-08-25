@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-import unittest, os, subprocess
+import unittest, os, subprocess, struct
 from unittest.mock import patch
 from tinygrad import Tensor
-from tinygrad.device import Device, Compiler, enumerate_devices_str
+from tinygrad.device import Device, Compiler, CompileError, enumerate_devices_str
 from tinygrad.helpers import diskcache_get, diskcache_put, getenv, Context, Target, WIN, OSX, DEV
 from tinygrad.runtime.support.c import DLL
 
@@ -184,6 +184,28 @@ class TestCompiler(unittest.TestCase):
     with Context(CCACHE=0):
       a = Tensor([0.,1.], device=Device.DEFAULT).realize()
       (a + 1).realize()
+
+class _FakeCompileProc:
+  # simulates a raw unbuffered pipe: read(n) hands back at most `chunk` bytes regardless of n
+  def __init__(self, reply:bytes, chunk:int):
+    self.stdin = self.stdout = self
+    self.reply, self.chunk, self.pos = reply, chunk, 0
+  def write(self, data): pass
+  def read(self, n:int) -> bytes:
+    end = min(self.pos + min(self.chunk, n), len(self.reply))
+    ret, self.pos = self.reply[self.pos:end], end
+    return ret
+
+class TestCompileServer(unittest.TestCase):
+  def test_fragmented_reassembly(self):
+    payload = bytes((i * 7) % 256 for i in range(5000))
+    proc = _FakeCompileProc(struct.pack("I", len(payload)) + payload, chunk=2)
+    self.assertEqual(Compiler().compile_server("src", proc), payload)
+
+  def test_eof_mid_body_raises(self):
+    payload = b"x" * 100
+    proc = _FakeCompileProc(struct.pack("I", len(payload) + 50) + payload, chunk=3)  # promises 50 bytes it never sends
+    self.assertRaisesRegex(CompileError, "got 100 of 150 bytes", Compiler().compile_server, "src", proc)
 
 @unittest.skip("this test is broken if you have tinymesa installed")
 @unittest.skipIf(OSX and 'libclang' in DLL._loaded_, "MTLCompiler can't be loaded after libclang on OSX")
