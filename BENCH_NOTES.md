@@ -946,3 +946,34 @@ DEV='METAL;NV' JITBEAM=2 PARALLEL=6 PYTHONPATH=. $PY extra/benchmark_llm.py --mo
 DEV=NV PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map NV --prompt-tokens 512 --decode-tokens 128
 ```
 
+
+### CORRECTION (main session, 2026-08-25): the 71 GB fp16-residency analysis above is WRONG
+
+The headline claim ("~71.01 GB resident regardless of quant; no quantized-weight-resident
+path") misread lazy evaluation as materialization. `model.py:602`'s `.cast('float16')` is a
+lazy expression on a lazy dequant chain, and `from_gguf` loads with `realize=False`
+(model.py:695) — params stay **unrealized dequant expressions**; the quantized blob bytes are
+what's device-resident, and dequant+cast fuse into consumer kernels (this is exactly the
+expression shape T1.10's MATVEC work matches, and how gpt-oss-20b's 12 GB MXFP4 has run on the
+24 GB card since TD.2).
+
+**Empirical falsification (this session):** qwen3:8b Q4_K_M (5.03 GB file, 8B params → ~16 GB
+if fp16-resident): `from_gguf` + `realize_placement()` on `DEV=NV:NAK` → GlobalCounters
+`mem_used = 5.02 GB`. Residency ≈ quantized file size.
+
+Reinterpretation of the four failed runs above:
+- Row 1 (all-NV, OOM at 23.17 GB): the **quantized** 22.85 GB file + working set is what
+  exceeded 24 GB — marginal, not structural. The registry UD-Q4_K_M (20.2 GB) is expected to
+  fit all-NV; being measured now.
+- Rows 3/3b (range-split swap explosion): the documented **T3.3 move-trap** — params placed on
+  the non-load device are force-realized at fp16 by `realize_placement()` (moved-param COPY
+  sits above the dequant). For a range split of a big model, ~half the model materializes fp16
+  → blowup. This is a real structural gap for big-model range splits, but it is a **load-path
+  gap (T4.21)**, not a residency ceiling.
+- Row 2 (all-METAL thrash): 22.85 GB quantized + colima 6 GiB + macOS on 36 GB — consistent
+  with quantized residency too.
+
+Consequently Q6_K_XL (~29 GB) pooled ~18/11 and Q8_0 (~37.4 GB) pooled ~20/17 remain feasible
+**once T4.21 lands** (place the blob *read* per-device so quantized bytes copy and dequant
+fuses on the target, instead of realizing moved params at fp16). The olmoe range-split bonus
+results in this section are unaffected and stand.
