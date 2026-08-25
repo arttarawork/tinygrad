@@ -31,6 +31,13 @@ class NVSignal(HCQSignal):
 
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
 
+def _fault_recovery_hint(dev) -> str:
+  # T4.23: is_err_state is only ever set from real GSP-reported events (support/nv/ip.py's OS_ERROR_LOG/MMU_FAULT_QUEUED
+  # handling), and NV never sets can_recover (hcq.py), so there's no safe in-process reset -- name the out-of-band fix
+  # instead of a bare "fault detected". Remote-only: local NVK/mock have no TinyGPU.app server to respawn.
+  return (" NV device is in an unrecoverable fault state -- reinitialize the eGPU session: "
+          "`pkill -f 'TinyGPU.*server'` (the client auto-respawns it), then retry.") if dev.is_remote() else ""
+
 NV_PFAULT_FAULT_TYPE = {dt:name for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_FAULT_TYPE_")}
 NV_PFAULT_ACCESS_TYPE = {dt:name.split("_")[-1] for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_ACCESS_TYPE_")}
 
@@ -606,7 +613,7 @@ class PCIIface(PCIIfaceBase):
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
-    if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
+    if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected." + _fault_recovery_hint(self.dev))
 
 class MOCKIface(NVKIface): count = 1
 
@@ -803,7 +810,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       for i, e in enumerate(sm_errors.smErrorStateArray):
         if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
 
-    raise RuntimeError("\n".join(report))
+    raise RuntimeError("\n".join(report) + _fault_recovery_hint(self))
 
   def _prof_init(self):
     self.profiler = self.iface.rm_alloc(self.subdevice, nv_gpu.MAXWELL_PROFILER_DEVICE,

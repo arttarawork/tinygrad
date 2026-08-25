@@ -4,7 +4,7 @@ from tinygrad.helpers import getenv
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
-from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue
+from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, _fault_recovery_hint
 
 class CountingMMIOInterface:
   """Fake MMIOInterface: one __getitem__/__setitem__ call == one socket-RPC message in the real RemoteMMIOInterface (system.py), so
@@ -158,6 +158,31 @@ class TestNVBindRemoteBatching(unittest.TestCase):
   def test_remote_buffer_collapses_to_one_bulk_write(self):
     stats = self._bind_and_count(is_remote=True, n_words=200)
     assert stats['w'] == 1, f"remote bind() should collapse to 1 bulk slice write regardless of queue length, got {stats['w']}"
+
+class TestNVFaultRecoveryHint(unittest.TestCase):
+  """T4.23: an NV device fault (is_err_state) is genuinely GSP/hardware-reported (support/nv/ip.py sets it only from real
+  NV_VGPU_MSG_EVENT_OS_ERROR_LOG/MMU_FAULT_QUEUED messages) and NV never sets can_recover (hcq.py) -- there is no safe
+  in-process reset, so the raised error must name the out-of-band fix instead of a bare message. Remote-only: local
+  NVK/mock have no TinyGPU.app server to respawn, so their message must stay byte-for-byte unchanged."""
+  def test_hint_names_the_fix_when_remote(self):
+    hint = _fault_recovery_hint(SimpleNamespace(is_remote=lambda: True))
+    assert "pkill -f 'TinyGPU.*server'" in hint, hint
+
+  def test_hint_is_empty_when_local(self):
+    assert _fault_recovery_hint(SimpleNamespace(is_remote=lambda: False)) == ""
+
+  def _fake_sleep_self(self, is_remote:bool):
+    stat_q = SimpleNamespace(read_resp=lambda: iter(()))
+    return SimpleNamespace(dev_impl=SimpleNamespace(gsp=SimpleNamespace(stat_q=stat_q), is_err_state=True),
+                            dev=SimpleNamespace(is_remote=lambda: is_remote))
+
+  def test_pciiface_sleep_raises_with_hint_when_remote(self):
+    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(self._fake_sleep_self(True), 200)
+    assert "pkill -f 'TinyGPU.*server'" in str(ctx.exception), ctx.exception
+
+  def test_pciiface_sleep_message_unchanged_when_local(self):
+    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(self._fake_sleep_self(False), 200)
+    assert str(ctx.exception) == "Device fault detected.", ctx.exception
 
 if __name__ == "__main__":
   unittest.main()
