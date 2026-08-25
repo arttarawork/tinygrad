@@ -3,9 +3,14 @@
 This is Artur's fork of tinygrad for making the NVIDIA/TinyGPU eGPU path fast for local LLMs
 and pooling the MacBook (Metal) with an RTX 3090. Before doing any work, read in order:
 
-1. `TASKS.md` — the task list with dependencies and environments; pick tasks from there.
-2. `NV_LLM_DESIGN.md` — the design doc (goals, current-state findings with file:line refs, workstreams).
+1. `TASKS.md` — **start with the "RESUME HERE" section** (state of play, where the artifacts
+   live, dock ops quickstart, next-task recommendation), then the task list + Status log.
+2. `NV_LLM_DESIGN.md` — the design doc; **§1.5 has the post-dock results and supersedes the
+   pre-dock framing** in §1-§2.
 3. `memory.md` — context, decision history, external research, supplementary repo findings.
+4. For any work touching the dock: `TD3_POOLING_NOTES.md` §0 and `BENCH_NOTES.md` on branch
+   `task/TD.3-pooling` (worktree `/Users/artur/Documents/tinygrad-dock`) — lane mechanics and
+   all measured data live there, not on this branch.
 
 Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line refs after rebases.
 

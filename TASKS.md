@@ -446,6 +446,7 @@ rows are not strictly date-sorted — **the latest row for a task wins.**
 | 2026-08-25 | qwen3.6-35b experiment | **partial — agent's 71 GB claim FALSIFIED by main session; T4.21 filed** | `task/TD.3-pooling` @ `7bafdf6b5` (agent) + `8486b1cd6` (correction) | Agent's runs: Q4_K_XL (22.85 GB) all-NV OOM at 23.17/24 GB (marginal, not structural), all-METAL thrash beside colima, range-split swap explosion. Agent's headline ("all quants dequant to 71 GB resident; no quantized-resident path") was a misread of lazy eval — **falsified empirically: qwen3:8b Q4_K_M 5.03 GB file → 5.02 GB measured on-NV residency** (`realize=False` keeps params as unrealized dequant exprs; quantized bytes resident, dequant fuses into consumers — the T1.10 expression shape). Range-split failure = the known **T3.3 move-trap** (moved share force-realizes fp16). **Agent's valuable bonus stands: olmoe RANGE split is byte-identical at depth (129/129, both BEAM states) AND wins BEAM'd (69.78 vs all-METAL 63.81 vs experts-split 43.84)** — T4.19's divergence is experts-split-specific; range split is the production shape. Q4_K_M all-NV datum being measured by main session. |
 | 2026-08-25 | T4.21 (new) | open | — | **Big-model range-split load path: place the blob READ, not the param.** `realize_placement()` materializes moved params at fp16 (COPY above dequant) — fine for small shares (T3.3 rule), fatal for range splits of >24 GB models (~half the model at fp16). Fix: in the device_map load path, copy the QUANTIZED blob bytes to the target device and keep dequant lazy on it (move the COPY below the dequant in each param's chain), so residency = quantized share per device. Payoff: qwen3.6-35B Q6_K_XL (~29 GB) pooled ~18/11, Q8_0 (~37.4 GB) pooled ~20/17 — quants neither device holds alone; the restored answer to "largest quant we can run". `[DOCK]`, upstream-relevant (device_map is fork-side but the lazy-load mechanics are shared). |
 | 2026-08-25 | qwen3.6-35B on the dock | **done — 56.58 tok/s, 1.8x llama.cpp-Metal** | `task/TD.3-pooling` @ `0704042c7`+`cce3a28f0` (BENCH_NOTES) | Main session, direct runs. **Answer to "largest quant that runs well": `MXFP4_MOE` (21.71 GB) all-NV, nvcc lane, `JITBEAM=1 PARALLEL=6` → decode 56.58 tok/s @ 225 GB/s (4096 ctx; 56.45 @ 768 — flat, so BEAM level not context was the fit).** vs llama.cpp-Metal ~31 on the same Mac. Ladder: no-BEAM NAK 2.50 → no-BEAM nvcc 7.07 → BEAM-1 nvcc 56.58 (8.0x). **`JITBEAM=2` OOMs** (search scratch 136 MB @ 22.70/24 GB) ⇒ model size sets the BEAM budget. Q4-class files (22.13-22.85 GB) OOM outright, context-independently (~1.6 GB fixed working set). **Why MXFP4 wins: the file is 78 expert tensors MXFP4 (ggml type 39 — T4.13's fix) + Q5_K attention (T4.2's fix)**; Unsloth UD-* files are IQ mixes (UD-Q3_K_XL = 31 of 35B elements IQ) → T4.22. Rule recorded: **prefer MXFP4/K-quant files over UD/IQ on this fork**. Also strengthens T4.21: pooling frees headroom for BEAM-2 AND long-context KV (llama.cpp serves 131k; we measured 4096). |
+| 2026-08-25 | T4.23 (new) | open | — | **NV device wedges after any OOM — recovery needs an out-of-band `pkill`.** Every capacity-limited run this session (5+) left the device in `is_err_state` ("Device fault detected" on the next `synchronize`), so the *next* unrelated run also fails until `pkill -f "TinyGPU.*server"` respawns the server. Cost: agents burn a run + a retry each time, and a naive retry loop looks like a reproducible bug (it fooled the TD.2c agent into a correct-but-expensive stop). Wanted: client-side recovery — on `MemoryError` from `_alloc`, tear down/reinit the device cleanly (or at minimum raise an error that NAMES the required respawn). Check whether `can_recover`/`error_state` (`hcq.py:426-433`) already has a reset path that just isn't wired for the remote iface. Small, high daily-friction payoff; also feeds the tinygpu_releases report. `[DOCK]`. |
 | 2026-08-25 | T4.22 (new) | open | — | **IQ-quant dequant materialization = upstream #17316 REPRODUCED on the dock:** qwen3.6-35B UD-Q3_K_XL (31/35B elements are IQ3_XXS/IQ4_XS) decodes at **1.86 tok/s / 164 GB/s = ~88 GB/token** all-NV (upstream reported ~83 GB/token, same 35B class) — IQ codebook LUT gathers hit rangeify's `buffer_in_reduce` refusal exactly like T4.13's MXFP4. Fix-shape investigation needed: IQ grids are arbitrary codebooks (NOT ALU-expressible like MXFP4), so candidates are (a) rangeify allowing small-const-buffer gathers to fuse into reduces (general fix, benefits all LUT quants, closes #17316), (b) load-time transcode (costly: ~int8-resident), (c) other. Evidence-first; tiny-config repro exists via any IQ tensor. **High upstream value: open issue + local repro + T4.13 precedent.** `[ANY→DOCK]`. Practical workaround: use plain K-quant files (no UD-/IQ mixes) on tinygrad. |
 | 2026-08-25 | T4.19 (new) | open | — | **Split-placement divergence at depth — NARROWED to the `experts:` split (2026-08-25 qwen-session bonus): the per-layer RANGE split is byte-identical 129/129 at the same depth, both BEAM states.** Original observation: experts-split rows diverge from the (mutually byte-identical) 4 single-device configs at decode token 60 under 512/128. Investigate the experts-split specifically: tiny-config bisection (which of the 3 hops, which dtype), logit-delta magnitude, fp16-KV interaction. **Fold in the 2-vs-3 hops/layer question** (TD.3-moe §8 flag) — same capture answers both. Not a blocker (range split is the production shape); needed before any "byte-identical pooling" claim covering experts-splits ships in TD.4 material. `[DOCK]`, Sonnet-able. |
 | 2026-08-25 | T4.20 (new) | open | — | **kernargs_bufs pooling (T4.18's deliberate leftover, now empirically blocking):** gpt-oss:20b split crashes in `HCQGraph.__init__` `kernargs_bufs` alloc (graph/hcq.py:32) at the TinyGPU ~128-slot ceiling — the 24-layer island count exceeds what the hw_page slab alone freed up. Needs a stable-address pooled allocation for per-island kernargs on remote ifaces (cross-backend file — design care) or the upstream protocol free-verb. Gates: any >16-layer MoE split on the dock. `[DOCK]`. |
@@ -466,13 +467,53 @@ rows are not strictly date-sorted — **the latest row for a task wins.**
 | 2026-08-24 | TD.1 | **done — FIRST LIGHT PASSED** | worktree `tinygrad-dock` @ fork master `b37d80fc9` | Bring-up sequence: dock first linked as **USB3 fallback** (ASM246X visible as plain USB device — replug + macOS accessory approval fixed it; USB4-vs-USB3 check is the first debug step forever); then TinyGPU.app install → DEXT approval (System Settings toggle; state `activated enabled` **without reboot**) → `DEV=NV` opened the device but **no `nvcc` on Mac**; **NAK lane worked**: `pip install tinymesa==25.2.7.2` → op correct → **test_tiny 19 passed / 2 skipped in 6.28s on `DEV=NV:NAK`**. §3.1 audit: 3090 = EVGA `10de:2204`, PCIe **Gen4 x4** tunnel, BAR1 = **256 MiB → `is_bar_small()=True`** (system.py:255); cmdq_page in **SYS aspace (host RAM, uncached+snooped)** per should_use_sysmem (system.py:266); **P2P refused for small-BAR** (system.py:297). nvcc/Docker lane untested (optional). GSP "WPR2 full reset" on first open is normal. |
 | 2026-08-21 | PR #1 merged + docs review | **done** | `memory` | Artur merged PR #1 → fork `master` = `457e1a915` (all Phase 0 work + upstream `b8cc74ecf`); task-branch base convention updated to fork `master`, `integration/wave1` retired as a base. Full docs review pass: banner/mermaid/TD.4/lanes de-staled; DEV=CPU + push-stagger + docs-push lessons promoted to conventions; Hermes note added to bench choreography; design-doc §1/§5/risks refreshed. Backup pushed: `memory` + 6 unmerged evidence branches (`task/bench-window-{2,3,4}`, `task/T0.3-bench-harness`, `task/T3.4-zero-copy`, `task/T4.1-matvec-pr`) to the fork. Upstream drift at review time: 32 commits past `b8cc74ecf` (incl. an llm kimi fix) — sync due, not performed (Artur's call). |
 
-## Parallelization notes
+## RESUME HERE (updated 2026-08-25 — read this before picking up work)
 
-Remaining lanes (updated 2026-08-21, Phase 0 complete): **(a)** PR train — blocked on Artur's
-route decision (memory.md §6 2026-08-20); **(b)** dock (TD.x); **(c)** optional T2.4 (rented
-3090). No launchable code tasks remain pre-dock. Upstream sync cadence: weekly (last sync
-`80bf60d78`, merged + pushed 2026-08-21 — fork master `b37d80fc9`); watch upstream #17446
-(competing gpt-oss arch — merge would conflict with our T1.3 in `llm/model.py`).
-Agent policy: one tight objective per agent, Sonnet at max effort, explicit STOP conditions,
-commit early, RELATIVE paths in worktrees; verify premises with a control experiment before
-optimizing (T1.4/T1.9/T4.10 all refuted their premises — cheapest work of the project).
+**State:** Phase 0 ✅, TD.1 ✅, TD.2 ✅, TD.3 correctness program ✅. The dock is live and every
+headline claim is measured. Best-known configs: `DEV=NV` (nvcc lane) + BEAM on everything;
+qwen3.6-35B-A3B MXFP4 hits 56.58 tok/s (1.8x llama.cpp-Metal). Pooling is byte-identical with
+~65-90 µs hops, and the **per-layer RANGE split** — not `experts:` — is the production shape.
+
+**Where the artifacts live** (the un-regenerable part — all pushed to the fork):
+- Docs/decisions: `memory` branch (this file, `NV_LLM_DESIGN.md`, `memory.md`).
+- **Dock operational notes + all bench data: `task/TD.3-pooling`** (worktree
+  `/Users/artur/Documents/tinygrad-dock`) → `TD3_POOLING_NOTES.md` (§0 lane mechanics, §7 RPC/
+  ceiling, §8 T4.18) and `BENCH_NOTES.md` (TD.2 truth table, transport validation, BEAM'd
+  pooling, qwen3.6). **A fresh agent should read TD3_POOLING_NOTES.md §0 before any dock run.**
+- Fix branches (each PR-ready, cherry-pickable): `task/T4.14-compile-server-shortread`;
+  T4.17 (`257ce6788`) + T4.18 (`74a0e861b`) sit on `task/TD.3-pooling`.
+- Bench CSVs: `extra/bench_results_2026-08-2{4,5}.csv` on that branch (the 08-25 one is gitignored).
+
+**Dock ops quickstart (hard-won; ignore at your peril):**
+- Two compiler lanes: **`DEV=NV` = nvcc**, needs colima running (`colima start`; VM is 8 vCPU/
+  6 GiB) — 2.8-4x faster than NAK, has tensor cores. **`DEV=NV:NAK` = mesa/tinymesa**, no docker,
+  good for correctness work. Mixed pooling: **`DEV='METAL;NV:NAK'`** — lane choice is
+  process-wide; device_map strings stay plain `METAL`/`NV`.
+- `--env PARALLEL=6` on every nvcc-lane BEAM run (default 12 oversubscribes the colima VM →
+  BrokenPipeError from the compile server; not a bug).
+- **BEAM budget is set by free VRAM**: JITBEAM=2's search scratch OOMs beside a >21 GB model;
+  JITBEAM=1 still bought 8x on qwen3.6. Small models: use 2.
+- **After any OOM/fault the NV device wedges** — `pkill -f "TinyGPU.*server"` (client respawns).
+  "WPR2 is up. Issuing a full reset." on first open is normal.
+- Quant rule: **prefer MXFP4/K-quant GGUFs over Unsloth UD-/IQ files** (IQ dequant materializes,
+  ~88 GB/token — T4.22).
+- Bench window: llama-server may be stopped daily 22:00-19:00 (must run 19:00-22:00); check it
+  is idle first, and **restore as soon as the bench work ends**, not at window end.
+
+**Next task recommendation: T4.21** (blob-read placement). It is the single unlock for big-quant
+pooling, BEAM-2 headroom, and long-context — i.e. the difference between good benchmarks and
+Artur running his daily model on this. Then T4.22 (upstream value), T4.20 (unblocks >16-layer
+MoE splits), T4.19 (correctness claim hygiene).
+
+**Blocked on Artur, nothing moves without a decision:** PR-train route (now led by T4.14/T4.17/
+T4.18 — see TD.4), the tinygpu_releases issue report, the upstream sync push (workflow scope),
+TD.4 publishing. Upstream sync cadence: weekly (last `80bf60d78` → fork master `b37d80fc9`,
+2026-08-21; **33+ commits pending, plus the fp16-KV one-line conflict — keep ours**). Watch
+upstream #17493 (rangeify rewrite — re-validate T4.13/T1.4/T4.9 if it merges), #17446, #17478.
+
+Agent policy: one tight objective per agent, **Sonnet at max effort**, explicit STOP conditions,
+commit early, RELATIVE paths in worktrees, foreground-blocking bench runs (a backgrounded run
+with no supervisor stalls the matrix). Verify premises with a control experiment before
+optimizing — T1.4/T1.9/T4.10 refuted their own premises, and on 2026-08-25 an agent's
+"71 GB fp16-resident" analysis was falsified by one 5-minute measurement. **If an agent's
+analytical claim contradicts established project data, measure before it reaches the docs.**

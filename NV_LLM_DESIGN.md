@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Living doc (written 2026-08-18; last full review 2026-08-21) |
+| Status | Living doc (written 2026-08-18; last full review 2026-08-25 — **§1.5 carries the post-dock results; the pre-dock framing below is kept for provenance but §1.5 wins on any conflict**) |
 | Date | 2026-08-18 |
 | Baseline | `tinygrad/tinygrad` @ `af2a43c85` (v0.13.0-968, master as of today) |
 | Hardware | MacBook Pro M3 Pro 36 GB (Metal, ~150 GB/s) + RTX 3090 24 GB (sm_86, 936 GB/s) in a TB/USB4 eGPU dock via TinyGPU |
@@ -25,6 +25,50 @@ Three goals, in priority order:
 - **G3 — Upstreamability.** Every change lands as a small, benchmarked PR that survives tinygrad's review culture; nothing depends on a long-lived fork.
 
 An important honesty note on the baseline: tinygrad's published CI numbers run `JITBEAM=2` (beam-searched kernels); the defaults a fresh user gets are un-beamed (`BEAM=0`, `helpers.py:231`). Some of the public "10x slower" gap may be configuration, not capability. **Measured 2026-08-18 on this MacBook (METAL, qwen3:8b Q4_K_M — see `task/T0.3-bench-harness` BENCH_NOTES.md):** llama.cpp decode 27.27 tok/s; tinygrad upstream 4.92 no-BEAM / 12.86 BEAM (so beam alone is a 2.6x config gap); our Phase 0 levers take it to a final stable 7.38 no-BEAM (+50%) / 14.40 BEAM (+12%, 53% of llama.cpp — bench window 4). The remaining ~2x vs llama.cpp is the WS1 fused-attention + further kernel work.
+
+## 1.5 Post-dock results (2026-08-24/25) — supersedes the pre-dock framing above
+
+The dock arrived 2026-08-23; TD.1→TD.3 ran 2026-08-24/25. Everything below is measured on the
+real 3090-over-USB4 (details: TASKS.md status rows; data: `BENCH_NOTES.md` +
+`TD3_POOLING_NOTES.md` on `task/TD.3-pooling`).
+
+**G1 — single-eGPU speed: MET, ahead of target.** Best config is `DEV=NV` (nvcc) + BEAM.
+Decode tok/s: llama3.2:1b **149.1** (above the llama.cpp-CUDA 110-130 reference band),
+qwen3:8b **46.9** (1.73x llama.cpp-Metal's 27.1), gpt-oss:20b **60.9** (~4x our Metal BEAM),
+qwen3.6-35B-A3B MXFP4 **56.6** (1.8x llama.cpp-Metal). The doc's premise that the eGPU runs
+"~10x slower than the Mac's iGPU" was a **configuration** artifact, not a capability one:
+compiler lane (nvcc vs NAK ≈ 2.8-4x) and BEAM (up to 8x) account for essentially all of it.
+
+**The transport is exonerated for decode.** Once HCQGraph engages, host/socket dispatch is ~3%
+of a token; ~97% is on-GPU kernel time (TD.2a). The prepared transport levers were still
+validated on real hardware — T2.1 **+12% D2H** (3.06→3.43 GB/s, tunnel-DMA-bound), T2.2
+**2.51x** faster 1 GiB map — but they move load/copyout, not decode. WS2's remaining value is
+therefore load-time, not steady-state.
+
+**G2 — pooling: works, with a corrected shape.** METAL+NV splits are byte-identical with both
+sides graph-batching and **~65-90 µs/hop** (8-9x cheaper than the METAL↔CPU floor, because NV's
+synchronize is a native timeline-signal wait). Two corrections to the goal as originally stated:
+1. **Placement is reversed from this doc's G2 text.** "Attention/KV on the 3090, experts on the
+   Mac" is wrong on two counts: the GGUF load device must be the **big-memory** side (moved
+   params force-realize at fp16 — T3.3), and BEAM's tensor-core gains land on **attention**, so
+   leaving attention on Metal is what made the `experts:` split finish *last* once BEAM was on
+   (43.8 vs 115.5 all-NV, olmoe).
+2. **The production shape is the per-layer RANGE split** — byte-identical at depth, ~1 boundary
+   instead of ~85 graph islands, and BEAM'd it beats all-METAL (69.8 vs 63.8 on olmoe).
+   `experts:` placement remains useful only for capacity, not speed.
+**Pooling's real value case is narrower and sharper than G2 assumed:** for a model that fits one
+device, put it there. Pooling earns its keep when the model does *not* fit — and it buys three
+things at once: capacity, VRAM headroom for a deeper BEAM search (JITBEAM=2 OOMs beside a 21.7 GB
+model), and long-context KV. That case is currently blocked by **T4.21** (the load path realizes
+the moved share at fp16), which is now the project's highest-leverage open item.
+
+**G3 — upstreamability: three new PR-shaped fixes**, all found on real hardware, all small with
+docker-free tests: T4.14 (compile-server short-read), T4.17 (RPC status-before-fd + recvmsg
+loop), T4.18 (`hw_page` slab under TinyGPU's ~128-slot sysmem ceiling). Two runtime findings are
+issue-report material rather than PRs: TinyGPU's slot ceiling and the fact that `RemoteCmd` has
+no free/unmap verb. Still-open perf gaps are named, not hand-waved: T4.22 (IQ dequant
+materializes, ~88 GB/token — reproduces upstream #17316), T4.20 (kernargs pooling), T4.19
+(experts-split divergence at depth).
 
 ## 2. Why this is winnable
 
