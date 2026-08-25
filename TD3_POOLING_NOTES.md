@@ -167,6 +167,223 @@ the hop.
 
 ---
 
+## 7. MoE shape (TD.3-moe): routed experts on NV, rest on METAL
+
+Reproduces T3.3's MoE placement cross-backend on real hardware: `experts:NV` (RTX 3090) + everything
+else on METAL. Worktree/branch unchanged (`tinygrad-dock`, `task/TD.3-pooling`). Model: olmoe
+(`allenai/OLMoE-1B-7B-0924-Instruct-GGUF` Q4_K_M, 16 blocks, 64 experts, 8 active/token, dim=2048,
+already in the fetch cache: `.../downloads/d9f8816f773421fa69637257a3f71cdc`, 4,213,512,672 bytes).
+
+**TL;DR: the MoE placement logic itself is fully correct cross-backend at real scale (exact tokens,
+3 copies/layer confirmed) — but a new, structural bug in the NV eGPU transport (independent of T4.14,
+undiscovered until this session) blocks the real olmoe split from ever reaching graphed/steady-state
+execution. Correctness is proven; the steady-state performance number is a well-grounded prediction,
+not a direct measurement, as a result.**
+
+### 0. Mechanism correction: "NV:NAK" is a `DEV=` target string, not a device_map string
+
+The env brief's phrasing ("use the NV:NAK device string") doesn't map onto `device_map`/`Tensor(device=...)`
+literally — confirmed empirically before writing anything:
+
+```
+>>> Tensor([1,2,3], device='NV:NAK')
+ValueError: invalid literal for int() with base 10: 'NAK'   # ops_nv.py's _select_iface parses
+                                                              # the segment after ":" as a device INDEX
+```
+
+The real mechanism (already established by TD.1/TD.2a/TD.2b/TD.2c, just not spelled out in the TD.3
+brief): `DEV` is a global renderer/default-device override parsed by `Target.parse` (`helpers.py:193-230`),
+keyed by device NAME, e.g. `DEV=NV:NAK` sets `Device.DEFAULT="NV"` **and** forces NV's renderer to
+`NAKRenderer` (tinymesa, no docker) for the whole process. `device_map`/`Tensor(device=...)` strings stay
+plain `"NV"` throughout. To keep `Device.DEFAULT=METAL` (needed for this file's `Device.DEFAULT=="METAL"`
+test-skip convention) while still routing NV compiles through NAK, use the multi-target form:
+`DEV='METAL;NV:NAK'` (semicolon-separated `Target` list; verified both forms directly — `Device.DEFAULT`
+and `Device['NV'].renderer` come out exactly as expected, no docker touched). Quote it — bash treats
+unquoted `;` as a command separator. Running the full `test_llm_device_map.py` file with
+`DEV='METAL;NV:NAK'` (including the pre-existing, docker-authored `TestDeviceMapMetalNV`) is 31/31 green
+with colima stopped, confirming this is the correct, permanent invocation for this dock.
+
+### 1. Tiny synthetic MoE, both directions (objective 1) — PASS
+
+Added `TestDeviceMapMoEExpertsMetalNV` to `test/unit/test_llm_device_map.py`, mirroring
+`TestDeviceMapMoEExpertsMetalCPU` (same `MOE_TEST_CONFIG`: 4 blocks, 4 experts, k=2). Run with
+`DEV='METAL;NV:NAK'`:
+
+- `test_experts_on_nv_rest_on_metal` (the production shape): exact tokens vs an all-METAL reference
+  over 2 prompts x 6 generate steps each (prefill + JIT replay), **and** the captured-COPY hop count
+  is exactly `4*3=12` (h, sel in; x_down out — see §3).
+- `test_experts_on_metal_rest_on_nv` (reverse, cheap per the brief): exact tokens vs an all-NV
+  reference, same 2 prompts. No capture introspection here (objective 1 only asked for "cheap").
+
+31/31 in the file (29 pre-existing + 2 new), mypy + ruff clean. Swap unaffected (1066->1067 MB).
+
+### 2. olmoe production shape vs both references (objective 2) — PASS (tokens), blocked (graphed perf)
+
+`extra/benchmark_llm.py --device-map "METAL,experts:NV" --prompt-tokens 16 --decode-tokens 64`,
+greedy, no BEAM:
+
+| run | DEV | load device | load | warm | decode tok/s | 64 tokens |
+|---|---|---|---|---|---|---|
+| all-METAL | (none) | METAL | 1.488s | 32.347s | 2.195 | `[604, 253, 4376, 273, 253, 31142, ...]` |
+| all-NV | `NV:NAK` | NV | 5.763s | 27.080s | 12.894 | **identical** |
+| split (experts:NV, rest METAL) | `NV:NAK` | NV | 7.899s | 16.830s | 0.864 (eager, see §6) | **identical** |
+
+All three produce the **exact same 64-token greedy sequence** — olmoe is argmax-equivalent
+METAL/NV/split at this horizon, same as the dense T3.3/TD.3 findings, now confirmed for the real MoE
+production shape too. The split run only completes in eager mode (`JIT=0`, see §6) because the graphed
+path hits a structural transport bug before producing a single token — correctness is proven, the
+benchmark-mode tok/s above is **not** comparable to the graphed references (eager pays full per-kernel
+Python dispatch every step; not a boundary-cost measurement).
+
+### 3. Hop count (objective 3) — 3/layer confirmed by mechanism + tiny/live introspection; NOT re-verified live on real olmoe over NV (blocked)
+
+`FFNBlock._feed_forward` (`tinygrad/llm/model.py:167-180`) is the entire mechanism: `h.to(expert_dev),
+sel.to(expert_dev)` (2 "in" copies) then `x_down = ...to(x.device)` (1 "out" copy) — generic Tensor
+ops, zero scale- or backend-specific branching. Confirmed exactly `3/layer` two independent ways this
+session:
+- Tiny-config captured-COPY introspection (§1): `12 = 4*3`, both directions.
+- Live `DEBUG=2` steady-state trace on the same tiny config (§4 below): exactly 12 copy lines, in the
+  predicted h(64B)/sel(8B)/x_down(128B) pattern, repeating once per block.
+
+Also ran the tiny `MOE_TEST_CONFIG` at olmoe's **real depth** (`num_blocks=16`, still-synthetic
+weights, `DEV=NV:NAK`) purely to rule out a topology-depth trigger for §6's bug — it passed cleanly
+(16 layers x 3 = 48 copies implied by the same code path, no crash), which is corroborating but not a
+substitute for §3's actual ask: the captured-COPY count could not be taken directly on real olmoe over
+NV, because JIT capture never completes there (§6). Given the mechanism has no size- or depth-dependent
+branch, `48 = 16*3` for real olmoe follows from the code, not from a fresh introspection run.
+
+### 4. Boundary cost (objective 4) — measured on tiny (real dock hardware), predicted for olmoe
+
+Live `DEBUG=2` graphed steady-state, one decode step, tiny `MOE_TEST_CONFIG` (`METAL,experts:NV`,
+`DEV='METAL;NV:NAK'`), 12 copies across 4 layers:
+
+| hop | payload | timings (4 layers) | avg |
+|---|---|---|---|
+| h in (NV<-METAL) | 64 B | 70.75, 70.25, 67.96, 66.29 us | 68.8 us |
+| sel in (NV<-METAL) | 8 B | 66.29, 66.04, 64.33, 66.29 us | 65.7 us |
+| x_down out (METAL<-NV) | 128 B | 63.12, 61.79, 63.58, 61.88 us | 62.6 us |
+
+All 12 cluster in **62-71 us**, average **65.7 us** — same flat-floor character T3.2/TD.3 found (cost
+doesn't track payload size at these scales: 8 B and 128 B cost the same as 64 B), and in the same
+regime as TD.3's dense 80-90 us/hop finding (a bit lower here, still same order of magnitude; both
+numbers are well under 1M elements, T3.2's bandwidth-bound threshold). Real olmoe's actual hop
+payloads (h~8 KB, sel~32 B, x_down~64 KB per token) are *also* comfortably inside that flat-floor
+regime, so this tiny measurement extrapolates directly: **predicted olmoe boundary cost = 48 hops x
+~65-90 us = ~3.1-4.3 ms/token** — consistent with (same order as, low end of) the task's ~4-5 ms/token
+prediction. This is a **prediction grounded in a real on-dock measurement of the exact hop shape**, not
+a direct end-to-end measurement on olmoe itself: §6's bug blocks the graphed split from running at all,
+so the TD.3-dense-style "split tok/s vs all-NV tok/s, decompose the delta, attribute the remainder to
+METAL compute share" exercise could not be completed for the real model this session.
+
+### 5. Load-direction rule (objective 5) — holds by code argument + partial live evidence; wrong direction not forced live
+
+Rule (T3.3, CPU): the GGUF load device (`Device.DEFAULT` when `gguf_load()` runs) must be the
+big-memory/bulk side, or the cross-device `.to()` in `load_state_dict`/`realize_placement` force-realizes
+the moved tensors at full fp16 before the copy, losing fused dequant. With experts on NV (the bulk of a
+MoE model's weights), the load device must be NV.
+
+- **Correct direction, live**: `DEV=NV:NAK` (`Device.DEFAULT=NV`) load of real olmoe with
+  `experts:NV` (no motion — same-device, fused) + the small METAL share moving (force-realize, but
+  small) completed in **7.899s** — comparable to the all-NV reference's 5.763s, no anomaly. §2's exact
+  tokens confirm correctness too.
+- **Wrong direction, NOT run live**: `Device.DEFAULT=METAL` would force the ~12.88 GB fp16 expert
+  weights (`64 experts x 2048 x 1024 x 3 tensors x 16 layers x 2 bytes`, computed directly from this
+  GGUF's own metadata — matches T3.3's CPU-measured "~13 GB for olmoe" almost exactly, same model) to
+  materialize on METAL/host RAM before copying to NV. Deliberately not forced this session: llama-server
+  already holds ~17-23 GB resident on a 36 GB machine, so a real +13 GB transient sits close to the
+  edge, and §6 found a new NV-transport fragility that could compound unpredictably under a heavier
+  real-scale load — compounding an already-understood risk with a newly-found unknown one is exactly
+  the "don't fight it" case the brief calls out, just encountered one step earlier (at the memory-risk
+  decision) rather than after seeing the blowup.
+- **Code-path argument for why the CPU-proven mechanism transfers**: `Transformer.realize_placement`
+  (`model.py:557-584`) and `nn.state.load_state_dict`'s cross-device line (`v.replace(state_dict[k].to(v.device))`,
+  `nn/state.py:213`) contain **zero backend-specific branches** — generic `Tensor.to()`/`.contiguous()`/
+  `.realize()` calls throughout. T3.3's CPU-measured blowup is a property of this shared, backend-agnostic
+  code path, not of CPU specifically.
+- **Verdict: rule holds.** High confidence from the code-path argument + matching analytic sizing +
+  the correct direction's clean, fast, exact-token real-olmoe run; the wrong-direction blowup itself
+  was reasoned about rather than re-triggered live, by choice, for the risk reasons above.
+
+### 6. Structural finding: NV eGPU transport drops an ancillary FD under real-scale mixed-graph load (new — not T4.14, different call site)
+
+Real olmoe's graphed split (`DEV=NV:NAK`, `--device-map "METAL,experts:NV"`, default JIT) crashes
+**deterministically (2/2)** during `model.warmup()`'s first JIT capture/replay, after a successful
+7.9s load:
+
+```
+IndexError: list index out of range
+  File "tinygrad/runtime/support/system.py", line 379, in _rpc
+    fd = struct.unpack('<i', anc[0][2][:4])[0]      # anc came back empty -- no fd delivered
+  File "tinygrad/runtime/support/system.py", line 441, in alloc_sysmem   (APLRemotePCIDevice)
+  File "tinygrad/runtime/ops_nv.py", line 107, in bind                   (NVComputeQueue.bind)
+  File "tinygrad/runtime/graph/hcq.py", line 217, in __init__            (HCQGraph, first-use queue bind)
+  File "tinygrad/engine/realize.py", line 136, in get_graph_runtime
+```
+
+`RemotePCIDevice._rpc`'s `has_fd=True` branch (`system.py:377-379`) does a single, non-retrying
+`sock.recvmsg(17, socket.CMSG_LEN(4))` with no short-read handling — unlike its sibling `_recvall`
+(same file, `:368-372`), which correctly loops until it has all requested bytes. On a long-lived,
+heavily-reused stream socket (the TinyGPU.app RPC channel lives for the whole process), SCM_RIGHTS
+ancillary data is only delivered attached to the specific `recvmsg()` call that reads the *first* byte
+of the sender's `sendmsg()` — any prior short/misaligned read anywhere on that socket can silently
+strand a later call's ancillary FD. This is the same bug **class** T4.14 already fixed (short-read
+truncation), just a different call site never exercised by any prior TD session (nobody had previously
+combined `Device.DEFAULT=NV` load-direction with a real-scale mixed METAL+NV graph until this task).
+
+**Isolated with a targeted repro matrix** (all `device_map="METAL,experts:NV"`-shaped):
+
+| scenario | Device.DEFAULT | weights | result |
+|---|---|---|---|
+| tiny MoE, 4 layers | METAL | synthetic | pass (committed test) |
+| tiny MoE, 4 layers | **NV** | synthetic | pass |
+| tiny MoE, **16 layers** (olmoe's real depth) | **NV** | synthetic | pass |
+| real **dense** llama3.2:1b, 16 layers | **NV** | real GGUF | pass |
+| real **olmoe**, 16 layers, MoE | **NV** | real GGUF | **crash, 2/2** |
+
+Neither `Device.DEFAULT=NV` alone, nor 16-layer interleaving depth alone, nor real-GGUF scale alone
+(dense) reproduces it — only real-scale **MoE** GGUF loading (many large per-tensor transfers feeding
+straight into a mixed-graph capture) does. Consistent with (not proven as) a load-time framing desync
+that only surfaces on the next `has_fd=True` call, i.e. the graph's queue-bind.
+
+**Workaround found (diagnostic, not a fix): `JIT=0`** disables `TinyJit` capture entirely (falls back
+to eager per-op dispatch, `engine/jit.py:260`), which avoids `HCQGraph` construction altogether and
+produced §2's byte-identical, correct split tokens. Not usable for steady-state perf measurement (pure
+Python dispatch overhead per kernel).
+
+**Not fixed** — per the task's STOP condition: this is `tinygrad/runtime/support/system.py` socket-
+protocol surgery (a different subsystem from `model.py`, and a different bug from T4.14), well outside
+a MoE-placement-verification task's scope. Documented here as a candidate follow-up: harden
+`RemotePCIDevice._rpc`'s `has_fd` branch with the same retry discipline `_recvall` already has.
+
+### Exact commands (MoE)
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+OLMOE=/Users/artur/Library/Caches/tinygrad/downloads/d9f8816f773421fa69637257a3f71cdc
+
+# tiny synthetic, both directions (objective 1) -- committed regression test
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -v -k MoEExpertsMetalNV
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -v   # full file, 31/31
+
+# olmoe references + production split (objective 2)
+PYTHONPATH=.          $PY extra/benchmark_llm.py --model $OLMOE --device-map METAL --prompt-tokens 16 --decode-tokens 64
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map NV    --prompt-tokens 16 --decode-tokens 64
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "METAL,experts:NV" --prompt-tokens 16 --decode-tokens 64  # crashes graphed (see S6)
+JIT=0 DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "METAL,experts:NV" --prompt-tokens 16 --decode-tokens 64  # eager workaround -- exact tokens
+
+# boundary-cost measurement (objective 4) -- ad hoc script, not committed, same pattern as TD.3's capture-check
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/moe_hop_cost.py   # builds tiny MOE_TEST_CONFIG w/ device_map="METAL,experts:NV",
+                                                                 # warms up, wraps one steady-state decode step in Context(DEBUG=2)
+
+# gates
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -v   # 31 passed
+PYTHONPATH=.        $PY -m mypy tinygrad/                                          # Success: no issues found in 216 source files
+$PY -m ruff check test/unit/test_llm_device_map.py                                 # All checks passed
+```
+
+---
+
 ## Exact commands
 
 ```bash
