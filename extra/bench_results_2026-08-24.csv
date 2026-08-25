@@ -6,3 +6,8 @@ qwen3:8b,tinygrad,NV:NAK,,6.536,16.51,3.72,23.63
 qwen3:8b,tinygrad,NV:NAK,JITBEAM=2,6.491,66.66,31.44,197.01
 gpt-oss:20b,tinygrad,NV:NAK,,8.608,78.69,7.42,25.80
 gpt-oss:20b,tinygrad,NV:NAK,JITBEAM=2,8.625,117.29,26.81,105.33
+llama3.2:1b,tinygrad,NV,JITBEAM=2 PARALLEL=6,4.922,507.32,149.12,170.63
+qwen3:8b,tinygrad,NV,,6.771,22.58,9.99,63.37
+qwen3:8b,tinygrad,NV,JITBEAM=2 PARALLEL=6,6.473,118.88,46.87,287.79
+gpt-oss:20b,tinygrad,NV,,8.648,111.69,18.77,65.28
+gpt-oss:20b,tinygrad,NV,JITBEAM=2 PARALLEL=6,8.653,207.62,60.85,243.20

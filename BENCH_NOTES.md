@@ -266,8 +266,11 @@ cited only as an order-of-magnitude class, not a controlled comparison):
 Goal: run the 5 previously-skipped `DEV=NV` BEAM/no-BEAM cells (llama3.2:1b JITBEAM=2; qwen3:8b
 no-BEAM + JITBEAM=2; gpt-oss:20b no-BEAM + JITBEAM=2) now that T4.14 (`d11b3522c`, cherry-picked
 onto TD.2b's `c76b1a08c` — this branch's HEAD for this session) fixes the short-read truncation in
-`Compiler.compile_server()` (`tinygrad/device.py`), plus a parity check. **Result: blocked on cell
-1.** Cells 2-5 and the parity check were not attempted.
+`Compiler.compile_server()` (`tinygrad/device.py`), plus a parity check. **First pass: blocked on
+cell 1** (stale poisoned compile-cache rows, diagnosed below). **After the main session evicted the
+4 poisoned rows, all 5 cells were resumed and completed successfully** (one further, distinct
+resource-contention issue surfaced and was mitigated along the way — see "Resumed after cache
+eviction" below). All rows below ran with the T4.14 fix cherry-picked on the branch.
 
 **Cell 1 (`llama3.2:1b`, `NV`, `JITBEAM=2`):**
 ```
@@ -320,33 +323,121 @@ compile cache, not data; 2850 valid entries just get recompiled once on next use
 independently confirmed correct and only 4/2854 rows are affected, this is expected (not guaranteed)
 to fully unblock `DEV=NV` BEAM.
 
-**Full table — unchanged from TD.2b, now with a root-caused (not merely "crashes") reason for the
-open cells:**
+## Resumed after cache eviction
+
+The main session evicted the 4 identified rows from `compile_nv_sm_86_22` and reported
+2854→2850 rows, 0 corrupt remaining, warm cache otherwise preserved. Re-verified independently
+before spending any GPU time (re-ran the same read-only `elf_loader` scan): **2850/2850 parse
+clean.** Resumed the 5-cell sequence.
+
+**Cell 1 retry (post-eviction), plain rerun:** hit a *different* failure —
+`BrokenPipeError: [Errno 32] Broken pipe` writing to the compile-server's stdin
+(`device.py:325`, `unwrap(proc.stdin).write(...)`), i.e. the persistent compile-server subprocess
+itself had died. Not the T4.14 signature (no `elf_loader` involved) — this is the compile-server
+process dying mid-run, not a truncated read. Root cause: `PARALLEL` defaults to
+`NUM_CPU_THREADS` (`tinygrad/helpers.py:263,269`), which is **12** on this M3 Pro (`sysctl
+hw.logicalcpu`), so a `JITBEAM=2` run spawns up to 12 concurrent `docker run` compile-server
+containers against colima's **8 vCPU / 6 GiB** VM — plausible OOM/contention under sustained BEAM
+load once a run finally got far enough (past the elf_loader bug) to reach that concurrency level
+for the first time. `docker run --rm` auto-removes containers on exit, so no post-mortem exit code
+was recoverable; this is inferred from the resource math and precedent (BENCH_NOTES' own history:
+an earlier no-BEAM starvation crash on this rig, fixed by a colima resize 2/2GB→8/6GB, distinct
+from but same *family* as this one — no-BEAM's low concurrency never hit this ceiling, only BEAM's
+did). Mitigation: retried with `--env PARALLEL=6` (already a documented convention lever per this
+file's own T0.3 section and TD.2's original brief) to cut concurrent containers to match colima's
+vCPU budget with headroom, rather than resizing the VM (a bigger, less reversible lever). **Cell 1
+succeeded** on this retry. Applied `PARALLEL=6` to both remaining JITBEAM=2 cells (3 and 5)
+pre-emptively — bigger models mean more kernels, i.e. equal-or-worse concurrency pressure, so no
+reason to rediscover the same failure on qwen3:8b/gpt-oss:20b. No-BEAM cells (2, 4) ran at default
+parallelism (no BEAM search means no heavy concurrent-compile burst) and were clean on the first
+try, confirming the concurrency-not-a-general-DEV=NV-problem read.
+
+All 5 cells then completed cleanly, no further crashes of either signature:
+
+| # | Cell | load s | warm s | prefill tok/s | decode tok/s | GB/s |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | llama3.2:1b NV JITBEAM=2 PARALLEL=6 | 4.92 | 577.4 | 507.3 | **149.12** | 170.6 |
+| 2 | qwen3:8b NV no-BEAM | 6.77 | 32.3 | 22.6 | **9.99** | 63.4 |
+| 3 | qwen3:8b NV JITBEAM=2 PARALLEL=6 | 6.47 | 1196.0 | 118.9 | **46.87** | 287.8 |
+| 4 | gpt-oss:20b NV no-BEAM | 8.65 | 33.5 | 111.7 | **18.77** | 65.3 |
+| 5 | gpt-oss:20b NV JITBEAM=2 PARALLEL=6 | 8.65 | 728.6 | 207.6 | **60.85** | 243.2 |
+
+CSV rows appended to `extra/bench_results_2026-08-24.csv` (all `stack=tinygrad, device=NV`,
+`flags` as shown). Note `warm` (which includes the full BEAM search for JITBEAM cells) does *not*
+scale monotonically with model size — gpt-oss:20b's BEAM warmup (728.6s) is faster than qwen3:8b's
+(1196.0s) despite gpt-oss:20b being the larger model by parameter count, consistent with TD.2b's
+own finding that kernel *count/shape diversity* (not raw parameter count) drives BEAM search cost —
+plausible for an MoE architecture with fewer distinct kernel shapes relative to its size than a
+dense model.
+
+**Full table — completed, all lanes:**
 
 | Model | Lane | Config | load s | prefill tok/s | decode tok/s | GB/s |
 |---|---|---|---:|---:|---:|---:|
 | llama3.2:1b | NV:NAK | no-BEAM | 5.01 | 55.3 | **7.13** | 8.4 |
 | llama3.2:1b | NV:NAK | JITBEAM=2 | 4.91 | 341.0 | **96.06** | 112.5 |
 | llama3.2:1b | NV | no-BEAM | 4.92 | 142.5 | **28.16** | 33.0 |
-| llama3.2:1b | NV | JITBEAM=2 | — | — | **blocked (poisoned cache row, root-caused above)** | — |
+| llama3.2:1b | NV | JITBEAM=2 | 4.92 | 507.3 | **149.12** | 170.6 |
 | qwen3:8b | NV:NAK | no-BEAM | 6.54 | 16.5 | **3.72** | 23.6 |
 | qwen3:8b | NV:NAK | JITBEAM=2 | 6.49 | 66.7 | **31.44** | 197.0 |
-| qwen3:8b | NV | no-BEAM | — | — | **not attempted (blocked by cell-1 STOP)** | — |
-| qwen3:8b | NV | JITBEAM=2 | — | — | **not attempted (blocked by cell-1 STOP)** | — |
+| qwen3:8b | NV | no-BEAM | 6.77 | 22.6 | **9.99** | 63.4 |
+| qwen3:8b | NV | JITBEAM=2 | 6.47 | 118.9 | **46.87** | 287.8 |
 | gpt-oss:20b | NV:NAK | no-BEAM | 8.61 | 78.7 | **7.42** | 25.8 |
 | gpt-oss:20b | NV:NAK | JITBEAM=2 | 8.63 | 117.3 | **26.81** | 105.3 |
-| gpt-oss:20b | NV | (either) | — | — | **not attempted (blocked by cell-1 STOP)** | — |
+| gpt-oss:20b | NV | no-BEAM | 8.65 | 111.7 | **18.77** | 65.3 |
+| gpt-oss:20b | NV | JITBEAM=2 | 8.65 | 207.6 | **60.85** | 243.2 |
 
-**Parity check (qwen3:8b `NV` JITBEAM=2 vs JITBEAM=0):** not performed — depends on a completed
-qwen3:8b `NV` JITBEAM=2 run, which never happened this session.
+Every cell in the matrix now has a number — this table is complete for the first time in TD.2.
 
-**Updated takeaway on lane choice:** still moot, unchanged from TD.2b. `DEV=NV`+BEAM still cannot
-complete a run on this dock, so whether it beats NAK+BEAM (96.06 / 31.44 / 26.81 tok/s decode on
-llama3.2:1b / qwen3:8b / gpt-oss:20b) remains **unmeasured** — this session neither confirms nor
-denies the "4x-on-no-BEAM suggests real headroom" projection from TD.2b's takeaway #2. NAK+BEAM
-remains the only lane that has ever produced a complete, usable high-throughput number on this dock.
-The T4.14 fix itself is vindicated (99.86% of the existing NV compile cache is valid, matching its
-own repro's 10/10), so the remaining blocker is narrowly scoped (4 known rows) and well-understood,
-not an open question about the fix's correctness — unlike TD.2b's finding, this is no longer "an
-unfixed compiler bug," it is "a fixed bug whose blast radius includes a few stale cache entries that
-outlived it."
+**Parity check (qwen3:8b `NV` JITBEAM=2 vs JITBEAM=0): PASS — byte-identical, 129/129 tokens** (1
+prefill + 128 decode; programmatic list-equality check on the captured `output [...]` lists from
+cells 2 and 3 above, not eyeballed — same methodology as TD2a/TD.2b's parity checks). BEAM's kernel
+selection on the `DEV=NV` lane does not change output on this model either, matching every other
+parity check run in this file.
+
+**Updated takeaway on lane choice: `DEV=NV`+BEAM beats `NV:NAK`+BEAM on every model, and the margin
+grows with model size — the opposite of BEAM's own shrinking-multiplier trend.**
+
+| Model | NAK+BEAM | NV+BEAM | NV/NAK (BEAM) | NAK no-BEAM | NV no-BEAM | NV/NAK (no-BEAM) |
+|---|---:|---:|---:|---:|---:|---:|
+| llama3.2:1b | 96.06 | **149.12** | **1.55x** | 7.13 | 28.16 | 3.95x |
+| qwen3:8b | 31.44 | **46.87** | **1.49x** | 3.72 | 9.99 | 2.69x |
+| gpt-oss:20b | 26.81 | **60.85** | **2.27x** | 7.42 | 18.77 | 2.53x |
+
+`DEV=NV`+BEAM is the new best-known decode number on this dock for all three models, confirming
+TD.2b's takeaway #2 prediction ("if the compile-server bug gets fixed, `DEV=NV`+BEAM is the single
+largest untested lever on this dock") — it was right, though the size of the win doesn't simply
+track the no-BEAM lane gap: gpt-oss:20b has the *smallest* no-BEAM NV/NAK edge (2.53x) but the
+*largest* BEAM NV/NAK edge (2.27x vs 1.49-1.55x for the other two) — tensor-core-capable codegen
+(`DEV=NV`'s CUDARenderer/NVCCRenderer, `NV_LLM_DESIGN.md` §3.3) combined with a real search budget
+evidently compounds better on gpt-oss:20b's kernel mix than on the other two, not merely inheriting
+the no-BEAM lane gap. Within the `NV` lane itself, BEAM/no-BEAM multiplier still shrinks with model
+size (5.30x → 4.69x → 3.24x, llama3.2:1b → qwen3:8b → gpt-oss:20b) — the same qualitative pattern
+TD.2b found on NAK (13.5x → 8.5x → 3.6x), just at smaller absolute multiples because NV's no-BEAM
+floor is already much higher.
+
+vs Phase-0 METAL and llama.cpp-METAL baselines (see "Comparison vs Phase-0 baselines" above for the
+source figures): qwen3:8b NV+BEAM (46.87) is **3.25x** METAL-BEAM (14.40) and, notably, **1.73x**
+llama.cpp-METAL (27.07) — the first `tinygrad` config in this whole table to beat the llama.cpp
+reference on any lane/stack. gpt-oss:20b NV+BEAM (60.85) is **3.92x** METAL-BEAM (15.52). Even NV's
+*no-BEAM* now clears METAL no-BEAM on both models (qwen3:8b 1.35x, gpt-oss:20b 1.71x) — a reversal
+of NAK's no-BEAM, which lost to METAL (0.50x/0.68x); tensor cores alone, without any search, already
+close most of that gap.
+
+vs external llama.cpp-native-CUDA references (different rig, order-of-magnitude class only — see
+caveat in the header above): `llama3.2:1b` NV+BEAM (149.12) now **exceeds** the 110-130 tok/s
+reference band outright (115-136%), the first time this table has matched or beaten that class of
+number. `qwen3:8b` NV+BEAM (46.87) reaches **43%** of the ~109 tok/s 3090-native-Linux figure, up
+from NAK+BEAM's 29% — real progress, though still the largest remaining gap of the three models,
+consistent with takeaway 3(a) below.
+
+**Revised bottleneck read (supersedes TD.2b takeaway 3(a)):** NAK's total absence of tensor cores
+was named as "the single most consequential fix on this dock" once `DEV=NV` was unblocked — it now
+is unblocked, tensor cores are in play, and qwen3:8b still sits at 43% of the external CUDA
+reference. The remaining gap is therefore *not* primarily the tensor-core question (that lever has
+now been pulled and helped a lot, 1.49-2.27x over NAK+BEAM) — TD.2b's takeaway 3(b) (no fused
+attention by default, 5 kernels/layer/token, `NV_LLM_DESIGN.md` §3.4) and 3(c) (the GGUF-quantized
+gemv kernel-selection gap) are the more likely remaining floors, both structural/kernel-selection
+issues that a working tensor-core lane doesn't by itself fix. Not re-measured in this session
+(out of scope, measurement only) — flagged for whichever task picks up T2.4 or the fused-attention
+work next.
