@@ -983,6 +983,181 @@ OCELOT_PATH=/Users/artur/Documents/tinygrad/.venv/lib/libgpuocelot.dylib DEV=MOC
   $PY -m pytest test/test_tiny.py test/device/test_hcq.py -q   # 49 passed, 6 skipped, 14 subtests passed
 ```
 
+### 12. T4.16: does the MATVEC/quantized-gemv heuristic fire on NV? — yes, and it helps *more* there than on METAL
+
+**Verdict up front:** the heuristic fires identically on **all three** lanes tested — METAL, `NV:NAK`,
+and `NV` (nvcc, colima came back up mid-task, see note below) — byte-identical applied-opts sequence
+on all three — and it *helps* on both NV lanes by more than it does on METAL for the same synthetic
+Q4_0/Q4_K gemv: 2.3x (`NV:NAK`) and 2.3-5.3x (`NV` nvcc) vs. 1.06-1.27x (METAL). **No fix made —
+nothing is broken.** This refutes the working hypothesis TASKS.md's T4.16 entry states ("T1.10's
+MATVEC heuristic path never fires on NV shapes") and this file's own `BENCH_NOTES.md` takeaway 3(c)
+("NV-side counterpart status that's still untested/unimplemented... this heuristic gap... is still
+the decode floor") — both were untested assumptions; both are now measured and wrong on all lanes
+checked. Correction added at that spot in `BENCH_NOTES.md`.
+
+#### Does it fire? (objective 1)
+
+The heuristic's *only* renderer-capability gate is `k.ren.has_local and ... k.ren.has_shared`
+(`tinygrad/codegen/opt/heuristic.py:70-71`). Both default `True` on the base `Renderer` class
+(`tinygrad/renderer/__init__.py:64,66`) and are **not overridden** by `NAKRenderer`, `CUDARenderer`,
+`NVCCRenderer`, or `PTXRenderer` (checked all four class bodies directly) — only `ClangRenderer`
+(CPU), `LVPRenderer` (Mesa llvmpipe software rasterizer, not a serving target here), and a couple of
+ISA renderers set `has_local=False`. There is no NV-specific, or CUDA-vs-NAK-specific, gate anywhere
+in the guard — the code has no reason to distinguish them.
+
+Confirmed empirically, two ways, on all three lanes (`DEV=METAL`, `DEV=NV:NAK`, and `DEV=NV` — the
+nvcc/colima lane was flagged "not run, colima stopped" earlier in this same task; colima came back up
+mid-session — env brief update — so it was cheap to close the gap rather than leave it inferred):
+1. **The repo's own T1.10 tests, run unmodified**
+   (`test/opt/test_kernel_opts.py::test_matvec_heuristic_sees_through_cast` /
+   `_sees_through_quant_dequant` / `_quant_dequant_real_pipeline`) — these `assertEqual`/`assertIn`
+   the applied-opts sequence against a hardcoded `[OptOps.GROUP, OptOps.LOCAL, OptOps.UPCAST]` for a
+   fp16 gemv and for real Q4_0/Q4_K/Q6_K-shaped GGUF dequant gemvs (a hand-built AST *and* the real
+   `.realize()` pipeline through `pm_split_ranges`). **3/3 PASS on `DEV=METAL`, `DEV=NV:NAK`, and
+   `DEV=NV`** — same assertion, same hardcoded expected sequence, all three lanes, no code changes
+   between runs (just the `DEV=` env var).
+2. **Live `DEBUG=3` capture** of the heuristic's own internal print (`heuristic.py:87`, only
+   reachable from inside the guarded branch, right before it returns) on a real 8192x8192 Q4_0-shaped
+   gemv, identical on both NV lanes:
+   ```
+   MATVEC: k.full_shape=[8192, 256, 2, 16] r0_1 MV_BLOCKSIZE=4 MV_THREADS_PER_ROW=8 MV_ROWS_PER_THREAD=4
+   ```
+   (`DEV=NV:NAK` and `DEV=NV` both print this exact line, byte-for-byte.) Direct proof of branch
+   entry, not inferred from timing — `[8192, 256, 2, 16]` is the block/sub-block/byte split of the
+   reduce axis (Q4_0 block=32 → 8192/32=256, further split 2x16) that T1.10's fix specifically taught
+   the heuristic to walk.
+
+Source inspection (the capability-gate argument above) already predicted this would generalize across
+NV's compile lanes since `CUDARenderer`/`NVCCRenderer`/`PTXRenderer` share `NAKRenderer`'s
+`has_local=True, has_shared=True` defaults — the live `DEV=NV` run now confirms that prediction rather
+than leaving it as inference. `pgrep -fl "TinyGPU.*server"` stayed at exactly 1 and swap stayed flat
+(1564 MB) across every cell in this sub-section; nothing dock-side needed a respawn.
+
+#### Does it help? (objective 2)
+
+Microbench: `x @ w.T`, `x=(1,COLS)` fp32, `w=(ROWS,COLS)` GGUF-quantized (Q4_0/Q4_K via
+`ggml_data_to_tensor`, the same helper T1.10's own tests use), `ROWS=COLS=8192` (a real llama-class
+FFN-projection scale; ~36-37 MB raw quantized blob). `Context(BEAM=0, DEBUG=2)` forces the hand-coded
+(no-search) path — `DEBUG>=2` is required for `engine/realize.py` to actually populate
+`GlobalCounters.time_sum_s` (otherwise `et` stays `None` and nothing is measured, a dead end hit
+first). Timed via reset-then-read `GlobalCounters.time_sum_s` around `.realize()` (same pattern
+`test/external/speed_v_theoretical.py` already uses), min of 5 post-warmup samples (1 warmup call
+dropped). `MV=0` — the heuristic's own escape hatch, `getenv("MV",1)`, confirmed to be T4.1's
+"`MV=0` ≡ unpatched control" — disables only the MATVEC branch; **toggled via subprocess env, not
+`Context`**, because `getenv` is `@functools.cache`d (`tinygrad/helpers.py:159`) and latches to
+whatever it read on its first call in the process — it cannot be flipped mid-process.
+
+An initial attempt at T1.10's own unit-test shape (1024x4096, ~2.25 MB raw) was dispatch-overhead-
+dominated (100-150us fixed cost dwarfing the actual transfer, MV=1 sometimes *slower* than MV=0 —
+pure noise) and produced nothing usable as a bandwidth signal; recorded so nobody repeats it.
+
+| Device | Quant | MV=1 (heuristic on, default) | MV=0 (heuristic off) | Ratio |
+|---|---|---:|---:|---:|
+| METAL (sanity control) | Q4_0 | 46.87 GB/s | 44.41 GB/s | 1.06x |
+| METAL (sanity control) | Q4_K | 32.96 GB/s | 25.99 GB/s | 1.27x |
+| **NV:NAK** | **Q4_0** | **78.5 GB/s** | **34.17 GB/s** | **2.30x** |
+| **NV:NAK** | **Q4_K** | **66.9 GB/s** | **28.73 GB/s** | **2.33x** |
+| **NV (nvcc)** | **Q4_0** | **210.6 GB/s** | **40.1 GB/s** | **5.25x** |
+| **NV (nvcc)** | **Q4_K** | **121.4 GB/s** | **52.0 GB/s** | **2.33x** |
+
+Every NV row reproduced twice independently (both quant types, both MV settings, both lanes):
+<0.3% run-to-run variance throughout. Swap flat (1564-1572 MB, no growth) and exactly one
+`TinyGPU...server` process throughout every cell in both NV lanes (checked before and after each).
+`NV` (nvcc) cells used plain single realizes (no `JITBEAM`), so none of TD.2c's BEAM-era
+compile-server concurrency/`PARALLEL` concerns apply here.
+
+**Reading the table:** on both NV lanes the heuristic doesn't just fire, it delivers a *larger*
+relative win (2.30-2.33x on NAK, 2.33-5.25x on nvcc) than the identical harness shows on METAL
+(1.06-1.27x) for this exact op. The absolute GB/s numbers are **not** directly comparable cross-device
+(3090 HBM ≈936 GB/s vs. M3 Pro unified memory ≈150-200 GB/s peak — NAK's 78.5 GB/s and nvcc's 210.6
+GB/s beating METAL's 46.9 GB/s here is raw hardware headroom on one isolated kernel, not evidence
+NAK/nvcc-overall beats METAL-overall; TD.2's real-model finding that NAK no-BEAM decode is 0.50-0.68x
+of METAL no-BEAM stands, measured across a full mixed kernel workload, not contradicted by this). What
+this table *does* establish: **this specific heuristic is not the source of that gap, on either NV
+lane.** The quantized-gemv MATVEC path is doing its job on NV, at least as well as on METAL — better,
+by this measure. TD.2's takeaway 3(c) is refuted (correction added in `BENCH_NOTES.md`). The real
+0.50-0.68x floor is elsewhere in the decode kernel mix — takeaways 3(a) (NAK has no tensor cores) and
+3(b) (5-kernel unfused attention/layer) are unaffected by this finding and remain the standing
+explanation. Bonus cross-check: nvcc-MV=1 beats NAK-MV=1 by 2.68x (Q4_0) / 1.81x (Q4_K) here — same
+direction and same order of magnitude as TD.2's independent "`DEV=NV` no-BEAM codegen is ~4x faster
+than `DEV=NV:NAK` no-BEAM codegen" finding (llama3.2:1b, real model decode), from a completely
+different measurement (one isolated synthetic kernel vs. a whole model's decode loop) — good agreement
+between the two, not a coincidence chased further here.
+
+One methodology caveat worth naming: this `MV=0` control is *not* equivalent to T1.10's original
+pre-fix baseline. `MV=0` only skips the hand-tuned GROUP/LOCAL/UPCAST recipe; the rest of
+`hand_coded_optimizations` (generic local-axis grouping further down the function) still recognizes
+this AST as reduce-shaped and still applies its own (weaker) opts. T1.10's pre-fix bug was a total
+pattern-match miss (the dequant MUL wasn't recognized as matvec-shaped *at all*), which is a
+different, worse baseline than "matvec recognized, hand-tuned sizing skipped." Both are legitimate
+things to measure; this section measures the latter (the one the current `MV` escape hatch actually
+gives you), and it's the more relevant one for "is the *current* heuristic pulling its weight on NV."
+
+#### Fix? (objective 3)
+
+Not applicable — nothing is broken. No changes made in `tinygrad/`.
+
+#### Does BEAM moot this? (objective 4)
+
+Structurally, yes — not just "in practice, mostly." `apply_opts()`
+(`tinygrad/codegen/opt/postrange.py:334-350`) is a strict if/elif: `beam >= 1` (line 340) calls
+`beam_search()` — an independent Opt-space search seeded from the raw, un-optimized kernel;
+`hand_coded_optimizations()` (lines 347-350) — and therefore the entire MATVEC branch this section is
+about — is reached only in the `elif`, i.e. **never called at all once `JITBEAM>=1`/`BEAM>=1`.** This
+question has zero relevance to any BEAM'd run, on any device — not a small effect, a structurally
+absent one.
+
+Per TD.2's own truth table (this file's prerequisite reading), BEAM already delivers large
+multipliers on NV independent of this heuristic entirely:
+- `NV:NAK`: qwen3:8b 3.72→31.44 tok/s (8.45x), gpt-oss:20b 7.42→26.81 (3.61x), llama3.2:1b 7.13→96.06
+  (13.47x)
+- `NV` (nvcc, post-T4.14 fix): llama3.2:1b 28.16→149.12 (5.30x), qwen3:8b 9.99→46.87 (4.69x),
+  gpt-oss:20b 18.77→60.85 (3.24x)
+
+So T4.16 is exactly what the task brief scoped it as: a cold-start/no-BEAM-UX-only question — and the
+answer is reassuring for that UX too, since this particular lever already works on NV without any
+changes.
+
+**Recommendation: no action needed.** Close T4.16 as investigated, hypothesis refuted, no fix
+required — an acceptable, expected outcome for this task's priority.
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+
+# objective 1: existing T1.10 tests, unmodified, on all three lanes -- 3/3 pass, identical opts, every lane
+PYTHONPATH=. DEV=METAL      $PY -m pytest test/opt/test_kernel_opts.py -k matvec -v   # 3 passed
+PYTHONPATH=. DEV='NV:NAK'   $PY -m pytest test/opt/test_kernel_opts.py -k matvec -v   # 3 passed
+PYTHONPATH=. DEV=NV         $PY -m pytest test/opt/test_kernel_opts.py -k matvec -v   # 3 passed (colima up mid-task)
+
+# objective 1: live proof of branch entry on a real 8192x8192 Q4_0 gemv (ad hoc, not committed)
+# -- run once with DEV='NV:NAK' and once with DEV=NV; byte-identical "MATVEC: ..." line both times
+DEV='NV:NAK' PYTHONPATH=. $PY -c "
+from tinygrad import Tensor, dtypes
+from tinygrad.helpers import Context
+from tinygrad.llm.gguf import ggml_data_to_tensor
+ROWS, COLS = 8192, 8192
+raw = Tensor.randint(ROWS*(COLS//32)*18, low=0, high=256, dtype=dtypes.uint8).realize()
+x = Tensor.rand(1, COLS).realize()
+w = ggml_data_to_tensor(raw, ROWS*COLS, 2).reshape(ROWS, COLS)
+with Context(BEAM=0, DEBUG=3): (x @ w.T).realize()"   # prints "MATVEC: k.full_shape=[8192, 256, 2, 16] ..."
+
+# objective 2: microbench, ad hoc script (not committed) -- MV toggled via subprocess env, not Context
+DEV=METAL           PYTHONPATH=. $PY t416_matvec_bench.py 2 12   # Q4_0, Q4_K -- MV=1 (default)
+DEV=METAL    MV=0   PYTHONPATH=. $PY t416_matvec_bench.py 2 12   # MV=0
+DEV='NV:NAK'        PYTHONPATH=. $PY t416_matvec_bench.py 2 12   # MV=1 (default)
+DEV='NV:NAK' MV=0   PYTHONPATH=. $PY t416_matvec_bench.py 2 12   # MV=0
+DEV=NV              PYTHONPATH=. $PY t416_matvec_bench.py 2 12   # MV=1 (default, colima up mid-task)
+DEV=NV       MV=0   PYTHONPATH=. $PY t416_matvec_bench.py 2 12   # MV=0
+
+# gates -- no tinygrad/ code changed (only these two .md files); run to confirm the investigation
+# itself left no regressions, not because anything here needed fixing
+PYTHONPATH=. $PY -m pytest test/opt -q       # 38 passed, 4 skipped, 1 xfailed, 5 subtests passed
+PYTHONPATH=. $PY -m pytest test/unit -q -n12 # 846 passed, 71 skipped, 4 xfailed, 2 subtests passed
+PYTHONPATH=. $PY -m mypy tinygrad/           # Success: no issues found in 216 source files
+$PY -m ruff check .                          # All checks passed
+```
+
 ---
 
 ## Exact commands

@@ -247,6 +247,16 @@ cited only as an order-of-magnitude class, not a controlled comparison):
    *below* Mac METAL no-BEAM (0.50-0.68x) on identical-quantization models is the clearest evidence
    this heuristic gap, not raw bandwidth, is still the decode floor on this lane absent BEAM.
 
+   **CORRECTION (T4.16, 2026-08-25): (c) is refuted — the heuristic fires on NV and helps more there
+   than on METAL.** Tested directly on **both** NV lanes (existing T1.10 unit tests run unmodified
+   under `DEV=NV:NAK` and `DEV=NV`/nvcc — colima came back up mid-task — plus a live `DEBUG=3` capture
+   of the heuristic's own firing message on a real Q4_0-shaped gemv on both lanes, plus an `MV=1` vs
+   `MV=0` microbench): applied-opts sequence is byte-identical to METAL on all three lanes, and the
+   measured speedup is **2.30-2.33x on NV:NAK** and **2.33-5.25x on `DEV=NV`/nvcc** vs. **1.06-1.27x on
+   METAL** for the same synthetic Q4_0/Q4_K gemv (`TD3_POOLING_NOTES.md` §12 has the full
+   numbers/methodology). The 0.50-0.68x no-BEAM floor this takeaway pointed at is real, but this
+   heuristic is not its cause — (a) and (b) above remain the standing explanation.
+
 ## Environment notes
 
 - colima's docker VM was resized mid-session from its default 2 CPU/2 GB to 8 CPU/6 GB (main-session
