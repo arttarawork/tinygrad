@@ -326,6 +326,19 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   Also this session: Artur's subagent policy (Sonnet 5 max-effort for Sonnet-proof subtasks)
   promoted into the repo CLAUDE.md conventions.
 
+- **2026-08-25 (DOCK NIGHT 1 — TD.1→TD.3 flagship in ~30 h):** full detail in TASKS.md status
+  rows (TD.2a/b/c, T4.14, TD.3, TD.3-moe, T4.17, T2.1+T2.2, T4.18). The arc: first light →
+  complete truth table (**best config `DEV=NV`+BEAM everywhere: 1b 149, qwen3:8b 46.9, gpt-oss
+  60.9 tok/s — beats llama.cpp-Metal and the llama.cpp-CUDA 1b band**) → transport exonerated →
+  dense pooling ~free (80-90 µs/hop) → **graphed MoE pooling: olmoe experts-on-3090 byte-exact,
+  41.1 tok/s split = 3.2x all-NV**. Three small PR-shaped runtime fixes found on real hardware:
+  T4.14 (compile-server short-read), T4.17 (RPC status-before-fd + recvmsg loop), T4.18
+  (hw_page slab under the TinyGPU ~128-slot ceiling; wire protocol has NO free verb — upstream
+  report candidate, needs Artur's go). Ops facts that carry: NAK lane = tinymesa, no docker;
+  nvcc lane = colima (8 CPU/6 GiB, `PARALLEL=6` for BEAM) — colima STOPPED at session end;
+  lane selection is process-wide `DEV='METAL;NV:NAK'`, never in device_map strings; bench-window
+  policy exercised (llama-server stopped 23:17→restored ~02:20, well inside the 22:00-19:00 grant).
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
