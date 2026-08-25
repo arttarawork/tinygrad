@@ -7,7 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, unwrap
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
@@ -81,7 +81,11 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     super().__init__()
 
   def __del__(self):
-    if self.binded_device is not None: self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
+    # T4.18: hw_page slices carved from _hwq_slab (see bind()) share the slab's owner/meta and must not
+    # be individually freed -- the slab itself is never freed (same lifetime as the device, like the
+    # existing 32x2MB copy pool). Only a real (non-slab) allocation needs releasing.
+    if (dev:=self.binded_device) is not None and not (dev.is_remote() and self.hw_page.base is dev._hwq_slab):
+      dev.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
 
   def nvm(self, subchannel, mthd, *args, typ=2): self.q((typ << 28) | (len(args) << 16) | (subchannel << 13) | (mthd >> 2), *args)
 
@@ -104,7 +108,24 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
 
   def bind(self, dev:NVDevice):
     self.binded_device = dev
-    self.hw_page = dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True))
+    sz = len(self._q) * 4
+    if dev.is_remote():
+      # T4.18: the remote/APL transport (TinyGPU.app over Thunderbolt) allows only ~128-130 outstanding
+      # has_fd sysmem allocations, EVER -- the wire protocol has no unmap verb, so a freed hw_page's slot
+      # is never reclaimed. A cross-device METAL+NV graph splits into dozens of small graph islands (one
+      # per device boundary), each needing its own permanently-resident hw_page; that alone can exhaust
+      # the budget before a real MoE model finishes its first JIT capture (measured: olmoe needs ~85
+      # such islands). Serve hw_page from one lazily-allocated, never-freed, bump-suballocated slab
+      # instead of a fresh RPC per bind() -- same one-alloc-many-small-pieces shape as the existing
+      # 32x2MB copy-staging pool -- falling back to a real allocation if the slab is ever exhausted.
+      # Local/NVK path (is_remote() always False) is untouched.
+      if dev._hwq_slab is None:
+        dev._hwq_slab, dev._hwq_bump = dev.allocator.alloc(4 << 20, BufferSpec(cpu_access=True)), BumpAllocator(4 << 20, wrap=False)
+      slab, bump = unwrap(dev._hwq_slab), unwrap(dev._hwq_bump)
+      try: self.hw_page = slab.offset(bump.alloc(sz, 16), sz)
+      except RuntimeError: self.hw_page = dev.allocator.alloc(sz, BufferSpec(cpu_access=True, nolru=True))
+    else:
+      self.hw_page = dev.allocator.alloc(sz, BufferSpec(cpu_access=True, nolru=True))
     hw_view = self.hw_page.cpu_view().view(fmt='I')
     if hw_view.is_remote:
       # RPC-backed buffer (T2.2's MMIOInterface.is_remote, set on RemoteMMIOInterface): one bulk slice write beats len(self._q) separate
@@ -602,6 +623,10 @@ class NVDevice(HCQCompiled[NVSignal]):
                      "cmdq_size": 0x200000}
   _REMOTE_SIZING = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
                      "cmdq_size": 0x200000}
+
+  # T4.18: lazily-allocated shared slab for NVCommandQueue.bind()'s hw_page on the remote transport -- see bind().
+  _hwq_slab: HCQBuffer|None = None
+  _hwq_bump: BumpAllocator|None = None
 
   def is_remote(self) -> bool:
     # True only behind PCIIface's RemotePCIDevice (macOS TinyGPU over Thunderbolt/TCP): checked on the concrete BAR1 MMIOInterface
