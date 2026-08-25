@@ -1036,3 +1036,249 @@ context (llama.cpp serves this model at 131k; we measured to 4096).
 
 Open follow-up (not chased): find the max context that still fits at JITBEAM=1, and whether
 JITBEAM=2 fits a smaller MXFP4-class file.
+
+# T4.24 validation — coherence + cross-stack parity for the 56.58 tok/s headline (2026-08-25/26)
+
+The headline above had zero correctness validation behind it: `extra/benchmark_llm.py` uses a
+synthetic fake-token-ID prompt and prints raw IDs only, and a context-dependent divergence
+(JITBEAM=1 @4096 vs @768) was flagged but never explained. Three verdicts below, in the order
+the brief asked for them. `DEV=NV` (nvcc lane) throughout, MXFP4_MOE file, greedy
+(temperature=0.0) throughout. No STOP condition was hit this session (no garbage output, no
+GPU wedge — NV health-checked clean before, and after, all runs below).
+
+## A. Coherence + cross-stack parity
+
+Real prompts (not the synthetic `[257, 1000, 1001, ...]` ramp) through tinygrad's actual
+tokenizer+generate path: `SimpleTokenizer.from_gguf_kv` + `Transformer.generate`, the same two
+classes `tinygrad/llm/cli.py` itself calls — driven from a small ad hoc script (not committed,
+per this file's own convention for one-off tools; see Exact commands) that reuses those classes
+directly instead of going through argparse+stdin, so N prompts share one model load and I get
+exact token IDs back, not just streamed text. No-BEAM, `max_context=768`, greedy (the CLI's own
+default: `model.py:531-541` — `temperature=None` is the only argmax trigger, and `generate()`
+defaults `temperature=0.0`, converted to `None` before sampling).
+
+**Raw completion (3 prompts, 100 decode tokens each, no chat template — isolates the
+model+kernel computation from any chat-template cross-implementation differences):**
+
+- *"The capital of France is Paris. The capital of Japan is"* → continues with 13 more correct
+  capital-city facts (Germany→Berlin, Italy→Rome, Spain→Madrid, UK→London, Australia→Canberra,
+  Canada→Ottawa, Brazil→Brasilia, India→New Delhi, China→Beijing, Russia→Moscow, Egypt→Cairo,
+  South Africa→Pretoria, Argentina→Buenos Aires) — every one factually correct.
+- *"Once upon a time, in a small village nestled between two mountains, there lived an old
+  clockmaker named"* → coherent short story ("Mr. Thompson", a boy named Timmy, a broken pocket
+  watch), grammatical, sensible narrative arc, no repetition/collapse.
+- `def fibonacci(n): """Return the nth Fibonacci number.""" if n <= 1: return n` → completes
+  with valid Python (`else: return fibonacci(n-1) + fibonacci(n-2)`), a `main()` driver, hits
+  the vocab's real `<|endoftext|>` token (248044 — distinct from the chat eos/eot id 248046
+  this harness's `is_end()` checks for, so generation continues past it) and starts a fresh,
+  still-syntactically-valid file.
+
+Zero garbage in any of the three. All fully coherent, factually correct, syntactically valid.
+
+**Tokenizer parity, independently verified with `llama-tokenize --ids`** (zero GPU involved,
+pure vocab lookup): for all 3 raw prompts, tinygrad's `SimpleTokenizer.encode()` matches
+llama.cpp's tokenization of the identical text **token-for-token, exactly** (e.g. prompt 1 →
+both give `[760, 6511, 314, 9338, 369, 11751, 13, 561, 6511, 314, 6124, 369, ...]`; checked all
+3 prompts' full overlapping length, 0 mismatches). Both also agree the model has no BOS token
+(`tok.bos_id=None`: `tokenizer.ggml.add_bos_token` is false in this GGUF; llama-tokenize's
+default — which normally prepends BOS — emits none here either). Two independent tokenizer
+implementations reading the same GGUF vocab agree exactly, so any divergence found below is a
+model/kernel computation difference, not a tokenization artifact.
+
+**Cross-stack parity, chat mode both sides.** Tried hard to get llama-cli into true raw
+completion to match the above 1:1 — `-no-cnv`, `--no-conversation`, `--no-jinja`, all
+combinations tried (also had to add `-st`/`--single-turn` throughout: without it, `-p` with
+closed/piped stdin drops into an interactive REPL that busy-loops printing empty `> ` prompts
+forever once stdin hits EOF — burned >100MB of log twice before adding `-st`; noting this so
+nobody repeats it). None of the anti-template flags bypass the model's embedded chat template
+when `-p` is given and the GGUF has one: `--no-jinja` still produced a `<think>` block and a
+terse chat-style "Tokyo." instead of a raw factual continuation. Pivoted to comparing **chat
+mode on both stacks** instead — arguably the more relevant comparison anyway, since it exercises
+two independent chat-template implementations (tinygrad's `cli.py` `jinja2.Environment` vs
+llama.cpp's own jinja engine) rendering the *identical* `tokenizer.chat_template` string from
+the *identical* GGUF file. llama-cli invocation: `-st --temp 0 --seed 0 -n 150 -ngl 99
+--no-warmup -p "<message>" < /dev/null` (default conversation/jinja, single-turn so it exits
+cleanly).
+
+| prompt | result |
+|---|---|
+| "What is the capital of Japan?" | **150/150 tokens byte-identical** between tinygrad-NV and llama.cpp-Metal — the full 5-step reasoning trace, word for word, cut off mid-sentence at the 150-token cap identically on both sides |
+| "Write a short story about an old clockmaker in a mountain village." | Identical for the first ~100+ tokens (full plot brainstorm, character name "Elias", identical phrasing throughout), **diverges** right after "...Isolated, misty, quiet, perhaps ": tinygrad continues "slow-paced. The mountains could be a character themselves—watching, enduring."; llama.cpp continues "a bit magical or timeless. The mountains could be a character themselves." Both fluent, both sensible — a different adjective choice that then cascades. |
+| "Write a Python function that returns the nth Fibonacci number." | Diverges early, right after "**Understand the User Request:**": tinygrad continues the sentence inline (" The user wants..."); llama.cpp breaks to a new bullet ("\n   - The user wants..."). Both correctly state the Fibonacci recurrence (F(n)=F(n-1)+F(n-2), F(0)=0, F(1)=1) and stay fully coherent throughout. |
+
+**Verdict A: tinygrad's output is coherent** — fluent, factually correct, syntactically valid
+across all 6 prompts tested (3 raw completion, 3 chat). Cross-stack parity with llama.cpp is
+prompt-dependent: sometimes byte-exact for the full 150-token window, sometimes diverges as
+early as ~15-20 tokens in — but every observed divergence produces a fluent-but-different
+continuation, never garbage or incoherence, matching the known-benign cross-implementation
+FP-drift class from T4.10/T4.3 precedent (per the brief), not a correctness bug.
+
+## B. Same-config BEAM parity @ max-context=2048
+
+Fixed shape 2048 — never previously BEAM-searched (confirmed via the `beam_search_22` sqlite
+cache table, `~/Library/Caches/tinygrad/cache.db`: 892 rows before this session's work, growing
+steadily to 900+ during the run below — a genuine from-scratch search, not a cache replay), same
+synthetic prompt (`extra/benchmark_llm.py`, matching the headline's own methodology exactly),
+greedy, `DEV=NV`:
+
+| config | warm time | decode tok/s | vs. the shared no-BEAM reference |
+|---|---:|---:|---|
+| JITBEAM=0 | 76.1s | 7.07 | — (this run *is* the reference) |
+| JITBEAM=1 PARALLEL=6 | 172.6s (fresh search) | 56.70 | **diverges at decode index 106** (of 129) |
+
+**Answer: NOT byte-identical.** JITBEAM=1 and JITBEAM=0 at the same fixed shape produce
+different tokens starting at decode position 106 — a near-tied argmax flip (token 303 vs 7693).
+Textually: no-BEAM → "...Did you mean to paste a specific code snippet? If you were trying to
+share a piece **of code (e.g., Java, Python, C++, JavaScript)**, please **re-paste it cleanly**.
+For example, I see fragments like"; BEAM-1 → "...share a piece **of code (e.g., in Python,
+Java, C++, or JavaScript)**, please **re-paste it cleanly**. For example, if you". Same benign
+class again: fluent, grammatical, semantically equivalent (same 4 languages, reordered + added
+connectives), not garbage.
+
+This is the parity check the headline never got, and the answer is a real, reproducible **no**
+— and this isolates it cleanly: same shape, same prompt, only the BEAM flag differs, no
+shape-change confound at all (rules out "it's just a stale/wrong cache entry for 2048"). Put
+together with verdict C (BEAM-1@768 matches this same reference exactly; BEAM-1@4096 diverges
+at 18; BEAM-1@2048 diverges at 106 — three different outcomes at three shapes, all against the
+same no-BEAM reference), the pattern is: **every fresh BEAM search is its own independent roll
+against near-tied kernel candidates; whether it lands on the same answer as no-BEAM (or as
+another BEAM run at a different shape) isn't guaranteed, and the divergence position isn't
+predictable in advance.** Reassuringly, decode speed is consistent across all three JITBEAM=1
+shapes measured this session (56.62 @768, 56.80 @4096, 56.70 @2048 — within run-to-run noise of
+each other and of the original 56.45/56.58 headline numbers), so **the headline's tok/s number
+is robust and shape-independent**; it's specifically byte-level output reproducibility
+(BEAM-vs-no-BEAM, or BEAM-vs-BEAM at a different shape) that isn't guaranteed.
+
+## C. Context divergence (768 vs 4096) — reproduced exactly, root-caused with code + a control experiment
+
+Reproduced with the *exact* harness/args the original headline measurement used
+(`extra/benchmark_llm.py --prompt-tokens 512 --decode-tokens 128`, synthetic ramp prompt,
+`DEV=NV`), so this is a clean apples-to-apples repro, not a new methodology:
+
+| pair | result (programmatic diff, full 129-token arrays) |
+|---|---|
+| no-BEAM @768 vs no-BEAM @4096 vs no-BEAM @2048 | **129/129 IDENTICAL, all three** |
+| BEAM-1 @768 vs no-BEAM reference | **129/129 IDENTICAL** |
+| BEAM-1 @768 vs BEAM-1 @4096 | **diverge at index 18 exactly** — matches the brief's own "starting at decode token 18" precisely |
+
+So: no-BEAM is context-invariant (confirmed three ways — 768, 4096, and 2048 all agree exactly).
+BEAM-1@768 *also* matches that same reference exactly. **BEAM-1@4096 is the outlier**,
+diverging from all the others at exactly token 18 and staying diverged after that (checked to
+the end of the 129-token array, not just the first mismatch).
+
+Decoded: shared prefix through token 17 is `<|im_end|>\n<|im_start|><think>\n\n</think>\n\nIt
+looks like your input is a jumbled mix of` — the model correctly identifies the benchmark
+harness's synthetic fake-token-ID prompt as corrupted/jumbled input, itself a small bonus
+coherence data point even on garbage input. Then at token 18:
+- BEAM-1@768 picks token 1970 (" code"): "...a jumbled mix of **code** snippets, keywords, and
+  random characters...Did you mean to paste a specific code snippet?"
+- BEAM-1@4096 picks token 15019 (" programming"): "...a jumbled mix of **programming** keywords,
+  syntax fragments, and random characters...I can identify several common programming concepts
+  and languages embedded in the text..."
+
+A single near-tied argmax flip ("code" vs "programming") cascades into two different but both
+fully coherent continuations — the same benign class as verdict A's and B's divergences.
+
+**Leading hypothesis (BEAM picks different kernels per max-context-dependent shape) confirmed
+from the code, not just inferred from black-box behavior:**
+
+- `tinygrad/llm/model.py:297` — `TransformerBlock`'s KV cache (the `full_attention_interval=4`
+  layers, i.e. 10 of 40 real blocks per this file's earlier GGUF metadata dump) is
+  `Tensor.empty(2, B, n_kv_heads, self.config.max_context, head_dim, ...)`: **`max_context` is
+  a concrete, compile-time integer dimension of this buffer, not a symbolic bound.** Every
+  kernel touching this cache (`model.py:259-260`) has a literally different, concretely-shaped
+  AST at 768 vs 4096 vs 2048 — a real shape difference that BEAM's independent per-shape search
+  (keyed on `s.ast.key`, `codegen/opt/search.py:112`) can resolve differently run to run.
+- `tinygrad/llm/model.py:452` (`GatedDeltaNetBlock`, the recurrent 30-of-40 blocks):
+  `self.recurrent_state = Tensor.zeros(B, num_v_heads, head_v_dim, head_k_dim, ...)` — **no
+  `max_context` term anywhere in its shape**, and the surrounding comment (written for the
+  unrelated fp16-vs-fp32 precision question, T1.1a) says so explicitly: *"It's also O(1) in
+  max_context (no memory win from halving it)."* The recurrent state's own heavy compute (the
+  delta-rule scan, `model.py:404-430`) never touches a max_context-sized tensor.
+- `start_pos` (`UOp.variable("start_pos", 0, self.config.max_context-1)`, `model.py:378`, and
+  `generate()`'s `v_start_pos`) is threaded into *every* block including recurrent ones, and
+  does embed `max_context` as its declared bound wherever it's used — including the recurrent
+  block's own `initial = start_pos.eq(0)` reset check. So recurrent-block kernels aren't 100%
+  exempt from a fresh cache-key/re-search per max_context either. But that use is a trivial
+  scalar/broadcast compare with no meaningful BEAM search space (nothing to tile/upcast on a
+  scalar select) — an independent re-search of it can't produce a different-and-numerically-
+  consequential kernel the way a concretely-resized attention/KV kernel's search can.
+
+**This refutes the SSM-state (T1.1a fp32 recurrent state) alternative explanation, with a
+control experiment, not just a code-reading argument:** the recurrent path's fp32-state
+handling is identically present in the no-BEAM runs too (same forward pass, same dtypes, same
+`GatedDeltaNetBlock` code, BEAM or not) — if the SSM state's precision/handling were what made
+output depend on max_context, no-BEAM@768/@4096/@2048 would have diverged from each other too.
+They didn't (129/129 identical, all three, confirmed both directly and transitively). The only
+thing that differs between the runs that diverge (any BEAM-1 pair at different shapes) and the
+ones that don't (every no-BEAM pair, and BEAM-1@768-vs-reference) is whether BEAM ran an
+independent kernel search per shape — directly implicating BEAM's per-max_context-AST search
+over the concretely max_context-sized attention/KV kernels, not the recurrent/SSM path.
+
+Did not additionally pull a raw `DEBUG=2` per-kernel-opts dump to name the exact differing
+kernel by hand (the brief's "check ... if cheap" ask) — deliberate scope call: a full
+kernel-level dump for a 41-block MoE hybrid model, even over just the first 18 decode steps, is
+thousands of lines and not actually cheap to produce or read here, and the code-level shape
+evidence above (concrete-vs-symbolic-with-no-search-space) already pins down *which class* of
+kernel must be responsible without needing to empirically rediscover that via log-grepping.
+
+## Is the 56.58 tok/s headline safe to publish?
+
+**Yes, as a speed claim — with one caveat now documented that wasn't before.** The model
+produces coherent, correct, fluent output on every prompt tested (verdict A) and the ~56-57
+tok/s decode speed is consistent across every shape and BEAM run measured this session,
+including a brand-new one (2048) never measured before (verdict B) — the headline number is
+real and robust, not a fluke of one lucky shape. The caveat: **BEAM search is not
+output-deterministic relative to a no-BEAM/differently-shaped reference** (verdicts B and C) —
+this is a genuine, now-precisely-characterized, reproducible property of this fork's BEAM
+integration on this model, rooted in per-shape kernel research picking different-but-valid
+implementations for the (few) genuinely shape-dependent kernels. Every single divergence found
+across 9 comparisons (3 chat prompts, 3 shape pairs in verdict C, 1 pair in verdict B) was a
+fluent, grammatical, semantically-sound alternative continuation — never garbage, never a
+repeated/collapsed/off-topic output. No STOP condition was triggered. Recommend publishing the
+headline with a one-line addendum: decode speed is stable across shapes and BEAM settings, but
+BEAM'd output is not guaranteed byte-identical to a non-BEAM'd or differently-shaped run of the
+same prompt (known benign FP-drift class, precedented at T4.10/T4.3).
+
+## Exact commands
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+MXFP4=/Users/artur/models/qwen3.6-35b-a3b-mxfp4/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+
+# A: tokenizer parity (no GPU) -- llama-tokenize vs tinygrad's SimpleTokenizer
+llama-tokenize -m $MXFP4 -p "The capital of France is Paris. The capital of Japan is" --ids
+llama-tokenize -m $MXFP4 -p "Once upon a time, in a small village nestled between two mountains, there lived an old clockmaker named" --ids
+llama-tokenize -m $MXFP4 -f p3.txt --ids   # p3.txt = the fibonacci docstring prompt (has newlines/quotes)
+
+# A: raw-completion coherence (ad hoc script, not committed -- loads Transformer.from_gguf +
+# SimpleTokenizer.from_gguf_kv directly, same classes cli.py uses, one model load for all 3 prompts)
+DEV=NV PYTHONPATH=. $PY /path/to/coherence_check.py --model $MXFP4 --max-context 768 --decode 100 \
+  --prompts "The capital of France is Paris. The capital of Japan is" \
+            "Once upon a time, in a small village nestled between two mountains, there lived an old clockmaker named" \
+            "$(cat p3.txt)"
+
+# A: chat-mode coherence + cross-stack (ad hoc script -- adds cli.py's own jinja2/FallbackTemplate
+# chat-template construction on top of the same loader)
+DEV=NV PYTHONPATH=. $PY /path/to/coherence_chat.py --model $MXFP4 --max-context 768 --decode 150 \
+  --prompts "What is the capital of Japan?" \
+            "Write a short story about an old clockmaker in a mountain village." \
+            "Write a Python function that returns the nth Fibonacci number."
+# llama.cpp side (run sequentially, never concurrently with the above -- both want the whole 21.7GB
+# resident): -st is REQUIRED or a closed/piped stdin busy-loops printing empty "> " forever after EOS
+llama-cli -m $MXFP4 -st --temp 0 --seed 0 -n 150 -ngl 99 --no-warmup -p "<one of the 3 prompts above>" < /dev/null
+
+# B: same-shape BEAM parity @ 2048 (fresh search, ~173s warmup)
+DEV=NV                       PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --max-context 2048 --prompt-tokens 512 --decode-tokens 128
+DEV=NV JITBEAM=1 PARALLEL=6  PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --max-context 2048 --prompt-tokens 512 --decode-tokens 128
+
+# C: 768/4096 reproduction (768 and 4096 BEAM caches were already warm from the headline session)
+DEV=NV                       PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --max-context 768  --prompt-tokens 512 --decode-tokens 128
+DEV=NV                       PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+DEV=NV JITBEAM=1 PARALLEL=6  PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --max-context 768  --prompt-tokens 512 --decode-tokens 128
+DEV=NV JITBEAM=1 PARALLEL=6  PYTHONPATH=. $PY extra/benchmark_llm.py --model $MXFP4 --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+
+# NV health check, run before starting and after every run all session -- always clean, no wedge
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+```
