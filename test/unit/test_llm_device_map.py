@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from tinygrad import Tensor, nn, Device
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, parse_device_map
@@ -430,6 +431,27 @@ class TestDeviceMapMoEExpertsMetalNV(unittest.TestCase):
 
     for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
       self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+  def test_experts_split_no_divergence_deep(self):
+    """T4.19: real olmoe's experts-split diverges from the single-device references at decode index 60
+    (512-prompt/128-decode depth, BENCH_NOTES.md's "Correctness caveat" section) -- root-caused to
+    ordinary cross-device FP non-associativity in the expert GEMV (tiny, ~1e-6-abs per layer, growing
+    with depth) tipping a near-tied final-logit argmax, NOT a routing/dtype bug (sel matched exactly
+    across all 16 layers at the actual divergence step). Confirmed (ad hoc, this session) that random-
+    weight tiny configs do NOT reproduce the divergence even at olmoe's real depth (16 blocks) pushed to
+    8000 decode steps -- 125x deeper than production's trigger point. Pin that as a regression guard:
+    a real bug reintroduced into the hop mechanism (e.g. sel corrupted at the .to(expert_dev) hop) would
+    very likely show up well before this depth, cheaply, without needing real-olmoe-scale hardware."""
+    deep_cfg = replace(MOE_TEST_CONFIG, num_blocks=16, max_context=300)  # olmoe's real depth, tiny otherwise
+    ref = Transformer(deep_cfg, device_map="METAL")
+    _randomize_experts(ref)
+    Tensor.realize(*nn.state.get_parameters(ref))
+    split = Transformer(deep_cfg, device_map="METAL,experts:NV")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    prompt = [2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    self.assertEqual(self._generate(ref, prompt, 200), self._generate(split, prompt, 200))
 
 if __name__ == '__main__':
   unittest.main()

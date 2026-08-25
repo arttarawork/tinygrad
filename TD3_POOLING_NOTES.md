@@ -510,6 +510,205 @@ allocation, peak count unchanged. Root cause (above): nothing is freed until pro
 keyed on "wait for a free" never gets a hit while the run is still alive. Reverted in favor of the slab,
 which doesn't depend on freeing anything.
 
+### 9. T4.19 — experts-split divergence at decode index 60: root-caused (class a, benign FP drift), not a routing bug; hops-per-layer re-confirmed at 3
+
+BENCH_NOTES.md's "Correctness caveat" (BEAM'd-pooling session) found the `experts:NV` split diverging
+from the mutually-byte-identical single-device references at decode index 60 of the 512-prompt/128-
+decode convention (`ref=1232` vs `split=11723`), a real, deeper-than-T4.18/§8's-16/64-horizon finding
+that never got explained. This session explains it with per-tensor evidence, not just re-observing it.
+
+**TL;DR: class (a), benign cross-device FP drift — not a routing/dtype bug.** The expert GEMV (matmul,
+not the copy) computes a tiny (~1e-6-abs at layer 0) different value on NV vs METAL for identical inputs
+— ordinary cross-backend floating-point non-associativity — which compounds through the residual stream
+across 16 layers (~1e-3-abs by layer 15) until it tips a genuinely near-tied final-logit argmax (top-2
+gap collapses from a normal-step ~0.8 to ~0.01–0.02 exactly at the divergence step). Expert routing
+(`sel`) matches **exactly**, all 16 layers, at the actual divergence step — the routing-bug candidate is
+directly ruled out, not just assumed. Does not reproduce at tiny scale even pushed 125x past the real
+trigger depth. The hops-per-layer count is **3**, re-confirmed at real decode shape with a clean capture
+— §8's "2 hops visible" open item does not hold up.
+
+#### 9.1 Reproduction (real olmoe, 512-prompt/128-decode, NAK lane) — objective 1
+
+Re-ran BENCH_NOTES.md's exact convention fresh at this session's HEAD (`539c83d5f`), `DEV=NV:NAK`
+(brief's preferred lane; compile-fast, same shape as nvcc per the brief):
+
+```
+all-NV reference:  [321, 420, ..., 6973, 15, 380, 1232, 1537, ...]
+METAL,experts:NV:  [321, 420, ..., 6973, 15, 380, 11723, 6003, ...]
+```
+Programmatic diff (full 129-element arrays): **first divergence at index 60 exactly** (`ref[60]=1232`,
+`split[60]=11723`), 69/129 total mismatches after that (the two trajectories fall into different
+repetition loops, as expected for this synthetic prompt at this depth — neither is garbage). Matches
+BENCH_NOTES.md's documented numbers exactly — same bug, reproduced fresh, not a stale/one-off finding.
+
+#### 9.2 Tiny-scale bisection (objective 1) — does NOT reproduce
+
+Built tiny MoE configs (`test/unit/test_llm_device_map.py`'s `MOE_TEST_CONFIG` shape, randomized expert
+weights via the file's own `_randomize_experts`) and ran decode far past the committed test's 6-step
+check, looking for the split to diverge from an all-METAL/all-NV reference at *any* point:
+
+| shape | seeds tried | max decode steps | divergences found |
+|---|---|---:|---:|
+| shallow, 4 blocks (`MOE_TEST_CONFIG` as-is) | 7, 1, 42, 123 | 2500 | 0 |
+| deep, 16 blocks (olmoe's real depth, same tiny dim/experts) | 7, 1, 42 | 2500 (seed 7 also run to **8000**) | 0 |
+| deep+wide, 16 blocks, dim=64, hidden=128, 8 experts/k=2 | 7 | 2500 | 0 |
+
+Zero divergences across every (shape, seed) combination — including 8000 decode steps on the config
+that matches olmoe's real depth, **125x** the real trigger's index-60 depth. (Round 2's sweep hit the
+already-documented T4.18 §8 `kernargs_bufs` sysmem ceiling — expected, not a new bug: accumulating many
+sequential JIT-graphed `Transformer` instances with different shapes in one long-lived process exhausts
+the ~128-130 concurrent-`alloc_sysmem` limit that `kernargs_bufs` was explicitly left unfixed for. Fixed
+with the standard `pkill -f "TinyGPU.*server"` + NV health-check, then continued in a fresh process.)
+**Verdict: no tiny repro.** Per the brief, continued the hop/class isolation on real olmoe directly.
+Random untrained weights plausibly just don't produce the same near-tied router/logit geometry a real
+trained model's logit distribution does; not investigated further (would need real trained tiny weights,
+out of scope for a 2-hour task).
+
+#### 9.3 Which hop carries the numerical difference (objective 2) — the expert GEMV, not either copy
+
+Instrumented real olmoe (`dim=2048, 16 blocks, 64 experts, k=8, vocab=50304`) by monkeypatching (not
+editing) `FFNBlock._feed_forward`/`Transformer.forward` to stash per-layer `sel`/`h`/`x_down`/`probs`
+tensor refs and the final logits. Constraint discovered along the way: `TransformerBlock.__call__`'s
+`_run` closure is `@function(precompile=True, allow_implicit=True)`-wrapped, which runs with
+`Context(ALLOW_DEVICE_USAGE=0)` (`tinygrad/function.py:53`) — `.item()`/`.tolist()` are disallowed while
+still inside that trace. Worked around by stashing bare Tensor refs inside `_feed_forward` and only
+extracting values in `Transformer.forward` *after* the block loop returns (a plain, unguarded method).
+
+Ran both `ref` (all-METAL) and `split` (`METAL,experts:NV`) under the **normal fast graphed JIT** up to
+output index 58 (identical state to the real 512/128 run, verified: both match the §9.1 logs exactly
+through index 58), then switched the last few steps to `Context(JIT=0)` (eager, `engine/jit.py:260`'s
+"ignore" branch — runs `Transformer.forward`'s Python body fresh every call instead of replaying a
+captured graph) so the monkeypatch fires. Per-layer `xdown_sample` delta (first 8 elements of the
+expert-output tensor, ref vs split) at step 60:
+
+| layer | 0 | 1 | 2 | 4 | 8 | 12 | 15 |
+|---|---|---|---|---|---|---|---|
+| abs delta | 2.3e-6 | 3.0e-6 | 1.5e-5 | 4.6e-5 | 4.0e-4 | 7.5e-4 | 1.9e-3 |
+
+`h` (the pre-hop input, identical at layer 0 since nothing has diverged yet) and `sel` (the routing
+indices) are **exact bit-for-bit copies** across the `.to(expert_dev)` hop by construction (`.to()` is a
+data movement, not a compute op) — confirmed empirically too (`sel` matches at every layer, see §9.4).
+The delta is already present at **layer 0's `x_down`** (2.3e-6 abs, on O(1)-magnitude values) — i.e. the
+instant the identical `h`/`sel` reach the expert GEMV computed on NV vs. the same GEMV computed on
+METAL, the two hardware/kernel paths produce a tiny different rounding, then it **compounds roughly
+800x over the 16-layer residual stream** (2.3e-6 → 1.9e-3) until it's large enough to matter at the
+final LM-head argmax. **Verdict: the expert compute itself (cross-backend non-associative FP reduction),
+not either copy** — `h`-in and `sel`-in carry zero error (lossless data movement); `x_down`-out carries
+exactly whatever error the NV-vs-METAL GEMV already introduced upstream of it.
+
+**Corroborating control experiment (not requested, but cheap and load-bearing):** with the identical
+state through index 58, `split[60]` **does not diverge from `ref[60]`** when the tail is run eagerly
+(`1232` both) — vs. `11723` in the fully-graphed run. Same weights, same tokens, same device placement;
+the only thing that changed is graphed-replay vs. eager-dispatch execution of the *same* logical ops.
+This is exactly what a genuinely near-tied comparison should do (fragile, execution-path-sensitive) and
+is not what a structural bug (e.g. corrupted indices) would do (mode-independent, wouldn't care whether
+the last few kernels were graphed or eager). Consistent with — and a direct instance of — candidate
+(a)'s literal mechanism: a boundary/execution-path change alters accumulation/fusion order enough to
+flip a hair's-breadth argmax.
+
+#### 9.4 Naming the class (objective 3) — (a), benign FP drift; the heart-of-the-task check
+
+**Expert-ID match at the divergence step:** at step 60 (the actual flip), `sel` (all 8 selected expert
+IDs) matches **exactly, at all 16 layers**, ref vs. split — routing is not the source of the bug. (One
+nuance worth recording: at step 59, two layers show a same-*set*-different-*order* `sel` — e.g. layer 13
+`[...,9,45,...]` vs `[...,45,9,...]` — a `pairwise_topk` tie-break flip from the same accumulating drift;
+harmless, since `probs = scores.gather(-1, sel)` gathers with the same permuted `sel`, so the weighted
+sum is unaffected. This is corroborating evidence the drift is real and growing, not a second bug.)
+
+**Logit-gap evidence:**
+
+| step | max abs logit delta | ref top1–top2 gap | split top1–top2 gap | flips under graphed JIT? |
+|---|---:|---:|---:|---|
+| 59 | 0.101 | 0.826 | 0.823 | no (both pick 380) |
+| **60** | 0.152 | **0.0225** | **0.0114** | **yes** (ref picks 1232, split picks 11723) |
+| 61 | 0.038 | 0.112 | 0.115 | no (both pick 1537) |
+
+At step 60 both `ref` and `split`'s top-2 candidates are the **identical pair** {1232, 11723} — both
+placements agree these two tokens are neck-and-neck; the gap between them (0.011–0.022 out of logits
+~13) is 35-70x smaller than a normal step's ~0.8 gap. This is precisely the brief's candidate-(a)
+signature ("logit deltas ... tiny and the top-2 logits are near-tied"), not candidate (b)'s ("routing
+difference" — ruled out above — "or a delta far larger than fp16 rounding" — 0.15 absolute on a ~13-scale
+logit is small, and it's concentrated in a genuine coin-flip-close tie, not a gross error).
+
+**Verdict: class (a).** Experts-split pooling is numerically sound. The T4.18/§7/§8 "byte-identical"
+correctness claim for this model/placement needs the qualifier BENCH_NOTES.md already flagged: exact at
+the 16-prompt/64-decode horizon those sessions tested, and *still mechanistically sound* at the deeper
+512/128 horizon — the divergence there is the same ordinary cross-backend FP-non-associativity class as
+T4.10/T4.24/T3.3's dense findings, now confirmed (not just presumed) for the `experts:` MoE placement
+shape too, with the routing-bug alternative explicitly measured and ruled out rather than assumed away.
+This closes the TD.4 documentation-risk item BENCH_NOTES.md's caveat flagged.
+
+#### 9.5 Hops-per-layer at decode shape (objective 4) — 3, not 2; §8's open item resolved
+
+§8 flagged a live decode-shape capture showing only 2 cross-device copies/layer (64 KB METAL←NV + 8 KB
+NV←METAL) against the tiny-model/code-path-confirmed 3, and left it open ("not completed this session").
+Re-captured cleanly this session: warmed up normally, drove 1 prefill + 2 decode calls to force the
+greedy rollout JIT key past capture into confirmed **steady-state replay** (`cnt>=2`, `engine/jit.py`'s
+"jit exec" branch), then wrapped exactly one more decode call in `Context(DEBUG=2)` and read the raw
+copy lines (full log saved, 100 lines, 49 mention `copy`):
+
+```
+NV      copy    8.00 KB,      NV <- METAL     (h in)
+NV      copy       32 B,      NV <- METAL     (sel in)
+METAL   copy   64.00 KB,   METAL <- NV        (x_down out)
+```
+repeating **exactly 16 times** (once per real olmoe block) = 48 cross-device copies, plus one unrelated
+`4 B, METAL <- METAL` same-device copy (sampled-token bookkeeping, not a MoE hop) = 49 total, matching
+the grep count exactly. Payload sizes match olmoe's real shape precisely (`h`: 1×1×2048×4B = 8192B;
+`sel`: 1×1×8×4B = 32B; `x_down`: 1×1×8×2048×4B = 65536B — `dim=2048`, `k=8` from this GGUF's own
+metadata). **This is the full 3/layer, not 2** — matching the tiny-model count (§1/§3) and the
+zero-branching code-path argument (`model.py:171-172,180`'s three `.to()` calls) exactly, with no
+surprises. §8's "2" was very likely a capture-methodology artifact (e.g. capturing the one-time JIT-
+*capture* step rather than a confirmed steady-state *replay*, or a grep that missed the tiny 32 B line
+among the noise) rather than a real structural difference — this session's capture explicitly verified
+`cnt>=2` before capturing and saved the full raw log, so there's no such ambiguity here. **Answer: 3
+hops/layer at decode shape, same as every other shape measured.**
+
+#### 9.6 Regression test + gates
+
+Added `test_experts_split_no_divergence_deep` to `TestDeviceMapMoEExpertsMetalNV`
+(`test/unit/test_llm_device_map.py`): olmoe-depth (16-block) tiny config, 200-decode-step exact-match
+check between `ref` and `split` — a much deeper regression guard than the existing 6-step placement
+test, cheap (a few seconds), and would very likely catch a real routing/dtype bug reintroduced into the
+hop mechanism (§9.2 found zero false positives up to 8000 steps on this shape, so the guard has real
+margin, not a hair-trigger). 32/32 in the file (31 pre-existing + 1 new), `DEV='METAL;NV:NAK'`; full
+`test/unit -q -n12` 844 passed / 71 skipped / 4 xfailed (same DEV); mypy (`Success: no issues found in
+216 source files`); ruff (`All checks passed!`) all green. Swap held ~1.8 GB throughout (no regression),
+NV health-checked clean before, during (after the expected T4.18-ceiling hit), and after.
+
+### Exact commands (T4.19)
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+OLMOE=/Users/artur/Library/Caches/tinygrad/downloads/d9f8816f773421fa69637257a3f71cdc
+
+# 9.1: reproduce the divergence fresh (NAK lane)
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map NV --prompt-tokens 512 --decode-tokens 128
+DEV=NV:NAK PYTHONPATH=. $PY extra/benchmark_llm.py --model $OLMOE --device-map "METAL,experts:NV" --prompt-tokens 512 --decode-tokens 128
+# programmatic diff of the two "output [...]" lists -> first mismatch at index 60
+
+# 9.2: tiny bisection (ad hoc scripts, not committed) -- 0 divergences, up to 8000 decode steps
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/tiny_bisect.py    # 400 steps x 3 shapes x seed=7
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/tiny_bisect2.py   # 2500 steps x 3 shapes x up to 4 seeds
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/tiny_bisect3.py   # 8000 steps, deep-16block, seed=7
+pkill -f "TinyGPU.*server"   # only needed after round 2's expected T4.18-Sec8 kernargs-ceiling hit
+
+# 9.3/9.4: hop-trace instrumentation (ad hoc, not committed) -- monkeypatches _feed_forward/forward,
+# 58 graphed steps then Context(JIT=0) for the tail; saves a pickle of per-layer/per-step tensors
+DEV=NV:NAK PYTHONPATH=. $PY /path/to/olmoe_hop_trace.py
+
+# 9.5: decode-shape hop count (ad hoc, not committed) -- warms up, forces steady-state replay
+# (1 prefill + 2 decode calls), then Context(DEBUG=2) around exactly one more decode call
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY /path/to/olmoe_decode_copies.py
+
+# gates
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit/test_llm_device_map.py -v   # 32 passed
+DEV='METAL;NV:NAK' PYTHONPATH=. $PY -m pytest test/unit -q -n12   # 844 passed, 71 skipped, 4 xfailed
+PYTHONPATH=. $PY -m mypy tinygrad/                                # Success: no issues found in 216 source files
+$PY -m ruff check test/unit/test_llm_device_map.py                # All checks passed
+```
+
 ### Exact commands (T4.18)
 
 ```bash
