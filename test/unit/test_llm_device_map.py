@@ -378,5 +378,58 @@ class TestDeviceMapMoEExpertsMetalCPU(unittest.TestCase):
         if "CPU" in devs and "METAL" in devs: expert_copies += 1
     self.assertEqual(expert_copies, 4 * 3)  # same 3-copies/layer shape as the homogeneous CPU:0/CPU:2 case
 
+@unittest.skipUnless(Device.DEFAULT == "METAL" and "NV" in Device.get_available_devices(), "Metal default + a real NV device required to run")
+class TestDeviceMapMoEExpertsMetalNV(unittest.TestCase):
+  """TD.3-moe: the MoE PRODUCTION shape on real dock hardware -- routed experts (ffn_{gate,up,down}_exps,
+  the bulk of a MoE model's weights) on the RTX 3090 (NV), attention+norms+router+KV on METAL. Same shape
+  as TestDeviceMapMoEExpertsMetalCPU, but the second backend is real NV instead of CPU.
+  NOTE: run this class with DEV='METAL;NV:NAK' -- colima/docker is stopped on this dock, so bare NV would
+  route new kernel compiles through the (unavailable) docker nvcc compile-server. "NV:NAK" is a DEV
+  target-string renderer override (device="NV", renderer="NAK", tinymesa, no docker), NOT a device_map
+  device string -- "NV:NAK" as a device_map/Tensor(device=...) value raises (the trailing segment parses
+  as a device INDEX, not a renderer). device_map/Tensor strings below stay plain "NV"; see
+  TD3_POOLING_NOTES.md's MoE section for the full mechanism writeup."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_experts_on_nv_rest_on_metal(self):
+    # the flagship shape this task exists to validate: experts (bulk) on NV, everything else on METAL
+    ref = Transformer(MOE_TEST_CONFIG, device_map="METAL")
+    _randomize_experts(ref)
+    split = Transformer(MOE_TEST_CONFIG, device_map="METAL,experts:NV")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["NV"] * 4)
+    self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["METAL"] * 4)
+
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    rollout_jit = split.jit[(False, True, None)]
+    self.assertIsNotNone(rollout_jit.captured)
+    expert_copies = 0
+    for call in rollout_jit.captured.linear.src:
+      if call.src[0].op is Ops.COPY:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        if "NV" in devs and "METAL" in devs: expert_copies += 1
+    self.assertEqual(expert_copies, 4 * 3)  # same 3-copies/layer shape as MetalCPU (h, sel in; x_down out)
+
+  def test_experts_on_metal_rest_on_nv(self):
+    # reverse direction, cheap correctness-only check (not the production shape) -- objective 1's "once, cheap"
+    ref = Transformer(MOE_TEST_CONFIG, device_map="NV")
+    _randomize_experts(ref)
+    split = Transformer(MOE_TEST_CONFIG, device_map="NV,experts:METAL")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["METAL"] * 4)
+    self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["NV"] * 4)
+
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
 if __name__ == '__main__':
   unittest.main()
