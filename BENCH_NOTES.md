@@ -260,3 +260,93 @@ cited only as an order-of-magnitude class, not a controlled comparison):
   RSS for the harness process stayed under 1.3 GB.
 - `NV:NAK` was 100% reliable across all 6 of its cells (3 models x 2 configs) — every crash in this
   session was on the `DEV=NV` (Docker/NVRTC) lane.
+
+## Post-T4.14 DEV=NV rerun (TD.2c, 2026-08-25)
+
+Goal: run the 5 previously-skipped `DEV=NV` BEAM/no-BEAM cells (llama3.2:1b JITBEAM=2; qwen3:8b
+no-BEAM + JITBEAM=2; gpt-oss:20b no-BEAM + JITBEAM=2) now that T4.14 (`d11b3522c`, cherry-picked
+onto TD.2b's `c76b1a08c` — this branch's HEAD for this session) fixes the short-read truncation in
+`Compiler.compile_server()` (`tinygrad/device.py`), plus a parity check. **Result: blocked on cell
+1.** Cells 2-5 and the parity check were not attempted.
+
+**Cell 1 (`llama3.2:1b`, `NV`, `JITBEAM=2`):**
+```
+PYTHONPATH=. .venv/bin/python extra/bench_llm.py tinygrad --model llama3.2:1b --device NV \
+  --env JITBEAM=2 --prompt-tokens 512 --decode-tokens 128 --csv extra/bench_results_2026-08-24.csv
+```
+Attempt 1: `load 5.000s`, then crashes inside `model.warmup()`'s second `generate()` pass, inside
+BEAM search's candidate-timing loop (`codegen/opt/search.py:148 beam_search` →
+`engine/realize.py:330 time_call` → `exec_kernel` → `get_runtime` → `ops_nv.py:264`) with
+`ValueError: Buffer size too small (0 instead of at least 832 bytes)` in `elf_loader`
+(`runtime/support/elf.py:22`) — the exact T4.14 signature. Per protocol (capture traceback, retry
+the exact cell once, stop if it recurs), retried once: **byte-identical failure** (`load 4.905s`,
+same call site, same "832 bytes" shortfall). Two attempts, two identical crashes → STOP condition
+("T4.14 signature recurs twice") triggered; no further `DEV=NV` cells attempted.
+
+**Root cause (read-only diagnostic, no GPU, no source changes — not a second live transport bug):**
+`Compiler.compile_cached()` (`tinygrad/device.py:314-319`) checks `diskcache_get(self.cachekey,
+src)` *before* ever calling `compile()`/`compile_server()`, gated by `CCACHE` which defaults to `1`
+(`tinygrad/helpers.py:279`). Parsed all 2854 rows of the on-disk NV compile cache
+(`~/Library/Caches/tinygrad/cache.db`, table `compile_nv_sm_86_22`) through the repo's own
+`elf_loader` directly (pure bytes-in parse, no device needed): **2850/2854 (99.86%) parse as valid
+ELF; exactly 4 do not.** All 4 bad entries are truncated to precisely **32764 bytes** (= 32768 − the
+4-byte length prefix — matching T4.14's own commit message: "replies >~32KB truncated"), short by
+832 or 768 bytes. Stable IDs (sha256 of cache key, first 12 hex): `9220c86d6319` (key 1300 chars,
+needs +832B), `ecfccf0219c0` (key 1104 chars, needs +832B), `2bc223371124` (key 94238 chars, needs
++768B), `c3259d3e2388` (key 61071 chars, needs +768B) — the two large keys are plausibly
+qwen3:8b/gpt-oss:20b-class kernels, the two small ones plausibly llama3.2:1b-class.
+
+These 4 rows are **legacy poison from TD.2b's pre-fix session**: the *old* `compile_server()` did a
+single `.read(sz)` call that can return fewer than `sz` bytes on a raw pipe without raising (a
+short-but-nonempty read is still truthy), so some of TD.2b's 5 reproduced pre-fix crashes
+nonetheless returned a truthy, truncated cubin that `compile_cached()` dutifully wrote to disk as a
+"successful" compile. T4.14's fix (`_read_exactly()`, looping until the promised byte count or EOF)
+is real and correct — 2850/2854 pre-existing entries are valid, consistent with the fix's own
+`extra/repro_t414.py` passing 10/10 — but it only prevents *future* truncation; it cannot
+retroactively repair rows cached wrong before it landed. Because `CCACHE` defaults on, any run
+(this one included) whose kernel/BEAM-candidate search regenerates one of those 4 exact source
+strings gets the poisoned blob back verbatim, bypassing `compile_server()` (and the fix) entirely —
+which is exactly why the retry reproduced byte-for-byte: it's a deterministic cache replay, not a
+fresh race. Given 2 of the 4 poisoned keys look qwen3:8b/gpt-oss:20b-sized, cells 2-5 would
+plausibly have hit the same class of block; this was not empirically re-verified (stopped per
+protocol before spending budget on cells expected to reproduce a now-understood, already-diagnosed
+failure).
+
+**Recommended unblock for a future session (not performed here — out of scope for a measurement-only
+task and outside the STOP-triggered mandate to stop and report):** evict the 4 identified rows from
+`compile_nv_sm_86_22` (by the sha256 IDs above) or drop/rebuild that one table (cheap — it's a
+compile cache, not data; 2850 valid entries just get recompiled once on next use), or run once with
+`CCACHE=0` to bypass the disk cache entirely, then retry this exact 5-cell matrix. Given the fix is
+independently confirmed correct and only 4/2854 rows are affected, this is expected (not guaranteed)
+to fully unblock `DEV=NV` BEAM.
+
+**Full table — unchanged from TD.2b, now with a root-caused (not merely "crashes") reason for the
+open cells:**
+
+| Model | Lane | Config | load s | prefill tok/s | decode tok/s | GB/s |
+|---|---|---|---:|---:|---:|---:|
+| llama3.2:1b | NV:NAK | no-BEAM | 5.01 | 55.3 | **7.13** | 8.4 |
+| llama3.2:1b | NV:NAK | JITBEAM=2 | 4.91 | 341.0 | **96.06** | 112.5 |
+| llama3.2:1b | NV | no-BEAM | 4.92 | 142.5 | **28.16** | 33.0 |
+| llama3.2:1b | NV | JITBEAM=2 | — | — | **blocked (poisoned cache row, root-caused above)** | — |
+| qwen3:8b | NV:NAK | no-BEAM | 6.54 | 16.5 | **3.72** | 23.6 |
+| qwen3:8b | NV:NAK | JITBEAM=2 | 6.49 | 66.7 | **31.44** | 197.0 |
+| qwen3:8b | NV | no-BEAM | — | — | **not attempted (blocked by cell-1 STOP)** | — |
+| qwen3:8b | NV | JITBEAM=2 | — | — | **not attempted (blocked by cell-1 STOP)** | — |
+| gpt-oss:20b | NV:NAK | no-BEAM | 8.61 | 78.7 | **7.42** | 25.8 |
+| gpt-oss:20b | NV:NAK | JITBEAM=2 | 8.63 | 117.3 | **26.81** | 105.3 |
+| gpt-oss:20b | NV | (either) | — | — | **not attempted (blocked by cell-1 STOP)** | — |
+
+**Parity check (qwen3:8b `NV` JITBEAM=2 vs JITBEAM=0):** not performed — depends on a completed
+qwen3:8b `NV` JITBEAM=2 run, which never happened this session.
+
+**Updated takeaway on lane choice:** still moot, unchanged from TD.2b. `DEV=NV`+BEAM still cannot
+complete a run on this dock, so whether it beats NAK+BEAM (96.06 / 31.44 / 26.81 tok/s decode on
+llama3.2:1b / qwen3:8b / gpt-oss:20b) remains **unmeasured** — this session neither confirms nor
+denies the "4x-on-no-BEAM suggests real headroom" projection from TD.2b's takeaway #2. NAK+BEAM
+remains the only lane that has ever produced a complete, usable high-throughput number on this dock.
+The T4.14 fix itself is vindicated (99.86% of the existing NV compile cache is valid, matching its
+own repro's 10/10), so the remaining blocker is narrowly scoped (4 known rows) and well-understood,
+not an open question about the fix's correctness — unlike TD.2b's finding, this is no longer "an
+unfixed compiler bug," it is "a fixed bug whose blast radius includes a few stale cache entries that
+outlived it."
