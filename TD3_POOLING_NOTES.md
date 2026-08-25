@@ -1158,6 +1158,201 @@ PYTHONPATH=. $PY -m mypy tinygrad/           # Success: no issues found in 216 s
 $PY -m ruff check .                          # All checks passed
 ```
 
+### 13. T4.22: IQ3_XXS/IQ4_XS dequant materialization (upstream #17316) — FIXED, same class as T4.13, no rangeify change
+
+**Verdict up front: fixed.** IQ3_XXS and IQ4_XS dequant (`gguf.py` types 18/23) used `Tensor`-indexed
+LUT gathers exactly like pre-fix MXFP4 (T4.13) — confirmed via live instrumentation that the same
+named check (`buffer_in_reduce`, `schedule/rangeify.py:258-266`) refuses to fuse them into MoE's
+`weight[sel]` gather, forcing full-expert materialization every decode step. Root cause matches the
+task's hypothesis exactly; **the "IQ grids are not ALU-expressible" half of the hypothesis is only
+half true** — one of IQ3_XXS's two gathers (`even_signs`, a sign-parity table) turned out to be a
+genuine closed-form bit trick after all (T4.13-style ALU), and the two truly-arbitrary codebooks
+(IQ3_XXS's 256-entry grid, IQ4_XS's 16-entry `kvalues_iq4nl`) are small enough to replace with a
+**compile-time balanced binary select-tree** (nested `.where()` over the table's literal float
+constants) instead of a bit trick — mechanically equivalent to T4.13's fix (no buffer touched, so
+`buffer_in_reduce` never fires) without needing a closed-form formula. **No rangeify/scheduler code
+was touched.**
+
+#### Mechanism (objective 1) — confirmed two ways, byte numbers worse than T4.13's original bug
+
+Source inspection: `_ggml_iq_grid(...)[blocks[:,2:66]]` (grid) and `even_signs[sign_idx]` (sign
+parity) in type 18, `iq4_xs_lut[q]` in type 23, are all `Tensor.__getitem__` advanced-index gathers.
+`Tensor._getitem`'s general path for a single tensor-indexed axis (`mixin/op.py:105-134`, `len(dims)==1`
+so the "consecutive indices" fast path at line 111 never applies) compiles this to a one-hot mask
+times the source, **summed via a REDUCE** (`mask.where(x, 0).sum(sum_axis)`) — i.e. every LUT/grid
+gather is *itself* a REDUCE that reads a real buffer (the table). When this sits inside a bufferize
+candidate that's a would-be input to a consuming reduce (MoE's `weight[sel]`), `remove_bufferize`'s
+`buffer_in_reduce` check (walks each `REDUCE`'s own source for `PARAM`/`STAGE`/`AFTER`) sees exactly
+that and refuses to remove the bufferize — forcing full materialization. Live-instrumented (temporary
+`print` in `buf_gate`, reverted after use, zero diff left behind): a candidate bufferize shaped
+`(32, 256, 256)` — **the full (N_EXPERTS, out, in) expert tensor** — shows `buffer_in_reduce=True` for
+IQ3_XXS and IQ4_XS but is **absent** from Q4_K's and (already-fixed) MXFP4's traces at the identical
+config, in the identical test harness (mirrors T4.11/T4.13's own `TestGPTOSSDecodeByteBudgetMXFP4`:
+gpt-oss arch, N_EXPERTS=32, EXPERTS_PER_TOK=4, `Transformer.from_gguf` + `model.generate()`, real JIT
+path, `DEV=CPU` for a backend-independent AST-shape byte count — dims bumped to DIM=HIDDEN=256 from
+T4.11/13's 64/128 because IQ3_XXS/IQ4_XS need 256-element block alignment that gguf-py's
+`quant_shape_from_byte_shape` enforces on `raw_dtype` tensors, unlike MXFP4's 32-element blocks).
+
+A **plain dense gemv** (no MoE gather at all) does **not** reproduce the blowup for either type —
+confirmed by direct measurement (1.98x/1.00x analytic bytes) before realizing why: `buffer_in_reduce`
+only controls whether a *separate materialize-then-reread* boundary is inserted, which costs at most
+~2x regardless of the consumer. The catastrophic multiplier is specific to MoE's `weight[sel]`: if the
+dequant bufferize can't be pushed past the gather, `weight[sel]` ends up indexing an **already fully
+materialized dense array**, paying N_EXPERTS/EXPERTS_PER_TOK (here 8x) instead of 1x — and IQ3_XXS
+pays *even more* than that dense estimate because it chains **two independent** gathers (grid AND
+sign-parity), each forcing its own full materialization, compounding rather than adding:
+
+| type | pre-fix actual/gathered | pre-fix actual/dense | (T4.13 MXFP4 pre-fix, for scale) |
+|---|---:|---:|---:|
+| IQ3_XXS (18) | **63.50x** | **7.94x** (worse than "all experts"!) | ~8x gathered |
+| IQ4_XS (23) | **42.31x** | **5.29x** | |
+
+This matches (and slightly exceeds, on the dominant IQ3_XXS format) the real qwen3.6-35B UD-Q3_K_XL
+finding this task started from (~88 GB/token measured, ~83 GB/token on upstream #17316's reporter) —
+the mechanism, not just the byte-order-of-magnitude, transfers exactly.
+
+#### Options evaluated (objective 2)
+
+**(a) Rangeify: relax `buffer_in_reduce` generally — rejected, two independent reasons, no code
+written.** This fork already has a generalized version of exactly this idea living in the same
+function: `PCONTIG>2`'s partial-bufferize path (`rangeify.py:267-282`, `out_in_ratio<10` gate). Tested
+directly on this shape: **`PCONTIG=0/2/3` produce byte-identical schedules** (2,907,280 B every time,
+3 fresh processes) — the ratio gate compares *element* counts (dequant output elements vs. raw bytes
+treated as elements) and a quant format's ~2-4x element-level compression never clears the 10x bar
+tuned for attention's O(seq²) blowup (`PCONTIG_ATTN_NOTES.md`'s own subject). **Even where that gate
+does engage, this fork's own prior investigation (T1.7, same file) already proved it produces
+silently wrong numerics** on generic reduce-feeds-reduce patterns (double matmul: max abs diff 2.98
+vs. numpy; softmax; SDPA) — a live, unresolved, first-party correctness bug in the exact code path
+option (a) would need to extend. A brand-new, narrowly-scoped relaxation is conceivable but proving
+it safe (T4.9-style: full survey of what else routes through `remove_bufferize`) is multi-hour work
+by T1.7's own demonstrated difficulty, and **upstream PR #17493 is a full rangeify rewrite** — low
+expected shelf life for new logic there. Matches this task's own STOP condition; not attempted.
+
+**(b) Load-time transcode — not attempted, quantified enough to reject.** fp16 transcode roughly
+doubles resident size (T4.21 specifically fixed a residency blowup on this exact model; undoing it
+is a non-starter). int8/requantize-to-Q4_0 is a genuine *lossy* re-quantization needing its own
+perplexity/precision study — bigger scope than this task's budget, and still costs real extra
+residency (IQ3_XXS/IQ4_XS are ~3.1-4.25 bits/weight; even Q4_0 is 4.5 bits/weight nominal).
+
+**(c) Selected — per-table fix, matched to what each table actually is:**
+- `even_signs` (128-entry "table"): not actually arbitrary — `even_signs[i] == i | (parity(i)<<7)`
+  (ggml derives the 8th sign bit from 7-bit parity to save a bit). Replaced with the standard
+  XOR-fold SWAR parity trick (`px = i^(i>>4); px ^= px>>2; px ^= px>>1; bit7 = (px&1)<<7`) — pure ALU,
+  **no size limit**, same spirit as T4.13's MXFP4 bit-tricks. Bit-exact for all 128 values (exhaustive).
+- IQ3_XXS's 256-entry grid and IQ4_XS's 16-entry `kvalues_iq4nl`: genuinely arbitrary codebooks (no
+  bit formula — confirmed by inspection: `kvalues_iq4nl = (-127,-104,-83,...)`, a hand-tuned
+  non-uniform table). Replaced with a **compile-time balanced binary select-tree**: nested `.where()`
+  comparing the code against literal Python-int thresholds, bottoming out at literal Python-float
+  leaves — zero `Tensor`/buffer anywhere in the expression, so `buffer_in_reduce` can never fire
+  (there's no REDUCE at all, let alone one touching a buffer). One shared helper, `select_const`
+  (nested in `ggml_data_to_tensor`, next to the existing `q_to_uint8` helper), used by both types.
+
+Deliberately **not** extended to IQ3_S (type 21, 512-entry grid) or IQ2_S (type 22, 1024-entry grid)
+this session — same bug class (both still gather via `_ggml_iq_grid(...)[q]`, confirmed by
+inspection), `select_const` would mechanically apply, but a linear select-tree costs `len(vals)-1`
+`.where()`s and neither format appears in the qwen3.6 file this task is scoped to (BENCH_NOTES'
+histogram: only IQ3_XXS + IQ4_XS). Given IQ3_XXS's 256-entry tree already showed a real no-BEAM
+slowdown (below), 511/1023-entry trees are a real open question, not a safe extrapolation — flagged
+as a natural, well-scoped follow-up (ideally with a smarter 2-level split-table lookup, Q4_K-scale-
+staging-style, rather than a fully linear tree, if the byte win doesn't hold up at that size).
+
+#### Verification (objective 3 — T4.13-grade rigor)
+
+- **Bit-exact, exhaustive over the full code space** (not sampled): all 128 `even_signs` values, all
+  256 IQ3_XXS grid codes (both checked directly against the pre-patch gather form, `array_equal`).
+  IQ4_XS also cross-checked against an independent from-scratch numpy port of the block format
+  (0 mismatches on 507,648/524,288 non-NaN elements against random raw bytes; the ~3% NaN entries are
+  from fully-random synthetic scale bytes hitting fp16 NaN bit patterns, identical positions in old
+  and new code — a test-data artifact, not a bug).
+  **Existing repo tests are the strongest signal**: `test/unit/test_gguf.py`'s `test_dequantization_iq3_xxs`/
+  `_iq4_xs` and `test_gguf_gemv_iq3_xxs`/`_iq4_xs` (real quantize/dequantize via the `gguf` pip
+  package, i.e. ground truth independent of this session) — **11/11 pass unmodified**.
+- **Byte count**, real model+JIT harness, both types, confirmed on **CPU, METAL, and real NV
+  hardware (`NV:NAK` and `NV` nvcc)** — schedule-level fix, byte counts match across backends as
+  expected:
+
+  | type | pre-fix actual/gathered | **post-fix actual/gathered** | (Q4_K control / MXFP4-fixed, same harness) |
+  |---|---:|---:|---:|
+  | IQ3_XXS | 63.50x | **1.59-1.60x** | 1.44-1.73x / 1.42-2.47x |
+  | IQ4_XS | 42.31x | **1.42-1.81x** | (same row) |
+
+  Both land squarely in the same healthy range as the known-good controls — full resolution, not a
+  partial improvement.
+- **New regression test** (`test/unit/test_llm_gptoss.py::TestGPTOSSDecodeByteBudgetIQ`, mirrors
+  `TestGPTOSSDecodeByteBudgetMXFP4`): **proven failing pre-fix** (`38,234,500 B` / `35,350,148 B`
+  actual vs. `<3x gathered` asserted, via `git stash push -- tinygrad/llm/gguf.py` with the test kept
+  in place), **passes post-fix**.
+
+#### Does BEAM change the picture? (objective 4) — yes, decisively, and it's the crux of the recommendation
+
+Unlike T4.13 (where bytes were the whole story), **here the trade is bytes-for-ALU, and whether that
+trade is worth it depends on BEAM**, tested directly (same tiny 2-layer/32-expert/256-dim config,
+`DEBUG=2`+`GlobalCounters.time_sum_s`, min-of-3 post-warmup, fresh process per cell):
+
+| lane | broken (no BEAM) | fixed (no BEAM) | fixed (`JITBEAM=2`) | broken (`JITBEAM=2`) |
+|---|---:|---:|---:|---:|
+| METAL, IQ4_XS | 1.222 ms | **0.514 ms (2.38x faster)** | — | — |
+| METAL, IQ3_XXS | 1.272 ms | 3.388 ms (2.67x **slower**) | **1.320 ms** | 1.697 ms |
+| `NV:NAK`, IQ3_XXS | 0.884 ms | 12.070 ms (13.65x **slower**) | not measured | — |
+| `NV` (nvcc), IQ3_XXS | 0.954 ms | 2.267 ms (2.37x **slower**) | attempted, did not finish in budget* | — |
+
+IQ4_XS's 16-way tree is an unambiguous win on every axis, BEAM or not. **IQ3_XXS's 256-way tree is a
+genuine no-BEAM regression on every lane tested** — worst on `NV:NAK` (NAK's weaker codegen is hit
+hardest by the extra ALU), still a regression on nvcc and METAL. **But with `JITBEAM=2` on METAL, the
+fixed version is 22% *faster* than the broken version at BEAM'd-2** (1.320 ms vs. 1.697 ms) *while
+still reading ~27x fewer bytes* (2.31x gathered vs. 63.53x) — BEAM finds a materially better schedule
+for the select-tree that the hand-coded path doesn't, the same structural fact T4.16 established
+generically (`apply_opts` never calls `hand_coded_optimizations` once `beam>=1` — BEAM is an
+independent from-scratch search, not a refinement of the naive lowering). **This fork's own
+production qwen3.6 config always runs BEAM'd** (BENCH_NOTES' headline: `JITBEAM=1 PARALLEL=6`
+nvcc) — no-BEAM is a cold-start/dev-loop path only (T4.16's own framing). On that basis the fix is
+recommended for the configuration this fork actually serves; the no-BEAM path is a known, honestly-
+reported soft spot for IQ3_XXS specifically, not silently swept under the rug.
+
+*`JITBEAM`'s per-kernel search over the remote nvcc nvcc/colima compile-server pays a real
+round-trip per candidate (~8-10s observed for one 22-25-action kernel search) — for a full decode
+step's ~20-30 distinct kernel shapes this did not complete inside this task's time budget on the tiny
+synthetic config. A real characterized cost (nvcc BEAM cold-start latency), not a correctness or
+methodology concern — noted for whoever next measures a fresh nvcc BEAM config from cold.
+
+#### Real-model confirmation — not run this session (same pattern as T4.13's own first session)
+
+Mirrors T4.13's own history exactly: T4.13's original fix session also deferred the real-model
+number ("Real-model tok/s confirm = next bench window") and got it in a **separate**, later session
+(bench window 4). Given (1) the byte-count fix is confirmed via the *exact* T4.11/T4.13 harness
+methodology, on real NV hardware, not just a synthetic proxy, and (2) a real 16.85 GB
+`Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` load + `JITBEAM` cold-compile (many more distinct kernel shapes
+than this session's 2-layer toy) would very likely have exceeded this task's remaining budget on its
+own (see the nvcc-BEAM latency note above), this was a deliberate scope call, not an oversight.
+**Next step**: `DEV=NV --device-map NV`, `JITBEAM=1 PARALLEL=6`,
+`/Users/artur/models/qwen3.6-35b-a3b-q3/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf`, expect decode well above
+the current 1.86 tok/s floor — **not quoting a specific target number**: the measured wall-clock
+trade at toy scale (bytes down ~40-60x, but only a ~22% BEAM'd wall-clock win, not a bytes-scale
+win) shows this is not purely memory-bound the way MXFP4's fix was, so a naive
+byte-ratio extrapolation would overpromise.
+
+#### Gates, all green
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+PYTHONPATH=. $PY -m pytest test/unit/test_gguf.py test/unit/test_llm_gptoss.py -v -k "iq or Iq or IQ"  # 13 passed
+PYTHONPATH=. $PY -m pytest test/unit -q -n12   # 848 passed, 71 skipped, 4 xfailed, 2 subtests passed
+PYTHONPATH=. $PY -m pytest test/opt -q         # 38 passed, 4 skipped, 1 xfailed, 5 subtests passed
+PYTHONPATH=. $PY -m mypy tinygrad/             # Success: no issues found in 216 source files
+$PY -m ruff check .                            # All checks passed
+DEV=CPU PYTHONPATH=. $PY -m pytest test/unit/test_gguf.py test/unit/test_llm_gptoss.py -q  # 55 passed
+# proof the new test is real (not vacuously true): fails pre-fix with the fix stashed, test kept
+git stash push -- tinygrad/llm/gguf.py
+PYTHONPATH=. $PY -m pytest test/unit/test_llm_gptoss.py -v -k ByteBudgetIQ  # 2 FAILED (38.2MB / 35.4MB actual vs <3x gathered)
+git stash pop
+```
+Mock-NV not run: no NV-specific (`ops_nv.py`/`hcq.py`) code was touched, only `tinygrad/llm/gguf.py`
+and one test file — outside the brief's "if NV code is touched" trigger. Dock health verified clean
+before/after every real-hardware cell above (`pgrep -fl "TinyGPU.*server"` exactly one throughout;
+one transient `nv_usb4.lock` contention from an interrupted background BEAM run cleared on retry with
+no wedge, confirmed by a trivial `Tensor([1,2,3])+1` round-trip).
+
 ---
 
 ## Exact commands

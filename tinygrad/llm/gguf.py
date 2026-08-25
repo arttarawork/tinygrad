@@ -48,6 +48,19 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     shift_tensor, bitmask = Tensor.const(tuple(2**(i*b) for i in range(8//b)), t.dtype), 0xff >> (8 - b)
     return t.unsqueeze(-1).div(shift_tensor, rounding_mode="trunc").bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
 
+  def select_const(idx: Tensor, vals, lo: int = 0):
+    # Selects vals[idx] via a compile-time balanced binary decision tree (nested .where() over
+    # Python float constants) instead of a Tensor-indexed gather. A gather reads its table through
+    # a buffer-accessing REDUCE (Tensor.__getitem__'s one-hot-sum, mixin/op.py) that rangeify's
+    # buffer_in_reduce refuses to fuse into a consuming reduce -- same class of bug as ggml_type==39's
+    # MXFP4 LUT below, for genuinely arbitrary (non-bit-decomposable) codebooks: IQ3_XXS's 256-entry
+    # grid and IQ4_XS's 16-entry kvalues_iq4nl (T4.22). Bit-exact vs the gather form (verified
+    # exhaustively over the full code space for both tables); cheap for small tables like these --
+    # not a general gather replacement.
+    if len(vals) == 1: return vals[0]
+    mid = lo + len(vals)//2
+    return (idx < mid).where(select_const(idx, vals[:len(vals)//2], lo), select_const(idx, vals[len(vals)//2:], mid))
+
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
     blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
@@ -92,9 +105,24 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       scale_words = blocks[:, 66:98].bitcast(dtypes.uint32)
       db = d * (scale_words.rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.5
       sign_idx = scale_words.unsqueeze(-1).rshift(Tensor.const((0, 7, 14, 21), dtypes.uint32)).bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
-      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
-      signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
-      grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[:, 2:66]].reshape((-1, 8, 4, 8))
+      # even_signs[i] == i | (parity_bit(i) << 7): ggml stores only 7 sign bits/group and derives the
+      # 8th from parity (even_signs was a real Tensor+gather -- a buffer-reading REDUCE inside the
+      # dequant expression, same class of bug as T4.13's MXFP4 LUT; see the ggml_type==39 comment
+      # above). Computed via the standard XOR-fold SWAR parity trick instead: bit-exact for all 128
+      # values (verified), pure ALU, no buffer.
+      px = sign_idx ^ sign_idx.rshift(4)
+      px = px ^ px.rshift(2)
+      px = px ^ px.rshift(1)
+      even_signs_sign_idx = sign_idx.bitwise_or(px.bitwise_and(1).lshift(7))
+      signs = (q_to_uint8(even_signs_sign_idx.reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
+      # iq3xxs_grid is a genuine 256-entry codebook (not bit-decomposable like the parity above) --
+      # select_const dodges the same buffer_in_reduce issue without a formula (see its docstring).
+      # flat (256*4,), matching _ggml_iq_grid's own unpack order
+      grid_vals = tuple(float((w >> (8*i)) & 0xFF) for w in _ggml.iq3xxs_grid for i in range(4))
+      code = blocks[:, 2:66].cast(dtypes.int32)
+      # (-1,64,4): degroup the 4 interleaved sub-values per code
+      grid4 = Tensor.stack(*[select_const(code, grid_vals[c::4]) for c in range(4)], dim=-1)
+      grid = grid4.reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)
     if ggml_type == 21:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
@@ -113,12 +141,13 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     if ggml_type == 23:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1))
       scale_shifts = Tensor.const((0, 2, 4, 6, 8, 10, 12, 14), dtypes.uint16)
-      iq4_xs_lut = Tensor(list(_ggml.kvalues_iq4nl), dtype=dtypes.float32, device=t.device)
       scales_l = Tensor.stack((sl:=blocks[:, 4:8]).bitwise_and(0xF), sl.rshift(4), dim=2).reshape((-1, 8))
       scales_h = blocks[:, 2:4].bitcast(dtypes.uint16).unsqueeze(-1).rshift(scale_shifts).bitwise_and(0x03).reshape((-1, 8)).cast(dtypes.uint8)
       scales = (scales_l.bitwise_or(scales_h.lshift(4)).bitcast(dtypes.int8) - 32).cast(dtypes.float32).reshape((-1, 8, 1))
       q = (qs:=blocks[:, 8:].reshape((-1, 8, 16))).bitwise_and(0xF).cat(qs.rshift(4), dim=2)
-      return (d * scales * iq4_xs_lut[q]).flatten(-2)
+      # kvalues_iq4nl is a genuine 16-entry codebook (not bit-decomposable like MXFP4's E2M1 below) --
+      # select_const dodges the same buffer_in_reduce issue without a formula (see its docstring).
+      return (d * scales * select_const(q, _ggml.kvalues_iq4nl)).flatten(-2)
     if ggml_type == 39:
       # e8m0 block scale and the E2M1 4-bit value are computed via ALU bit-ops instead of Tensor-indexed
       # LUT gathers (the original form: `lut_tensor[codes]`). A gather reads a real buffer through a

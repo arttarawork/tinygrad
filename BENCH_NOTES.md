@@ -999,7 +999,7 @@ tinygrad decodes efficiently. All runs `--max-context 2048 --prompt-tokens 512
 |---|---:|---|---|---:|---:|---|
 | UD-Q4_K_XL (local, MTP) | 22.85 | NV:NAK | — | — | — | OOM, `Used: 23.17 GB` |
 | UD-Q4_K_M (registry) | 22.13 | NV:NAK | — | — | — | OOM, `Used: 23.73 GB`; also OOMs at max-context 1024 ⇒ working set is context-INdependent (~1.6 GB) |
-| UD-Q3_K_XL | 16.85 | NV:NAK | — | 1.86 | 164.1 | fits; **~88 GB/token — IQ dequant materializing (T4.22 = upstream #17316 reproduced)** |
+| UD-Q3_K_XL | 16.85 | NV:NAK | — | 1.86 | 164.1 | fits; **~88 GB/token — IQ dequant materializing (T4.22 = upstream #17316 reproduced, FIXED below — same file's real tok/s not yet re-measured)** |
 | MXFP4_MOE | 21.71 | NV:NAK | — | 2.50 | 11.2 | fits; ~4.5 GB/token (bytes HEALTHY — T4.13 fusion works) but 1% of card bw ⇒ kernel/latency-bound |
 | MXFP4_MOE | 21.71 | NV (nvcc) | — | **7.07** | 31.6 | 2.8x the NAK lane, same file — the usual lane gap |
 | MXFP4_MOE | 21.71 | NV (nvcc) | JITBEAM=2 PARALLEL=6 | *(see next commit)* | | headline run |
@@ -1454,4 +1454,51 @@ PYTHONPATH=.                    $PY -m mypy tinygrad/                 # Success:
 
 # NV health check after every run this session -- always clean, no wedge
 DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+```
+
+# T4.22 — IQ3_XXS/IQ4_XS dequant fix, byte + wall-clock before/after (2026-08-25)
+
+Follow-up to the `UD-Q3_K_XL` row above (**~88 GB/token, upstream #17316**). Root-caused and fixed:
+same `buffer_in_reduce` mechanism as T4.13's MXFP4 (`tinygrad/llm/gguf.py`, types 18/23), no rangeify
+change. Full writeup in `TD3_POOLING_NOTES.md` §13. Numbers below are the real-model+JIT byte-budget
+harness (T4.11/T4.13's own `TestGPTOSSDecodeByteBudgetMXFP4` methodology, N_EXPERTS=32/top-4,
+DIM=HIDDEN=256 for block alignment) and a synthetic decode-step wall-clock comparison — **not** the
+16.85 GB real file (deferred to a future bench window, same pattern T4.13 itself followed).
+
+| type | lane | pre-fix actual/gathered | post-fix actual/gathered | pre-fix time | post-fix time (no BEAM) | post-fix time (`JITBEAM=2`) |
+|---|---|---:|---:|---:|---:|---:|
+| IQ3_XXS | CPU (byte estimate) | 63.50x | **1.59x** | — | — | — |
+| IQ4_XS | CPU (byte estimate) | 42.31x | **1.42x** | — | — | — |
+| IQ4_XS | METAL | — | — | 1.222 ms | **0.514 ms (2.38x faster)** | not measured (already a win) |
+| IQ3_XXS | METAL | — | — | 1.272 ms | 3.388 ms (2.67x **slower**) | **1.320 ms** (vs. 1.697 ms broken-BEAM'd — 22% faster) |
+| IQ3_XXS | `NV:NAK` | — | — | 0.884 ms | 12.070 ms (13.65x **slower**) | not completed in budget |
+| IQ3_XXS | `NV` (nvcc) | — | — | 0.954 ms | 2.267 ms (2.37x **slower**) | not completed in budget (nvcc BEAM search latency, see notes doc) |
+
+**Reading this**: IQ4_XS (16-entry codebook) is a clean win on every axis tested. IQ3_XXS (256-entry
+codebook, the dominant format by element count in the real UD-Q3_K_XL file) trades bytes for ALU via
+a compile-time select-tree — a real *regression* without BEAM on all three lanes tested, but a **net
+win with BEAM** (this fork's actual production configuration for quantized models — see the qwen3.6
+headline above, always `JITBEAM>=1`). Byte fix confirmed cross-backend (CPU/METAL/`NV:NAK`/`NV`);
+wall-clock cross-checked on METAL and (no-BEAM only) both NV lanes; `NV`+`JITBEAM` did not finish
+inside this task's budget for a 2-layer toy config (nvcc's remote per-kernel BEAM compile is itself
+slow cold — a separate, real, characterized cost, not a correctness question).
+
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+# byte budget, mirrors TestGPTOSSDecodeByteBudgetMXFP4 (ad hoc script, not committed -- the committed
+# regression test is test/unit/test_llm_gptoss.py::TestGPTOSSDecodeByteBudgetIQ)
+PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs   # actual/gathered=1.59x (was 63.50x pre-fix)
+PYTHONPATH=. $PY t422_iq_moe_repro.py iq4xs    # actual/gathered=1.42x (was 42.31x pre-fix)
+# wall-clock, no-BEAM vs JITBEAM=2, both pre-/post-fix via `git stash push -- tinygrad/llm/gguf.py`
+T422_DEV=METAL             PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV=METAL JITBEAM=2   PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV='NV:NAK'          PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV=NV                PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+# gates
+PYTHONPATH=. $PY -m pytest test/unit -q -n12   # 848 passed, 71 skipped, 4 xfailed, 2 subtests passed
+PYTHONPATH=. $PY -m mypy tinygrad/             # Success: no issues found in 216 source files
+                 $PY -m ruff check .           # All checks passed
+# NV health check, before/after every real-hardware cell -- exactly one server throughout
+pgrep -fl "TinyGPU.*server"
 ```
