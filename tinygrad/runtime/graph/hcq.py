@@ -29,7 +29,11 @@ class HCQGraph(MultiGraphRunner):
     for runtime in self.runtimes:
       if runtime is None: continue
       kernargs_size[runtime.dev] += round_up(runtime.kernargs_alloc_size, 16)
-    self.kernargs_bufs: dict[Compiled, HCQBuffer] = {d:d.allocator._alloc(max(sz, 1), BufferSpec(cpu_access=True)) for d,sz in kernargs_size.items()}
+    # T4.20: defer to a device-provided pool when present (NV only today) instead of a fresh alloc per graph
+    # island -- NV's remote transport can sustain only ~128 outstanding sysmem allocs for the process
+    # lifetime (T4.18). Duck-typed so AMD/QCOM (no alloc_kernargs) take the exact original path, unchanged.
+    self.kernargs_bufs: dict[Compiled, HCQBuffer] = {d:(pool(sz) if (pool:=getattr(d, 'alloc_kernargs', None)) else
+      d.allocator._alloc(max(sz, 1), BufferSpec(cpu_access=True))) for d,sz in kernargs_size.items()}
 
     # Fill initial arguments.
     self.ji_args: dict[int, HCQArgsState] = {}
@@ -313,7 +317,9 @@ class HCQGraph(MultiGraphRunner):
 
     if PROFILE and self.kickoff_value >= 1: self.collect_timestamps()
 
-    for fdev, buf in self.kernargs_bufs.items(): fdev.allocator._free(buf, BufferSpec(cpu_access=True))
+    for fdev, buf in self.kernargs_bufs.items():
+      if (unpool:=getattr(fdev, 'free_kernargs', None)) is not None: unpool(buf)
+      else: fdev.allocator._free(buf, BufferSpec(cpu_access=True))
 
   @staticmethod
   def supports_uop(batch_devs:list[Compiled], new_call:UOp) -> bool:

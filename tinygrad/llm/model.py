@@ -6,7 +6,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.nn import Linear
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve
+from tinygrad.uop.ops import resolve, Ops
 
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
@@ -559,12 +559,24 @@ class Transformer:
     e.g. `nn.state.load_state_dict(model, state_dict, realize=False); model.realize_placement()` for manual loaders.
     No-op (single attribute check) when device_map wasn't passed to __init__.
 
-    load_state_dict's assignment is a `.to(param.device)` per tensor; when that device differs from the load
-    source it's an unrealized COPY. Left lazy, that COPY gets captured into the JIT trace and re-executed (dequant
-    AND copy) every token (measured: 21 spurious COPYs/step on a 2-block METAL/CPU split test model -> 1 real one,
-    once realized here). Only the moved-off-Device.DEFAULT params pay this: a COPY is a materialization boundary
-    either way, so it never fused the GGUF dequant into the consuming matmul in the first place -- same-device
-    params are left alone and keep that fusion (the memory win from never materializing full weights).
+    load_state_dict's assignment is a `.to(param.device)` per tensor (nn/state.py:214, nothing layered after
+    it); when that device differs from the load source, `.to` returns a NEW tensor whose OUTERMOST op is an
+    unrealized COPY of the entire upstream expression -- e.g. a GGUF param whose dequant was built on the load
+    device, or a manually-placed weight built on whatever device it happened to be constructed on. Left lazy,
+    that COPY gets captured into the JIT trace and re-executed (recomputing everything upstream of it, AND
+    the copy) every token (measured: 21 spurious COPYs/step on a 2-block METAL/CPU split test model -> 1 real
+    one, once realized here).
+
+    Only params whose top-level op IS that COPY pay this, so only those get eagerly realized below (T4.21):
+    a `gguf.py`-loaded param placed via device_map has its raw quantized blob staged directly on the target
+    device (T4.21's loader-side fix) with the dequant built ON TOP of that -- `.to(param.device)` is then a
+    no-op (device already matches, no COPY node at all), so it never reaches this method's `moved` list in a
+    state that needs realizing; forcing it anyway would eagerly materialize the FULL dequantized (e.g. fp16)
+    size instead of leaving it fused into the consuming matmul like a same-device param -- fine for a small
+    moved share, a multi-GB blowup for a big-model range split (T4.21's bug). Checking the top-level op instead
+    of blanket-realizing every moved param is what makes that distinction cheaply, with no UOp-graph rewrite:
+    a REAL cross-device COPY (this method's actual job) is always the outermost op right after `load_state_dict`
+    (see nn/state.py:214) -- if it isn't there, there's nothing left for this method to do for that param.
 
     Also a footgun guard: a hand-built weight assigned without device= (e.g. Tensor.randn(...), which defaults to
     Device.DEFAULT) silently strands itself off the map instead of following its block's placement. Assert (not
@@ -573,11 +585,12 @@ class Transformer:
     if self._placed_devices is None: return
     params = nn.state.get_parameters(self)
     moved = [p for p in params if p.device != Device.DEFAULT]
-    for p in moved: p.replace(p.contiguous())
-    # Tensor.realize(*moved) is `moved[0].realize(*moved[1:])` -- with moved empty (every param's device_map
-    # entry happens to canonicalize to Device.DEFAULT, e.g. device_map="CPU:0" when DEV=CPU) that's a bare
-    # Tensor.realize() call with no `self` bound at all: TypeError, not skip-nothing-to-do. Guard it.
-    if moved: Tensor.realize(*moved)
+    to_realize = [p for p in moved if p.uop.op is Ops.COPY]
+    for p in to_realize: p.replace(p.contiguous())
+    # Tensor.realize(*to_realize) is `to_realize[0].realize(*to_realize[1:])` -- with to_realize empty (no
+    # moved param, or T4.21's loader already placed every moved param's blob with no COPY left to realize)
+    # that's a bare Tensor.realize() call with no `self` bound at all: TypeError, not skip-nothing-to-do. Guard it.
+    if to_realize: Tensor.realize(*to_realize)
     # params are always single-device here (llm/model.py never shards a weight) -- cast satisfies canonicalize's str|None signature
     stray = sorted(set(Device.canonicalize(cast(str, p.device)) for p in params) - self._placed_devices)
     assert not stray, f"device_map: param(s) landed on {stray}, outside the configured device_map {sorted(self._placed_devices)} " \
@@ -595,8 +608,10 @@ class Transformer:
   def from_gguf(gguf:Tensor|str|pathlib.Path, max_context:int|None=DEFAULT_MAX_CONTEXT, *,
                 device_map:str|dict[int|str,str]|None=None,
                 realize=bool(getenv("REALIZE", 0))) -> tuple[Transformer, dict]:
-    # gguf_load streams per-tensor (T1.9); no need to force the whole file onto the default device first
-    kv, state_dict = gguf_load(gguf)
+    # gguf_load streams per-tensor (T1.9); no need to force the whole file onto the default device first.
+    # T4.21: device_map threaded straight in, so cross-device tensors stage their raw blob on the target
+    # device and dequant there -- see the T4.21 comment in gguf.py's _gguf_parse for the mechanism.
+    kv, state_dict = gguf_load(gguf, device_map)
 
     # all state items should be float16, not float32
     state_dict = {k:v.cast('float16') if getenv("HALF", 1) else v for k,v in state_dict.items()}

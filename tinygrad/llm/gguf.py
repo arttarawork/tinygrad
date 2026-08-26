@@ -48,6 +48,19 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     shift_tensor, bitmask = Tensor.const(tuple(2**(i*b) for i in range(8//b)), t.dtype), 0xff >> (8 - b)
     return t.unsqueeze(-1).div(shift_tensor, rounding_mode="trunc").bitwise_and(bitmask).transpose(-1, -2).flatten(-2)
 
+  def select_const(idx: Tensor, vals, lo: int = 0):
+    # Selects vals[idx] via a compile-time balanced binary decision tree (nested .where() over
+    # Python float constants) instead of a Tensor-indexed gather. A gather reads its table through
+    # a buffer-accessing REDUCE (Tensor.__getitem__'s one-hot-sum, mixin/op.py) that rangeify's
+    # buffer_in_reduce refuses to fuse into a consuming reduce -- same class of bug as ggml_type==39's
+    # MXFP4 LUT below, for genuinely arbitrary (non-bit-decomposable) codebooks: IQ3_XXS's 256-entry
+    # grid and IQ4_XS's 16-entry kvalues_iq4nl (T4.22). Bit-exact vs the gather form (verified
+    # exhaustively over the full code space for both tables); cheap for small tables like these --
+    # not a general gather replacement.
+    if len(vals) == 1: return vals[0]
+    mid = lo + len(vals)//2
+    return (idx < mid).where(select_const(idx, vals[:len(vals)//2], lo), select_const(idx, vals[len(vals)//2:], mid))
+
   if (nelements_nbytes := _GGML_QUANT.get(ggml_type)) is not None:
     from tinygrad.runtime.autogen import ggml_common as _ggml
     blocks = t[:(n//nelements_nbytes[0])*nelements_nbytes[1]].reshape((-1, nelements_nbytes[1])).contiguous()
@@ -92,9 +105,24 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       scale_words = blocks[:, 66:98].bitcast(dtypes.uint32)
       db = d * (scale_words.rshift(28).cast(dtypes.float32) + 0.5).reshape((-1, 8, 1, 1)) * 0.5
       sign_idx = scale_words.unsqueeze(-1).rshift(Tensor.const((0, 7, 14, 21), dtypes.uint32)).bitwise_and(0x7F).reshape((-1, 32)).cast(dtypes.int32)
-      even_signs = Tensor([i | (0x80 if i.bit_count() % 2 else 0) for i in range(128)], dtype=dtypes.uint8, device=t.device)
-      signs = (q_to_uint8(even_signs[sign_idx].reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
-      grid = _ggml_iq_grid(t.device, _ggml.iq3xxs_grid, (256, 4))[blocks[:, 2:66]].reshape((-1, 8, 4, 8))
+      # even_signs[i] == i | (parity_bit(i) << 7): ggml stores only 7 sign bits/group and derives the
+      # 8th from parity (even_signs was a real Tensor+gather -- a buffer-reading REDUCE inside the
+      # dequant expression, same class of bug as T4.13's MXFP4 LUT; see the ggml_type==39 comment
+      # above). Computed via the standard XOR-fold SWAR parity trick instead: bit-exact for all 128
+      # values (verified), pure ALU, no buffer.
+      px = sign_idx ^ sign_idx.rshift(4)
+      px = px ^ px.rshift(2)
+      px = px ^ px.rshift(1)
+      even_signs_sign_idx = sign_idx.bitwise_or(px.bitwise_and(1).lshift(7))
+      signs = (q_to_uint8(even_signs_sign_idx.reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
+      # iq3xxs_grid is a genuine 256-entry codebook (not bit-decomposable like the parity above) --
+      # select_const dodges the same buffer_in_reduce issue without a formula (see its docstring).
+      # flat (256*4,), matching _ggml_iq_grid's own unpack order
+      grid_vals = tuple(float((w >> (8*i)) & 0xFF) for w in _ggml.iq3xxs_grid for i in range(4))
+      code = blocks[:, 2:66].cast(dtypes.int32)
+      # (-1,64,4): degroup the 4 interleaved sub-values per code
+      grid4 = Tensor.stack(*[select_const(code, grid_vals[c::4]) for c in range(4)], dim=-1)
+      grid = grid4.reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)
     if ggml_type == 21:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1, 1))
@@ -113,12 +141,13 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
     if ggml_type == 23:
       d = blocks[:, :2].bitcast(dtypes.float16).cast(dtypes.float32).reshape((-1, 1, 1))
       scale_shifts = Tensor.const((0, 2, 4, 6, 8, 10, 12, 14), dtypes.uint16)
-      iq4_xs_lut = Tensor(list(_ggml.kvalues_iq4nl), dtype=dtypes.float32, device=t.device)
       scales_l = Tensor.stack((sl:=blocks[:, 4:8]).bitwise_and(0xF), sl.rshift(4), dim=2).reshape((-1, 8))
       scales_h = blocks[:, 2:4].bitcast(dtypes.uint16).unsqueeze(-1).rshift(scale_shifts).bitwise_and(0x03).reshape((-1, 8)).cast(dtypes.uint8)
       scales = (scales_l.bitwise_or(scales_h.lshift(4)).bitcast(dtypes.int8) - 32).cast(dtypes.float32).reshape((-1, 8, 1))
       q = (qs:=blocks[:, 8:].reshape((-1, 8, 16))).bitwise_and(0xF).cat(qs.rshift(4), dim=2)
-      return (d * scales * iq4_xs_lut[q]).flatten(-2)
+      # kvalues_iq4nl is a genuine 16-entry codebook (not bit-decomposable like MXFP4's E2M1 below) --
+      # select_const dodges the same buffer_in_reduce issue without a formula (see its docstring).
+      return (d * scales * select_const(q, _ggml.kvalues_iq4nl)).flatten(-2)
     if ggml_type == 39:
       # e8m0 block scale and the E2M1 4-bit value are computed via ALU bit-ops instead of Tensor-indexed
       # LUT gathers (the original form: `lut_tensor[codes]`). A gather reads a real buffer through a
@@ -171,7 +200,7 @@ def _parse_header(header: Tensor) -> tuple[dict, list, int]:
   t_infos = [ (read_str(r), tuple(read_uint64(r) for _ in range(read_uint32(r))), read_int32(r), read_uint64(r)) for _ in range(n_tensors) ]
   return kv_data, t_infos, r.tell()
 
-def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
+def _gguf_parse(tensor: Tensor, device_map:str|dict[int|str,str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   # [T1.9] Only a small header prefix gets realized to parse KV metadata + tensor infos -- not the whole
   # (multi-GB) file. Tensor DATA is staged in bounded batches (_STAGE_BATCH) below instead of one whole-file
   # blob: no single allocation is ever bigger than one batch, which matters under memory pressure (a
@@ -193,10 +222,46 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
   alignment = kv_data.get("general.alignment", 32)
   data_start = round_up(pos, alignment)
 
-  # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH) into one
-  # disk->device copy each, instead of one copy per tensor. Each tensor's dequant graph still starts
-  # from its own VIEW of the (already-realized) batch, so per-tensor fusion is unaffected -- this only
-  # changes how many COPY ops the loader issues, not what ends up resident on device.
+  # [T4.21] When a device_map is given, stage each tensor's raw (still-quantized) blob straight onto ITS
+  # placed device instead of always Device.DEFAULT, so the dequant expression built on top of it runs where
+  # the bytes already live -- no COPY sits above the dequant. Left as the pre-T4.21 Device.DEFAULT-only
+  # behavior (dev_for=None) when device_map is None, so single-device loads are untouched.
+  #
+  # Transformer.realize_placement() (llm/model.py) force-realizes params moved off Device.DEFAULT, once,
+  # right after load, to stop the JIT from recapturing a dequant+COPY every token (see its docstring). Before
+  # this fix, "moved off Device.DEFAULT" meant the COPY wrapped the *finished* dequant (built on the load
+  # device, at fp16), so realizing it force-materialized the full fp16 size on the LOAD device before the
+  # bytes ever reached the target -- fine for T3.3's small moved share, a multi-GB swap spike for a big-model
+  # range split. Building the dequant ON the target device from the start (this function) means that same
+  # forced realize now just computes it locally there -- cheap, and exactly the residency T1.9 intended.
+  #
+  # Mirrors the block/experts placement Transformer.__init__ computes from the same parse_device_map() output
+  # (model.py) -- by GGUF tensor name here, since this runs before any Transformer/nn.Module exists to read
+  # placement back off of. Imported locally: model.py imports gguf_load at module scope, so a top-level
+  # import here would cycle; by the time anything actually calls gguf_load, model.py is fully initialized.
+  dev_for: Callable[[str], str]|None = None
+  if device_map is not None:
+    from tinygrad.llm.model import parse_device_map
+    arch = kv_data.get('general.architecture')
+    # num_blocks must match from_gguf's own formula exactly (real blocks, MTP nextn excluded). A later
+    # multi-part-split file may carry partial/no KV (only split 0 is guaranteed the full tensor listing) --
+    # fall back to Device.DEFAULT staging for it rather than KeyError on a rare, untested combination.
+    num_blocks = kv_data[f'{arch}.block_count'] - kv_data.get(f'{arch}.nextn_predict_layers', 0) if arch is not None \
+      and f'{arch}.block_count' in kv_data else None
+    if num_blocks is not None:
+      dmap, experts_dev = parse_device_map(device_map, num_blocks)
+      def _dev_for(name: str) -> str:
+        if not name.startswith("blk."): return dmap[0] if name == "token_embd.weight" else dmap[-1]
+        if experts_dev is not None and any(f".ffn_{w}_exps." in name for w in ("gate", "up", "down")): return experts_dev
+        idx = int(name.split(".", 2)[1])
+        return dmap[idx] if idx < len(dmap) else dmap[-1]  # e.g. qwen3.6's unreferenced MTP nextn block
+      dev_for = _dev_for
+
+  # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH, and -- when
+  # device_map is active -- sharing a target device) into one disk->device copy each, instead of one copy
+  # per tensor. Each tensor's dequant graph still starts from its own VIEW of the (already-realized) batch,
+  # so per-tensor fusion is unaffected -- this only changes how many COPY ops the loader issues and which
+  # device(s) they land on, not the fusion itself.
   infos = sorted(((name, dims, typ, off, _ggml_nbytes(prod(dims), typ)) for name, dims, typ, off in t_infos), key=lambda x: x[3])
 
   def flush(batch: list[tuple[str, tuple[int, ...], int, int, int]]) -> dict[str, Tensor]:
@@ -204,14 +269,14 @@ def _gguf_parse(tensor: Tensor) -> tuple[dict, dict[str, Tensor]]:
     # realize the raw (still-quantized) batch bytes right away, same as the pre-T1.9 whole-file realize
     # did -- this is required regardless (DISK can't run the dequant ALU ops) and keeps the scheduler
     # from tangling hundreds of small COPYs into the same schedule as the per-tensor dequant graphs below.
-    staged = tensor[data_start + lo:data_start + hi].to(None).realize()
+    staged = tensor[data_start + lo:data_start + hi].to(dev_for(batch[0][0]) if dev_for else None).realize()
     return {name: ggml_data_to_tensor(staged[off - lo:off - lo + nbytes], prod(dims), typ).reshape(*reversed(dims))
             for name, dims, typ, off, nbytes in batch}
 
   state_dict: dict[str, Tensor] = {}
   batch: list[tuple[str, tuple[int, ...], int, int, int]] = []
   for info in infos:
-    if batch and info[3] + info[4] - batch[0][3] > _STAGE_BATCH:
+    if batch and (info[3] + info[4] - batch[0][3] > _STAGE_BATCH or (dev_for is not None and dev_for(info[0]) != dev_for(batch[0][0]))):
       state_dict.update(flush(batch))
       batch = []
     batch.append(info)
@@ -224,7 +289,7 @@ def _gguf_split_paths(path: pathlib.Path, kv: dict) -> list[pathlib.Path]:
   if not (m := re.match(r"^(.*)-00001-of-\d{5}\.gguf$", str(path))): raise ValueError(f"first split path must end with -00001-of-NNNNN.gguf: {path}")
   return [pathlib.Path(f"{m.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total+1)]
 
-def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
+def gguf_load(fn: Tensor|str|pathlib.Path, device_map:str|dict[int|str,str]|None=None) -> tuple[dict, dict[str, Tensor]]:
   """
   Loads a .gguf file, returning the `kv_data` and `state_dict`. Multi-part splits are auto-merged when loaded by path.
 
@@ -238,9 +303,12 @@ def gguf_load(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, Tensor]]:
   ```
 
   NOTE: The provided tensor must be on a device that supports execution.
+
+  `device_map` (same syntax as `tinygrad.llm.model.Transformer`/`parse_device_map`) places each tensor's raw
+  blob directly on its mapped device instead of `Device.DEFAULT` -- see the T4.21 comment in `_gguf_parse`.
   """
-  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)))
+  kv, sd = _gguf_parse(fn if isinstance(fn, Tensor) else Tensor(pathlib.Path(fn)), device_map)
   if kv.get('split.count', 1) <= 1: return kv, sd
   if isinstance(fn, Tensor): raise ValueError("multi-part GGUF requires a path argument (got Tensor)")
-  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp))[1])
+  for pp in _gguf_split_paths(pathlib.Path(fn), kv)[1:]: sd.update(_gguf_parse(Tensor(pp), device_map)[1])
   return kv, sd

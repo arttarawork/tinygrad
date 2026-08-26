@@ -372,14 +372,22 @@ class RemotePCIDevice(PCIDevice):
     return data
 
   @staticmethod
+  def _recvmsg_all(sock:socket.socket, n:int) -> tuple[bytes, int|None]:
+    # a fragmented reply can land the ancillary fd on any recvmsg() call, not just the first -- keep using recvmsg (never plain recv) until n bytes
+    data, fd = b'', None
+    while len(data) < n and (r:=sock.recvmsg(n - len(data), socket.CMSG_LEN(4)))[0]:
+      data += r[0]
+      if r[1]: fd = struct.unpack('<i', r[1][0][2][:4])[0]
+    if len(data) < n: raise RuntimeError(f"Connection closed: got {len(data)} of {n} bytes")
+    return data, fd
+
+  @staticmethod
   def _rpc(sock:socket.socket, dev_id:int, cmd:int, *args:int, bar:int=0, readout_size:int=0, payload:bytes=b'', has_fd=False):
     sock.sendall(struct.pack('<BIIQQQ', cmd, dev_id, bar, *(*args, 0, 0, 0)[:3]) + payload)
-    if has_fd:
-      msg, anc, _, _ = sock.recvmsg(17, socket.CMSG_LEN(4))
-      fd = struct.unpack('<i', anc[0][2][:4])[0]
-    else: msg, fd = RemotePCIDevice._recvall(sock, 17), None
+    msg, fd = RemotePCIDevice._recvmsg_all(sock, 17) if has_fd else (RemotePCIDevice._recvall(sock, 17), None)
     if (resp:=struct.unpack('<BQQ', msg))[0] != 0:
       raise RuntimeError(f"RPC failed: {RemotePCIDevice._recvall(sock, resp[1]).decode('utf-8') if resp[1] > 0 else 'unknown error'}")
+    if has_fd and fd is None: raise RuntimeError("RPC succeeded but no fd was received")
     RemotePCIDevice._rpc_count += 1
     return (resp[1], resp[2]) + ((RemotePCIDevice._recvall(sock, readout_size) if readout_size > 0 else None),) + (fd,)
 
@@ -428,13 +436,26 @@ class APLRemotePCIDevice(RemotePCIDevice):
   def __init__(self, devpref:str, pcibus:str):
     self.ensure_app()
     sock_path, sock = getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    for i in range(100):
-      with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
-        sock.connect(sock_path)
-        break
-      if i == 0: subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-      time.sleep(0.05)
-    else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    import fcntl # to support windows
+    lock_fd = os.open(f"{sock_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    # T4.25: concurrent spawns race the server's own bind()/stale-socket recovery and orphan most losers in accept() forever -- serialize.
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+      proc:subprocess.Popen|None = None
+      for i in range(100):
+        with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
+          sock.connect(sock_path)
+          break
+        if i == 0: proc = subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.05)
+      else:
+        if proc is not None:
+          proc.kill()
+          proc.wait()
+        raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    finally:
+      fcntl.flock(lock_fd, fcntl.LOCK_UN)
+      os.close(lock_fd)
     super().__init__(devpref, "usb4", sock=sock)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:

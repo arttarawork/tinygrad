@@ -445,6 +445,127 @@ class TestGPTOSSDecodeByteBudgetMXFP4(unittest.TestCase):
       f"decode step read {actual} B, expected near the gathered-MXFP4 estimate ({gathered} B) -- looks "
       f"like the MXFP4 dequant materialized the full (dense, {dense} B) expert tensor before the gather")
 
+class TestGPTOSSDecodeByteBudgetIQ(unittest.TestCase):
+  """T4.22: upstream #17316 reproduced on this fork -- IQ3_XXS/IQ4_XS dequant materialized ALL
+  experts per decode token, same buffer_in_reduce class as T4.13's pre-fix MXFP4 (see the
+  ggml_type==39 comment in gguf.py), but WORSE: IQ3_XXS's dequant chains TWO independent
+  Tensor-gathers (the iq3xxs_grid codebook AND the even_signs sign-parity table), each
+  independently forcing full materialization, so pre-fix it read ~63x the gathered-MoE estimate --
+  8x even the DENSE all-experts estimate (measured; MXFP4 pre-fix was ~8x gathered, not 8x dense).
+
+  Fix (gguf.py, ggml_type 18/23): even_signs is replaced with an exact XOR-fold parity computation
+  (pure ALU bit-ops, unbounded size, same spirit as MXFP4's own fix). The iq3xxs_grid codebook (256
+  entries) and IQ4_XS's kvalues_iq4nl table (16 entries) are genuine arbitrary codebooks with no
+  closed-form bit trick, so they're replaced with a compile-time balanced binary select-tree
+  (nested .where() over the table's literal Python floats) instead -- mechanically dodges
+  buffer_in_reduce because the expression touches no buffer or gather at all, not because of any
+  bit-decomposition. All three replacements are bit-exact vs the original Tensor-gather form
+  (verified exhaustively over the full code space in an ad-hoc session script; test/unit/test_gguf.py's
+  TestGGUF/TestGGUFGEMV already separately cover bit-exactness against gguf-py's real quantizer for
+  IQ3_XXS/IQ4_XS end to end -- this class only guards the byte-count regression).
+
+  Needs a block-aligned per-expert row (256-element blocks for IQ3_XXS/IQ4_XS) unlike
+  T4.11/T4.13's DIM=64/HIDDEN=128 (fine for MXFP4's 32-element blocks) -- DIM=HIDDEN=256 instead;
+  gguf-py's quant_shape_from_byte_shape enforces real per-row block alignment for raw_dtype
+  tensors. IQ3_XXS/IQ4_XS have no Python quantizer in the gguf package (quantize() raises
+  NotImplementedError) so raw block bytes are hand-rolled (random, structurally valid) instead of a
+  real quantization -- fine for a byte-COUNT mechanism test, not a numerics one."""
+  DIM, HIDDEN = 256, 256
+  N_HEADS, N_KV_HEADS, HEAD_DIM = 8, 2, 8
+  N_EXPERTS, EXPERTS_PER_TOK, NUM_BLOCKS = 32, 4, 2
+  VOCAB, MAX_CTX = 50, 64
+  GGML_NBYTES = {18: (256, 98), 23: (256, 136)}  # ggml_type: (elements/block, bytes/block) -- gguf.py's _GGML_QUANT
+
+  def _build_gguf(self, path: pathlib.Path, rng: np.random.Generator, ggml_type: int):
+    w = gguf.GGUFWriter(str(path), "gpt-oss")
+    w.add_context_length(self.MAX_CTX)
+    w.add_embedding_length(self.DIM)
+    w.add_block_count(self.NUM_BLOCKS)
+    w.add_head_count(self.N_HEADS)
+    w.add_head_count_kv(self.N_KV_HEADS)
+    w.add_key_length(self.HEAD_DIM)
+    w.add_value_length(self.HEAD_DIM)
+    w.add_layer_norm_rms_eps(1e-5)
+    w.add_expert_count(self.N_EXPERTS)
+    w.add_expert_used_count(self.EXPERTS_PER_TOK)
+    w.add_expert_feed_forward_length(self.HIDDEN)
+    w.add_rope_freq_base(10000.0)
+    w.add_token_list([f"<t{i}>" for i in range(self.VOCAB)])
+
+    def norm(name, dim): w.add_tensor(name, rng.normal(1.0, 0.1, dim).astype(np.float16))
+    def lin(name, out_f, in_f, bias):
+      w.add_tensor(f"{name}.weight", rng.normal(0, 0.3, (out_f, in_f)).astype(np.float16))
+      if bias: w.add_tensor(f"{name}.bias", rng.normal(0, 0.3, out_f).astype(np.float16))
+
+    nelem, nbytes = self.GGML_NBYTES[ggml_type]
+    for i in range(self.NUM_BLOCKS):
+      p = f"blk.{i}"
+      norm(f"{p}.attn_norm.weight", self.DIM)
+      norm(f"{p}.post_attention_norm.weight", self.DIM)
+      lin(f"{p}.attn_q", self.N_HEADS * self.HEAD_DIM, self.DIM, bias=True)
+      lin(f"{p}.attn_k", self.N_KV_HEADS * self.HEAD_DIM, self.DIM, bias=True)
+      lin(f"{p}.attn_v", self.N_KV_HEADS * self.HEAD_DIM, self.DIM, bias=True)
+      lin(f"{p}.attn_output", self.DIM, self.N_HEADS * self.HEAD_DIM, bias=True)
+      w.add_tensor(f"{p}.attn_sinks.weight", rng.normal(0, 0.5, self.N_HEADS).astype(np.float16))
+      w.add_tensor(f"{p}.ffn_gate_inp.weight", rng.normal(0, 0.05, (self.N_EXPERTS, self.DIM)).astype(np.float16))
+      w.add_tensor(f"{p}.ffn_gate_inp.bias", rng.normal(0, 1, self.N_EXPERTS).astype(np.float16))
+
+      for name, out_f, in_f in ((f"{p}.ffn_gate_exps", self.HIDDEN, self.DIM), (f"{p}.ffn_up_exps", self.HIDDEN, self.DIM),
+                                 (f"{p}.ffn_down_exps", self.DIM, self.HIDDEN)):
+        assert in_f % nelem == 0, f"{in_f=} {nelem=} not block-aligned"
+        n = self.N_EXPERTS * out_f * in_f
+        raw = rng.integers(0, 256, n // nelem * nbytes, dtype=np.uint8)
+        # raw_shape is gguf-py's convention for raw_dtype tensors: BYTE shape (last axis =
+        # bytes/row), not the logical element shape -- quant_shape_from_byte_shape derives the
+        # logical shape from it.
+        w.add_tensor(f"{name}.weight", raw, raw_shape=(self.N_EXPERTS, out_f, in_f // nelem * nbytes),
+                     raw_dtype=gguf.GGMLQuantizationType(ggml_type))
+        w.add_tensor(f"{name}.bias", rng.normal(0, 0.3, (self.N_EXPERTS, out_f)).astype(np.float16))
+
+    w.add_tensor("token_embd.weight", rng.normal(0, 0.3, (self.VOCAB, self.DIM)).astype(np.float16))
+    w.add_tensor("output_norm.weight", rng.normal(1.0, 0.1, self.DIM).astype(np.float16))
+    w.add_tensor("output.weight", rng.normal(0, 0.3, (self.VOCAB, self.DIM)).astype(np.float16))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+  @Context(DEV="CPU")  # see TestGPTOSSDecodeByteBudgetMXFP4's identical comment: device_map would
+  # force-realize params at load time and defeat the dequant fusion this test exists to catch.
+  def _run(self, ggml_type: int):
+    rng = np.random.default_rng(7)
+    with tempfile.TemporaryDirectory() as d:
+      path = pathlib.Path(d) / "byte-budget-iq.gguf"
+      self._build_gguf(path, rng, ggml_type)
+      model, _ = Transformer.from_gguf(path, max_context=self.MAX_CTX)
+
+    # chunk_size=1 (not T4.11/T4.13's 32): the assertion below only ever reads the STEADY-STATE
+    # DECODE call's byte count, which is chunk_size-invariant (verified: identical actual byte
+    # count at chunk_size=1 vs 32) -- prefill's shape/width plays no part in what's being checked.
+    # IQ3_XXS's 256-leaf select-tree dequant (vs IQ4_XS's 16-leaf one) is expensive to COMPILE, not
+    # just to run (T4.26's documented no-BEAM runtime regression, ~2.4-13.6x elsewhere), and that
+    # compile cost scales heavily with the *prefill* kernel's chunk width: chunk_size=32 made this
+    # test's prefill step alone take ~43s in isolation and it was CI's sole failure (xdist worker
+    # OOM/abort on a 4-vCPU/16GB runner, PR #2 run 32919852416) despite passing every time locally.
+    # chunk_size=1 collapses prefill onto the same (cheap, already-decode-shaped) kernel, cutting
+    # this test's wall time ~4-5x with zero change to the assertion or the measured value.
+    gen = model.generate([1, 2, 3, 4, 5], chunk_size=1, temperature=0.0)
+    for _ in range(1 + 5): next(gen)  # prefill + warm the decode jit variant
+    GlobalCounters.reset()
+    next(gen)
+    actual = GlobalCounters.global_mem
+
+    nelem, nbytes = self.GGML_NBYTES[ggml_type]
+    per_expert_bytes = (2 * self.HIDDEN * self.DIM + self.DIM * self.HIDDEN) // nelem * nbytes  # gate + up + down
+    gathered = self.NUM_BLOCKS * self.EXPERTS_PER_TOK * per_expert_bytes
+    dense = self.NUM_BLOCKS * self.N_EXPERTS * per_expert_bytes
+    self.assertLess(actual, 3 * gathered,
+      f"decode step read {actual} B, expected near the gathered-MoE estimate ({gathered} B) -- looks "
+      f"like the ggml_type={ggml_type} dequant materialized the full (dense, {dense} B) expert tensor before the gather")
+
+  def test_decode_bytes_stay_near_gathered_not_dense_iq3_xxs(self): self._run(18)
+  def test_decode_bytes_stay_near_gathered_not_dense_iq4_xs(self): self._run(23)
+
 # ---------------------------------------------------------------------------------------------
 # Real gpt-oss-20b GGUF, metadata-only validation (no tensor data touched - GGUFReader mmaps the
 # file and we only read the kv/token-list section). Skipped in CI where the file isn't present.
