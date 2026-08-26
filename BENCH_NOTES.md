@@ -1753,3 +1753,265 @@ PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' 
 # NV health check, before/after every real-hardware cell
 pgrep -fl "TinyGPU.*server"
 ```
+
+# T4.30: BEAM re-validation post-T4.27 (2026-08-25/26)
+
+T4.27 (merged into this branch, `765cb16ef`) fixed `beam_search`'s silent fallback to an untouched,
+zero-opts seed kernel when every candidate in a round fails to compile/time (T4.15's finding: 15/50
+NV kernels landed there under the qwen3.6 split's `JITBEAM=2`, a ~4x regression vs `JITBEAM=1`). This
+task re-measures the 5 headline BEAM'd cells against that fix, with every search **forced fresh**
+(never a cache replay of the old, possibly-degraded choices).
+
+## Method: forcing a genuinely fresh search, and proving it
+
+`beam_search()`'s cache key is `{ast, amt, device, suffix}` (`codegen/opt/search.py:115`) — it does
+**not** encode the result, so a normal run would silently replay whatever was cached under the old,
+buggy code. `IGNORE_BEAM_CACHE=1` (a `ContextVar`, `helpers.py:242`) sets `disable_cache=True`, which
+skips only the `diskcache_get` **read** at the top of `beam_search` (`search.py:116`) — the
+unconditional `diskcache_put` at the end (`search.py:193`) still fires, so a forced-fresh run also
+**self-heals the cache**, overwriting the old degraded entries with the new (correct) ones for every
+future non-forced run. Used `IGNORE_BEAM_CACHE=1` on every cell below — already this fork's own
+precedent (T4.15 §Q1) rather than hand-editing the sqlite `beam_search_22` table.
+
+**Proof it actually re-ran, not a cache hit:** T4.15 itself established the tell — "reproducing both
+configs ... hit cache and returned in under 2 minutes each, not 830s." Baseline row count in
+`~/Library/Caches/tinygrad/cache.db`'s `beam_search_22` table before any cell: **1264 rows**. Cell 1's
+warm time came in at **1113.5s** — nowhere near the sub-120s cache-replay ceiling, decisively a live
+search. (Row count after was still 1264 — expected, not a red flag: the key is unchanged from the old
+buggy run, so `diskcache_put` upserts the existing row's *value* in place rather than inserting a new
+one; row count can't distinguish this from a no-op, warmup wall-clock can and does.)
+
+## Pre-flight finding: 12 stale `TinyGPU.*server` processes already accumulated
+
+Before running anything, `pgrep -fl "TinyGPU.*server"` returned **12** processes, not the expected
+one — per the brief, this is reported. Cleared with `pkill -f "TinyGPU.*server"` (no socket removal);
+a subsequent NV health check spawned exactly **one** fresh server, confirming T4.25's spawn fix itself
+is fine — these 12 were pre-existing accumulation from before this task's window opened, not something
+that appeared during normal operation here.
+
+## Cell 1 (done first, per the brief): qwen3.6-35B split `0-7:METAL,8-39:NV`, `JITBEAM=2` — the pathological cell
+
+`DEV='METAL;NV' JITBEAM=2 PARALLEL=6 IGNORE_BEAM_CACHE=1`, max-context 4096, 512/128 prompt/decode —
+identical config to T4.21/T4.15's own pathological row.
+
+| metric | old (buggy, T4.21) | new (post-T4.27, forced-fresh) | delta |
+|---|---:|---:|---:|
+| load | 11.184s | 11.479s | flat |
+| warm | 830.344s | **1113.543s** | +34% (see below) |
+| prefill tok/s | 9.196 | **55.363** | 6.02x |
+| decode tok/s | 7.582 | **32.576** | **4.30x** |
+
+**32.576 tok/s now *exceeds* the old (pre-T4.27) `JITBEAM=1` record of 31.097 by ~4.8%** — BEAM-2 is no
+longer worse than BEAM-1 on this config; it's the new best. This directly answers the task's central
+question for the single cell most likely to show it.
+
+**WARNING census (T4.27's new diagnostics):**
+- Per-round "no viable candidate" warning: fired **once** — `"WARNING: BEAM found no viable candidate
+  this round (1 tried, 0 failed: {})"`. The exception counter is **empty** (`{}`) — this is the benign
+  termination path T4.27_NOTES.md §2.2 called out (the round's one remaining candidate deduped via
+  `seen_libs` or the 1000x-compute filter, neither of which count as a failure), not a compile/transport
+  flake.
+- Final fallback warning ("no working action ... falling back to hand_coded_optimizations"): fired
+  **zero** times — no kernel ended up on the degraded fallback path; every one of this model's ~95
+  kernels found a real, timed candidate.
+- Separately observed: **6x** raw `write /dev/stdout: broken pipe` lines (non-Python, no traceback,
+  no exception class — plausibly Go/docker-CLI-side chatter, see Cell 2's analysis below for the
+  confirmed mechanism). Non-fatal here; the run completed with exit code 0 and a fully coherent result.
+
+**Verdict for Cell 1: T4.27's fix works, decisively, on the exact cell it was built for.**
+
+## Cell 2 attempt 1: lost to a tooling mistake, not a dock/tinygrad bug
+
+First attempt combined "launch" and "block" in one shell-backgrounded (`&`) foreground Bash call.
+When that call's own 10-minute timeout fired, the tool killed the whole shell session — including the
+`&` child, which was never detached from it — silently aborting the qwen3:8b `JITBEAM=2` search mid-
+warmup (no warm/prefill/decode line, just a `multiprocessing.resource_tracker` leaked-semaphore
+warning, the expected symptom of a pool holder dying mid-search). Contrast with Cell 1, which used the
+Bash tool's own `run_in_background: true` (a real detached task, immune to any polling call's
+timeout) — that survived across two 10-minute polling-call boundaries with no issue. **Fix applied for
+every run after this: always launch via `run_in_background: true`, never shell-level `&` inside a
+foreground call that itself might time out.**
+
+Fallout from the kill (cleared before retrying, not a T4.25 regression — a violent external SIGTERM
+skips normal cleanup handlers by construction): `TinyGPU.*server` count went 1 → 8; `docker ps -a`
+showed 16 orphaned `ghcr.io/tinygrad/cuda-arm64:v2.3` containers stuck in `Created` state. Cleared with
+`docker container prune -f` + `pkill -f "TinyGPU.*server"`; NV health check confirmed clean (single
+respawn, `Tensor([1,2,3]).sum()==6.0`) before retrying.
+
+## Cell 2 attempt 2: qwen3:8b, `DEV=NV`, `JITBEAM=2` — hard crash, a NEW finding outside T4.27's scope
+
+Relaunched correctly (`run_in_background: true`). Crashed with **exit code 1** after `load 6.437s`,
+preceded by **300** `time="..." level=error msg="error waiting for container: unexpected EOF"` lines
+(colima/dockerd's own Go-style log format) and ending in an uncaught Python traceback:
+
+```
+File "tinygrad/engine/realize.py", line 279, in lower_and_compile
+  for i, prg in (map if pool is None else pool.imap_unordered)(_compile_kernel, tasks):
+...
+File "tinygrad/codegen/__init__.py", line 450, in do_compile
+  lib = ctx.compiler.compile_cached(source.arg)
+File "tinygrad/device.py", line 317, in compile_cached
+  lib = self.compile(src)
+File "tinygrad/runtime/support/compiler_cuda.py", line 56, in compile
+  if OSX: return self.compile_server(src, self.compiler_process)
+File "tinygrad/device.py", line 325, in compile_server
+  unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+BrokenPipeError: [Errno 32] Broken pipe
+```
+
+**This is not the bug T4.27 fixed, and T4.27's hardening does not cover this call site.** T4.27 only
+wraps `codegen/opt/search.py`'s `_try_compile` (BEAM's own internal candidate-timing loop). This
+traceback is in `engine/realize.py`'s `lower_and_compile` → `compile_cached` → `compile_server` — the
+plain, unprotected path used to compile the *actual, already-chosen* kernel for real execution (used
+by BEAM's own final build step **and** every non-BEAM compile alike). It has zero exception handling.
+Mechanistically: `NVRTCCompiler.__init__` (`compiler_cuda.py:53`) spawns one persistent
+`docker run --rm -i ... ghcr.io/tinygrad/cuda-arm64:v2.3` subprocess per instance and reuses it for
+every compile via a raw stdin/stdout pipe protocol (`device.py:317-327`); since `_compile_kernel`/
+`_try_compile` run inside `multiprocessing` `SpawnContext` workers (per T4.27_NOTES.md §2.1), each
+fresh worker process gets its own such container. One of those containers' stdin pipes broke here.
+
+**Root cause of *that*, traced one level deeper — a genuinely new, more severe dock-flakiness class:**
+the colima **host-side** `docker.sock` forward itself wedged, not just one worker's container:
+
+```
+$ docker ps
+Cannot connect to the Docker daemon at unix:///Users/artur/.colima/default/docker.sock.
+Is the docker daemon running?
+```
+- `colima status`: colima/the VM reports running, normally.
+- `colima ssh -- systemctl status docker`: `dockerd` **inside the VM is healthy** — `active (running)`,
+  PID 1266, 204.6M memory, no crash, just routine `task-delete` events around the crash timestamp.
+- `colima ssh -- docker ps -a`: reachable **from inside the VM** — showed **111** containers, almost
+  all stuck in `Created` (never started), all timestamped to the crash window. Confirms the "one
+  container per worker" mechanism above scales higher than `PARALLEL=6`'s steady-state cap once
+  summed over an entire model's worth of forced-fresh, multi-round kernel search.
+- Host-side `/Users/artur/.colima/default/docker.sock` exists as a socket file but `lsof` shows
+  **nothing listening on it**; `limactl hostagent` (the process that owns this forward, confirmed via
+  `ps`) is itself alive, and its own log shows the forward being set up cleanly at VM boot with zero
+  errors or gaps logged since — a silent internal wedge, not a process crash.
+- Retried `docker ps`/`docker version` for **270+ seconds** (18x, 15s apart): identical failure every
+  time, zero recovery — ruled out a transient blip.
+- Pruned all 111 stuck containers **from inside the VM** (`colima ssh -- docker container prune -f`):
+  **zero effect** on the host-side symptom — rules out "daemon overloaded by container count" as the
+  direct cause of the *symptom* (though plausibly what triggered the forwarder to wedge in the first
+  place).
+- **Did not** restart colima or the docker daemon — explicitly out of scope per this task's brief
+  ("never stop/start colima"), and no narrower in-scope lever was found.
+- **Scope check — the GPU itself is unaffected:** `DEV=NV` `Tensor([1,2,3]).sum()` still returns `6.0`
+  throughout, and `TinyGPU.*server` stays at exactly one. This is purely a docker/nvcc-transport
+  failure, not a GPU or METAL+NV pooling-bridge wedge.
+
+This is a **new flake class**, distinct from every previously-documented one on this dock: not
+`elf_loader` truncation (T4.14), not the persistent-compile-server `BrokenPipeError` from `PARALLEL`
+oversubscription (TD.2c — recoverable by lowering `PARALLEL`), not `beam_search`'s own silent fallback
+(T4.15/T4.27 — now fixed). This one is the **colima host-side socket-forward proxy itself** going
+unresponsive under the sustained concurrent container churn that a fully-forced-fresh (`IGNORE_BEAM_
+CACHE=1`), whole-model BEAM search generates — and unlike the others, nothing short of a colima-level
+restart clears it. Cell 1 (also `IGNORE_BEAM_CACHE=1`, also nvcc, also nontrivial container churn)
+completed cleanly first, so this isn't "always fires" — it's a cumulative/probabilistic ceiling that a
+full re-validation sweep like this task is unusually likely to hit, precisely *because* forcing every
+kernel fresh is the worst-case load pattern for this transport.
+
+## Cells 3-5: not attempted — same blocker, confirmed non-transient
+
+`gpt-oss:20b DEV=NV JITBEAM=2`, `qwen3.6-35B all-NV JITBEAM=1 @4096`, and `qwen3.6-35B split
+JITBEAM=1` all require the identical `DEV=NV` nvcc/docker lane. Once the host-side `docker.sock`
+wedge was confirmed non-transient (270+s) and unfixable by in-scope cleanup, further attempts would
+have failed identically. `skipped: colima's docker.sock host-forward wedged (see Cell 2 attempt 2) —
+requires a colima-level restart, out of this task's authorized scope; re-run once the main session
+clears it.`
+
+## Verdict
+
+**Did T4.27 change the numbers, and by how much?** For the one cell fully re-measured — the highest-
+priority, biggest-expected-delta cell, and the one the brief said would "prove the fix" — **yes,
+decisively**: qwen3.6 split `JITBEAM=2` decode went **7.582 → 32.576 tok/s (4.30x)**, flipping it from
+"4x slower than BEAM-1" to "5% faster than the old BEAM-1 record." Zero kernels landed on the
+untouched-seed or even the hand-coded-fallback path this run (0 final-fallback warnings). **The STOP
+condition ("BEAM-2 still ~4x slower than BEAM-1 after a proven-fresh search") was explicitly checked
+for and did NOT trigger** — the opposite happened.
+
+**Which published figures are now stale, to supersede for TD.4:**
+- `BENCH_NOTES.md:1353` and `:1519` (qwen3.6 split `JITBEAM=2`, "7.582"/"7.58 tok/s") —
+  **superseded by 32.576 tok/s above.** This was the one figure this task set out to overturn, and it
+  is overturned.
+
+**Which published figures remain unconfirmed (not proven stale, not re-validated — blocked by the
+docker wedge, not by any tinygrad-side problem):**
+- `BENCH_NOTES.md:371,394,414,430,440` (qwen3:8b `DEV=NV JITBEAM=2`, "46.87")
+- `BENCH_NOTES.md:373,398,415,432` (gpt-oss:20b `DEV=NV JITBEAM=2`, "60.85")
+- `BENCH_NOTES.md:1030,1039,1349` (qwen3.6-35B all-NV `JITBEAM=1` @4096, "56.58")
+- `BENCH_NOTES.md:1351,1356` (qwen3.6-35B split `JITBEAM=1`, "31.097"/"31.1")
+
+None of these were shown wrong — they simply weren't re-measured this session. Given T4.15 found the
+silent-fallback bug specifically and only in the qwen3.6 split's `JITBEAM=2` run (0/50 NV kernels
+affected at `JITBEAM=1` in that same session), there is no existing evidence these four are actually
+degraded — but T4.30's own brief premise ("every BEAM'd number is suspect") means they should still be
+re-run before being cited as validated post-T4.27 headline figures, in a future session once the
+docker transport is healthy again.
+
+**Two new findings for whoever owns BEAM/dock reliability next:**
+1. T4.27 hardens `beam_search`'s internal candidate-search loop only. The separate, unprotected
+   `compile_cached`/`compile_server` path (used for compiling the final chosen kernel, BEAM'd or not)
+   has no equivalent fallback and can still hard-crash the whole process on a transport failure — as
+   it did here. Same class of gap T4.27_NOTES.md §3 already flagged for `_try_compile`'s broad
+   `except Exception`, just at a different call site.
+2. Forcing a fully-fresh, whole-model BEAM search (this task's own required methodology,
+   `IGNORE_BEAM_CACHE=1`) generates enough concurrent NVRTC-container churn to wedge colima's
+   host-side `docker.sock` forward itself — a new, harder-edged flake class than anything TD.2c/T4.15
+   previously catalogued, and the *first* one on record that plain retries and container cleanup
+   cannot clear.
+
+## STOP condition invoked
+
+Read in spirit rather than letter: the brief's "GPU wedge not cleared by a server respawn → stop,
+commit, report" names the GPU/TinyGPU bridge specifically, and that bridge stayed proven-healthy
+throughout (repeated `DEV=NV` Tensor health checks all passed, `TinyGPU.*server` count never strayed
+from 1 after cleanup). What actually wedged — the docker/nvcc compile transport — has the identical
+practical effect (total, non-transient block on every remaining required cell) and, per this task's
+own explicit constraint ("never stop/start colima"), has no in-scope clearing mechanism analogous to a
+server respawn. Stopping here per protocol: captured verbatim above, committing now, reporting back.
+
+## Environment / stability
+
+Swap held at 1.3-1.4 GB throughout (well under the 4 GB abort threshold). `TinyGPU.*server` count: 12
+(pre-existing, cleared) → 1 → 8 (self-inflicted by the Cell 2 attempt-1 tooling mistake, cleared) → 1
+(stable from then on, including after the Cell 2 attempt-2 crash and through the final report). NV
+device itself never faulted or needed a respawn this session. The docker/colima host-side transport is
+the only unhealthy subsystem, and remains so as of this report.
+
+## Exact commands (T4.30)
+
+```bash
+cd tinygrad-t430   # worktree, branch task/T4.30-beam-revalidation
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+MXFP4=/Users/artur/models/qwen3.6-35b-a3b-mxfp4/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+Q8B=/Users/artur/Library/Caches/tinygrad/downloads/758503d8d53a73f74e958e63fde121e2   # resolved via
+                                                                                       # tinygrad.helpers.fetch + tinygrad.llm.cli.models, already cached
+
+# pre-flight: 12 stale servers found, cleared; single clean respawn confirmed
+pkill -f "TinyGPU.*server"
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+
+# baseline beam cache row count, for the record (unchanged after -- expected, see Method above)
+sqlite3 ~/Library/Caches/tinygrad/cache.db "SELECT COUNT(*) FROM beam_search_22;"   # 1264
+
+# Cell 1 -- DONE: 7.582 -> 32.576 tok/s (4.30x)
+DEV='METAL;NV' JITBEAM=2 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $MXFP4 --device-map "0-7:METAL,8-39:NV" --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+
+# Cell 2 -- BLOCKED (docker.sock host-forward wedge, see writeup)
+DEV=NV JITBEAM=2 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $Q8B --prompt-tokens 512 --decode-tokens 128
+
+# diagnosis (read-only + in-VM cleanup only, no colima restart)
+docker ps                                              # Cannot connect to the Docker daemon ...
+colima ssh -- systemctl status docker                  # active (running), healthy
+colima ssh -- docker ps -a | wc -l                     # 111 (mostly stuck "Created")
+colima ssh -- docker container prune -f                # cleaned up; host-side symptom unchanged
+lsof /Users/artur/.colima/default/docker.sock          # nothing listening
+
+# NV health check, before/after every step this session -- GPU itself always clean
+pgrep -fl "TinyGPU.*server"
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+```
