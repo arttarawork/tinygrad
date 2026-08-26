@@ -6,6 +6,7 @@ from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
+from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, _fault_recovery_hint
 
 class CountingMMIOInterface:
@@ -221,30 +222,97 @@ class TestNVKernargsPoolSlab(unittest.TestCase):
   def test_local_kernargs_allocate_per_call(self):
     assert (n:=self._alloc_free_n(is_remote=False, n=40)) == 40, f"local kernargs alloc must keep one alloc per call (unchanged), got {n}"
 
+class _FakePCIConfig:
+  """In-memory PCI config space: just enough of PCIDevice's read_config/write_config_flush for T4.37's bus-master tests."""
+  def __init__(self, command:int=pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER):
+    self.space = {pci.PCI_COMMAND: command}
+  def read_config(self, offset:int, size:int) -> int: return self.space.get(offset, 0)
+  def write_config_flush(self, offset:int, value:int, size:int) -> None: self.space[offset] = value
+
+def _fake_pciiface_self(is_remote:bool) -> SimpleNamespace:
+  """Minimal stand-in for a PCIIface `self`, faulted: enough of dev_impl/pci_dev for sleep()'s quiesce-then-raise path."""
+  stat_q = SimpleNamespace(read_resp=lambda: iter(()))
+  return SimpleNamespace(pci_dev=_FakePCIConfig(), dev=SimpleNamespace(is_remote=lambda: is_remote),
+                          dev_impl=SimpleNamespace(gsp=SimpleNamespace(stat_q=stat_q), is_err_state=True))
+
 class TestNVFaultRecoveryHint(unittest.TestCase):
   """T4.23: an NV device fault (is_err_state) is genuinely GSP/hardware-reported (support/nv/ip.py sets it only from real
   NV_VGPU_MSG_EVENT_OS_ERROR_LOG/MMU_FAULT_QUEUED messages) and NV never sets can_recover (hcq.py) -- there is no safe
   in-process reset, so the raised error must name the out-of-band fix instead of a bare message. Remote-only: local
-  NVK/mock have no TinyGPU.app server to respawn, so their message must stay byte-for-byte unchanged."""
+  NVK/mock have no TinyGPU.app server to respawn, so their message must stay byte-for-byte unchanged.
+
+  T4.37: the fix named here used to be `pkill -f 'TinyGPU.*server'` -- doing exactly that under a live fault is what
+  DMA-panicked the host on 2026-08-26 (T4.36), so the hint was rewritten to point at a fresh client's controlled reset
+  instead. See TestNVQuiesceOnFault below for the bus-master-clearing mechanism that makes that safe."""
   def test_hint_names_the_fix_when_remote(self):
     hint = _fault_recovery_hint(SimpleNamespace(is_remote=lambda: True))
-    assert "pkill -f 'TinyGPU.*server'" in hint, hint
+    assert "fresh client" in hint.lower() and "bus-master" in hint.lower(), hint
+    assert "pkill -f 'TinyGPU" not in hint, "must no longer tell the user to pkill the server -- that caused T4.36"
 
   def test_hint_is_empty_when_local(self):
     assert _fault_recovery_hint(SimpleNamespace(is_remote=lambda: False)) == ""
 
-  def _fake_sleep_self(self, is_remote:bool):
-    stat_q = SimpleNamespace(read_resp=lambda: iter(()))
-    return SimpleNamespace(dev_impl=SimpleNamespace(gsp=SimpleNamespace(stat_q=stat_q), is_err_state=True),
-                            dev=SimpleNamespace(is_remote=lambda: is_remote))
-
   def test_pciiface_sleep_raises_with_hint_when_remote(self):
-    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(self._fake_sleep_self(True), 200)
-    assert "pkill -f 'TinyGPU.*server'" in str(ctx.exception), ctx.exception
+    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(_fake_pciiface_self(True), 200)
+    assert "fresh client" in str(ctx.exception).lower(), ctx.exception
 
   def test_pciiface_sleep_message_unchanged_when_local(self):
-    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(self._fake_sleep_self(False), 200)
+    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(_fake_pciiface_self(False), 200)
     assert str(ctx.exception) == "Device fault detected.", ctx.exception
+
+class TestNVQuiesceOnFault(unittest.TestCase):
+  """T4.37: the 2026-08-26 DART panic (T4.36) happened because the NV fault path raised without ever clearing PCI
+  bus-master -- a faulted GPU's GSP firmware keeps DMAing into host-sysmem queues, and killing the server (T4.23's old
+  recovery hint) tore those mappings down while the GPU could still reach them. These assert the fault path clears
+  MASTER (idempotently, and without touching other PCI_COMMAND bits) before it raises, and that backends with no
+  pci_dev at all (NVKIface/MOCKIface) are provably untouched."""
+
+  def test_pciiface_sleep_clears_bus_master_on_fault(self):
+    fake = _fake_pciiface_self(True)
+    cmd = fake.pci_dev.read_config(pci.PCI_COMMAND, 2)
+    assert cmd & pci.PCI_COMMAND_MASTER and cmd & pci.PCI_COMMAND_MEMORY, "fixture should start with MASTER+MEMORY set"
+    with self.assertRaises(RuntimeError): PCIIface.sleep(fake, 200)
+    cmd = fake.pci_dev.read_config(pci.PCI_COMMAND, 2)
+    assert not (cmd & pci.PCI_COMMAND_MASTER), "MASTER must be cleared after a fault"
+    assert cmd & pci.PCI_COMMAND_MEMORY, "only MASTER should be touched, not the rest of PCI_COMMAND"
+
+  def test_pciiface_sleep_clear_is_idempotent(self):
+    fake = _fake_pciiface_self(True)
+    with self.assertRaises(RuntimeError): PCIIface.sleep(fake, 200)
+    # is_err_state never clears itself and MASTER is already off -- a second sleep() (e.g. a stale poller) must still
+    # raise cleanly, not blow up because the bit was already clear.
+    with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(fake, 200)
+    assert not (fake.pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER)
+    assert "fresh client" in str(ctx.exception).lower(), ctx.exception
+
+  def _fake_hang_self(self, is_nvd:bool):
+    pci_dev = _FakePCIConfig()
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    iface = SimpleNamespace(pci_dev=pci_dev, rm_control=lambda *a, **k: no_fault)
+    return SimpleNamespace(iface=iface, debugger=None, debug_channel=0, is_remote=lambda: True, is_nvd=lambda: is_nvd), pci_dev
+
+  def test_on_device_hang_clears_bus_master_when_nvd(self):
+    fake, pci_dev = self._fake_hang_self(is_nvd=True)
+    with self.assertRaises(RuntimeError): NVDevice.on_device_hang(fake)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), "MASTER must be cleared after a hang"
+
+  def test_on_device_hang_leaves_non_pciiface_untouched(self):
+    # NVKIface/MOCKIface have no pci_dev at all -- is_nvd() must gate the write so this path is never touched for them.
+    fake, pci_dev = self._fake_hang_self(is_nvd=False)
+    with self.assertRaises(RuntimeError): NVDevice.on_device_hang(fake)
+    assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "must be untouched when not is_nvd()"
+
+  def test_device_fini_clears_bus_master_when_faulted(self):
+    pci_dev = _FakePCIConfig()
+    fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=lambda: None, is_err_state=True))
+    PCIIface.device_fini(fake)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER)
+
+  def test_device_fini_leaves_bus_master_when_clean(self):
+    pci_dev = _FakePCIConfig()
+    fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=lambda: None, is_err_state=False))
+    PCIIface.device_fini(fake)
+    assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "a clean exit must not touch bus-master"
 
 class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
   """T4.25: APLRemotePCIDevice.__init__'s connect-or-spawn loop (support/system.py) had no cross-process
