@@ -1964,6 +1964,79 @@ should be expected to hit the same wedge again absent a change to the transport 
 `PARALLEL`, a persistent-compiler-process redesign, or a colima/docker-version change), none of which
 are in scope for a measurement-only task.
 
+## Mitigation attempt (`BEAM_MAX_TASKS_PER_CHILD=500` + `PARALLEL=4`) — wedged again, and the assumed mechanism doesn't fully explain what was observed
+
+Main session diagnosed a specific mechanism and a no-code-change mitigation: `tinygrad/engine/worker.py`
+recycles each compile worker every `BEAM_MAX_TASKS_PER_CHILD` tasks (default 16), and
+`compiler_cuda.py`'s `NVRTCCompiler.__init__` spawns a fresh persistent `docker run` container per
+worker — so a long search issues many container spawns. Recipe: `--env BEAM_MAX_TASKS_PER_CHILD=500`
+(31x fewer recycles) + `--env PARALLEL=4` (fewer concurrent containers), everything else identical
+(`IGNORE_BEAM_CACHE=1`, `NO_COLOR=1`, forced-fresh). Protocol: run Cell 2 alone first as a probe,
+sample `docker ps -aq | wc -l` before/during/after; if it wedges again, stop immediately, no restart,
+no Cells 3-5, just report.
+
+**Verified before running:** `tinygrad/engine/worker.py`'s `worker_pool` is a genuine module-level
+singleton (`if worker_pool is None: worker_pool = _WorkerContext().Pool(PARALLEL.value, _init_worker,
+(), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))`, only ever constructed once per process, explicitly
+"shared by kernel lowering and BEAM search" per its own comment) — so the mitigation's premise (one
+pool, recycled less often) is structurally sound, not a guess.
+
+**Pre-flight:** `docker ps -aq` → 0, `TinyGPU.*server` → 1, swap 1.2 GB, NV health check → `6.0`. Clean.
+
+**Cell 2 probe (`qwen3:8b DEV=NV JITBEAM=2 PARALLEL=4 BEAM_MAX_TASKS_PER_CHILD=500
+IGNORE_BEAM_CACHE=1`), container count sampled every 15s:**
+
+| time | containers |
+|---|---:|
+| load done (6.727s) | — |
+| +~10s | 1 |
+| +~25s | **143** |
+| +~55s | 164 |
+| +~3.5min | 193 |
+| +~5min | 218 |
+| +~9min | 217 |
+| +~10.5min | 287 |
+| (crash) | 0 (daemon reset) |
+
+**Wedged again — the mitigation did not hold.** Final error was a clean-ish `tinygrad.device.CompileError:
+compile server EOF: got 0 of 4 bytes` (`device.py:307`, `_read_exactly`) this time rather than a raw
+`BrokenPipeError` — the persistent compile-server pipe returned EOF instead of refusing the write —
+plus 10 more non-fatal `write /dev/stdout: broken pipe` lines. Docker itself came back reachable
+afterward with 0 containers (not "cannot connect" like the earlier host-forward wedge) — consistent
+with the daemon itself crashing under resource pressure and restarting cleanly, rather than the
+host-side socket-forward proxy silently hanging as before. Also newly observed mid-run (not fatal,
+but corroborating): `docker: Error response from daemon: failed to set up container networking:
+failed to create endpoint ... resource temporarily unavailable` — a veth/network-namespace exhaustion
+symptom, i.e. the VM ran out of some kernel networking resource for creating more container network
+interfaces, which is a plausible proximate trigger for a dockerd crash at high container counts.
+
+**The observed growth curve is hard to reconcile with the stated mechanism alone.** With a genuine
+singleton pool, `PARALLEL=4` workers, and `BEAM_MAX_TASKS_PER_CHILD=500`, a pure "one container per
+worker, recycled every 500 tasks" model predicts on the order of *single digits* of containers for
+quite a while (4 persistent workers, each needing 500 compiles before its first recycle) — not **143
+within roughly 15-25 seconds of load finishing**, before any worker could plausibly have completed
+anywhere near 500 tasks yet. Two readings, not adjudicated further per the stop-immediately
+instruction: either (a) something spawns a container per compile *task* rather than per worker
+*lifetime* for at least part of this path (contradicting the "cached on the persistent worker"
+model), or (b) `qwen3:8b`'s `JITBEAM=2` search issues few enough distinct rounds that most of the 143+
+containers came from someplace other than the recycle-per-500-tasks path this mitigation targets
+(e.g. the separate non-BEAM `lower_and_compile` final-kernel-compile pool, or per-round pool restarts
+not visible from the outside). Whichever it is, **the mitigation as specified did not curb container
+growth to "small instead of climbing into the hundreds"** — it reached 287, the same order of
+magnitude as the original unmitigated crash's 111.
+
+**Per protocol: stopped immediately.** Did not restart colima or docker (it appears to have
+self-recovered to a reachable, empty state on its own). Did not attempt Cells 3-5. GPU/TinyGPU bridge
+and swap stayed healthy throughout (`TinyGPU.*server` = 1, swap 1.2 GB, `Tensor([1,2,3]).sum()==6.0`
+before and after) — this remains, across all three attempts now, purely a docker/nvcc-transport
+problem, never a GPU problem.
+
+**This escalates the finding exactly as the coordinator flagged it would:** from "robustness gap,
+retry or restart and move on" to "blocks measurement work on the nvcc lane, needs a code-level fix
+before any further BEAM re-validation on this dock is worth attempting." The two existing env knobs
+tried (`BEAM_MAX_TASKS_PER_CHILD`, `PARALLEL`) are not sufficient on their own for a whole-model,
+fully-forced-fresh (`IGNORE_BEAM_CACHE=1`) search of a model this size on this transport.
+
 ## Verdict
 
 **Did T4.27 change the numbers, and by how much?** For the one cell fully re-measured — the highest-
@@ -2013,7 +2086,14 @@ reproducible under this task's own required methodology").
    302 `unexpected EOF` lines, identical traceback). This is a reliably reproducible cost of this
    task's own re-validation methodology on this dock, not a one-off — worth a real fix (transport
    redesign or a lower concurrency ceiling for forced-fresh sweeps) before the next full BEAM
-   revalidation pass, not just a restart-and-retry.
+   revalidation pass, not just a restart-and-retry. **Upgraded again by the mitigation attempt:**
+   `BEAM_MAX_TASKS_PER_CHILD=500` + `PARALLEL=4` (targeting the specific worker-recycle-spawns-a-
+   container mechanism, verified structurally sound — `get_worker_pool()` is a genuine singleton) did
+   not hold either — container count still reached 287 (same order of magnitude as the original
+   111), and grew far faster (143 within ~15-25s of load) than that mechanism alone predicts for 4
+   workers not yet due for their first 500-task recycle. Net status: **two existing env knobs tried,
+   neither sufficient**; this is now a "blocks nvcc-lane measurement work" severity finding needing a
+   source-level fix, not a "robustness gap" retry loop.
 
 ## STOP condition invoked
 
@@ -2096,4 +2176,19 @@ DEV='METAL;NV' JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. 
 docker ps -a                                           # Cannot connect to the Docker daemon ...
 pgrep -fl "TinyGPU.*server" | wc -l                     # 1
 sysctl vm.swapusage                                     # 1.2GB, unchanged
+
+# --- mitigation attempt, after main session restarted colima again + diagnosed the mechanism ---
+# pre-flight: docker 0 containers, TinyGPU=1, swap 1.2GB, NV check passes
+
+# Cell 2 probe, container-count-sampling loop run alongside it (docker ps -aq | wc -l every 15s)
+DEV=NV JITBEAM=2 PARALLEL=4 BEAM_MAX_TASKS_PER_CHILD=500 IGNORE_BEAM_CACHE=1 NO_COLOR=1 \
+  PYTHONPATH=. $PY extra/benchmark_llm.py --model $Q8B --prompt-tokens 512 --decode-tokens 128
+# containers: 1 -> 143 (~15s) -> 164 -> 193 -> 218 -> 217 -> 287 -> crash -> 0 (daemon reset)
+# CompileError: compile server EOF: got 0 of 4 bytes (device.py:307), + 10x "broken pipe"
+# WEDGED AGAIN. Stopped immediately per protocol -- no restart, no Cells 3-5 attempted.
+
+# post-mortem
+docker ps -aq | wc -l                                   # 0 (daemon reachable again, reset)
+pgrep -fl "TinyGPU.*server" | wc -l                      # 1
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"  # 6.0
 ```
