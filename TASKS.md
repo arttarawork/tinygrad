@@ -563,8 +563,18 @@ TD.4 publishing. Upstream sync cadence: weekly (last `80bf60d78` → fork master
 upstream #17493 (rangeify rewrite — re-validate T4.13/T1.4/T4.9 if it merges), #17446, #17478.
 
 Agent policy: one tight objective per agent, **Sonnet at max effort**, explicit STOP conditions,
-commit early, RELATIVE paths in worktrees, foreground-blocking bench runs (a backgrounded run
-with no supervisor stalls the matrix). Verify premises with a control experiment before
+commit early, RELATIVE paths in worktrees.
+**Long-running commands — the #1 recurring failure (5 agents on 2026-08-25/26):** agents end
+their turn after backgrounding a bench/CI run, and nothing re-invokes them when a plain
+background process exits, so the work silently stalls until a human notices. **Telling them
+"foreground only" is NOT sufficient — it failed every time.** What works: give them the blocking
+idiom to paste into the SAME tool call, e.g.
+`until grep -q "^decode" LOG || ! pgrep -f benchmark_llm >/dev/null; do sleep 20; done; tail -5 LOG`
+so the call cannot return before the run finishes. Budget for the fact that the harness
+auto-backgrounds anything over ~600 s.
+**Also give every agent a spawn worktree of its own** (`git worktree add … <sha> --detach` then
+`git switch -c`) when two may run at once — same-worktree agents clobber each other. Branch off a
+commit, not a branch name that is already checked out elsewhere (that errors). Verify premises with a control experiment before
 optimizing — T1.4/T1.9/T4.10 refuted their own premises, and on 2026-08-25 an agent's
 "71 GB fp16-resident" analysis was falsified by one 5-minute measurement. **If an agent's
 analytical claim contradicts established project data, measure before it reaches the docs.**
