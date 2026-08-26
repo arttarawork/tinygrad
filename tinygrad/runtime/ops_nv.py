@@ -10,7 +10,7 @@ from tinygrad.device import Compiled, BufferSpec, TinyELF
 from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, unwrap
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
-from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
+from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa, pci
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
 from tinygrad.runtime.support.system import System, PCIIfaceBase, MAP_FIXED
@@ -35,8 +35,11 @@ def _fault_recovery_hint(dev) -> str:
   # T4.23: is_err_state is only ever set from real GSP-reported events (support/nv/ip.py's OS_ERROR_LOG/MMU_FAULT_QUEUED
   # handling), and NV never sets can_recover (hcq.py), so there's no safe in-process reset -- name the out-of-band fix
   # instead of a bare "fault detected". Remote-only: local NVK/mock have no TinyGPU.app server to respawn.
-  return (" NV device is in an unrecoverable fault state -- reinitialize the eGPU session: "
-          "`pkill -f 'TinyGPU.*server'` (the client auto-respawns it), then retry.") if dev.is_remote() else ""
+  # T4.37: `pkill`ing the server here is what DMA-panicked the host on 2026-08-26 (T4.36) -- it tore down this client's
+  # mappings while GSP was still bus-mastering. The fault path now clears MASTER first (PCIIface.sleep/on_device_hang),
+  # so name the real fix instead: a fresh client, which runs a controlled reset (RemoteCmd.RESET, support/system.py:413).
+  return (" NV device is in an unrecoverable fault state (PCI bus-master now cleared) -- start a FRESH CLIENT to "
+          "recover (it performs a controlled reset). Do not `pkill` the server while a fault is live.") if dev.is_remote() else ""
 
 NV_PFAULT_FAULT_TYPE = {dt:name for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_FAULT_TYPE_")}
 NV_PFAULT_ACCESS_TYPE = {dt:name.split("_")[-1] for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_ACCESS_TYPE_")}
@@ -609,11 +612,22 @@ class PCIIface(PCIIfaceBase):
   def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
-  def device_fini(self): self.dev_impl.fini()
+  def device_fini(self):
+    # T4.37: fini_hw() needs GSP alive to answer its RPC, so clear bus-master only after -- but in a `finally`: on a faulted
+    # GPU that RPC times out (seen live: "Timeout waiting for RPC response for command 47"), and the clear must still run so a
+    # normal exit with a live fault never leaves a bus-mastering GPU once this client's mappings are torn down on disconnect.
+    try: self.dev_impl.fini()
+    finally:
+      if self.dev_impl.is_err_state:
+        self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
-    if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected." + _fault_recovery_hint(self.dev))
+    if self.dev_impl.is_err_state:
+      # T4.37: clear bus-master before raising so a faulted GPU can't DMA anywhere -- GSP keeps DMAing fault events into
+      # its host-sysmem queues after a fault (support/nv/ip.py); idempotent (AND with an already-clear bit is a no-op).
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+      raise RuntimeError("Device fault detected." + _fault_recovery_hint(self.dev))
 
 class MOCKIface(NVKIface): count = 1
 
@@ -834,6 +848,10 @@ class NVDevice(HCQCompiled[NVSignal]):
       for i, e in enumerate(sm_errors.smErrorStateArray):
         if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
 
+    # T4.37: clear bus-master before raising, same as PCIIface.sleep() -- after the RPCs above, which still need GSP
+    # alive. is_nvd()-gated: NVKIface/MOCKIface have no pci_dev and never reach a live GSP fault this way.
+    if self.is_nvd():
+      self.iface.pci_dev.write_config_flush(pci.PCI_COMMAND, self.iface.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
     raise RuntimeError("\n".join(report) + _fault_recovery_hint(self))
 
   def _prof_init(self):
