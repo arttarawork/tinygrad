@@ -1,4 +1,4 @@
-import os, shutil, struct, subprocess, tempfile, threading, unittest
+import os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from tinygrad.helpers import getenv
@@ -337,12 +337,18 @@ class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
   fix actually needed is just a flock(LOCK_EX) around the whole connect-or-spawn sequence, serializing
   spawns so the race above can never start. Drives the real subprocess/socket/flock path with a fake
   APP_PATH (a trivial bind+listen / hang script); only RemotePCIDevice.__init__ (the unrelated
-  device-ownership handshake that follows, not part of this fix) is stubbed out."""
+  device-ownership handshake that follows, not part of this fix) is stubbed out.
+
+  T4.40a extends this fixture: the fix under test shells out to pgrep/ps for liveness detection, so a
+  patched Popen call is no longer synonymous with "spawned a server" -- self.procs (below) tracks every
+  child for teardown, self.spawned_servers tracks only real [APP_PATH, "server", sock_path] spawns made
+  while subprocess.Popen was patched, i.e. spawns the code under test actually made."""
 
   def setUp(self):
     self.tmpdir = tempfile.mkdtemp(prefix="t425_")
     self.sock_path = os.path.join(self.tmpdir, "tinygpu.sock")
     self.procs:list[subprocess.Popen] = []
+    self.spawned_servers:list[subprocess.Popen] = []
 
   def tearDown(self):
     for p in self.procs:
@@ -364,10 +370,25 @@ class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
     def counting(*a, **k):
       p = real_popen(*a, **k)
       self.procs.append(p)
+      if isinstance(p.args, list) and len(p.args) >= 2 and p.args[1] == "server": self.spawned_servers.append(p)
       return p
     return counting
 
   def _sock_getenv(self, k, d=None): return self.sock_path if k == "APL_REMOTE_SOCK" else d
+
+  def _getenv_with(self, **overrides):
+    """Like _sock_getenv, plus fixed values for other keys (T4.40a: PYTEST_XDIST_WORKER / NV_NO_SPAWN)."""
+    def fn(k, d=None): return self.sock_path if k == "APL_REMOTE_SOCK" else overrides.get(k, d)
+    return fn
+
+  def _pgrep_sees(self, app_path:str, timeout=2.0) -> bool:
+    # fork() makes the pid visible immediately but execve() into app_path is not synchronous with Popen()
+    # returning -- poll briefly instead of assuming the first pgrep call already sees the post-exec argv.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+      if subprocess.run(["pgrep", "-f", f"{app_path} server"], stdout=subprocess.PIPE, text=True).stdout.strip(): return True
+      time.sleep(0.01)
+    return False
 
   def test_concurrent_construction_spawns_exactly_once(self):
     # listen() backlog must comfortably exceed the thread count below: nothing ever calls accept(), so every
@@ -399,7 +420,8 @@ class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
       for t in threads: t.join(timeout=10)
 
     assert results == ["ok"] * 6, f"all 6 concurrent constructions should succeed, got {results}"
-    assert len(self.procs) == 1, f"6 constructors racing an empty socket dir should spawn exactly ONE server, got {len(self.procs)}"
+    n = len(self.spawned_servers)
+    assert n == 1, f"6 constructors racing an empty socket dir should spawn exactly ONE server, got {n}"
 
   def test_failed_spawn_is_killed_not_orphaned(self):
     hang = self._script("hang.py", "import time\ntime.sleep(60)\n")  # never binds -> connect() never succeeds
@@ -415,9 +437,102 @@ class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "Failed to connect"):
         _FakeAPL("NV", "0000:00:00.0")
 
-    assert len(self.procs) == 1
-    self.procs[0].wait(timeout=2)
-    assert self.procs[0].poll() is not None, "a spawn that never connects must be killed, not orphaned"
+    assert len(self.spawned_servers) == 1
+    self.spawned_servers[0].wait(timeout=2)
+    assert self.spawned_servers[0].poll() is not None, "a spawn that never connects must be killed, not orphaned"
+
+  def test_live_unresponsive_server_blocks_spawn_and_names_the_situation(self):
+    """T4.40a (i): a server that's alive but wedged (e.g. bound to a faulted GSP session, HANDOFF_2026-08-26.md
+    section 2) must never get a sibling spawned next to it -- two servers on one device is the precondition
+    both 2026-08-26 host panics share. Simulate it directly: a real process matching "<APP_PATH> server",
+    spawned BEFORE construction (so it looks exactly like a leftover from an earlier session), that never
+    binds the socket -- every connect() attempt genuinely fails."""
+    hang = self._script("hang.py", "import time\ntime.sleep(60)\n")  # never binds -> connect() never succeeds
+    wedged = subprocess.Popen([hang, "server", self.sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    self.procs.append(wedged)
+    assert self._pgrep_sees(hang), "fixture bug: pre-spawned fake server never became visible to pgrep"
+
+    class _FakeAPL(APLRemotePCIDevice):
+      APP_PATH = hang
+      def ensure_app(self): pass
+
+    with patch("subprocess.Popen", side_effect=self._fake_popen()), \
+         patch("tinygrad.runtime.support.system.getenv", side_effect=self._sock_getenv), \
+         patch("time.sleep", lambda s: None), \
+         patch.object(RemotePCIDevice, "__init__", lambda self, *a, **k: None):
+      with self.assertRaisesRegex(RuntimeError, "is alive but not accepting connections"):
+        _FakeAPL("NV", "0000:00:00.0")
+
+    assert len(self.spawned_servers) == 0, f"a pre-existing live server must block the spawn entirely, got {len(self.spawned_servers)} new spawn(s)"
+
+  def test_xdist_never_spawns_next_to_a_wedged_server_either(self):
+    """T4.40a: the xdist/NV_NO_SPAWN branch must also recognize a genuinely wedged server (not just "absent")
+    -- this is T4.38's addendum scenario verbatim: a serial pytest run opening NV against a server left over
+    from a previously-faulted session."""
+    hang = self._script("hang.py", "import time\ntime.sleep(60)\n")
+    wedged = subprocess.Popen([hang, "server", self.sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    self.procs.append(wedged)
+    assert self._pgrep_sees(hang), "fixture bug: pre-spawned fake server never became visible to pgrep"
+
+    class _FakeAPL(APLRemotePCIDevice):
+      APP_PATH = hang
+      def ensure_app(self): pass
+
+    with patch("subprocess.Popen", side_effect=self._fake_popen()), \
+         patch("tinygrad.runtime.support.system.getenv", side_effect=self._getenv_with(PYTEST_XDIST_WORKER="gw0")), \
+         patch.object(RemotePCIDevice, "__init__", lambda self, *a, **k: None):
+      with self.assertRaisesRegex(RuntimeError, "is alive but not accepting connections"):
+        _FakeAPL("NV", "0000:00:00.0")
+
+    assert len(self.spawned_servers) == 0, f"xdist must never spawn next to a wedged server either, got {len(self.spawned_servers)} spawn(s)"
+
+  def test_xdist_or_no_spawn_never_spawns_and_raises_immediately(self):
+    """T4.40a (iii): a probe / xdist worker must never spawn, with no server present in either trigger mode."""
+    for label, overrides in [("xdist", {"PYTEST_XDIST_WORKER": "gw0"}), ("NV_NO_SPAWN", {"NV_NO_SPAWN": 1})]:
+      with self.subTest(label=label):
+        class _FakeAPL(APLRemotePCIDevice):
+          APP_PATH = "/nonexistent/T440a_test_fake_app"  # never spawned, never pgrep-matched -- must stay that way
+          def ensure_app(self): pass
+
+        with patch("subprocess.Popen", side_effect=self._fake_popen()), \
+             patch("tinygrad.runtime.support.system.getenv", side_effect=self._getenv_with(**overrides)), \
+             patch.object(RemotePCIDevice, "__init__", lambda self, *a, **k: None):
+          with self.assertRaisesRegex(RuntimeError, "no TinyGPU server process found"):
+            _FakeAPL("NV", "0000:00:00.0")
+
+    assert len(self.spawned_servers) == 0, f"a probe/xdist worker must never spawn, got {len(self.spawned_servers)} spawn(s)"
+
+  def test_xdist_worker_connects_to_a_responsive_server_without_spawning(self):
+    """T4.40a (iv): xdist worker + a responsive pre-existing server -> connects fine, spawns nothing."""
+    server = self._script("server.py", "import socket, sys, time\n"
+                                        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+                                        "s.bind(sys.argv[-1])\n"
+                                        "s.listen(64)\n"
+                                        "time.sleep(30)\n")
+    running = subprocess.Popen([server, "server", self.sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    self.procs.append(running)
+    deadline = time.time() + 2.0
+    while True:
+      probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+      try:
+        probe.connect(self.sock_path)
+        probe.close()
+        break
+      except (ConnectionRefusedError, FileNotFoundError):
+        probe.close()
+        if time.time() > deadline: raise
+        time.sleep(0.01)
+
+    class _FakeAPL(APLRemotePCIDevice):
+      APP_PATH = server
+      def ensure_app(self): pass
+
+    with patch("subprocess.Popen", side_effect=self._fake_popen()), \
+         patch("tinygrad.runtime.support.system.getenv", side_effect=self._getenv_with(PYTEST_XDIST_WORKER="gw0")), \
+         patch.object(RemotePCIDevice, "__init__", lambda self, *a, **k: None):
+      _FakeAPL("NV", "0000:00:00.0")  # must not raise
+
+    assert len(self.spawned_servers) == 0, f"an xdist worker must never spawn even while waiting, got {len(self.spawned_servers)} new spawn(s)"
 
 if __name__ == "__main__":
   unittest.main()
