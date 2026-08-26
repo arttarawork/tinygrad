@@ -1912,7 +1912,7 @@ completed cleanly first, so this isn't "always fires" — it's a cumulative/prob
 full re-validation sweep like this task is unusually likely to hit, precisely *because* forcing every
 kernel fresh is the worst-case load pattern for this transport.
 
-## Cells 3-5: not attempted — same blocker, confirmed non-transient
+## Cells 3-5: not attempted this pass — same blocker, confirmed non-transient
 
 `gpt-oss:20b DEV=NV JITBEAM=2`, `qwen3.6-35B all-NV JITBEAM=1 @4096`, and `qwen3.6-35B split
 JITBEAM=1` all require the identical `DEV=NV` nvcc/docker lane. Once the host-side `docker.sock`
@@ -1920,6 +1920,49 @@ wedge was confirmed non-transient (270+s) and unfixable by in-scope cleanup, fur
 have failed identically. `skipped: colima's docker.sock host-forward wedged (see Cell 2 attempt 2) —
 requires a colima-level restart, out of this task's authorized scope; re-run once the main session
 clears it.`
+
+## Retry pass after main-session colima restart — Cells 2-5 all blocked again, immediately
+
+Main session stopped and restarted colima (daemon reconnects cleanly, `NCPU=8`, the 111 stuck
+containers gone). Pre-flight confirmed clean: `docker ps -aq` → 0, `TinyGPU.*server` → 1, swap 1.2 GB,
+`DEV=NV` Tensor health check → `6.0`.
+
+**Cell 2 retry (qwen3:8b, `DEV=NV JITBEAM=2`, same command as before):** crashed again — **identical
+signature**, `load 6.389s` then the exact same `BrokenPipeError` at `device.py:325`
+(`compile_server` → `unwrap(proc.stdin).write(...)`), preceded by **302** `"error waiting for
+container: unexpected EOF"` lines (vs 300 the first time). The transport re-wedged on the very first
+heavy (`PARALLEL=6` + `IGNORE_BEAM_CACHE=1`) nvcc BEAM attempt after a from-scratch colima restart —
+this was not a residual/lingering effect of the earlier crash, it is freshly reproduced.
+
+Per the coordinator's explicit instruction ("do NOT fight it — record blocked, move to the next
+cell"), moved straight to Cells 3-5 rather than re-diagnosing. All three failed identically and
+**fast** (model load completes normally, then the exact same `BrokenPipeError` on the very first
+compile attempt during warmup):
+
+| cell | load | outcome | `unexpected EOF` count |
+|---|---:|---|---:|
+| gpt-oss:20b `JITBEAM=2` | 8.652s | `BrokenPipeError` @ `device.py:325` | 0 |
+| qwen3.6 all-NV `JITBEAM=1` @4096 | 11.778s | `BrokenPipeError` @ `device.py:325` | 0 |
+| qwen3.6 split `JITBEAM=1` | 11.366s | `BrokenPipeError` @ `device.py:325` | 0 |
+
+**Zero** `unexpected EOF` lines for cells 3-5, vs. 302 for cell 2's retry — consistent with the daemon
+connection already being fully dead *before* cells 3-5 even started (an immediate connection failure
+on their first compile, not a mid-flight death after spawning many containers the way Cell 2's own
+crash — both times — did). `docker ps -a` confirmed "Cannot connect to the Docker daemon" continuously
+across all three attempts; it did not self-recover between cells. Could not evaluate the coordinator's
+requested container-accumulation signal ("watch `docker ps -aq | wc -l` between cells, climbing is
+itself a finding") for cells 3-5 specifically, because the daemon was unreachable before any of them
+could create containers — there was nothing to count. GPU/TinyGPU bridge and swap stayed healthy
+throughout this whole retry pass (`TinyGPU.*server` = 1, swap 1.2 GB, unchanged).
+
+**Escalated read vs. the original finding:** this is no longer "wedged once, needed an external
+restart." The wedge reproduced from a clean, freshly-restarted colima on the very next attempt at this
+task's own required methodology (`PARALLEL=6` + `IGNORE_BEAM_CACHE=1` nvcc BEAM search), with the
+identical exception, call site, and traceback both times. A colima restart is, at best, a **temporary
+reset** for this failure mode, not a durable fix — re-running these 4 cells with the same methodology
+should be expected to hit the same wedge again absent a change to the transport itself (e.g. lower
+`PARALLEL`, a persistent-compiler-process redesign, or a colima/docker-version change), none of which
+are in scope for a measurement-only task.
 
 ## Verdict
 
@@ -1943,12 +1986,17 @@ docker wedge, not by any tinygrad-side problem):**
 - `BENCH_NOTES.md:1030,1039,1349` (qwen3.6-35B all-NV `JITBEAM=1` @4096, "56.58")
 - `BENCH_NOTES.md:1351,1356` (qwen3.6-35B split `JITBEAM=1`, "31.097"/"31.1")
 
-None of these were shown wrong — they simply weren't re-measured this session. Given T4.15 found the
-silent-fallback bug specifically and only in the qwen3.6 split's `JITBEAM=2` run (0/50 NV kernels
-affected at `JITBEAM=1` in that same session), there is no existing evidence these four are actually
-degraded — but T4.30's own brief premise ("every BEAM'd number is suspect") means they should still be
-re-run before being cited as validated post-T4.27 headline figures, in a future session once the
-docker transport is healthy again.
+None of these were shown wrong — they simply couldn't be re-measured, **twice**: once before the main
+session's colima restart, and once again immediately after it (see "Retry pass" above — all 4 cells
+hit the identical `BrokenPipeError`/`device.py:325` signature on the very first post-restart attempt).
+Given T4.15 found the silent-fallback bug specifically and only in the qwen3.6 split's `JITBEAM=2` run
+(0/50 NV kernels affected at `JITBEAM=1` in that same session), there is no existing evidence these
+four are actually degraded — but T4.30's own brief premise ("every BEAM'd number is suspect") means
+they should still be re-run before being cited as validated post-T4.27 headline figures. Given the
+wedge reproduced immediately post-restart, a bare retry is unlikely to be enough next time — whoever
+picks this up should budget for either a `PARALLEL` below 6, or treating the docker transport itself
+as the thing to fix first (see finding 2 below, now upgraded from "new flake class" to "reliably
+reproducible under this task's own required methodology").
 
 **Two new findings for whoever owns BEAM/dock reliability next:**
 1. T4.27 hardens `beam_search`'s internal candidate-search loop only. The separate, unprotected
@@ -1960,25 +2008,35 @@ docker transport is healthy again.
    `IGNORE_BEAM_CACHE=1`) generates enough concurrent NVRTC-container churn to wedge colima's
    host-side `docker.sock` forward itself — a new, harder-edged flake class than anything TD.2c/T4.15
    previously catalogued, and the *first* one on record that plain retries and container cleanup
-   cannot clear.
+   cannot clear. **Upgraded by the retry pass:** a full colima restart clears it only until the *next*
+   `PARALLEL=6`+`IGNORE_BEAM_CACHE=1` nvcc BEAM run, which re-wedged it immediately (Cell 2's retry,
+   302 `unexpected EOF` lines, identical traceback). This is a reliably reproducible cost of this
+   task's own re-validation methodology on this dock, not a one-off — worth a real fix (transport
+   redesign or a lower concurrency ceiling for forced-fresh sweeps) before the next full BEAM
+   revalidation pass, not just a restart-and-retry.
 
 ## STOP condition invoked
 
 Read in spirit rather than letter: the brief's "GPU wedge not cleared by a server respawn → stop,
 commit, report" names the GPU/TinyGPU bridge specifically, and that bridge stayed proven-healthy
-throughout (repeated `DEV=NV` Tensor health checks all passed, `TinyGPU.*server` count never strayed
-from 1 after cleanup). What actually wedged — the docker/nvcc compile transport — has the identical
-practical effect (total, non-transient block on every remaining required cell) and, per this task's
-own explicit constraint ("never stop/start colima"), has no in-scope clearing mechanism analogous to a
-server respawn. Stopping here per protocol: captured verbatim above, committing now, reporting back.
+throughout, across both passes (repeated `DEV=NV` Tensor health checks all passed, `TinyGPU.*server`
+count never strayed from 1 after cleanup, including through 4 more docker-transport crashes in the
+retry pass). What actually wedged — the docker/nvcc compile transport — has the identical practical
+effect (total, non-transient block on every remaining required cell) and, per this task's own explicit
+constraint ("never stop/start colima"), has no in-scope clearing mechanism analogous to a server
+respawn. It also reproduced immediately after the main session's own colima restart, so a second
+restart mid-task would not be expected to hold any better than the first. Stopping here per protocol
+after the coordinator-directed retry pass: captured verbatim above, committing now, reporting back.
 
 ## Environment / stability
 
-Swap held at 1.3-1.4 GB throughout (well under the 4 GB abort threshold). `TinyGPU.*server` count: 12
-(pre-existing, cleared) → 1 → 8 (self-inflicted by the Cell 2 attempt-1 tooling mistake, cleared) → 1
-(stable from then on, including after the Cell 2 attempt-2 crash and through the final report). NV
-device itself never faulted or needed a respawn this session. The docker/colima host-side transport is
-the only unhealthy subsystem, and remains so as of this report.
+Swap held at 1.2-1.4 GB throughout both passes (well under the 4 GB abort threshold). `TinyGPU.*server`
+count: 12 (pre-existing, cleared) → 1 → 8 (self-inflicted by the Cell 2 attempt-1 tooling mistake,
+cleared) → 1 (stable from then on, including through the original Cell 2 crash, the main session's
+colima restart, and all 4 retry-pass crashes, to the final report). NV device itself never faulted or
+needed a respawn this session, across either pass. The docker/colima host-side transport is the only
+subsystem that was ever unhealthy, and it remains so (confirmed unreachable) as of this report, having
+now failed identically both before and immediately after an external colima restart.
 
 ## Exact commands (T4.30)
 
@@ -2014,4 +2072,28 @@ lsof /Users/artur/.colima/default/docker.sock          # nothing listening
 # NV health check, before/after every step this session -- GPU itself always clean
 pgrep -fl "TinyGPU.*server"
 DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+
+# --- retry pass, after the main session restarted colima ---
+GPTOSS=/Users/artur/Library/Caches/tinygrad/downloads/35ff51c27772d214bab0172591e2ade8   # resolved via fetch, cached
+
+# pre-flight: docker 0 containers, TinyGPU=1, swap 1.2GB, NV check passes -- all clean
+docker ps -aq | wc -l                                  # 0
+
+# Cell 2 retry -- BLOCKED again, identical BrokenPipeError @ device.py:325, 302 unexpected-EOF lines
+DEV=NV JITBEAM=2 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $Q8B --prompt-tokens 512 --decode-tokens 128
+
+# Cells 3-5 -- attempted per "don't fight it, move on"; all BLOCKED, same signature, 0 EOF lines each
+# (daemon already unreachable by the time each one made its first compile attempt)
+DEV=NV JITBEAM=2 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $GPTOSS --prompt-tokens 512 --decode-tokens 128
+DEV=NV JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $MXFP4 --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+DEV='METAL;NV' JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $MXFP4 --device-map "0-7:METAL,8-39:NV" --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+
+# post-mortem: docker still unreachable, GPU/TinyGPU bridge unaffected throughout
+docker ps -a                                           # Cannot connect to the Docker daemon ...
+pgrep -fl "TinyGPU.*server" | wc -l                     # 1
+sysctl vm.swapusage                                     # 1.2GB, unchanged
 ```
