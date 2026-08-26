@@ -2,7 +2,7 @@
 import unittest, os, subprocess, struct, socket, threading, time
 from unittest.mock import patch
 from tinygrad import Tensor
-from tinygrad.device import Device, Compiler, CompileError, enumerate_devices_str
+from tinygrad.device import Device, Compiler, CompileError, CompileTransportError, enumerate_devices_str
 from tinygrad.helpers import diskcache_get, diskcache_put, getenv, Context, Target, WIN, OSX, DEV
 from tinygrad.runtime.support.c import DLL
 from tinygrad.runtime.support.system import RemotePCIDevice
@@ -188,14 +188,22 @@ class TestCompiler(unittest.TestCase):
 
 class _FakeCompileProc:
   # simulates a raw unbuffered pipe: read(n) hands back at most `chunk` bytes regardless of n
-  def __init__(self, reply:bytes, chunk:int):
+  def __init__(self, reply:bytes, chunk:int, pid:int=4242):
     self.stdin = self.stdout = self
-    self.reply, self.chunk, self.pos = reply, chunk, 0
+    self.reply, self.chunk, self.pos, self.pid = reply, chunk, 0, pid
   def write(self, data): pass
   def read(self, n:int) -> bytes:
     end = min(self.pos + min(self.chunk, n), len(self.reply))
     ret, self.pos = self.reply[self.pos:end], end
     return ret
+
+class _DeadPipeProc:
+  # simulates a compile-server process whose stdin pipe is already closed (the server died)
+  def __init__(self, pid:int=4242):
+    self.stdin = self.stdout = self
+    self.pid = pid
+  def write(self, data): raise BrokenPipeError(32, "Broken pipe")
+  def read(self, n:int) -> bytes: raise AssertionError("should never read after a failed write")
 
 class TestCompileServer(unittest.TestCase):
   def test_fragmented_reassembly(self):
@@ -204,9 +212,26 @@ class TestCompileServer(unittest.TestCase):
     self.assertEqual(Compiler().compile_server("src", proc), payload)
 
   def test_eof_mid_body_raises(self):
+    # T4.31: a dead/short-lived server (EOF mid-reply) is a transport failure, not a compile failure --
+    # must raise the more specific CompileTransportError (still an instance of CompileError) so a
+    # caller can tell "respawn and retry" apart from "this source genuinely failed to compile".
     payload = b"x" * 100
     proc = _FakeCompileProc(struct.pack("I", len(payload) + 50) + payload, chunk=3)  # promises 50 bytes it never sends
-    self.assertRaisesRegex(CompileError, "got 100 of 150 bytes", Compiler().compile_server, "src", proc)
+    self.assertRaisesRegex(CompileTransportError, "got 100 of 150 bytes", Compiler().compile_server, "src", proc)
+
+  def test_broken_pipe_raises_transport_error(self):
+    # T4.31: compile_server() used to let a bare BrokenPipeError from a dead compile-server process
+    # propagate uncaught, killing the whole run with no indication of which transport died.
+    proc = _DeadPipeProc(pid=1234)
+    self.assertRaisesRegex(CompileTransportError, "pid=1234", Compiler().compile_server, "src", proc)
+
+  def test_genuine_compile_error_is_not_a_transport_error(self):
+    # T4.31: a real compile failure always completes the wire protocol (a 0-byte reply) -- must stay
+    # plain CompileError, never CompileTransportError, so callers never retry a genuinely bad source.
+    proc = _FakeCompileProc(struct.pack("I", 0), chunk=3)
+    with self.assertRaises(CompileError) as ctx:
+      Compiler().compile_server("src", proc)
+    self.assertNotIsInstance(ctx.exception, CompileTransportError)
 
 @unittest.skipIf(WIN, "AF_UNIX fd-passing (SCM_RIGHTS) isn't supported on Windows")
 class TestRemotePCIDeviceRPC(unittest.TestCase):
