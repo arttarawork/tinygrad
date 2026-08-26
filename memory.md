@@ -355,6 +355,15 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   colima was down; §5.2 count; `.pyc` untracked on the T4.37 branch (`73561c88a`). Plan agreed: a GPU-free week —
   T4.40 step 0 (RCA, Sonnet agent dispatched) → T4.40(a) → T4.39 → T4.33 validation → PR #3 (phase1b→master) —
   while Artur decides §5.1; dock only after T4.40 + verification with him present.
+- **2026-08-26 evening (queue executed):** T4.39 done+verified (`3379a0831`). RCA (Fable fork) → `T4.40_RCA.md`
+  (`161014c97`): root cause = orphaned-session teardown; panic 1 = A1 (T4.37 covers it), panic 2 = A2 uncovered
+  failed-init variant; no pkill in either; fixes 40-1..5. T4.40(a) done+verified (`940f65d79`, = 40-4, server
+  spawn discipline). **PR #3 merged → fork master = `5dea150e5`** (+ T4.37 + T4.31); phase1b retired as a base.
+  T4.33 validation done: trustworthy to push (Artur, workflow scope), zero regressions/slips, and it CONFIRMED
+  the A2 precondition (gate script lacked `DEV=CPU` → collection-time NV probe on both trees). T4.40(b) dispatched
+  (Sonnet, off `5dea150e5`): fixes 40-1 (clear MASTER on `NVDevice.__init__` failure) + 40-2 (clear on `fini()`
+  raise, not just `is_err_state`), with the #16536 healthy-path negative control. Remaining for the dock: 40-3
+  (halt-before-mastering, needs a hardware pass with Artur) + the §5.1 decision + the tinygpu_releases report (RCA §8 draft).
 
 ## 7. Sources
 
