@@ -1,9 +1,11 @@
-import os, struct, unittest
+import os, shutil, struct, subprocess, tempfile, threading, unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 from tinygrad.helpers import getenv
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
+from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, _fault_recovery_hint
 
 class CountingMMIOInterface:
@@ -243,6 +245,102 @@ class TestNVFaultRecoveryHint(unittest.TestCase):
   def test_pciiface_sleep_message_unchanged_when_local(self):
     with self.assertRaises(RuntimeError) as ctx: PCIIface.sleep(self._fake_sleep_self(False), 200)
     assert str(ctx.exception) == "Device fault detected.", ctx.exception
+
+class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
+  """T4.25: APLRemotePCIDevice.__init__'s connect-or-spawn loop (support/system.py) had no cross-process
+  lock, so simultaneous constructors could each fail their first connect() and each spawn a TinyGPU.app
+  server. Live repro on this dock: racing 10 real TinyGPU.app processes to bind() one fresh socket path
+  left only 4 with a clean 'bind: File exists'/'Address already in use' exit -- the other 6 landed in
+  accept() on a socket a losing peer's own stale-socket recovery had unlinked out from under them, and hung
+  there forever (confirmed with lsof + sample). Two of the three originally-suspected defects did NOT
+  reproduce on this platform and are deliberately left unaddressed: respawning over a genuinely stale
+  (dead-server) socket works fine as-is (TinyGPU.app unlinks and rebinds it itself: inode changes, client
+  connects, zero lingering -- verified live, twice); and retrying connect() on the same AF_UNIX SOCK_STREAM
+  socket after ECONNREFUSED/ENOENT works fine on macOS, unlike Linux (verified directly, no EINVAL). The
+  fix actually needed is just a flock(LOCK_EX) around the whole connect-or-spawn sequence, serializing
+  spawns so the race above can never start. Drives the real subprocess/socket/flock path with a fake
+  APP_PATH (a trivial bind+listen / hang script); only RemotePCIDevice.__init__ (the unrelated
+  device-ownership handshake that follows, not part of this fix) is stubbed out."""
+
+  def setUp(self):
+    self.tmpdir = tempfile.mkdtemp(prefix="t425_")
+    self.sock_path = os.path.join(self.tmpdir, "tinygpu.sock")
+    self.procs:list[subprocess.Popen] = []
+
+  def tearDown(self):
+    for p in self.procs:
+      try:
+        p.kill()
+        p.wait(timeout=2)
+      except Exception:
+        pass
+    shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+  def _script(self, name:str, body:str) -> str:
+    path = os.path.join(self.tmpdir, name)
+    with open(path, "w") as f: f.write("#!/usr/bin/env python3\n" + body)
+    os.chmod(path, 0o755)
+    return path
+
+  def _fake_popen(self):
+    real_popen = subprocess.Popen
+    def counting(*a, **k):
+      p = real_popen(*a, **k)
+      self.procs.append(p)
+      return p
+    return counting
+
+  def _sock_getenv(self, k, d=None): return self.sock_path if k == "APL_REMOTE_SOCK" else d
+
+  def test_concurrent_construction_spawns_exactly_once(self):
+    # listen() backlog must comfortably exceed the thread count below: nothing ever calls accept(), so every
+    # successful connect() just occupies one backlog slot permanently -- too small a backlog looks like a
+    # (suppressed, retried, eventually-timing-out) connection refusal and is a test-fixture bug, not a fix bug.
+    server = self._script("server.py", "import socket, sys, time\n"
+                                        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+                                        "s.bind(sys.argv[-1])\n"
+                                        "s.listen(64)\n"
+                                        "time.sleep(30)\n")
+
+    class _FakeAPL(APLRemotePCIDevice):
+      APP_PATH = server
+      def ensure_app(self): pass
+
+    results:list = []
+    def worker():
+      try:
+        _FakeAPL("NV", "0000:00:00.0")
+        results.append("ok")
+      except Exception as e:
+        results.append(e)
+
+    with patch("subprocess.Popen", side_effect=self._fake_popen()), \
+         patch("tinygrad.runtime.support.system.getenv", side_effect=self._sock_getenv), \
+         patch.object(RemotePCIDevice, "__init__", lambda self, *a, **k: None):
+      threads = [threading.Thread(target=worker) for _ in range(6)]
+      for t in threads: t.start()
+      for t in threads: t.join(timeout=10)
+
+    assert results == ["ok"] * 6, f"all 6 concurrent constructions should succeed, got {results}"
+    assert len(self.procs) == 1, f"6 constructors racing an empty socket dir should spawn exactly ONE server, got {len(self.procs)}"
+
+  def test_failed_spawn_is_killed_not_orphaned(self):
+    hang = self._script("hang.py", "import time\ntime.sleep(60)\n")  # never binds -> connect() never succeeds
+
+    class _FakeAPL(APLRemotePCIDevice):
+      APP_PATH = hang
+      def ensure_app(self): pass
+
+    with patch("subprocess.Popen", side_effect=self._fake_popen()), \
+         patch("tinygrad.runtime.support.system.getenv", side_effect=self._sock_getenv), \
+         patch("time.sleep", lambda s: None), \
+         patch.object(RemotePCIDevice, "__init__", lambda self, *a, **k: None):
+      with self.assertRaisesRegex(RuntimeError, "Failed to connect"):
+        _FakeAPL("NV", "0000:00:00.0")
+
+    assert len(self.procs) == 1
+    self.procs[0].wait(timeout=2)
+    assert self.procs[0].poll() is not None, "a spawn that never connects must be killed, not orphaned"
 
 if __name__ == "__main__":
   unittest.main()

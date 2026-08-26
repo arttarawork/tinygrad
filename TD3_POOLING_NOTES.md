@@ -1353,6 +1353,87 @@ before/after every real-hardware cell above (`pgrep -fl "TinyGPU.*server"` exact
 one transient `nv_usb4.lock` contention from an interrupted background BEAM run cleared on retry with
 no wedge, confirmed by a trivial `Tensor([1,2,3])+1` round-trip).
 
+### 14. T4.25: stale-server pileup — 2 of 3 hypothesized defects refuted live; fixed with a single flock
+
+**Verdict up front: fixed, but narrower than planned.** The main session's plan named three defects in
+`APLRemotePCIDevice.__init__` (`support/system.py:436-446`); the task brief for this session required
+verifying each live before building the fix around it. Two did not reproduce and were dropped rather than
+implemented — building them anyway would have been dead code on top of a wrong mechanism.
+
+**Defect 1 (stale socket never unlinked, server fails to bind) — REFUTED.** Killed a live server
+(`pkill`), confirmed the socket inode survives and `connect()` returns `ECONNREFUSED`, then spawned a
+fresh `TinyGPU.app server` directly at that exact stale path: it unlinked and rebound cleanly every time
+(inode changed 6825111→6825121, client connected immediately, empty log, zero lingering) — repeated twice.
+TinyGPU.app already self-heals a truly-dead stale socket; a client-side `os.unlink()` would be redundant.
+
+**Defect 3 (socket reuse across retries raises uncaught EINVAL) — REFUTED on this platform.** Directly
+retried `connect()` on the same `AF_UNIX SOCK_STREAM` socket after `ECONNREFUSED` and after
+`FileNotFoundError`, repeatedly, on this Mac: every retry behaved normally and eventually succeeded once a
+listener appeared, no `EINVAL`. Unlike Linux, macOS/BSD allows reconnecting a previously-failed stream
+socket. Since `APLRemotePCIDevice` is OSX-only (`support/system.py:83`), this is the only platform that
+matters for this class, so the fresh-socket-per-attempt change was dropped too.
+
+**Defect 2 (no cross-process lock) — CONFIRMED, and it's the whole mechanism.** Raced 10 real
+`TinyGPU.app server` processes against one fresh socket path: only 4 got a clean
+`bind: File exists`/`Address already in use` and exited; **the other 6 stayed alive**, `lsof` showed each
+holding an open `AF_UNIX` fd already unlinked from the filesystem, and `sample` caught all 6 blocked in
+`accept()` inside `TinyGPUCLIRunner.run_server`. Mechanism: TinyGPU.app's own stale-socket self-heal
+(defect 1's finding) is a `connect()`-to-check / `unlink()` / `bind()` sequence that is **not atomic**, so
+concurrent racers can unlink a sibling's freshly-live socket out from under it, orphaning the sibling in
+`accept()` on a now-nameless inode forever. This is a server-side race, but it can only fire if more than
+one client is ever mid-spawn at once — which is exactly what a client-side lock prevents categorically.
+
+**Fix (`support/system.py`, `APLRemotePCIDevice.__init__`, +13/−7 lines): a single `flock(LOCK_EX)`**
+around the whole connect-or-spawn loop, lockfile at `{sock_path}.lock`, released in a `finally` before
+`super().__init__()`. Fresh socket per attempt and client-side unlink were deliberately left out (both
+defects they'd fix didn't reproduce). Kept: kill+wait the spawned child before raising if the loop still
+never connects, so a doomed spawn is never orphaned.
+
+**Tests** (`test/external/external_test_nv.py::TestAPLRemotePCIDeviceSpawn`, real subprocess/socket/flock,
+fake `APP_PATH` script, only `RemotePCIDevice.__init__` stubbed): 6 real threads racing a `getenv`-injected
+empty socket dir spawn exactly 1 server (pre-fix: 6); a spawn that never connects is killed, not orphaned
+(pre-fix: `subprocess.TimeoutExpired` in teardown — it hangs forever). Both proven failing pre-fix via
+`git stash` of just the `system.py` diff, tests kept.
+
+**Hardware check (prescribed):** `pkill -f "TinyGPU.*server"` (stale socket left behind, confirmed), two
+sequential `DEV=NV:NAK` trivial tensor ops — both correct (`[2, 3, 4]`), second run reused the first run's
+server PID unchanged, `pgrep -fl "TinyGPU.*server" | wc -l` = **1**. Also found, unprompted: **15** stale
+servers already piled up system-wide from concurrent unrelated work in another worktree on this same dock
+(nearly double the previously-recorded max of 7) — cleared before the check, itself corroborating evidence
+of how easily this bites under real multi-session use.
+
+**Residual finding, out of scope for this fix:** a 5-way genuinely-concurrent-process stress test (5
+separate `DEV=NV:NAK` processes launched at once, not threads) still produced 3 live servers, not 1 —
+traced with a temporary debug log (not committed) to the *same* server-side non-atomic self-heal race as
+defect 2, now triggered a different way: a server that has accepted one connection but not yet consumed it
+looks "dead" (`ECONNREFUSED`, from a full accept backlog) to the *next* client's spawn attempt, which then
+wrongly self-heal-unlinks the still-live server. The client-side lock cannot close this because it's a
+property of the server's own accept-loop timing, not of when clients decide to spawn. Practical impact is
+bounded today: `RemotePCIDevice.__init__`'s pre-existing `nv_usb4.lock` (`system.py:149`, non-blocking)
+already refuses more than one process real device ownership at a time, so truly-simultaneous multi-process
+NV construction was never a supported path independent of this fix. Confirmed separately that a server
+survives an ordinary client disconnect (doesn't self-exit) — the gap is specifically the tight-race
+backlog case, not general multi-client reuse (proven fine by the sequential hardware check above). Flagged
+as a candidate follow-up (would need a post-connect liveness round-trip with retry, not a bigger lock).
+
+**Recovery procedure:** `pkill -f "TinyGPU.*server"` **alone is now safe** for the sequential/spread-out
+pattern that matches every historical sighting in this log (spawns minutes apart, not a tight race) — the
+fix's own hardware check above *is* that exact sequence. The old `pkill` + `rm -f` combination is no
+longer needed for that pattern. Keep `pkill` (not `pkill` + manual `rm -f`) as the documented workaround;
+do not add the `rm -f` back.
+
+**Gates:** new tests 2/2 (both proven failing pre-fix), `test/unit -q -n12` 848 passed / 71 skipped / 4
+xfailed (unchanged from the T4.22 baseline — the new tests live in `test/external/`, outside this count),
+mypy (`Success: no issues found in 216 source files`), ruff (`All checks passed!`), mock-NV
+(`OCELOT_PATH=... DEV=MOCK+NV:PTX` on `test/test_tiny.py test/device/test_hcq.py`) 49 passed / 6 skipped /
+14 subtests passed.
+
+**PR-readiness: ready**, same shape/size class as T4.14/T4.17/T4.23 (one file, one region, hand-verifiable,
+one lever) — with the caveat that the PR description should state plainly that 2 of the original 3
+suspected defects were investigated and found not to apply on macOS, since that's a materially different
+story from the original diagnosis and upstream reviewers (this code is fork-only today, but the pattern
+generalizes) would reasonably ask the same "did you verify this" question this task did.
+
 ---
 
 ## Exact commands

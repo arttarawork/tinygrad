@@ -436,13 +436,26 @@ class APLRemotePCIDevice(RemotePCIDevice):
   def __init__(self, devpref:str, pcibus:str):
     self.ensure_app()
     sock_path, sock = getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    for i in range(100):
-      with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
-        sock.connect(sock_path)
-        break
-      if i == 0: subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-      time.sleep(0.05)
-    else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    import fcntl # to support windows
+    lock_fd = os.open(f"{sock_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    # T4.25: concurrent spawns race the server's own bind()/stale-socket recovery and orphan most losers in accept() forever -- serialize.
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+      proc:subprocess.Popen|None = None
+      for i in range(100):
+        with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
+          sock.connect(sock_path)
+          break
+        if i == 0: proc = subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.05)
+      else:
+        if proc is not None:
+          proc.kill()
+          proc.wait()
+        raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+    finally:
+      fcntl.flock(lock_fd, fcntl.LOCK_UN)
+      os.close(lock_fd)
     super().__init__(devpref, "usb4", sock=sock)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
