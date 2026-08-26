@@ -1502,3 +1502,254 @@ PYTHONPATH=. $PY -m mypy tinygrad/             # Success: no issues found in 216
 # NV health check, before/after every real-hardware cell -- exactly one server throughout
 pgrep -fl "TinyGPU.*server"
 ```
+
+# T4.15: BEAM budget scaling, the BEAM-2 anomaly, and IQ x BEAM readiness for T4.26 (2026-08-25/26)
+
+Three linked BEAM questions from the env brief, in priority order (2 > 3 > 1, per brief). Lane mechanics
+per `TD3_POOLING_NOTES.md` §0 (`DEV=NV:NAK` forces the NAK/tinymesa renderer, no docker; `DEV=NV`/nvcc
+goes through the Docker NVRTC compile-server, `PARALLEL=6` on every such BEAM run per the TD.2c
+oversubscription lesson above). Bench window open (llama-server stopped, colima running) throughout;
+`pgrep -fl "TinyGPU.*server"` checked before every dock cell, one GPU fault hit and cleared by a
+respawn (§1.4). No `tinygrad/` source touched anywhere below -- every diff is either a disk-cache
+read/compare or a runtime monkeypatch in an ad hoc script (not committed).
+
+## 1. Question 2 (highest priority): why was qwen3.6-35B split `JITBEAM=2` 4x slower than `JITBEAM=1`?
+
+T4.21's own anomaly: `0-7:METAL,8-39:NV` range split, nvcc lane, max-context 4096 -- `JITBEAM=1`
+31.1 tok/s (99s warm) vs `JITBEAM=2` **7.58 tok/s (830s warm)**. T4.21's own beam cache was still warm
+this session -- reproducing both configs via `extra/benchmark_llm.py` hit cache and returned in under
+2 minutes each, not 830s -- so per the brief, no new search was spent on this question, only
+instrumentation of the already-cached decisions.
+
+### 1.1 Where: entirely inside one NV graph island, not spread across the step
+
+Steady-state single-decode-step breakdown (`model.warmup()`, then `Context(DEBUG=2)` around one more
+`next(gen)`, 5 live samples/config, default graphing):
+
+| graph island | device | kernels in island | `JITBEAM=1` tm (ms) | `JITBEAM=2` tm (ms) | ratio |
+|---|---|---:|---|---|---:|
+| "batched 918" (per-block NV forward) | NV | 918 (identical count, both configs) | 14.77-14.85 (mean 14.82) | 109.79-110.56 (mean 110.37) | **7.45x** |
+| "batched 229" (per-block METAL forward) | METAL | 229 (identical count, both) | 6.89-7.42 (mean 7.11) | 8.49-16.70 (mean 13.06) | 1.84x, noisy |
+| 4 small graphs + 2 tiny copies | both | 6/7/24/24 + 2 copies | 12-166 us, flat | 18-170 us, flat | ~1.0x |
+
+The entire ~4x step-level regression lives in the one 918-kernel NV island; everything else in the step
+is within ordinary run-to-run noise. Kernel **count** is identical (918=918, 229=229) in both configs --
+ruling out a graph/island-structure difference (the "or is the slowdown somewhere else entirely" branch
+of the brief's question). The NV island's numbers are also suspiciously *tight* (109.79-110.56ms, <1%
+spread; same for `JITBEAM=1`'s 14.77-14.85ms) -- not what "measurement noise on a busy tunnel" predicts;
+a noise-driven explanation would show far more run-to-run scatter than this.
+
+### 1.2 Why: BEAM-2 leaves 30% of the NV kernels completely unoptimized -- a real bug, not a worse-but-valid choice
+
+Compared the actual `applied_opts` BEAM chose per kernel by monkeypatching `diskcache_get` inside
+`tinygrad.codegen.opt.search` (read-only instrumentation, no `tinygrad/` source touched) to record
+every `beam_search` cache hit during `model.warmup()`. Matched kernels 1:1 across the two configs by
+**call-order position**, not by the diskcache `ast` key -- the key embeds `ast.arg.beam`
+(`codegen/__init__.py:314`, `sink = apply_opts(sink, ren, beam=ast.arg.beam)`), so the same kernel's
+cache key differs *by construction* between `JITBEAM=1` and `JITBEAM=2` (confirmed empirically: zero
+overlap between the two configs' 93-95 recorded ast keys). Verified the positional-correspondence
+assumption two ways: two separate `JITBEAM=1` runs reproduce byte-identical opts at every one of 95
+positions (0 diffs), and device/suffix/allow_test_size line up at every position between the
+`JITBEAM=1` and `JITBEAM=2` runs (0 mismatches/95) -- scheduling/fusion doesn't depend on beam width,
+only per-kernel tuning does, so position N is the same underlying kernel in both runs.
+
+| | `JITBEAM=1` | `JITBEAM=2` |
+|---|---:|---:|
+| NV kernel positions (of 95 total, 50 NV) with `applied_opts == []` (fully unoptimized) | **0 / 50** | **15 / 50 (30%)** |
+| METAL kernel positions (45 total) with `applied_opts == []` | 0 / 45 | 0 / 45 |
+| positions where the two configs chose different (non-empty) opts | -- | 73 / 95 |
+| positions with identical opts | -- | 7 / 95 |
+
+15 of the 50 unique NV kernels in this model -- squarely inside the 918-kernel island above -- get
+**zero** optimization under `JITBEAM=2` while getting real, multi-`Opt` tuning (GROUPTOP/LOCAL/UPCAST/
+UNROLL combinations) under `JITBEAM=1`, for the exact same kernel. **This is a real, mechanistically-
+explained bug, not "BEAM measured a worse kernel as faster":**
+
+`beam_search()` (`tinygrad/codegen/opt/search.py:111-178`) seeds `beam = [(s, inf)]` and, each round,
+times candidates via `_try_compile`/`_time_program`. `_try_compile` (lines 58-80) silently swallows
+**any** exception beyond `RuntimeError` (`except Exception as e: if BEAM_STRICT_MODE: raise e` --
+else dropped) and returns `None`, which the caller skips (`if proc is None: continue`). If **every**
+candidate in a round fails this way, `timed`/`opts` end up empty; the exit branch
+`elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]` never fires (guarded by
+`len(opts) > 0`), so `beam` is left at whatever it already was -- for a round-1 wipeout, the untouched
+seed `(s, inf)`, i.e. **`applied_opts=[]`, with no error, no log line, no signal anything went wrong**
+(the `BEAM_DEBUG` prints live downstream of the cache-hit early-return, so they're invisible here even
+with debug logging on, short of `IGNORE_BEAM_CACHE=1`).
+
+Round 1's candidate set is **provably amt-independent**: `get_kernel_actions(s, include_0=False)` is
+called once, on the same seed `s`, out of the same 193-action space (`codegen/opt/search.py:14-26`),
+regardless of `amt`. So for a kernel where `JITBEAM=1` finds a genuine improvement in round 1,
+`JITBEAM=2`'s round 1 starts from the *identical* candidate pool -- the only way it can come back with
+**nothing** is if timing/compiling those same candidates failed outright for that run. `JITBEAM=2`
+isn't searching a *worse* space; its attempt to execute the *same* search failed, silently, and the
+code degrades to the worst possible answer (no optimization) instead of erroring or keeping a partial
+result. `JITBEAM=2` naturally issues more total compile/time requests per kernel (each of its 2 beam
+survivors spawns its own fresh round of up to 193 candidates, vs `JITBEAM=1`'s 1 survivor), all against
+the *already-documented-flaky* NV/Docker NVRTC compile-server on this dock (TD.2c section, this file:
+`elf_loader` truncation, `BrokenPipeError` under concurrent load) -- more exposure to a known-
+intermittent pipeline, landing exclusively on NV (0/45 METAL positions affected; METAL's native
+compiler has none of this dock's documented docker-transport flakiness).
+
+**FINDING, not fixed here (per the brief):** `codegen/opt/search.py`'s `beam_search`/`_try_compile` has
+no way to distinguish "this round found nothing better" from "every candidate silently failed to
+compile/time" -- both produce the identical, unlogged `applied_opts=[]` result. Wider beams are *more*,
+not less, exposed to this on a lane with a flaky remote compile server -- the opposite of what a
+"more search budget helps" model predicts. **Smallest repro:** `DEV='METAL;NV' JITBEAM=2 PARALLEL=6`,
+load `Qwen3.6-35B-A3B-MXFP4_MOE.gguf` with `device_map="0-7:METAL,8-39:NV"`, `max_context=4096`, call
+`model.warmup()`; monkeypatch `tinygrad.codegen.opt.search.diskcache_get` to log every `beam_search`
+cache write and diff the resulting `applied_opts` lists against the same run with `JITBEAM=1` -- 15/50
+NV positions come back empty. (Confirming the exact silently-swallowed exception per kernel needs
+`IGNORE_BEAM_CACHE=1` + `BEAM_STRICT_MODE=1`, i.e. a fresh ~800s-class search; not spent here given the
+mechanism is already pinned down from the code plus the empty-vs-populated pattern -- left for whoever
+picks up a BEAM-reliability task.)
+
+### 1.3 Ruled out
+- **Noise on a busy tunnel:** no -- both configs' dominant-island timings are tight (<1% spread) across
+  5 live samples.
+- **Graph/island-count difference:** no -- kernel count is identical (918, 229) in both configs' islands.
+- **"BEAM-2 measured a kernel as fast during search but it replays slow"** (the brief's other named
+  hypothesis): not what happened here -- it isn't that a *specific candidate* was mistimed, it's that
+  *no candidate produced a timing at all* for 15 kernels, and the code silently kept the never-optimized
+  seed instead.
+
+### 1.4 GPU fault (orthogonal, cleared by respawn)
+
+Attempting to localize the exact bad kernel(s) further by disabling JIT graphing (`JIT_BATCH_SIZE=1`,
+to get one DEBUG=2 line per kernel instead of one per island) worked cleanly for `JITBEAM=1`'s kernel
+set (1934 NV + 488 METAL individual kernel launches over 2 decode steps, no issue) but **faulted the
+NV device on the very first post-warmup call** for `JITBEAM=2`'s kernel set (`ops_nv.py:616`,
+`is_err_state`, "Device fault detected"). Cleared by the documented procedure (`pkill -f
+"TinyGPU.*server"`, respawns on next use, verified via the standard `DEV=NV` health-check one-liner) --
+did not recur, and per the STOP condition this only requires stopping if a respawn *doesn't* clear it,
+so work continued. Recorded as a separate, orthogonal data point (an ungraphed-dispatch resource
+ceiling, plausibly the same family as T4.18/T4.20's kernarg-pooling-is-graph-only ceiling, since
+ungraphed execution bypasses that pooling) rather than folded into 1.1/1.2's evidence -- but it is a
+real, additional asymmetry: whatever `JITBEAM=2` chose for at least one of those 15 kernels is heavy/
+unusual enough that dispatching it outside the pooled graph path crashes the GPU, while `JITBEAM=1`'s
+equivalent kernel set does not.
+
+### Verdict (Q2)
+**Named cause, not narrowed-candidates-with-uncertainty:** `JITBEAM=2`'s wider beam issues more total
+requests against this dock's flaky NV/Docker compile pipeline over the course of one model's warmup;
+when a round's *entire* candidate batch fails to time (silently swallowed exceptions in
+`_try_compile`), `beam_search` has no fallback but the untouched, fully-unoptimized seed kernel, and
+never says so. 30% of this model's NV kernels landed there under `JITBEAM=2`; 0% did under `JITBEAM=1`.
+This fully explains the ~4x step-level and 7.45x island-level slowdown. **This is a FINDING, documented
+but not fixed** (measurement-only task).
+
+## 2. Question 3: IQ3_XXS x BEAM readiness for T4.26
+
+Used **T4.22's own synthetic harness** (`t422_iq_moe_repro.py`: 2-block, 32-expert/top-4 synthetic
+GGUF, DIM=HIDDEN=256, structurally-valid random IQ3_XXS blocks), not the real 16.85 GB
+`Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` -- same methodology T4.22 already validated (its own no-BEAM numbers
+reproduce here to within 0.5%, see table), and dramatically cheaper (all 6 cells below completed in
+under 3 minutes each; the real file would mean a 40-block BEAM search at qwen3.6 scale, i.e. Q2-class
+cost, for a question that only needs a directional readiness signal for T4.26).
+
+| lane | `JITBEAM` | time (ms) | vs same-lane no-BEAM | warmup wall time (cold) |
+|---|---:|---:|---:|---:|
+| `NV:NAK` | 0 (no-BEAM) | 12.118 | 1.00x | ~36s |
+| `NV:NAK` | 1 | 0.496 | **24.43x faster** | ~74s |
+| `NV:NAK` | 2 | 0.494 | **24.53x faster** | ~93s |
+| `NV` (nvcc) | 0 (no-BEAM) | 2.278 | 1.00x | ~38s |
+| `NV` (nvcc) | 1 | 0.475 | **4.80x faster** | ~41s |
+| `NV` (nvcc) | 2 | 0.438 | **5.20x faster** | ~171s |
+
+No-BEAM numbers match T4.22's own recorded post-fix figures almost exactly (12.118 vs 12.070ms NAK,
+2.278 vs 2.267ms nvcc -- confirms same harness/code state). vs T4.22's **pre-fix** no-BEAM baseline
+(0.884ms NAK / 0.954ms nvcc, from the same table above): once BEAM (any level >=1) is applied, the
+*post-fix* select-tree is **1.78-1.79x faster than pre-fix** on NAK and **2.01-2.18x faster than
+pre-fix** on nvcc -- a clear net win on both NV lanes, not just "roughly even" like METAL's own
+1.272ms-vs-1.320ms finding.
+
+**No Q2-style pathology here on either NV lane:** `JITBEAM=2` is flat-to-slightly-better than
+`JITBEAM=1` on both NAK (0.494 vs 0.496ms, within noise) and nvcc (0.438 vs 0.475ms, 8% faster) --
+consistent with this tiny 2-block/32-expert harness having far fewer unique NV kernel shapes to search
+than qwen3.6's 40-block model, so it stresses the flaky docker compile pipeline far less (§1.2's
+mechanism needs many kernels x many candidates to show up).
+
+### Verdict (Q3)
+IQ3_XXS's fix is a clear win once BEAM is on, on **both** NV lanes, not just METAL -- T4.26 can treat
+"ship IQ3_XXS as BEAM'd-only" as validated across METAL + NAK + nvcc, all showing the same qualitative
+shape (no-BEAM regression, BEAM'd net win vs pre-fix). No sign of the Q2 anomaly at this (small) scale.
+Used the synthetic harness, not the real IQ file (see above for why).
+
+## 3. Question 1 (lowest priority): does raising the BEAM budget recover the shrinking multiplier?
+
+`qwen3:8b`, `NV:NAK` lane (cheaper than gpt-oss per the brief's own steer; no-BEAM reference already on
+record from TD.2: 3.72 tok/s):
+
+| `JITBEAM` | decode tok/s | vs no-BEAM (3.72) | warmup (fresh, uncached) |
+|---:|---:|---:|---:|
+| 2 (reproduced) | 31.7 (31.44 orig.) | 8.45-8.52x | not re-measured cold this session (cache warm: 37s) |
+| 3 | 32.74 | 8.80x | **422s (7:02)** |
+| 4 | 34.62 | 9.31x | **517s (8:37)** |
+| 2 + `BEAM_UPCAST_MAX=1024`, `IGNORE_BEAM_CACHE=1` (forced fresh) | -- | -- | **>590s, did not finish (killed at timeout)** |
+
+Raising `JITBEAM` does help, monotonically, and the effort/reward tradeoff is real: 2->4 buys **+9.2%**
+decode speed (31.7 -> 34.62 tok/s) for **~8.5 more minutes** of warmup than the (already-not-cheap)
+`JITBEAM=2` cost. The BEAM/no-BEAM multiplier only creeps from 8.45x to 9.31x -- **recovering roughly
+10% of the gap** to llama3.2:1b's 13.5x, nowhere close to closing it. Opening the *per-kernel* search
+space instead of beam width (`BEAM_UPCAST_MAX=1024`, forced fresh via `IGNORE_BEAM_CACHE=1`) was tried
+once as the other named lever in the brief; it didn't even finish in the time `JITBEAM=4`'s *entire*
+search took, with no confirmed payoff -- not pursued further given this question's explicit lowest
+priority and the budget already spent on Q2/Q3.
+
+### Verdict (Q1)
+**Not worth it as a fix for the multiplier decay.** A little more search recovers a little more speed
+at rapidly compounding cost (each +1 `JITBEAM` roughly doubles warmup time here for single-digit-
+percent decode gains), consistent with TD.2's own standing explanation: the shrinking multiplier is a
+**structural** effect (unfused attention, per-layer costs that scale with layer count and that
+tile/thread search can't touch) more than a search-budget-starvation problem -- if it were mostly
+budget-starved, `JITBEAM=4` should have closed much more of the gap than it did. The `BEAM_UPCAST_MAX`
+knob tested is, if anything, a *worse* lever cost-wise than just raising `JITBEAM`, for this model/lane.
+
+## Environment / stability
+
+Bench window open throughout (llama-server stopped, colima running). Exactly one `TinyGPU.*server`
+before every cell except the one fault noted in §1.4 (cleared by a clean respawn, did not recur). Swap
+held in the 1.0-1.6 GB range throughout (well under the 4 GB abort threshold), checked before/after
+every dock cell. No `tinygrad/` source changed -- all instrumentation is monkeypatching in ad hoc
+scripts (not committed) that patch module-level references at runtime
+(`tinygrad.codegen.opt.search.diskcache_get`), never the source files themselves.
+
+## Exact commands (T4.15)
+```bash
+cd tinygrad-dock
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+MXFP4=/Users/artur/models/qwen3.6-35b-a3b-mxfp4/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+
+# Q2.1: reproduce, confirm cache warm (no new 830s search), graphed DEBUG=2 island breakdown --
+# ad hoc script (not committed): loads via device_map, model.warmup(), 1 prefill + 1 decode preroll,
+# then Context(DEBUG=2) around 5 more next(gen) calls
+DEV='METAL;NV' JITBEAM=1 PARALLEL=6 NO_COLOR=1 PYTHONPATH=. $PY q2_kernel_diag.py beam1.pkl 5
+DEV='METAL;NV' JITBEAM=2 PARALLEL=6 NO_COLOR=1 PYTHONPATH=. $PY q2_kernel_diag.py beam2.pkl 5
+
+# Q2.2: applied_opts diff -- same script, monkeypatches tinygrad.codegen.opt.search.diskcache_get to
+# record every beam_search cache hit (ast/amt/device/suffix -> opts) in call order, no source change
+PYTHONPATH=. $PY positional_diff2.py beam1.pkl beam2.pkl   # 88/95 differ; 15/50 NV positions -> [] under amt=2 only
+
+# Q2.4: ungraphed per-kernel attempt (JIT_BATCH_SIZE=1 disables JIT graphing) -- clean for amt=1,
+# faults NV for amt=2 (recovered: pkill -f "TinyGPU.*server", respawns on next use)
+DEV='METAL;NV' JITBEAM=1 JIT_BATCH_SIZE=1 PARALLEL=6 NO_COLOR=1 PYTHONPATH=. $PY q2_kernel_diag.py beam1_ungraphed.pkl 2   # clean
+DEV='METAL;NV' JITBEAM=2 JIT_BATCH_SIZE=1 PARALLEL=6 NO_COLOR=1 PYTHONPATH=. $PY q2_kernel_diag.py beam2_ungraphed.pkl 2   # NV device fault
+pkill -f "TinyGPU.*server"; DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"  # recovers clean
+
+# Q3: T4.22's own synthetic harness, both NV lanes, JITBEAM=0/1/2
+T422_DEV='NV:NAK' JITBEAM=0 PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV='NV:NAK' JITBEAM=1 PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV='NV:NAK' JITBEAM=2 PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV='NV'     JITBEAM=0 PARALLEL=6 PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV='NV'     JITBEAM=1 PARALLEL=6 PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+T422_DEV='NV'     JITBEAM=2 PARALLEL=6 PYTHONPATH=. $PY t422_iq_moe_repro.py iq3xxs
+
+# Q1: qwen3:8b, NV:NAK, budget sweep
+PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' --env JITBEAM=2 --prompt-tokens 512 --decode-tokens 128
+PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' --env JITBEAM=3 --prompt-tokens 512 --decode-tokens 128
+PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' --env JITBEAM=4 --prompt-tokens 512 --decode-tokens 128
+PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' --env JITBEAM=2 --env BEAM_UPCAST_MAX=1024 --env IGNORE_BEAM_CACHE=1 \
+  --prompt-tokens 512 --decode-tokens 128   # did not finish in 590s
+
+# NV health check, before/after every real-hardware cell
+pgrep -fl "TinyGPU.*server"
+```
