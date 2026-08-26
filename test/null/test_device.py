@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-import unittest, os, subprocess
+import unittest, os, subprocess, struct, socket, threading, time
 from unittest.mock import patch
 from tinygrad import Tensor
-from tinygrad.device import Device, Compiler, enumerate_devices_str
+from tinygrad.device import Device, Compiler, CompileError, enumerate_devices_str
 from tinygrad.helpers import diskcache_get, diskcache_put, getenv, Context, Target, WIN, OSX, DEV
 from tinygrad.runtime.support.c import DLL
+from tinygrad.runtime.support.system import RemotePCIDevice
 
 class TestDevice(unittest.TestCase):
   def test_canonicalize(self):
@@ -184,6 +185,92 @@ class TestCompiler(unittest.TestCase):
     with Context(CCACHE=0):
       a = Tensor([0.,1.], device=Device.DEFAULT).realize()
       (a + 1).realize()
+
+class _FakeCompileProc:
+  # simulates a raw unbuffered pipe: read(n) hands back at most `chunk` bytes regardless of n
+  def __init__(self, reply:bytes, chunk:int):
+    self.stdin = self.stdout = self
+    self.reply, self.chunk, self.pos = reply, chunk, 0
+  def write(self, data): pass
+  def read(self, n:int) -> bytes:
+    end = min(self.pos + min(self.chunk, n), len(self.reply))
+    ret, self.pos = self.reply[self.pos:end], end
+    return ret
+
+class TestCompileServer(unittest.TestCase):
+  def test_fragmented_reassembly(self):
+    payload = bytes((i * 7) % 256 for i in range(5000))
+    proc = _FakeCompileProc(struct.pack("I", len(payload)) + payload, chunk=2)
+    self.assertEqual(Compiler().compile_server("src", proc), payload)
+
+  def test_eof_mid_body_raises(self):
+    payload = b"x" * 100
+    proc = _FakeCompileProc(struct.pack("I", len(payload) + 50) + payload, chunk=3)  # promises 50 bytes it never sends
+    self.assertRaisesRegex(CompileError, "got 100 of 150 bytes", Compiler().compile_server, "src", proc)
+
+@unittest.skipIf(WIN, "AF_UNIX fd-passing (SCM_RIGHTS) isn't supported on Windows")
+class TestRemotePCIDeviceRPC(unittest.TestCase):
+  # RemotePCIDevice._rpc's has_fd branch rides an SCM_RIGHTS fd on a 17-byte reply that can arrive
+  # fragmented under load; drive it over a real AF_UNIX socketpair so recvmsg()/cmsg semantics are real.
+  @staticmethod
+  def _serve(server:socket.socket, sizes:list[int], fd:int, fd_frag:int):
+    header, pos = struct.pack('<BQQ', 0, 0, 0), 0
+    server.recv(33)  # drain the fixed 33-byte request header (no payload in these tests)
+    for i, sz in enumerate(sizes):
+      anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', fd))] if i == fd_frag else []
+      server.sendmsg([header[pos:pos + sz]], anc)
+      pos += sz
+      time.sleep(0.05)  # force the client to see this as a genuinely separate recvmsg() delivery
+
+  def _run(self, sizes:list[int], fd_frag:int):
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    r_fd, w_fd = os.pipe()
+    t = threading.Thread(target=self._serve, args=(server, sizes, r_fd, fd_frag), daemon=True)
+    t.start()
+    try:
+      _, _, _, fd = RemotePCIDevice._rpc(client, 0, 0, has_fd=True)
+      os.write(w_fd, b"hello")
+      self.assertEqual(os.read(fd, 5), b"hello")  # proves the received fd is the same pipe, not garbage
+      os.close(fd)
+    finally:
+      t.join(timeout=2)
+      client.close()
+      server.close()
+      os.close(r_fd)
+      os.close(w_fd)
+
+  def test_fd_on_first_fragment(self): self._run(sizes=[5, 12], fd_frag=0)
+  def test_fd_on_delayed_fragment(self): self._run(sizes=[10, 7], fd_frag=1)
+
+  def test_eof_mid_message_raises(self):
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    def serve():
+      server.recv(33)
+      server.sendmsg([struct.pack('<BQQ', 0, 0, 0)[:8]])  # 8 of 17 bytes, then hang up -- no fd ever sent
+      server.close()
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+      self.assertRaisesRegex(RuntimeError, "got 8 of 17 bytes", RemotePCIDevice._rpc, client, 0, 0, has_fd=True)
+    finally:
+      t.join(timeout=2)
+      client.close()
+
+  def test_failed_rpc_with_no_fd_raises_rpc_failed(self):
+    # a failing has_fd RPC (status != 0) legitimately carries no fd -- must surface as the normal
+    # "RPC failed" error, not get misread as a dropped fd (this is what real olmoe-scale NV allocation hits)
+    client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    def serve():
+      server.recv(33)
+      server.sendmsg([struct.pack('<BQQ', 1, 0, 0)])  # status=1, zero-length error body, no cmsg
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+      self.assertRaisesRegex(RuntimeError, "RPC failed", RemotePCIDevice._rpc, client, 0, 0, has_fd=True)
+    finally:
+      t.join(timeout=2)
+      client.close()
+      server.close()
 
 @unittest.skip("this test is broken if you have tinymesa installed")
 @unittest.skipIf(OSX and 'libclang' in DLL._loaded_, "MTLCompiler can't be loaded after libclang on OSX")

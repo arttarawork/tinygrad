@@ -7,7 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
-from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent
+from tinygrad.helpers import getenv, mv_address, round_up, data64, data64_le, prod, OSX, hi32, lo32, PROFILE, ContextVar, VIZ, ProfileEvent, unwrap
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
@@ -30,6 +30,13 @@ class NVSignal(HCQSignal):
     if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
 
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
+
+def _fault_recovery_hint(dev) -> str:
+  # T4.23: is_err_state is only ever set from real GSP-reported events (support/nv/ip.py's OS_ERROR_LOG/MMU_FAULT_QUEUED
+  # handling), and NV never sets can_recover (hcq.py), so there's no safe in-process reset -- name the out-of-band fix
+  # instead of a bare "fault detected". Remote-only: local NVK/mock have no TinyGPU.app server to respawn.
+  return (" NV device is in an unrecoverable fault state -- reinitialize the eGPU session: "
+          "`pkill -f 'TinyGPU.*server'` (the client auto-respawns it), then retry.") if dev.is_remote() else ""
 
 NV_PFAULT_FAULT_TYPE = {dt:name for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_FAULT_TYPE_")}
 NV_PFAULT_ACCESS_TYPE = {dt:name.split("_")[-1] for name,dt in nv_gpu.__dict__.items() if name.startswith("NV_PFAULT_ACCESS_TYPE_")}
@@ -81,7 +88,11 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     super().__init__()
 
   def __del__(self):
-    if self.binded_device is not None: self.binded_device.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
+    # T4.18: hw_page slices carved from _hwq_slab (see bind()) share the slab's owner/meta and must not
+    # be individually freed -- the slab itself is never freed (same lifetime as the device, like the
+    # existing 32x2MB copy pool). Only a real (non-slab) allocation needs releasing.
+    if (dev:=self.binded_device) is not None and not (dev.is_remote() and self.hw_page.base is dev._hwq_slab):
+      dev.allocator.free(self.hw_page, self.hw_page.size, BufferSpec(cpu_access=True, nolru=True))
 
   def nvm(self, subchannel, mthd, *args, typ=2): self.q((typ << 28) | (len(args) << 16) | (subchannel << 13) | (mthd >> 2), *args)
 
@@ -104,7 +115,24 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
 
   def bind(self, dev:NVDevice):
     self.binded_device = dev
-    self.hw_page = dev.allocator.alloc(len(self._q) * 4, BufferSpec(cpu_access=True, nolru=True))
+    sz = len(self._q) * 4
+    if dev.is_remote():
+      # T4.18: the remote/APL transport (TinyGPU.app over Thunderbolt) allows only ~128-130 outstanding
+      # has_fd sysmem allocations, EVER -- the wire protocol has no unmap verb, so a freed hw_page's slot
+      # is never reclaimed. A cross-device METAL+NV graph splits into dozens of small graph islands (one
+      # per device boundary), each needing its own permanently-resident hw_page; that alone can exhaust
+      # the budget before a real MoE model finishes its first JIT capture (measured: olmoe needs ~85
+      # such islands). Serve hw_page from one lazily-allocated, never-freed, bump-suballocated slab
+      # instead of a fresh RPC per bind() -- same one-alloc-many-small-pieces shape as the existing
+      # 32x2MB copy-staging pool -- falling back to a real allocation if the slab is ever exhausted.
+      # Local/NVK path (is_remote() always False) is untouched.
+      if dev._hwq_slab is None:
+        dev._hwq_slab, dev._hwq_bump = dev.allocator.alloc(4 << 20, BufferSpec(cpu_access=True)), BumpAllocator(4 << 20, wrap=False)
+      slab, bump = unwrap(dev._hwq_slab), unwrap(dev._hwq_bump)
+      try: self.hw_page = slab.offset(bump.alloc(sz, 16), sz)
+      except RuntimeError: self.hw_page = dev.allocator.alloc(sz, BufferSpec(cpu_access=True, nolru=True))
+    else:
+      self.hw_page = dev.allocator.alloc(sz, BufferSpec(cpu_access=True, nolru=True))
     hw_view = self.hw_page.cpu_view().view(fmt='I')
     if hw_view.is_remote:
       # RPC-backed buffer (T2.2's MMIOInterface.is_remote, set on RemoteMMIOInterface): one bulk slice write beats len(self._q) separate
@@ -585,7 +613,7 @@ class PCIIface(PCIIfaceBase):
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
-    if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
+    if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected." + _fault_recovery_hint(self.dev))
 
 class MOCKIface(NVKIface): count = 1
 
@@ -603,11 +631,39 @@ class NVDevice(HCQCompiled[NVSignal]):
   _REMOTE_SIZING = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
                      "cmdq_size": 0x200000}
 
+  # T4.18: lazily-allocated shared slab for NVCommandQueue.bind()'s hw_page on the remote transport -- see bind().
+  _hwq_slab: HCQBuffer|None = None
+  _hwq_bump: BumpAllocator|None = None
+
+  # T4.20: same shape, for HCQGraph.__init__'s per-graph-island kernargs_bufs (graph/hcq.py:32) -- the
+  # other ~34% of T4.18's sysmem-ceiling class, deliberately left alone there. Separate slab from hw_page's
+  # (variable-sized allocations, vs. hw_page's fixed 16KB) so neither's measured headroom skews the other's.
+  _kernargs_slab: HCQBuffer|None = None
+  _kernargs_bump: BumpAllocator|None = None
+
   def is_remote(self) -> bool:
     # True only behind PCIIface's RemotePCIDevice (macOS TinyGPU over Thunderbolt/TCP): checked on the concrete BAR1 MMIOInterface
     # (T2.2's is_remote flag), not iface type, since PCIIfaceBase can run against either a local or a Remote PCIDevice. NVKIface/MOCKIface
     # (Linux driver, mock) have no dev_impl.vram and are always local.
     return getattr(getattr(getattr(self.iface, 'dev_impl', None), 'vram', None), 'is_remote', False)
+
+  def alloc_kernargs(self, size:int) -> HCQBuffer:
+    # T4.20: graph/hcq.py's HCQGraph is cross-backend (AMD/QCOM use it too) and needs a stable address for
+    # a graph's kernargs across every future replay -- this never-freed bump slab (wrap=False) gives that
+    # for free: a slice's address never moves, and per T4.18, a remote sysmem free was already a no-op (no
+    # unmap verb), so "never free" costs nothing real freeing wasn't already failing to deliver.
+    sz = max(size, 1)
+    if not self.is_remote(): return self.allocator._alloc(sz, BufferSpec(cpu_access=True))
+    if self._kernargs_slab is None:
+      self._kernargs_slab, self._kernargs_bump = self.allocator.alloc(4 << 20, BufferSpec(cpu_access=True)), BumpAllocator(4 << 20, wrap=False)
+    slab, bump = unwrap(self._kernargs_slab), unwrap(self._kernargs_bump)
+    try: return slab.offset(bump.alloc(sz, 16), sz)
+    except RuntimeError: return self.allocator._alloc(sz, BufferSpec(cpu_access=True))  # slab exhausted: fall back to a real alloc
+
+  def free_kernargs(self, buf:HCQBuffer) -> None:
+    # Mirrors NVCommandQueue.__del__'s hw_page check: a slab-derived slice shares the slab's lifetime and
+    # must never be individually freed; a real (non-slab) allocation still needs releasing, as before.
+    if not (self.is_remote() and buf.base is self._kernargs_slab): self.allocator._free(buf, BufferSpec(cpu_access=True))
 
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
@@ -778,7 +834,7 @@ class NVDevice(HCQCompiled[NVSignal]):
       for i, e in enumerate(sm_errors.smErrorStateArray):
         if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
 
-    raise RuntimeError("\n".join(report))
+    raise RuntimeError("\n".join(report) + _fault_recovery_hint(self))
 
   def _prof_init(self):
     self.profiler = self.iface.rm_alloc(self.subdevice, nv_gpu.MAXWELL_PROFILER_DEVICE,

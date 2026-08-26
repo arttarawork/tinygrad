@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from tinygrad import Tensor, nn, Device
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, parse_device_map
@@ -190,6 +191,58 @@ class TestDeviceMapMetalCPU(unittest.TestCase):
     if Device["METAL"].graph is not None: self.assertIn("METAL", graphed_devs)  # METAL kernels got graph-batched
     self.assertIn("CPU", ungraphed_devs)               # CPU kernels stayed eager/sequential
 
+@unittest.skipUnless(Device.DEFAULT == "METAL" and "NV" in Device.get_available_devices(), "Metal default + a real NV device required to run")
+class TestDeviceMapMetalNV(unittest.TestCase):
+  """TD.3: the real Metal+NV pooling rehearsal (dock hardware) -- same shape as TestDeviceMapMetalCPU,
+  but the second backend is an actual RTX 3090 over the USB4/Thunderbolt eGPU tunnel instead of CPU.
+  Unlike CPU (never graphs), NV is HCQ-based and graph-batches too -- both islands should."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_split_matches_single_device(self):
+    ref, split = Transformer(TEST_CONFIG, device_map="METAL"), Transformer(TEST_CONFIG, device_map="0-1:METAL,2-3:NV")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    self.assertEqual([b.device for b in split.blk], ["METAL", "METAL", "NV", "NV"])
+    self.assertEqual(split.token_embd.weight.device, "METAL")  # consumed before the first block
+    self.assertEqual(split.output.weight.device, "NV")         # consumed after the last block
+
+    # identical outputs over prefill + several decode steps, twice (second prompt exercises JIT replay)
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    # lazily-created per-block state followed the activations to the mapped devices
+    self.assertEqual([b.cache_kv.device for b in split.blk], ["METAL", "METAL", "NV", "NV"])
+    self.assertEqual([b.freqs_cis.device for b in split.blk], ["METAL", "METAL", "NV", "NV"])
+
+    # JIT-capture characterization (TD.3 objective 4): the mixed METAL/NV trace captures end-to-end,
+    # same as METAL/CPU (T3.2). Unlike CPU, NV is HCQ-based (Device["NV"].graph is HCQGraph) so BOTH
+    # islands should graph-batch -- there is no "ungraphed backend" here the way CPU was.
+    rollout_jit = split.jit[(False, True, None)]
+    self.assertIsNotNone(rollout_jit.captured)
+    copies, graphed_devs, ungraphed_devs = [], set(), set()
+    for call in rollout_jit.captured.linear.src:
+      ast = call.src[0]
+      if ast.op is Ops.COPY:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        copies.append((devs, ast.arg))
+      elif ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "graph":
+        batch_devs = set()
+        for inner in ast.src[0].src: batch_devs |= set(u.device for u in inner.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        self.assertEqual(len(batch_devs), 1, f"graphed batch spans devices: {batch_devs}")  # graphing never crosses backends
+        graphed_devs |= batch_devs
+      else:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        self.assertLessEqual(len(devs), 1, f"ungraphed compute kernel with mixed-device buffers: {devs}")
+        ungraphed_devs |= devs
+    self.assertIn(({"METAL", "NV"}, "NV"), copies)  # the block-boundary activation hop, dst follows the map (NV is last)
+    if Device["METAL"].graph is not None: self.assertIn("METAL", graphed_devs)  # METAL kernels got graph-batched
+    if Device["NV"].graph is not None: self.assertIn("NV", graphed_devs)        # NV kernels got graph-batched too (HCQGraph)
+    self.assertEqual(ungraphed_devs, set())  # neither island is CPU-style ungraphed here
+
 @unittest.skipUnless(Device.DEFAULT == "METAL", "Metal device required to run")
 class TestDeviceMapMetalCPURecurrent(unittest.TestCase):
   def _generate(self, model, prompt, n, temperature=0.0):
@@ -325,6 +378,80 @@ class TestDeviceMapMoEExpertsMetalCPU(unittest.TestCase):
         devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
         if "CPU" in devs and "METAL" in devs: expert_copies += 1
     self.assertEqual(expert_copies, 4 * 3)  # same 3-copies/layer shape as the homogeneous CPU:0/CPU:2 case
+
+@unittest.skipUnless(Device.DEFAULT == "METAL" and "NV" in Device.get_available_devices(), "Metal default + a real NV device required to run")
+class TestDeviceMapMoEExpertsMetalNV(unittest.TestCase):
+  """TD.3-moe: the MoE PRODUCTION shape on real dock hardware -- routed experts (ffn_{gate,up,down}_exps,
+  the bulk of a MoE model's weights) on the RTX 3090 (NV), attention+norms+router+KV on METAL. Same shape
+  as TestDeviceMapMoEExpertsMetalCPU, but the second backend is real NV instead of CPU.
+  NOTE: run this class with DEV='METAL;NV:NAK' -- colima/docker is stopped on this dock, so bare NV would
+  route new kernel compiles through the (unavailable) docker nvcc compile-server. "NV:NAK" is a DEV
+  target-string renderer override (device="NV", renderer="NAK", tinymesa, no docker), NOT a device_map
+  device string -- "NV:NAK" as a device_map/Tensor(device=...) value raises (the trailing segment parses
+  as a device INDEX, not a renderer). device_map/Tensor strings below stay plain "NV"; see
+  TD3_POOLING_NOTES.md's MoE section for the full mechanism writeup."""
+  def _generate(self, model, prompt, n):
+    Tensor.manual_seed(42)
+    gen = model.generate(list(prompt))
+    return [next(gen) for _ in range(n)]
+
+  def test_experts_on_nv_rest_on_metal(self):
+    # the flagship shape this task exists to validate: experts (bulk) on NV, everything else on METAL
+    ref = Transformer(MOE_TEST_CONFIG, device_map="METAL")
+    _randomize_experts(ref)
+    split = Transformer(MOE_TEST_CONFIG, device_map="METAL,experts:NV")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["NV"] * 4)
+    self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["METAL"] * 4)
+
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+    rollout_jit = split.jit[(False, True, None)]
+    self.assertIsNotNone(rollout_jit.captured)
+    expert_copies = 0
+    for call in rollout_jit.captured.linear.src:
+      if call.src[0].op is Ops.COPY:
+        devs = set(u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None)
+        if "NV" in devs and "METAL" in devs: expert_copies += 1
+    self.assertEqual(expert_copies, 4 * 3)  # same 3-copies/layer shape as MetalCPU (h, sel in; x_down out)
+
+  def test_experts_on_metal_rest_on_nv(self):
+    # reverse direction, cheap correctness-only check (not the production shape) -- objective 1's "once, cheap"
+    ref = Transformer(MOE_TEST_CONFIG, device_map="NV")
+    _randomize_experts(ref)
+    split = Transformer(MOE_TEST_CONFIG, device_map="NV,experts:METAL")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    self.assertEqual([b.ffn_gate_exps.weight.device for b in split.blk], ["METAL"] * 4)
+    self.assertEqual([b.attn_norm.weight.device for b in split.blk], ["NV"] * 4)
+
+    for prompt in ([5, 6, 7, 8], [9, 10, 11, 12, 13]):
+      self.assertEqual(self._generate(ref, prompt, 6), self._generate(split, prompt, 6))
+
+  def test_experts_split_no_divergence_deep(self):
+    """T4.19: real olmoe's experts-split diverges from the single-device references at decode index 60
+    (512-prompt/128-decode depth, BENCH_NOTES.md's "Correctness caveat" section) -- root-caused to
+    ordinary cross-device FP non-associativity in the expert GEMV (tiny, ~1e-6-abs per layer, growing
+    with depth) tipping a near-tied final-logit argmax, NOT a routing/dtype bug (sel matched exactly
+    across all 16 layers at the actual divergence step). Confirmed (ad hoc, this session) that random-
+    weight tiny configs do NOT reproduce the divergence even at olmoe's real depth (16 blocks) pushed to
+    8000 decode steps -- 125x deeper than production's trigger point. Pin that as a regression guard:
+    a real bug reintroduced into the hop mechanism (e.g. sel corrupted at the .to(expert_dev) hop) would
+    very likely show up well before this depth, cheaply, without needing real-olmoe-scale hardware."""
+    deep_cfg = replace(MOE_TEST_CONFIG, num_blocks=16, max_context=300)  # olmoe's real depth, tiny otherwise
+    ref = Transformer(deep_cfg, device_map="METAL")
+    _randomize_experts(ref)
+    Tensor.realize(*nn.state.get_parameters(ref))
+    split = Transformer(deep_cfg, device_map="METAL,experts:NV")
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+
+    prompt = [2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    self.assertEqual(self._generate(ref, prompt, 200), self._generate(split, prompt, 200))
 
 if __name__ == '__main__':
   unittest.main()
