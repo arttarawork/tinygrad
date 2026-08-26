@@ -616,7 +616,14 @@ class PCIIface(PCIIfaceBase):
     # T4.37: fini_hw() needs GSP alive to answer its RPC, so clear bus-master only after -- but in a `finally`: on a faulted
     # GPU that RPC times out (seen live: "Timeout waiting for RPC response for command 47"), and the clear must still run so a
     # normal exit with a live fault never leaves a bus-mastering GPU once this client's mappings are torn down on disconnect.
+    # T4.40b (closes an A1 hole): is_err_state is only set by a GSP-delivered fault event -- a wedge whose fini() unload RPC
+    # itself times out/raises without ever having delivered one exits with is_err_state False, so the `finally` below alone
+    # would leave MASTER on. Clear unconditionally on any raise here too (idempotent alongside the is_err_state clear below
+    # if both fire); a healthy fini() with is_err_state False still hits neither clear (the #16536 guard, unchanged).
     try: self.dev_impl.fini()
+    except BaseException:
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+      raise
     finally:
       if self.dev_impl.is_err_state:
         self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
