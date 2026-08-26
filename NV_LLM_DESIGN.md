@@ -32,6 +32,12 @@ The dock arrived 2026-08-23; TD.1→TD.3 ran 2026-08-24/25. Everything below is 
 real 3090-over-USB4 (details: TASKS.md status rows; data: `BENCH_NOTES.md` +
 `TD3_POOLING_NOTES.md` on `task/TD.3-pooling`).
 
+**Safety addendum (2026-08-26): two host kernel panics occurred during dock work** (Apple DART/IOMMU asserts;
+RCA in `T4.40_RCA.md` on `memory`: a client that exits without a successful GSP unload while bus-mastering gets
+its DMA mappings torn down under a live GSP-RM). Client-side remediation is shipped and verified (T4.37 on
+master + T4.40a/b branches); dock measurement is paused pending HANDOFF §5.1 and a supervised hardware pass
+(fix 40-3). All numbers below predate the panics and stand.
+
 **G1 — single-eGPU speed: MET, ahead of target.** Best config is `DEV=NV` (nvcc) + BEAM.
 Decode tok/s: llama3.2:1b **149.1** (above the llama.cpp-CUDA 110-130 reference band),
 qwen3:8b **46.9** (1.73x llama.cpp-Metal's 27.1), gpt-oss:20b **60.9** (~4x our Metal BEAM),
