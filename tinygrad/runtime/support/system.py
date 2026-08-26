@@ -433,26 +433,65 @@ class APLRemotePCIDevice(RemotePCIDevice):
     system(f"ditto -xk {fetch(f'https://github.com/tinygrad/tinygpu_releases/raw/{commit}/TinyGPU.zip', name=app_name)} /Applications")
     print(system(f"{cls.APP_PATH} install"))
 
+  @classmethod
+  def _live_server_pids(cls) -> list[int]:
+    # T4.40a: pgrep the real process table for "<APP_PATH> server" rather than keeping a pidfile. A pidfile is
+    # only as good as our own bookkeeping, and every server leaked under T4.25/T4.38 -- including ones already
+    # alive on the box before this code ever runs -- was spawned without one; pgrep sees those too. Ceiling:
+    # relies on pgrep's substring/regex match against the full command line, so an APP_PATH containing regex
+    # metacharacters could over-match -- not a real risk for a real install path or a plain tempdir script path.
+    out = subprocess.run(["pgrep", "-f", f"{cls.APP_PATH} server"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    return [int(pid) for pid in out.stdout.split()]
+
+  @staticmethod
+  def _proc_age(pid:int) -> str:
+    out = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    return out.stdout.strip() or "?"
+
+  @classmethod
+  def _server_status_msg(cls, sock_path:str) -> str:
+    if not (pids:=cls._live_server_pids()): return f"no TinyGPU server process found for {sock_path}"
+    who = ", ".join(f"pid {p}, age {cls._proc_age(p)}" for p in pids)
+    return f"a TinyGPU server ({who}) is alive but not accepting connections"
+
   def __init__(self, devpref:str, pcibus:str):
     self.ensure_app()
     sock_path, sock = getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     import fcntl # to support windows
+
+    # T4.40a: a probe or an xdist test worker must never spawn a server of its own -- xdist workers race each
+    # other 1:1 and each spawns one (T4.38: 12 leaked from a single -n12 run). Fail fast onto whatever already
+    # exists instead of waiting out the retry budget below.
+    if getenv("PYTEST_XDIST_WORKER", "") or getenv("NV_NO_SPAWN", 0):
+      with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
+        sock.connect(sock_path)
+        super().__init__(devpref, "usb4", sock=sock)
+        return
+      raise RuntimeError(f"{self._server_status_msg(sock_path)} (spawning is disabled here: xdist worker or NV_NO_SPAWN=1; see T4.40).")
+
     lock_fd = os.open(f"{sock_path}.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     # T4.25: concurrent spawns race the server's own bind()/stale-socket recovery and orphan most losers in accept() forever -- serialize.
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     try:
+      # T4.40a: never spawn next to a server that's already alive, responsive or not -- two servers holding the
+      # same physical GPU is the precondition both 2026-08-26 host panics share (HANDOFF_2026-08-26.md §2).
+      # Snapshot once under the lock, so a concurrent spawn decision elsewhere can't race this read.
+      pre_existing = bool(self._live_server_pids())
       proc:subprocess.Popen|None = None
       for i in range(100):
         with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
           sock.connect(sock_path)
           break
-        if i == 0: proc = subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if i == 0 and not pre_existing:
+          proc = subprocess.Popen([self.APP_PATH, "server", sock_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.05)
       else:
         if proc is not None:
           proc.kill()
           proc.wait()
-        raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+          raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
+        raise RuntimeError(f"{self._server_status_msg(sock_path)} -- it is probably bound to a faulted GSP session; "
+                            "do NOT pkill it under a live fault; see HANDOFF_2026-08-26.md §2 / T4.40.")
     finally:
       fcntl.flock(lock_fd, fcntl.LOCK_UN)
       os.close(lock_fd)
