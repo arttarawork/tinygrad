@@ -539,7 +539,17 @@ class TestGPTOSSDecodeByteBudgetIQ(unittest.TestCase):
       self._build_gguf(path, rng, ggml_type)
       model, _ = Transformer.from_gguf(path, max_context=self.MAX_CTX)
 
-    gen = model.generate([1, 2, 3, 4, 5], chunk_size=32, temperature=0.0)
+    # chunk_size=1 (not T4.11/T4.13's 32): the assertion below only ever reads the STEADY-STATE
+    # DECODE call's byte count, which is chunk_size-invariant (verified: identical actual byte
+    # count at chunk_size=1 vs 32) -- prefill's shape/width plays no part in what's being checked.
+    # IQ3_XXS's 256-leaf select-tree dequant (vs IQ4_XS's 16-leaf one) is expensive to COMPILE, not
+    # just to run (T4.26's documented no-BEAM runtime regression, ~2.4-13.6x elsewhere), and that
+    # compile cost scales heavily with the *prefill* kernel's chunk width: chunk_size=32 made this
+    # test's prefill step alone take ~43s in isolation and it was CI's sole failure (xdist worker
+    # OOM/abort on a 4-vCPU/16GB runner, PR #2 run 32919852416) despite passing every time locally.
+    # chunk_size=1 collapses prefill onto the same (cheap, already-decode-shaped) kernel, cutting
+    # this test's wall time ~4-5x with zero change to the assertion or the measured value.
+    gen = model.generate([1, 2, 3, 4, 5], chunk_size=1, temperature=0.0)
     for _ in range(1 + 5): next(gen)  # prefill + warm the decode jit variant
     GlobalCounters.reset()
     next(gen)
