@@ -190,6 +190,10 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     print(colored(f"WARNING: BEAM found no working action for {s.colored_shape()}, falling back to hand_coded_optimizations", "red"))
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     beam[0] = (hand_coded_optimizations(beam[0][0].copy()), beam[0][1])
-  if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
+  # T4.39: an inf best time means the search never produced an empirically-validated winner -- either the
+  # total-failure fallback above (whose score is still the untouched seed's inf) or a candidate whose only
+  # timing attempt hit _time_program's AssertionError path (search.py:50). Don't persist that: a later run
+  # would otherwise silently replay an unvalidated kernel forever with none of the WARNINGs above.
+  if CACHELEVEL >= 1 and not math.isinf(beam[0][1]): diskcache_put("beam_search", key, beam[0][0].applied_opts)
   if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(beam[0][1], w=0)}, applied_opts={beam[0][0].applied_opts}")
   return beam[0][0]
