@@ -1753,3 +1753,175 @@ PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' 
 # NV health check, before/after every real-hardware cell
 pgrep -fl "TinyGPU.*server"
 ```
+
+# T4.29 — IQ3_XXS/IQ4_XS dequant fix, real-model payoff on Qwen3.6-35B-A3B-UD-Q3_K_XL (2026-08-26)
+
+Follow-up to T4.22 (synthetic-harness byte/wall-clock fix). Two prior real-model attempts produced
+nothing (T4.36: host kernel panic mid-run; a second lost to a process restart) — this session started
+fresh on `task/T4.29-iq-realmodel` @ `b37c792c6` (T4.37 in tree, hardware-verified). Model: the real
+`Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf` (16.85 GB, 31 of 35B elements IQ3_XXS/IQ4_XS), all-NV, exact pre-fix
+config replicated (`--max-context 2048 --prompt-tokens 512 --decode-tokens 128`). Exactly one
+`TinyGPU.*server` throughout (PID 12271, never touched, even across the fault below), swap ≤0.6 MB
+throughout, bench window open (llama-server stopped, colima up).
+
+## Headline: does the byte fix survive to the real model, and does wall-clock follow?
+
+| config (`NV:NAK`) | load | warm | prefill tok/s | decode tok/s | GB/s | GB/token |
+|---|---:|---:|---:|---:|---:|---:|
+| **pre-fix** (2026-08-25, on record) | — | — | — | 1.859 | 164.1 | 88.27 |
+| post-fix, no-BEAM | 20.4s | 201.6s | 0.712 | **0.716** | 2.45 | **3.42** |
+| post-fix, `JITBEAM=1` (cache-hit — see note) | 23.0s | 217.8s | 0.852 | **0.852** | 2.81 | 3.30 |
+| post-fix, `JITBEAM=2` (fresh search, 0 faults) | 22.9s | 740.97s | 0.853 | **0.853** | 2.81 | 3.29 |
+
+**Bytes: the ~88 GB/token pathology is gone — 25.8-26.8x fewer bytes moved per token at every BEAM
+level**, exactly the fix T4.22 predicted, now confirmed on the real 40-block model, not just the 2-block
+synthetic harness. **Wall-clock did NOT follow: every post-fix configuration is SLOWER than the pre-fix
+(buggy, over-fetching) baseline** — no-BEAM is 2.60x slower, and even a fully-searched `JITBEAM=2` is
+still 2.18x slower. This is the real-model confirmation of T4.22's own synthetic warning ("a real
+regression without BEAM on all three lanes tested") — and it goes past what T4.22's synthetic 2-block
+harness predicted: T4.22 called IQ3_XXS "a net win with BEAM" (1.78-1.79x *faster* than pre-fix on NAK) at
+synthetic scale, but at real 40-block scale BEAM never closes the gap — `JITBEAM=2` only shrinks the
+regression from 2.60x to 2.18x and never crosses back above the pre-fix baseline. Plausible cause (not
+directly re-measured this session, but consistent with the qwen3.6 arch note recorded earlier in this
+file): 30 of this model's 40 blocks are recurrent GatedDeltaNet blocks that never touch the IQ MoE dequant
+path at all, so optimizing only the MoE gather/dequant kernels moves the needle far less on real per-step
+time than it did on the synthetic harness's 2-block, all-MoE model.
+
+**Note on `JITBEAM=1`'s cache status:** zero fresh `BEAM_SEARCH:` log lines (vs `JITBEAM=2`'s 100) prove
+it was a 100% disk-cache replay — almost certainly the leftover cache entries from T4.36's crashed first
+attempt, which per that writeup had reached exactly this shape's `JITBEAM=1` fresh-search rung before the
+panic. Kept in the table anyway because it's a legitimate production data point (this fork always ships
+BEAM-cached kernels) and because it corroborates `JITBEAM=2`: the two independently-obtained numbers
+(0.852 vs 0.853 tok/s) agree within noise, so the crashed attempt's partial cache was not corrupted, and
+BEAM-1 vs BEAM-2 make no real difference at this scale.
+
+## The `JITBEAM` ladder T4.26 needs
+
+| | `JITBEAM=1` (cache-hit) | `JITBEAM=2` (fresh) |
+|---|---:|---:|
+| decode tok/s | 0.852 | 0.853 (1.00x, flat within noise) |
+| GB/s | 2.81 | 2.81 |
+| warm (compile cost) | 217.8s | **740.97s** |
+
+`JITBEAM=2` fit comfortably (16.85 GB model / 24 GB card, as predicted) with **zero faults across 100
+freshly-searched kernels** on the NAK lane. No BEAM-2-vs-BEAM-1 pathology here (unlike the MXFP4
+split-model case in T4.15 — that was nvcc/Docker-pipeline-specific and this run is all-NAK, no Docker
+involved). Subtracting the no-BEAM compile floor (201.6s) from `JITBEAM=2`'s fresh warm (740.97s) gives
+**~539s (~9 minutes) of genuine BEAM-2 search cost** for this file at this shape on the NAK lane — a real,
+non-trivial, one-time cost, but it completed cleanly.
+
+## The nvcc-lane bonus row: hit the T4.34 fault class, captured verbatim
+
+Attempted `DEV=NV JITBEAM=1 PARALLEL=6` (same shape) as the optional bonus row. It **faulted** during
+`model.warmup()`'s fresh search, before ever printing `warm` — the exact T4.34 fault class, caught in the
+act for the first time on the real model. Full log kept at `t429_cell4_nvcc_jitbeam1.log` (scratch, not
+committed). Verbatim, in order:
+
+1. **No classic `MMU fault: 0x... | type | access` line this time** (grepped for it: 0 hits). Code reason,
+   confirmed by reading `ops_nv.py`: that rich report is only assembled by `on_device_hang()`
+   (`ops_nv.py:833-855`), a *different* call site from the cheap `is_err_state` check in `sleep()`
+   (`ops_nv.py:624-630`) that actually fired here. `is_err_state` is set asynchronously the moment the GSP
+   reports an `OS_ERROR_LOG`/`MMU_FAULT_QUEUED` event (`support/nv/ip.py:74`) — no print of its own unless
+   it's specifically `OS_ERROR_LOG` (prints a "GSP LOG:" line; 0 hits for that too, so this was the silent
+   `MMU_FAULT_QUEUED` variant). Once the flag is set, every subsequent `sleep()` call takes the cheap
+   early-exit and never reaches `on_device_hang()`'s register read. **New finding for whoever owns T4.34
+   next: the rich fault report is not guaranteed even when `Device fault detected` fires — it depends on
+   which code path notices first.**
+2. **The actual first-observed symptom, repeated 59x across the run:** `Timeout waiting for RPC response
+   for command 76` immediately before each `BEAM failed for opts: [...]` line — every BEAM candidate from
+   that point on failed via a GSP RPC timeout, not a compile error.
+3. **Four separate kernels' searches degraded to a permanently-untimed result** (`grep -n "BEAM_SEARCH:
+   final tm=infs"` → lines 3036/3643/4262/4330 of the saved log), each preceded by `WARNING: BEAM found no
+   viable candidate this round (19 tried, 19 failed: {'RuntimeError': 19})` and `WARNING: BEAM found no
+   working action for ..., falling back to hand_coded_optimizations`. Example (line 4330, verbatim):
+   `BEAM_SEARCH: final tm=infs , applied_opts=[Opt(op=OptOps.UPCAST, axis=0, arg=4), Opt(op=OptOps.UNROLL,
+   axis=4, arg=0), Opt(op=OptOps.LOCAL, axis=0, arg=32)]`. **This refines T4.15 §1.2's theorized mechanism**
+   (all-candidates-fail leaves the kernel unoptimized) with two things T4.15 couldn't see without a
+   captured fault: (a) there IS a graceful fallback (`hand_coded_optimizations`, not silently the bare
+   empty seed) — better than T4.15 feared; but (b) **`beam_search()`'s unconditional `diskcache_put` at
+   `codegen/opt/search.py:193` writes this never-successfully-timed `applied_opts` to the persistent disk
+   cache anyway** — a future run hitting this exact cache key will silently replay an
+   empirically-unvalidated kernel forever, with no marker that it was a fault-degraded fallback rather than
+   a real search result. Not fixed here (measurement task) — flagging as a new finding for T4.26 or a
+   follow-up ticket.
+4. **Terminal crash**, uncaught (outside any `_try_compile` guard — this was a real compile during JIT
+   graph capture, not a BEAM candidate): `RuntimeError: Device fault detected. NV device is in an
+   unrecoverable fault state (PCI bus-master now cleared) -- start a FRESH CLIENT to recover (it performs
+   a controlled reset). Do not \`pkill\` the server while a fault is live.` — T4.37's own message, fired
+   from `ops_nv.py:630`, cascading through 121 total occurrences as cleanup/atexit paths each independently
+   re-checked the already-tripped flag.
+
+**Recovery, verified immediately after (no manual intervention beyond starting fresh processes):**
+`TinyGPU.*server` stayed at exactly one, PID **12271, never touched** — confirming the fault stayed
+entirely client-side. A fresh client opened `NV` (nvcc) *and* `NV:NAK` cleanly right after (`6.0` on both
+health checks), swap unaffected. **This is the first end-to-end validation of T4.37 against a real,
+naturally-occurring fault** (T4.37's own verification session used a deliberately-forced fault via a bogus
+VA; this one happened on its own, mid-search, exactly like T4.34's storms and the T4.36 panic's trigger —
+and this time the machine did not panic and recovery needed zero manual steps). Did not retry a second
+nvcc attempt (1 of the 2-fault cap used; the fault data captured here is more valuable than a second clean
+decode number, and remaining budget was needed for writeup) — **no nvcc-lane decode/GB/s number for this
+file**, unlike the NAK-lane ladder above.
+
+## Coherence check (CLI-path classes, real prompts, no-BEAM, greedy/temperature=0)
+
+Used `Transformer.from_gguf` + `SimpleTokenizer.from_gguf_kv` directly (the same two classes
+`tinygrad/llm/cli.py` itself calls, per T4.24's own methodology), `max_context=768`, 80 decode tokens,
+`DEV=NV:NAK`, ad hoc script (not committed):
+
+| prompt | continuation |
+|---|---|
+| "The capital of France is Paris. The capital of Japan is" | "Tokyo. The capital of Germany is Berlin. ... Canberra. ... Ottawa. ... Brasilia. ... New Delhi. ... Beijing. ... Moscow. ... Cairo. The capital of South Africa is" — **every fact correct** |
+| "Once upon a time, in a small village nestled between two mountains, there lived an old clockmaker named" | "Mr. Thompson. He was known throughout the village for his exceptional craftsmanship..." — coherent, grammatical |
+
+**Both outputs are bit-exact reproductions of T4.24's own pre-fix coherence-check results** (same
+"Tokyo...Cairo" capital chain, same "Mr. Thompson" clockmaker name) — expected and reassuring, since
+T4.22's fix is a byte-accounting correction, not a numerics change, so identical greedy output is exactly
+what bit-exactness predicts. **Verdict: coherent, correct, fluent — confirmed, not just assumed**, per the
+brief's ask. (Decode-token IDs from the raw benchmark harness's synthetic-prompt runs above are also
+non-degenerate/non-repeating in all three NAK configs, a secondary, weaker signal pointing the same way.)
+
+## T4.26 recommendation
+
+**Redesign IQ3_XXS's 256-leaf select-tree; keep IQ4_XS's fix as shipped.** Reasoning, combining T4.22's
+per-format synthetic microbenchmark with this session's real-model aggregate:
+- The byte-accounting fix itself is correct and should stay for both formats — bit-exact output,
+  25.8-26.8x fewer bytes/token confirmed at real 40-block scale, not just synthetically.
+- But for the IQ3_XXS-dominant real file (67% of this file's IQ elements are IQ3_XXS by count), **no
+  configuration measured — no-BEAM, `JITBEAM=1`, or a fully-searched `JITBEAM=2` — beats the original
+  buggy over-fetching baseline's wall-clock**, contradicting the earlier synthetic-scale "net win with
+  BEAM" verdict. The gap shrinks with BEAM (2.60x slower → 2.18x slower) but never closes.
+- The compile-cost strike against IQ3_XXS is reconfirmed, worse than before: a genuinely fresh search on
+  the real model cost ~9 minutes on the NAK lane (clean) and **triggered a real T4.34-class device fault
+  on the nvcc lane** (recovered cleanly under T4.37, but still real, now-reproduced-twice instability
+  specifically on fresh BEAM searches of this kernel family).
+- IQ4_XS does not show this pattern in any measurement taken so far (T4.22's own METAL wall-clock was a
+  clean 2.38x win; nothing measured on IQ4_XS in isolation has regressed) — shipping it as-is is supported
+  by the evidence on hand.
+- "Keep IQ3_XXS BEAM'd-only" (T4.15 §2's verdict, from a 2-block synthetic harness) is **not supported by
+  the real model** and should not be the shipped conclusion; a LUT/gather-style approach for the 256-entry
+  codebook (the same class of fix T4.13 already used for MXFP4) is the recommended redesign direction
+  rather than a compile-time branch-select-tree, which this session's evidence says is fundamentally too
+  ALU-heavy for its byte savings on real hardware.
+
+## Exact commands
+```bash
+cd tinygrad-t429
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+MODEL=/Users/artur/models/qwen3.6-35b-a3b-q3/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
+
+# headline + ladder (NAK lane)
+DEV=NV:NAK                                                                  PYTHONPATH=. $PY extra/benchmark_llm.py --model $MODEL --max-context 2048 --prompt-tokens 512 --decode-tokens 128
+DEV=NV:NAK JITBEAM=1 PARALLEL=6 DEBUG=2 BEAM_DEBUG=2 BEAM_LOG_SURPASS_MAX=1 PYTHONPATH=. $PY extra/benchmark_llm.py --model $MODEL --max-context 2048 --prompt-tokens 512 --decode-tokens 128
+DEV=NV:NAK JITBEAM=2 PARALLEL=6 DEBUG=2 BEAM_DEBUG=2 BEAM_LOG_SURPASS_MAX=1 PYTHONPATH=. $PY extra/benchmark_llm.py --model $MODEL --max-context 2048 --prompt-tokens 512 --decode-tokens 128
+
+# nvcc-lane bonus (faulted -- see writeup)
+DEV=NV     JITBEAM=1 PARALLEL=6 DEBUG=2 BEAM_DEBUG=2 BEAM_LOG_SURPASS_MAX=1 PYTHONPATH=. $PY extra/benchmark_llm.py --model $MODEL --max-context 2048 --prompt-tokens 512 --decode-tokens 128
+
+# coherence (ad hoc script, not committed -- Transformer.from_gguf + SimpleTokenizer.from_gguf_kv, 80 decode tok, max_context=768, no-BEAM)
+DEV=NV:NAK PYTHONPATH=. $PY t429_coherence.py
+
+# NV health check + server count, before/after every real-hardware cell
+pgrep -fl "TinyGPU.*server"
+DEV=NV     PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+DEV=NV:NAK PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+```
