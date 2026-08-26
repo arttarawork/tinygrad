@@ -6,9 +6,11 @@
 # so a real search spawned hundreds of abandoned containers within seconds and eventually wedged the
 # colima/docker transport. These tests drive the fix's actual logic (_get_server/_compile_with_retry)
 # through a duck-typed fake compiler -- no OSX, Docker, or GPU required.
+# T4.43: compiler_qcom.py's non-aarch64 path had the identical bug shape, so this cache now lives in
+# compiler_server_cache.py and is shared by both -- see test_compiler_qcom.py for the QCOM-side proof.
 import unittest
 from tinygrad.device import CompileError, CompileTransportError
-from tinygrad.runtime.support import compiler_cuda as cc
+from tinygrad.runtime.support import compiler_server_cache as cc
 
 class _FakeProc:
   """stands in for a subprocess.Popen: alive until killed."""
