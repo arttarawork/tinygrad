@@ -1,0 +1,7 @@
+[B1] servers: 1
+[B2] pkill the server while the GPU is faulted (the sequence that panicked at 01:15)
+[B3] 60 s window in which a live GSP would DMA into unmapped queues if MASTER were still set...
+[B4] fresh client (expect 'WPR2 is up. Issuing a full reset.' then a correct result)
+nv usb4: WPR2 is up. Issuing a full reset.
+result: [2.0, 3.0]
+[B5] servers: 1  (want 1)

@@ -1,0 +1,122 @@
+MASTER before: 1
+kernel: E_4_4 signature bufs: 1
+fault raised: Timeout waiting for RPC response for command 76
+MASTER after fault: 0
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/weakref.py", line 566, in _exitfunc
+    f()
+    ~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/weakref.py", line 490, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 340, in _fini
+    def _fini(dev, buf, spec): dev.allocator.free(buf, buf.size, spec)
+                               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 269, in free
+    else: super().free(opaque, size, options)
+          ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 233, in free
+    self._free(opaque, options if options is not None else self.default_buffer_spec)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/helpers.py", line 127, in wrapper
+    try: return func(*args, **kwargs)
+                ~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 551, in _free
+    for dev in buf.mapped_devs: dev.synchronize()
+                                ~~~~~~~~~~~~~~~^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 426, in synchronize
+    if self.error_state is not None: raise self.error_state
+                                     ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 433, in synchronize
+    try: self.timeline_signal.wait(self.timeline_value - 1, timeout=timeout if timeout is not None and self.can_recover else None)
+         ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 294, in wait
+    self._sleep(cur_time - start_time)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/ops_nv.py", line 30, in _sleep
+    if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
+                                                                        ~~~~~~~~~~~~~~~~~~~~~~^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/ops_nv.py", line 628, in sleep
+    raise RuntimeError("Device fault detected." + _fault_recovery_hint(self.dev))
+RuntimeError: Device fault detected. NV device is in an unrecoverable fault state (PCI bus-master now cleared) -- start a FRESH CLIENT to recover (it performs a controlled reset). Do not `pkill` the server while a fault is live.
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/weakref.py", line 566, in _exitfunc
+    f()
+    ~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/weakref.py", line 490, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 340, in _fini
+    def _fini(dev, buf, spec): dev.allocator.free(buf, buf.size, spec)
+                               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 269, in free
+    else: super().free(opaque, size, options)
+          ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 233, in free
+    self._free(opaque, options if options is not None else self.default_buffer_spec)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/helpers.py", line 127, in wrapper
+    try: return func(*args, **kwargs)
+                ~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 551, in _free
+    for dev in buf.mapped_devs: dev.synchronize()
+                                ~~~~~~~~~~~~~~~^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 426, in synchronize
+    if self.error_state is not None: raise self.error_state
+                                     ^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/weakref.py", line 566, in _exitfunc
+    f()
+    ~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/weakref.py", line 490, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 340, in _fini
+    def _fini(dev, buf, spec): dev.allocator.free(buf, buf.size, spec)
+                               ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 269, in free
+    else: super().free(opaque, size, options)
+          ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 233, in free
+    self._free(opaque, options if options is not None else self.default_buffer_spec)
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/helpers.py", line 127, in wrapper
+    try: return func(*args, **kwargs)
+                ~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 551, in _free
+    for dev in buf.mapped_devs: dev.synchronize()
+                                ~~~~~~~~~~~~~~~^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 426, in synchronize
+    if self.error_state is not None: raise self.error_state
+                                     ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 433, in synchronize
+    try: self.timeline_signal.wait(self.timeline_value - 1, timeout=timeout if timeout is not None and self.can_recover else None)
+         ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 294, in wait
+    self._sleep(cur_time - start_time)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/ops_nv.py", line 30, in _sleep
+    if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
+                                                                        ~~~~~~~~~~~~~~~~~~~~~~^^^^^
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/ops_nv.py", line 628, in sleep
+    raise RuntimeError("Device fault detected." + _fault_recovery_hint(self.dev))
+RuntimeError: Device fault detected. NV device is in an unrecoverable fault state (PCI bus-master now cleared) -- start a FRESH CLIENT to recover (it performs a controlled reset). Do not `pkill` the server while a fault is live.
+Exception ignored in atexit callback <function <lambda> at 0x10584eda0>:
+Traceback (most recent call last):
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 57, in <lambda>
+    atexit.register(lambda: [Device[dn].finalize() for dn in Device._opened_devices])
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/hcq.py", line 501, in finalize
+    super().finalize()
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/device.py", line 417, in finalize
+    if hasattr(self, 'iface') and hasattr(self.iface, 'device_fini'): self.iface.device_fini()
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/ops_nv.py", line 616, in device_fini
+    self.dev_impl.fini()
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/nv/nvdev.py", line 105, in fini
+    for ip in [self.gsp, self.flcn]: ip.fini_hw()
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/nv/ip.py", line 518, in fini_hw
+    def fini_hw(self): self.rpc_unloading_guest_driver()
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/nv/ip.py", line 603, in rpc_unloading_guest_driver
+    self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER)
+  File "/Users/artur/Documents/tinygrad-t437/tinygrad/runtime/support/nv/ip.py", line 91, in wait_resp
+    raise RuntimeError(f"Timeout waiting for RPC response for command {cmd}")
+RuntimeError: Timeout waiting for RPC response for command 47
+NV synchronization failed before finalizing: Device fault detected. NV device is in an unrecoverable fault state (PCI bus-master now cleared) -- start a FRESH CLIENT to recover (it performs a controlled reset). Do not `pkill` the server while a fault is live.
