@@ -117,11 +117,17 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       signs = (q_to_uint8(even_signs_sign_idx.reshape((-1, 32, 1)), 1) == 0).where(1.0, -1.0).reshape((-1, 8, 4, 8))
       # iq3xxs_grid is a genuine 256-entry codebook (not bit-decomposable like the parity above) --
       # select_const dodges the same buffer_in_reduce issue without a formula (see its docstring).
-      # flat (256*4,), matching _ggml_iq_grid's own unpack order
-      grid_vals = tuple(float((w >> (8*i)) & 0xFF) for w in _ggml.iq3xxs_grid for i in range(4))
+      # T4.26: select the packed uint32 row ONCE (grid words already pack their 4 bytes, same layout
+      # _ggml_iq_grid unpacks) instead of running select_const 4x independently (one per interleaved
+      # sub-value, T4.22's original shape) -- same 255-node balanced tree, reused for all 4 bytes via
+      # a cheap post-select shift+mask instead of rebuilt 4x (bit-exact: unpacking byte c of the row
+      # select_const(code, iq3xxs_grid) picks is definitionally the same value the old per-component
+      # select_const(code, grid_vals[c::4]) computed -- both index the same 256-entry table by the
+      # same code; verified exhaustively over all 256 codes). ~4x fewer select nodes to compile/run.
       code = blocks[:, 2:66].cast(dtypes.int32)
+      packed = select_const(code, _ggml.iq3xxs_grid)
       # (-1,64,4): degroup the 4 interleaved sub-values per code
-      grid4 = Tensor.stack(*[select_const(code, grid_vals[c::4]) for c in range(4)], dim=-1)
+      grid4 = Tensor.stack(*[packed.rshift(8*c).bitwise_and(0xFF).cast(dtypes.float32) for c in range(4)], dim=-1)
       grid = grid4.reshape((-1, 8, 4, 8))
       return (db * grid * signs).flatten(-3)
     if ggml_type == 21:
