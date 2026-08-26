@@ -299,6 +299,7 @@ class DepsTracker:
 # **************** for Compiled Devices ****************
 
 class CompileError(Exception): pass
+class CompileTransportError(CompileError): pass  # the compile-server process/pipe died -- distinct from a genuine compile failure
 
 def _read_exactly(f, n:int) -> bytes:
   # raw pipes (bufsize=0) can short-read below n on a single call; loop until n bytes or EOF
@@ -322,9 +323,17 @@ class Compiler:
     argv = f"{cmd} {pathlib.Path(__file__).parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
     return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
-    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    sz = struct.unpack("I", _read_exactly(unwrap(proc.stdout), 4))[0]
-    if (lib:=_read_exactly(unwrap(proc.stdout), sz)): return lib
+    # NOTE: EOF/broken pipe here means the compile-server *process* died (docker/qcom transport), not that compilation failed --
+    # keep that distinct from the "Compilation Error" below (a real compile failure, always a fully-formed reply) so callers can
+    # retry the former (respawn the server) but must never silently retry/swallow the latter (T4.31).
+    try:
+      unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+      sz = struct.unpack("I", _read_exactly(unwrap(proc.stdout), 4))[0]
+      lib = _read_exactly(unwrap(proc.stdout), sz)
+    except (OSError, CompileError) as e:  # BrokenPipeError is an OSError
+      raise CompileTransportError(f"compile server transport broke (pid={proc.pid}, {type(e).__name__}: {e}) -- "
+                                   "the compile-server subprocess (docker/qcom) likely died mid-compile") from e
+    if lib: return lib
     raise CompileError("Compilation Error")
 
 
