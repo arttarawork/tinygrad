@@ -30,12 +30,13 @@ PR-train route decision.
 
 ## Conventions for agents
 
-- Branch per task: `task/T<id>-<slug>` **off fork `master`** — now **`cb05a6c64`** (the PR #2
-  merge, 2026-08-26: **all Phase 1 dock work** — T4.14/17/18/20/21/22/23/25/27 + the
-  `test/unit/test_nv.py` relocation — on top of the Phase 0 line). No local `master` branch
+- Branch per task: `task/T<id>-<slug>` **off fork `master`** — now **`5dea150e5`** (the PR #3
+  merge, 2026-08-26: PR #2's Phase 1 dock work — T4.14/17/18/20/21/22/23/25/27 + the
+  `test/unit/test_nv.py` relocation — **plus T4.37 (quiesce bus-master on NV fault) + T4.31 (docker
+  compile-server leak)**; `integration/phase1b` retired as a base, content now on master). No local `master` branch
   exists. **`origin` is the SSH remote and is interactive-only: fetch AND push via the explicit
   HTTPS URL** (`git fetch https://github.com/arttarawork/tinygrad.git master`) or `origin/master`
-  will silently sit stale. Retired as bases (content fully in `master`): `integration/wave1`,
+  will silently sit stale. Retired as bases (content fully in `master`): `integration/wave1`, `integration/phase1b`,
   `task/TD.3-pooling`, `task/T4.27-beam-silent-fallback`, `task/T4.28-integration`. The old
   baselines `af2a43c85` / `457e1a915` / `b37d80fc9` apply only to their era's branches.
   Remotes: `origin` = arttarawork/tinygrad fork, `upstream` = tinygrad/tinygrad.
