@@ -1,0 +1,260 @@
+# TinyGPU DEXT unified-log extract, 2026-08-26 (read 14:47 local; /usr/bin/log show --predicate 'eventMessage CONTAINS[c] "tinygpu" ...')
+# Times are local (EDT, UTC-4). The DEXT logs: NewUserClient created (a server opened the DEXT), bar mapping, rpc(0)=read cfg, rpc(1)=write cfg, rpc(2)=reset, rpc(3)=PrepareDMA (sysmem DMA map). It does NOT log client disconnects / DMA teardown.
+# PCI_COMMAND (cfg off:4): val 7 = IO|MEM|MASTER, val 3 = MASTER cleared.
+
+## Window 1: 01:05-01:16 (panic 1 at 01:15:41)
+2026-08-26 01:05:31.105 Df kernel[0:1dd219d] () tinygpu: NewUserClient created
+2026-08-26 01:05:31.105 Df kernel[0:1dd219d] () tinygpu: bar mapping 0 idx=0
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: read cfg off:4 sz:2, val:7
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: rpc (1) in:3, out:2
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: wr cfg off:4 sz:2, val:3
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: rpc (2) in:0, out:2
+2026-08-26 01:05:31.106 Df kernel[0:1dd219d] () tinygpu: reset
+2026-08-26 01:05:31.321 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:31.321 Df kernel[0:1dd219d] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 01:05:31.322 Df kernel[0:1dd219d] () tinygpu: rpc (1) in:3, out:2
+2026-08-26 01:05:31.322 Df kernel[0:1dd219d] () tinygpu: wr cfg off:4 sz:2, val:7
+2026-08-26 01:05:31.322 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:31.322 Df kernel[0:1dd219d] () tinygpu: read cfg off:4 sz:2, val:7
+2026-08-26 01:05:31.614 Df kernel[0:1dd219d] () tinygpu: bar mapping 1 idx=1
+2026-08-26 01:05:32.359 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.359 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=528384 segs=1
+2026-08-26 01:05:32.360 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.360 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 01:05:32.360 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.360 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:32.361 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.361 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 01:05:32.404 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.405 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=63676416 segs=1
+2026-08-26 01:05:32.438 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.438 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 01:05:32.438 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.438 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=24576 segs=1
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: bar mapping 3 idx=2
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: read cfg off:0 sz:4, val:220410de
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: read cfg off:2c sz:4, val:39753842
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 01:05:32.439 Df kernel[0:1dd219d] () tinygpu: read cfg off:8 sz:1, val:a1
+2026-08-26 01:05:35.037 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.037 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.041 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.041 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.045 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.045 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.049 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.049 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.053 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.053 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.057 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.057 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.060 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.060 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.064 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.064 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.068 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.068 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.072 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.072 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.075 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.075 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.079 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.079 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.083 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.083 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.087 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.087 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.090 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.090 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.094 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.094 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.098 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.098 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.102 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.102 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.105 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.105 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.109 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.109 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.113 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.113 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.117 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.117 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.120 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.120 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.124 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.124 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.128 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.128 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.132 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.132 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.135 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.135 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.139 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.139 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.143 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.143 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.146 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.146 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.150 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.150 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.154 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.154 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.158 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.158 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 01:05:35.163 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.163 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 01:05:35.164 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:05:35.165 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=16777216 segs=1
+2026-08-26 01:11:49.282 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:11:49.282 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=4194304 segs=1
+2026-08-26 01:11:49.293 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:11:49.293 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=4194304 segs=1
+2026-08-26 01:13:41.862 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:13:41.862 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=655360 segs=1
+2026-08-26 01:13:41.962 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:13:41.962 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=1310720 segs=1
+2026-08-26 01:13:42.714 Df kernel[0:1dd219d] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 01:13:42.714 Df kernel[0:1dd219d] () tinygpu: PrepareDMA size=573440 segs=1
+2026-08-26 01:15:30.915 Df kernel[0:1dd219d] () tinygpu: bar mapping 0 idx=0
+2026-08-26 01:15:30.915 Df kernel[0:1dd219d] () tinygpu: bar mapping 1 idx=1
+2026-08-26 01:15:30.915 Df kernel[0:1dd219d] () tinygpu: bar mapping 3 idx=2
+
+## Window 2: 11:50-12:06:59 (panic 2 at 12:06:34)
+2026-08-26 11:50:00.829 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 11:50:00.829 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:7
+2026-08-26 11:50:00.829 Df kernel[0:22022] () tinygpu: rpc (1) in:3, out:2
+2026-08-26 11:50:00.829 Df kernel[0:22022] () tinygpu: wr cfg off:4 sz:2, val:3
+2026-08-26 11:50:00.829 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 11:50:00.829 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 11:57:31.656 Df kernel[0:22022] () tinygpu: NewUserClient created
+2026-08-26 11:57:42.699 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 11:57:42.699 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 11:57:42.699 Df kernel[0:22022] () tinygpu: rpc (1) in:3, out:2
+2026-08-26 11:57:42.699 Df kernel[0:22022] () tinygpu: wr cfg off:4 sz:2, val:3
+2026-08-26 11:57:42.699 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 11:57:42.699 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 11:57:43.238 Df kernel[0:22022] () tinygpu: bar mapping 0 idx=0
+2026-08-26 11:57:43.238 Df kernel[0:22022] () tinygpu: bar mapping 1 idx=1
+2026-08-26 11:57:43.238 Df kernel[0:22022] () tinygpu: bar mapping 3 idx=2
+2026-08-26 11:57:43.239 Df kernel[0:304f8] () tinygpu: NewUserClient created
+2026-08-26 12:00:30.873 Df kernel[0:22022] () tinygpu: NewUserClient created
+2026-08-26 12:00:30.873 Df kernel[0:22022] () tinygpu: bar mapping 0 idx=0
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: rpc (1) in:3, out:2
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: wr cfg off:4 sz:2, val:3
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: rpc (2) in:0, out:2
+2026-08-26 12:00:30.874 Df kernel[0:22022] () tinygpu: reset
+2026-08-26 12:00:31.089 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:31.089 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:3
+2026-08-26 12:00:31.089 Df kernel[0:22022] () tinygpu: rpc (1) in:3, out:2
+2026-08-26 12:00:31.089 Df kernel[0:22022] () tinygpu: wr cfg off:4 sz:2, val:7
+2026-08-26 12:00:31.089 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:31.089 Df kernel[0:22022] () tinygpu: read cfg off:4 sz:2, val:7
+2026-08-26 12:00:31.385 Df kernel[0:22022] () tinygpu: bar mapping 1 idx=1
+2026-08-26 12:00:31.945 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:31.945 Df kernel[0:22022] () tinygpu: PrepareDMA size=528384 segs=1
+2026-08-26 12:00:31.945 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:31.946 Df kernel[0:22022] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 12:00:31.946 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:31.946 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:31.947 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:31.947 Df kernel[0:22022] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 12:00:31.999 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:32.000 Df kernel[0:22022] () tinygpu: PrepareDMA size=63676416 segs=1
+2026-08-26 12:00:32.037 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:32.037 Df kernel[0:22022] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 12:00:32.038 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:32.038 Df kernel[0:22022] () tinygpu: PrepareDMA size=24576 segs=1
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: bar mapping 3 idx=2
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: read cfg off:0 sz:4, val:220410de
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: read cfg off:2c sz:4, val:39753842
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: rpc (0) in:2, out:2
+2026-08-26 12:00:32.039 Df kernel[0:22022] () tinygpu: read cfg off:8 sz:1, val:a1
+2026-08-26 12:00:34.554 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.555 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.560 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.560 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.564 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.564 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.568 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.568 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.572 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.572 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.576 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.576 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.580 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.581 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.585 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.585 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.589 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.589 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.593 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.593 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.597 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.597 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.601 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.601 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.605 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.605 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.609 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.609 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.613 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.613 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.617 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.617 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.621 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.621 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.625 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.625 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.629 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.629 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.633 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.634 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.638 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.638 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.642 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.642 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.646 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.646 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.650 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.650 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.654 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.654 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.658 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.658 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.662 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.662 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.666 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.666 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.670 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.670 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.674 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.674 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.678 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.678 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.682 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.682 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.686 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.687 Df kernel[0:22022] () tinygpu: PrepareDMA size=2097152 segs=1
+2026-08-26 12:00:34.692 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.692 Df kernel[0:22022] () tinygpu: PrepareDMA size=16384 segs=1
+2026-08-26 12:00:34.694 Df kernel[0:22022] () tinygpu: rpc (3) in:0, out:0
+2026-08-26 12:00:34.695 Df kernel[0:22022] () tinygpu: PrepareDMA size=16777216 segs=1
+2026-08-26 12:00:34.876 Df kernel[0:22022] () tinygpu: bar mapping 0 idx=0
+2026-08-26 12:00:34.876 Df kernel[0:22022] () tinygpu: bar mapping 1 idx=1
+2026-08-26 12:00:34.876 Df kernel[0:22022] () tinygpu: bar mapping 3 idx=2

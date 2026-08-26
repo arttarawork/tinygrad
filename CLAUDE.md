@@ -13,24 +13,32 @@ and pooling the MacBook (Metal) with an RTX 3090. Before doing any work, read in
    `task/TD.3-pooling` (worktree `/Users/artur/Documents/tinygrad-dock`) — lane mechanics and
    all measured data live there, not on this branch.
 
-Docs are baselined at upstream `af2a43c85` (2026-08-18); re-verify file:line refs after rebases.
+Docs were baselined at upstream `af2a43c85` (2026-08-18); the 2026-08-26 panic analyses (`T4.36_DART_PANIC.md`,
+HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs after rebases.
 
 ## Machine roles
 - **MacBook M3 Pro 36 GB** (`ENV:MAC`): Metal perf work, mock-NV, METAL+CPU pooling rehearsal.
-  The eGPU dock (AOOSTAR AG02) + RTX 3090 is LIVE (TD.1 first light passed 2026-08-24 on
-  `DEV=NV:NAK`, worktree `/Users/artur/Documents/tinygrad-dock` @ fork master). TD.2 next.
+  The eGPU dock (AOOSTAR AG02) + RTX 3090 went live 2026-08-24 (TD.1→TD.3 done, truth table measured) —
+  but **ALL DOCK WORK IS HARD-STOPPED since 2026-08-26 after two host kernel panics** (HANDOFF §2/§5):
+  no `DEV=NV*`, no NV-opening pytest, no `pkill` of a TinyGPU server, until Artur's §5.1 decision.
 - **Bazzite box, RX 9070 XT** (`ENV:AMD`): descoped 2026-08-18 (AMD is not a target; shared-HCQ
   validation goes via mock-NV + rented 3090 instead — see TASKS.md T0.2/T2.1). If ever revived:
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off fork `master` (`457e1a915` since 2026-08-21 = the PR #1 merge:
-  all Phase 0 work + upstream `b8cc74ecf`; there is no local `master` — use `origin/master`).
-  The old baseline `af2a43c85` applies only to the original Phase 0 branches. Remotes: `origin` =
-  arttarawork/tinygrad (the fork), `upstream` = tinygrad/tinygrad. Rebase docs branch weekly and
-  **push `memory` + unmerged evidence branches after each session** (backup; see TASKS.md conventions).
+- Branch `task/T<id>-<slug>` off fork `master` = **`cb05a6c64`** (the PR #2 merge, 2026-08-26: all Phase 0 +
+  Phase 1 dock fixes). Dock trees: `integration/phase1b` (`b37c792c6` = master + T4.37 + T4.31) until PR #3
+  lands. There is no local `master`, and **`origin/*` tracking refs are STALE by construction** (SSH `origin`
+  is interactive-only; agents fetch/push via the explicit HTTPS URL `https://github.com/arttarawork/tinygrad.git`,
+  which never updates `origin/*`) — **never branch off `origin/master`** (it sits at the 08-21 sync `b37d80fc9`);
+  verify push state with `gh api repos/arttarawork/tinygrad/branches`. Older baselines (`af2a43c85`,
+  `457e1a915`, `b37d80fc9`) apply only to their era's branches. Remotes: `origin` = arttarawork/tinygrad (the
+  fork), `upstream` = tinygrad/tinygrad. Rebase docs branch weekly and **push `memory` + unmerged evidence
+  branches after each session** (backup; see TASKS.md conventions).
 - Python: there is **no bare `python`** on this Mac and Homebrew `python3` (3.14) has no test deps.
-  Use the repo venv: `PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q -n12`;
+  Use the repo venv: `DEV=CPU PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q` (serial; `-n12` only under
+  `DEV=CPU` — with the METAL default `-n` spawns one real TinyGPU server per worker, T4.38; `DEV=CPU` gates never
+  open NV except `test/device/test_hcq.py`, which opens `Device["NV"]` unconditionally);
   typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .`
   (from a worktree, the venv is at `/Users/artur/Documents/tinygrad/.venv` — `PYTHONPATH=.` makes
   the worktree's tinygrad win over anything installed).

@@ -339,7 +339,22 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   lane selection is process-wide `DEV='METAL;NV:NAK'`, never in device_map strings; bench-window
   policy exercised (llama-server stopped 23:17→restored ~02:20, well inside the 22:00-19:00 grant).
 
-- **2026-08-26 (QUEUE COMPLETE; TWO HOST PANICS; DOCK HARD-STOPPED):** Artur's ordered queue executed to completion (T4.24→T4.19→T4.23→T4.21→T4.20→T4.22→T4.15→T4.16, then T4.25/27/28/30/31/32/34/29/35/26/33 — every row in TASKS.md). Two identical `dart-apciec2 AppleT8110DART.cpp:2183` kernel panics (01:15, 12:06) during dock work; mechanism chain: GSP host-resident queues × server teardown × bus-master (T4.36), T4.37 shipped+verified but defeated by `nvdev.py:127` re-enable + multi-server leak (T4.38→T4.40). Headline results survive: qwen3:8b 47.9, gpt-oss 62.8, qwen3.6 56.58 (warm-cache-only), split 32.6, IQ verdict = IQ4_XS-only upstream. Upstream sync #4 merged locally (77 commits) but UNVALIDATED (agent lost) + unpushed (workflow scope). **Everything an agent needs: `HANDOFF_2026-08-26.md`.** Artur decides: T4.40 fix vs upstream report vs dock pause; PR train (10 fixes); TD.4 numbers.
+- **2026-08-26 (QUEUE COMPLETE; TWO HOST PANICS; DOCK HARD-STOPPED):** Artur's ordered queue executed to completion (T4.24→T4.19→T4.23→T4.21→T4.20→T4.22→T4.15→T4.16, then T4.25/27/28/30/31/32/34/29/35/26/33 — every row in TASKS.md). Two identical `dart-apciec2 AppleT8110DART.cpp:2183` kernel panics (01:15, 12:06) during dock work; mechanism chain: GSP host-resident queues × server teardown × bus-master (T4.36), T4.37 shipped+verified but defeated by `nvdev.py:127` re-enable + multi-server leak (T4.38→T4.40). Headline results survive: qwen3:8b 47.9, gpt-oss 62.8, qwen3.6 56.58 (warm-cache-only), split 32.6, IQ verdict = IQ4_XS-only upstream. Upstream sync #4 merged locally (77 commits) but UNVALIDATED (agent lost) + unpushed (workflow scope). **Everything an agent needs: `HANDOFF_2026-08-26.md`.** Artur decides: T4.40 fix vs upstream report vs dock pause; PR train (11 fixes); TD.4 numbers.
+- **2026-08-26 PM (handoff review + corrections; RCA dispatched):** every handoff §3 SHA verified against GitHub via
+  `gh api` — the local `origin/*` refs are stale by construction (HTTPS-URL pushes never update them; a fresh
+  `git status` shows `memory [ahead 56]` and no `origin/task/*`, which is NOT a backup gap). **Evidence found:** the
+  unified log survives reboots and the DEXT logs every client open/cfg write/reset/DMA map (extract committed as
+  `ulog_tinygpu_2026-08-26.txt`); the session transcripts (`~/.claude/projects/…/d9cf3c0c-*/`, incl. `subagents/`)
+  timestamp every command — the T4.33 agent's transcript survives there (5 conflicts; collection errors on its
+  first gate attempt). Re-dated panic 2: fault 11:50:00 (T4.37 cleared MASTER), a real FLR + fresh healthy GSP boot
+  at 12:00:30 by the T4.35 health check, then nothing for 6 min, then the T4.33 *post-merge* gate run (unvalidated
+  merge tree) opened NV ~12:06:2x → panic 12:06:34; **no pkill anywhere after 08:18**. Panic 1 likewise came 11 s
+  after a fresh-client attach. ⇒ both panics sit ~10 s after a fresh client's clear→FLR→GSP-boot on a GPU whose last
+  faulted GSP-RM was never unloaded; the handoff's original mechanism #2 is relabeled a hypothesis. Also fixed:
+  CLAUDE.md de-staled (master `cb05a6c64`, dock hard-stopped, never branch off `origin/master`, `DEV=CPU` gates);
+  colima was down; §5.2 count; `.pyc` untracked on the T4.37 branch (`73561c88a`). Plan agreed: a GPU-free week —
+  T4.40 step 0 (RCA, Sonnet agent dispatched) → T4.40(a) → T4.39 → T4.33 validation → PR #3 (phase1b→master) —
+  while Artur decides §5.1; dock only after T4.40 + verification with him present.
 
 ## 7. Sources
 
