@@ -26,9 +26,9 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off fork `master` = **`5dea150e5`** (the PR #3 merge, 2026-08-26: all Phase 0 +
-  Phase 1 dock fixes **incl. T4.37 + T4.31**). `integration/phase1b` is now RETIRED as a base — its content is
-  on master; dock trees = master or a descendant. There is no local `master`, and **`origin/*` tracking refs are STALE by construction** (SSH `origin`
+- Branch `task/T<id>-<slug>` off fork `master` = **`a770d485a`** (the PR #4 merge, 2026-08-26 = upstream
+  sync #4, 77 commits @ `4bdc86513`, on top of PR #3's T4.37+T4.31; fork line-cap 27000).
+  `integration/phase1b` is RETIRED as a base; dock trees = master or a descendant. There is no local `master`, and **`origin/*` tracking refs are STALE by construction** (SSH `origin`
   is interactive-only; agents fetch/push via the explicit HTTPS URL `https://github.com/arttarawork/tinygrad.git`,
   which never updates `origin/*`) — **never branch off `origin/master`** (it sits at the 08-21 sync `b37d80fc9`);
   verify push state with `gh api repos/arttarawork/tinygrad/branches`. Older baselines (`af2a43c85`,
