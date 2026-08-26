@@ -1,3 +1,7 @@
+> **DECISION 2026-08-26 (Artur): NOT FILING.** tinygpu_releases follows up only on their own dock (#16086) and
+> upstream does not accept AI-derived PRs (#14615). Kept as the internal RCA summary; the A3 exposure this leaves
+> is recorded in HANDOFF §5.1 and TASKS.
+
 # TinyGPU host-safety report — DRAFT for tinygrad/tinygpu_releases (filing = Artur's decision)
 
 *(Everything above the `---` divider is the proposed issue body, ready to copy-paste. Below the divider: filing notes for Artur.)*
