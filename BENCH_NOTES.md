@@ -1753,3 +1753,163 @@ PYTHONPATH=. $PY extra/bench_llm.py tinygrad --model qwen3:8b --device 'NV:NAK' 
 # NV health check, before/after every real-hardware cell
 pgrep -fl "TinyGPU.*server"
 ```
+
+# T4.35 — is the 56.58 tok/s headline reproducible cold? (2026-08-26)
+
+Settling whether the published **qwen3.6-35B-A3B MXFP4_MOE, all-NV, `JITBEAM=1 PARALLEL=6`,
+max-context 4096: decode 56.58 tok/s @ 225 GB/s** headline (measured 2026-08-25, right after a
+`JITBEAM=1`@768 run) is reproducible from a genuinely fresh (`IGNORE_BEAM_CACHE=1`) BEAM search,
+per T4.30 cell 4's suspicion that it depended on a cache warmed by that prior 768 run. Worktree
+`tinygrad-t435` off `b37c792c6` (`integration/phase1b`; T4.27/T4.31/T4.37 all in tree).
+
+## Pre-flight
+
+Clean start: 1 `TinyGPU.*server` (PID 12271), 0 docker containers, swap 0.56 MB, model file
+present (21,706,144,736 bytes). First health-check attempt (`DEV=NV`) **failed** with
+`BlockingIOError` acquiring `nv_usb4.lock` — a **sibling worktree's process** (PID 14567,
+`pytest test/unit -q`, cwd `tinygrad-t433`, the concurrent T4.33 upstream-sync task's own
+post-merge gate run) held the device's exclusive client-side lock. Per "ONE GPU process at a
+time," waited it out rather than compete for or touch it (no kill, no override) — it exited on
+its own after ~3.5 minutes; health check then passed cleanly (`6.0`).
+
+## Run 1 — cold attempt at the published shape (brief's step 1)
+
+`DEV=NV JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 DEBUG=2 BEAM_DEBUG=2 BEAM_LOG_SURPASS_MAX=1`,
+`--model $MXFP4 --max-context 4096 --prompt-tokens 512 --decode-tokens 128`. Confirmed genuinely
+fresh, not a replay: **32 `BEAM_SEARCH:` fresh-search banners** printed before the crash (a
+cache-hit never reaches that print). Only `load 13.489s` ever printed — no `warm`, `prefill`, or
+`decode` line — the process died during BEAM warmup, before warmup itself completed.
+
+**Two distinct, both-real failure classes hit in this one run** (full log kept locally,
+`t435_run1_cold4096.log`, gitignored per this repo's `*.log` rule — not committed, matches this
+file's own convention for scratch logs):
+
+1. **RPC-timeout / device-fault cascade (T4.34/T4.29 class)**, ~230s into the search, kernel
+   shape `2048 8 16 32`: **47x** `Timeout waiting for RPC response for command 76` — the exact
+   same command number T4.29 captured on its own nvcc-lane fault — no classic `MMU fault: 0x... |
+   type | access` line (0 hits; same silent `MMU_FAULT_QUEUED` variant T4.29 documented: the rich
+   report is only assembled by `on_device_hang()`, a different call site than the cheap
+   `is_err_state` check that actually fired). Then **119x** `Device fault detected` cascading
+   through per-candidate catches and the terminal `atexit`/`finalize` cleanup — T4.37's own
+   message verbatim: *"NV device is in an unrecoverable fault state (PCI bus-master now cleared)
+   -- start a FRESH CLIENT to recover... Do not `pkill` the server while a fault is live."*
+2. **Genuine VRAM `MemoryError`**, a later, unrelated kernel, shape `8 512 8 4 2 32`:
+   ```
+   MemoryError: Failed to allocate memory (OOM). Request size=0xb000000 ((4096, 4096))
+   MemoryError: Allocation of 176.00 MB failed on NV. Used: 22.99 GB
+   ```
+   **Byte-for-byte the same allocation-request signature T4.30's cell 4 hit** (`0xb000000` /
+   `(4096, 4096)` / 176.00 MB) — a **second, independent reproduction of the identical ceiling**,
+   one session apart, both from a forced-fresh `JITBEAM=1`@4096 search on this exact file. This
+   MemoryError is what actually terminated the process (uncaught at `benchmark_llm.py`); the
+   fault-storm above it had already flipped `is_err_state`, which is why cleanup then cascaded
+   into the 119 `Device fault detected` lines during unwind.
+
+**T4.39 check** (inf-timed fallback entries persisted to the disk cache — `grep -c "final
+tm=infs"`, no tooling built, per the brief): **3** this run, all inside the same RPC-timeout-hit
+region as failure class 1 — `[GROUP ax=3 amt=8, LOCAL ax=1 amt=4, UPCAST ax=1 amt=4]`,
+`[UNROLL ax=0 amt=0]`, `[GROUPTOP ax=1 amt=16]` — consistent with T4.29's finding that this
+fallback fires when a fault storm wipes out a whole round's candidates.
+
+**Container count** (T4.31 regression check), sampled every 20s throughout: `0 1 6 5 6 7 7 5 5 5
+5 5 5 5 5 5 5 5 6 6 6 6 6 6 6 6 6 6 6 0` — bounded single-digit for the full ~10-minute run,
+confirms T4.31's container-leak fix holds even under this two-failure-class run.
+
+**Recovery:** no `pkill`, nothing touched. Server PID 12271 untouched throughout. A fresh
+client's health check immediately after returned `6.0` cleanly — **T4.37 held** (second
+end-to-end validation of a naturally-occurring fault after T4.29's first). Per the brief, "do NOT
+retry a MemoryError more than once" — not retried; this run also counts against the 2-faulted-run
+cap (the RPC-timeout/`Device fault detected` class is a real fault; 1 of 2 used).
+
+## STOP condition invoked — before step 2 could start
+
+Immediately after Run 1's fresh-client health check passed, the mandatory pre-run server check
+(`pgrep -f "TinyGPU\.app/Contents/MacOS/TinyGPU server"`, exact-path form to avoid
+self-matching shell wrapper false-positives) found **2** real servers:
+
+| PID | started | ppid | note |
+|---|---|---|---|
+| 12271 | 09:56:15 | 1 | pre-existing, untouched all session |
+| 16373 | 11:57:31 | 16351 → 1 (re-parented) | spawned by the concurrent T4.33 sibling task's `pytest test/unit -q` in `tinygrad-t433`; orphaned once its parent pytest exited |
+
+Both listen on the identical socket path (`.../T/tinygpu.sock`). Re-confirmed twice more, 5s and
+~2 minutes later — persistent, not a transient race. Docker stayed at 0, swap at 0.56 MB, and the
+original server 12271 tested healthy throughout (my own health check succeeded just before this
+was discovered) — no other symptom, just the raw count.
+
+This is the brief's own named STOP condition (**">1 server appears on its own"**). Did not
+attempt to reap/kill the extra server: it belongs to a concurrent sibling task, not this one, and
+`T4.36_DART_PANIC.md` suspect #3 explicitly names a second server's teardown as a plausible
+contributor to the 08-26 host panic ("confirm exactly ONE server before any dock run" — the
+inverse of a green light to clean one up unilaterally). Stopped immediately and reporting instead.
+**Steps 2 (cold-768 → warm-4096 recipe) and 3 (cheap-fix attempt) were not attempted.**
+
+## Verdict for TD.4
+
+**(c)-leaning, not (a):** the 56.58 tok/s headline is **not reproducible from a forced-fresh
+search at the published shape**. This is now the **second independent reproduction**, one
+session apart, of a fatal outcome at cold `JITBEAM=1`@4096 on this 21.71 GB-on-24 GB config —
+T4.30 hit the `MemoryError` alone; today's run hit the byte-identical `MemoryError` signature
+(`0xb000000`/`(4096,4096)`/176.00 MB/`Used: 22.99 GB`) **plus** an independent RPC-timeout/
+device-fault cascade earlier in the same warmup. Two-for-two failures across two sessions is
+strong evidence this is a deterministic ceiling of the config, not a fluke of one unlucky run.
+
+**Whether (b) holds — a stated warm-cache precondition reliably reproduces ~56 tok/s — is
+UNTESTED this session**: the STOP fired before step 2 could run. Circumstantial support for (b),
+not proof: T4.24's verdict B independently fresh-searched `JITBEAM=1`@2048 (a shape never before
+searched) and it completed cleanly (172.6s warm, 56.70 tok/s) with no incident, and the original
+768/4096 headline pair was itself measured back-to-back in one 2026-08-25 session, 4096
+immediately following a 768 run. Consistent with, though not proof of, "a smaller-context search
+first (or any already-warm cache for the max-context-specific attention/KV kernels) is what lets
+4096 complete." **This fork has still never demonstrated a single-shot cold completion at 4096 on
+this exact config — every forced-fresh attempt at that shape (T4.30's, and today's) has failed.**
+
+**Today's re-measured number on this tree (`integration/phase1b` @ `b37c792c6`): none obtained.**
+Run 1 crashed during BEAM warmup before any `warm`/`prefill`/`decode` line printed, and the STOP
+condition blocked every subsequent attempt (the 768-recipe, the cheap-fix lever, and a clean
+warm-cache re-measurement were all in scope but not reached).
+
+**Recommendation for TD.4:** publish 56.58 tok/s only with an explicit precondition caveat —
+*"measured with a beam cache already warm for this shape; a forced-fresh search at this exact
+config has failed in 2/2 independent attempts (T4.30, T4.35) with the identical VRAM ceiling and,
+in one of the two, an additional device-fault cascade"* — not as a from-scratch reproduction. If
+a genuinely-cold number is needed for TD.4, use the split configuration's own cached ~31 tok/s
+figure (T4.21/T4.15, `JITBEAM=1`, fits with headroom to spare) rather than all-NV `JITBEAM=1`@4096
+cold.
+
+## Environment / stability
+
+Swap held at 0.56 MB throughout (never approached the 4 GB abort threshold). Docker: 0 containers
+before, bounded 0-7 during Run 1, 0 after. `TinyGPU.*server`: 1 (12271) before and immediately
+after Run 1's own health check; found at 2 on the next routine check (16373, a sibling task's
+spawn, unrelated to anything this session ran) — session stopped on discovery per protocol,
+touched neither server. 1 of the 2 permitted faulted-run slots used; 0 of 2 MemoryError retries
+used (none permitted, none attempted).
+
+## Exact commands (T4.35)
+
+```bash
+cd tinygrad-t435   # worktree, branch task/T4.35-cold-cache, base b37c792c6 (integration/phase1b)
+PY=/Users/artur/Documents/tinygrad/.venv/bin/python
+MXFP4=/Users/artur/models/qwen3.6-35b-a3b-mxfp4/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+
+# pre-flight: 1 server, 0 containers, swap 0.56MB -- health check first FAILED (BlockingIOError,
+# nv_usb4.lock held by a sibling worktree's pytest), waited ~3.5min for it to exit, then clean 6.0
+pgrep -f "TinyGPU\.app/Contents/MacOS/TinyGPU server"
+docker ps -aq | wc -l
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+
+# Run 1 -- cold, published shape: CRASHED (RPC-timeout/device-fault cascade @ ~230s, then a
+# distinct VRAM MemoryError on a later kernel). Log: t435_run1_cold4096.log (gitignored, scratch)
+DEV=NV JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 DEBUG=2 BEAM_DEBUG=2 BEAM_LOG_SURPASS_MAX=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $MXFP4 --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+
+# T4.39 count and fresh-search confirmation, from the same log
+grep -c "final tm=infs" t435_run1_cold4096.log        # 3
+grep -c "^BEAM_SEARCH:$" t435_run1_cold4096.log       # 32 (genuinely fresh, not a cache replay)
+
+# post-run: fresh-client health check (6.0, clean -- T4.37 held a second time), THEN the routine
+# server-count re-check came back 2 -- STOP condition, session ended here, neither server touched
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"
+pgrep -f "TinyGPU\.app/Contents/MacOS/TinyGPU server"   # 2 -- STOP
+```
