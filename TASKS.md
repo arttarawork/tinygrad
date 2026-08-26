@@ -503,7 +503,10 @@ rows are not strictly date-sorted — **the latest row for a task wins.**
 | 2026-08-24 | TD.1 | **done — FIRST LIGHT PASSED** | worktree `tinygrad-dock` @ fork master `b37d80fc9` | Bring-up sequence: dock first linked as **USB3 fallback** (ASM246X visible as plain USB device — replug + macOS accessory approval fixed it; USB4-vs-USB3 check is the first debug step forever); then TinyGPU.app install → DEXT approval (System Settings toggle; state `activated enabled` **without reboot**) → `DEV=NV` opened the device but **no `nvcc` on Mac**; **NAK lane worked**: `pip install tinymesa==25.2.7.2` → op correct → **test_tiny 19 passed / 2 skipped in 6.28s on `DEV=NV:NAK`**. §3.1 audit: 3090 = EVGA `10de:2204`, PCIe **Gen4 x4** tunnel, BAR1 = **256 MiB → `is_bar_small()=True`** (system.py:255); cmdq_page in **SYS aspace (host RAM, uncached+snooped)** per should_use_sysmem (system.py:266); **P2P refused for small-BAR** (system.py:297). nvcc/Docker lane untested (optional). GSP "WPR2 full reset" on first open is normal. |
 | 2026-08-21 | PR #1 merged + docs review | **done** | `memory` | Artur merged PR #1 → fork `master` = `457e1a915` (all Phase 0 work + upstream `b8cc74ecf`); task-branch base convention updated to fork `master`, `integration/wave1` retired as a base. Full docs review pass: banner/mermaid/TD.4/lanes de-staled; DEV=CPU + push-stagger + docs-push lessons promoted to conventions; Hermes note added to bench choreography; design-doc §1/§5/risks refreshed. Backup pushed: `memory` + 6 unmerged evidence branches (`task/bench-window-{2,3,4}`, `task/T0.3-bench-harness`, `task/T3.4-zero-copy`, `task/T4.1-matvec-pr`) to the fork. Upstream drift at review time: 32 commits past `b8cc74ecf` (incl. an llm kimi fix) — sync due, not performed (Artur's call). |
 
-## RESUME HERE (updated 2026-08-25 — read this before picking up work)
+## RESUME HERE
+
+> **→ READ `HANDOFF_2026-08-26.md` FIRST** — the complete post-panic handoff (state, branch map,
+> loose ends, Artur's pending decisions). Parts of this section predate it; the banners below stand.
 
 > **⚠ 2026-08-26: KERNEL PANIC — ALL DOCK RUNS PAUSED.** macOS panicked at 01:15 in `AppleT8110DART`
 > (the eGPU path's IOMMU) during a real-model NV run — a device DMA to an unmapped host address.
