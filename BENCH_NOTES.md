@@ -2037,6 +2037,98 @@ before any further BEAM re-validation on this dock is worth attempting." The two
 tried (`BEAM_MAX_TASKS_PER_CHILD`, `PARALLEL`) are not sufficient on their own for a whole-model,
 fully-forced-fresh (`IGNORE_BEAM_CACHE=1`) search of a model this size on this transport.
 
+## T4.31 lands the real fix — container leak resolved, Cells 3-5 attempted, two new orthogonal blockers found
+
+T4.31 (`b6040133c` in this worktree, cherry-picked from the main session's `05d6347b9`) found the actual
+mechanism behind the container explosion, and it fully explains why `BEAM_MAX_TASKS_PER_CHILD` didn't
+work: `Renderer.__reduce__` rebuilds a fresh `Compiler` on **every** multiprocessing unpickle, and on
+OSX `NVRTCCompiler.__init__` spawns a `docker run` server — but `beam_search` sends **one pool task per
+candidate**, each embedding a live `Renderer`. So it was one container **per candidate**, not per
+worker-recycle — completely decoupled from `BEAM_MAX_TASKS_PER_CHILD`, which only bounds worker
+*recycling*, not per-task Renderer reconstruction. This exactly matches what I flagged without being
+able to prove it: 143 containers in ~15-25s doesn't fit a per-worker model, but fits a per-candidate
+model trivially (a single `beam_search` round can dispatch well over 100 candidates). Fix caches the
+server process per `(class, arch, args)` and reaps at exit — verified structurally sound before relying
+on it (confirmed `05d6347b9`/`b6040133c` is HEAD via `git log`).
+
+**Cell 2 (qwen3:8b, `DEV=NV JITBEAM=2`): not re-run — attributing to T4.31's own acceptance test**, per
+the coordinator's instruction (same config, `PARALLEL=6`):
+
+| metric | old (buggy) | T4.31 acceptance run |
+|---|---:|---:|
+| warm | 1196.0s | **449.6s (2.66x faster)** |
+| decode tok/s | 46.87 | **47.905** |
+| containers | (111+, wedged) | **0 → 5-7 → 0 (bounded)** |
+
+47.905 vs 46.87 is within ordinary BEAM run-to-run noise — **qwen3:8b was never materially degraded**
+by the pre-T4.27/T4.31 bugs, unlike the qwen3.6 split's `JITBEAM=2` cell (Cell 1). Container count
+bounded (5-7, not hundreds) confirms the fix.
+
+**Cell 3 (gpt-oss:20b, `DEV=NV JITBEAM=2`, forced-fresh) — DONE, clean:**
+
+| metric | old (buggy) | new (post-T4.31, forced-fresh) |
+|---|---:|---:|
+| load | 8.65s | 8.617s |
+| warm | 728.6s | **179.225s (4.06x faster)** |
+| prefill tok/s | 207.6 | 204.909 |
+| decode tok/s | 60.85 | **62.819 (+3.2%, within BEAM noise)** |
+
+Container count sampled every 15s throughout: `1 → 6-7`, flat, never climbed — bounded exactly as
+T4.31 predicts. **WARNING census:** 6x per-round "no viable candidate," all with an **empty** exception
+counter (`0 failed: {}`, the benign `seen_libs`/compute-filter dedup path from Cell 1) — zero real
+compile/transport failures. 0x final-fallback warnings — no kernel degraded. 0x `broken pipe`, 0x
+`unexpected EOF` — the transport was completely silent this time, a first for any nvcc BEAM cell this
+task. **gpt-oss:20b was also not materially degraded** by the pre-T4.27/T4.31 bugs (62.819 vs 60.85,
+same noise band as Cell 2's qwen3:8b result).
+
+**Cell 4 (qwen3.6-35B all-NV, `JITBEAM=1` @4096, forced-fresh) — BLOCKED, but by a genuine VRAM OOM,
+not the docker transport:**
+
+Container count stayed bounded throughout (0 → 1 → 6-7, same healthy pattern as Cell 3) — **confirms
+T4.31's fix is unrelated to and does not mask this failure.** WARNING census: 4x per-round warnings —
+1 benign (`0 failed: {}`) and **3 real**, with actual `RuntimeError` counts (21/21, 4/4, 23/25 failed)
+— plus 3x final-fallback warnings (those 3 kernels degraded to `hand_coded_optimizations`). The run
+then hard-crashed:
+```
+MemoryError: Failed to allocate memory (OOM). Request size=0xb000000 ((4096, 4096))
+```
+in `tinygrad/runtime/support/memory.py`, propagated through `device.py:229`'s `alloc`. Not a wedge —
+the standard `DEV=NV` health check passed immediately afterward (`6.0`), `TinyGPU.*server` stayed at 1,
+docker stayed at 1 container. Not retried (a VRAM ceiling is deterministic, not a transport flake — a
+retry would reproduce it). **This refines, not contradicts, an already-documented risk**: the task
+brief itself flags "qwen3.6 all-NV leaves ~1 GB so BEAM-2 OOMs there — that cell stays `JITBEAM=1`,"
+implicitly treating `JITBEAM=1` as safe. It is *not* safe once forced fully fresh
+(`IGNORE_BEAM_CACHE=1`): a live BEAM search actually executes each candidate on real GPU buffers
+(`_time_program` → `time_call`), competing for the same ~1 GB headroom that a cache-hit replay (how
+the original 56.58 tok/s figure was almost certainly obtained) never has to touch. **The 56.58 baseline
+may never have been reproducible from a cold cache on this config** — an honest, load-bearing caveat
+for TD.4, independent of anything T4.27/T4.31 touch.
+
+**Cell 5 (qwen3.6-35B split `0-7:METAL,8-39:NV`, `JITBEAM=1`, forced-fresh) — BLOCKED, by a real GPU
+device fault that recurred once after a clean respawn (retry-once protocol exhausted, stopped per the
+brief):**
+
+Container count bounded both attempts (0 → 1 → 6-7, same healthy pattern) — again, not the docker
+transport. **Attempt 1:** crashed with `RuntimeError: Device fault detected. NV device is in an
+unrecoverable fault state` — occurred **109** times (caught and counted as ordinary `RuntimeError`
+failures inside `beam_search`'s own candidate loop, `search.py:157-161`, since a device fault surfaces
+as a plain `RuntimeError` there — it doesn't distinguish "this candidate is bad" from "the whole device
+is down," so it burns through the rest of that kernel's candidates and every subsequent kernel the same
+way). 20x per-round warnings, 20x final-fallback warnings — every kernel from the fault onward degraded
+to `hand_coded_optimizations` (a real, load-bearing win for T4.27's fix even in a losing scenario: the
+process still produced *a* usable set of opts up to the crash point instead of silently returning bare
+seeds). **Respawn** (`pkill -f "TinyGPU.*server"`, single clean respawn, health check `6.0`) cleared it
+immediately, so per this fork's own established protocol (TD.2c, T4.15 §1.4), **retried once**:
+**Attempt 2 recurred identically** — again exactly **109** device-fault occurrences (the exact same
+count both times — not random flakiness, a deterministic trigger point in this split's kernel
+sequence), again 20/20 warnings, final crash `NV synchronization failed before finalizing: Device fault
+detected` in `hcq.py:426`'s `synchronize`. **Per protocol, stopped here** — did not attempt a third
+time. Final respawn done for a clean handoff (`TinyGPU.*server` = 1, `6.0`, docker = 1 container, swap
+1.0 GB) — the GPU itself responds cleanly to every individual respawn; what doesn't hold is staying
+fault-free through this specific config's *entire* forced-fresh `JITBEAM=1` warmup. Orthogonal to both
+T4.27 (the silent-fallback bug) and T4.31 (the container leak) — a third, distinct dock-reliability
+finding from this one task.
+
 ## Verdict
 
 **Did T4.27 change the numbers, and by how much?** For the one cell fully re-measured — the highest-
@@ -2052,71 +2144,81 @@ for and did NOT trigger** — the opposite happened.
   **superseded by 32.576 tok/s above.** This was the one figure this task set out to overturn, and it
   is overturned.
 
-**Which published figures remain unconfirmed (not proven stale, not re-validated — blocked by the
-docker wedge, not by any tinygrad-side problem):**
-- `BENCH_NOTES.md:371,394,414,430,440` (qwen3:8b `DEV=NV JITBEAM=2`, "46.87")
-- `BENCH_NOTES.md:373,398,415,432` (gpt-oss:20b `DEV=NV JITBEAM=2`, "60.85")
-- `BENCH_NOTES.md:1030,1039,1349` (qwen3.6-35B all-NV `JITBEAM=1` @4096, "56.58")
-- `BENCH_NOTES.md:1351,1356` (qwen3.6-35B split `JITBEAM=1`, "31.097"/"31.1")
+**Which published figures are confirmed accurate (measured post-fix, within ordinary BEAM noise of the
+original — not stale, not degraded):**
+- `BENCH_NOTES.md:371,394,414,430,440` (qwen3:8b `DEV=NV JITBEAM=2`, "46.87") — **confirmed, 47.905**
+  (T4.31 acceptance run, attributed not re-run by me).
+- `BENCH_NOTES.md:373,398,415,432` (gpt-oss:20b `DEV=NV JITBEAM=2`, "60.85") — **confirmed, 62.819**
+  (this session, Cell 3).
 
-None of these were shown wrong — they simply couldn't be re-measured, **twice**: once before the main
-session's colima restart, and once again immediately after it (see "Retry pass" above — all 4 cells
-hit the identical `BrokenPipeError`/`device.py:325` signature on the very first post-restart attempt).
-Given T4.15 found the silent-fallback bug specifically and only in the qwen3.6 split's `JITBEAM=2` run
-(0/50 NV kernels affected at `JITBEAM=1` in that same session), there is no existing evidence these
-four are actually degraded — but T4.30's own brief premise ("every BEAM'd number is suspect") means
-they should still be re-run before being cited as validated post-T4.27 headline figures. Given the
-wedge reproduced immediately post-restart, a bare retry is unlikely to be enough next time — whoever
-picks this up should budget for either a `PARALLEL` below 6, or treating the docker transport itself
-as the thing to fix first (see finding 2 below, now upgraded from "new flake class" to "reliably
-reproducible under this task's own required methodology").
+**Which published figures remain unconfirmed — now blocked by two NEW, orthogonal findings, not the
+(now-fixed) docker transport:**
+- `BENCH_NOTES.md:1030,1039,1349` (qwen3.6-35B all-NV `JITBEAM=1` @4096, "56.58") — blocked by a
+  genuine VRAM `MemoryError` under forced-fresh search (Cell 4 above). Likely never reproducible from a
+  cold cache on this config regardless of T4.27/T4.31 — a real, separate ceiling.
+- `BENCH_NOTES.md:1351,1356` (qwen3.6-35B split `JITBEAM=1`, "31.097"/"31.1") — blocked by a real NV
+  device fault, reproduced identically (109 occurrences both times) across one respawn+retry (Cell 5
+  above).
 
-**Two new findings for whoever owns BEAM/dock reliability next:**
+Neither of these two remaining figures was shown *wrong* — both remain plausible, previously-measured
+numbers that this task simply couldn't re-confirm, for reasons that have nothing to do with BEAM
+correctness (one is a memory ceiling, one is a GPU-driver-level fault under sustained load) and are not
+regressions from anything T4.27 or T4.31 touched.
+
+**Four findings for whoever owns BEAM/dock reliability next, in the order this task surfaced them:**
 1. T4.27 hardens `beam_search`'s internal candidate-search loop only. The separate, unprotected
    `compile_cached`/`compile_server` path (used for compiling the final chosen kernel, BEAM'd or not)
-   has no equivalent fallback and can still hard-crash the whole process on a transport failure — as
-   it did here. Same class of gap T4.27_NOTES.md §3 already flagged for `_try_compile`'s broad
-   `except Exception`, just at a different call site.
-2. Forcing a fully-fresh, whole-model BEAM search (this task's own required methodology,
-   `IGNORE_BEAM_CACHE=1`) generates enough concurrent NVRTC-container churn to wedge colima's
-   host-side `docker.sock` forward itself — a new, harder-edged flake class than anything TD.2c/T4.15
-   previously catalogued, and the *first* one on record that plain retries and container cleanup
-   cannot clear. **Upgraded by the retry pass:** a full colima restart clears it only until the *next*
-   `PARALLEL=6`+`IGNORE_BEAM_CACHE=1` nvcc BEAM run, which re-wedged it immediately (Cell 2's retry,
-   302 `unexpected EOF` lines, identical traceback). This is a reliably reproducible cost of this
-   task's own re-validation methodology on this dock, not a one-off — worth a real fix (transport
-   redesign or a lower concurrency ceiling for forced-fresh sweeps) before the next full BEAM
-   revalidation pass, not just a restart-and-retry. **Upgraded again by the mitigation attempt:**
-   `BEAM_MAX_TASKS_PER_CHILD=500` + `PARALLEL=4` (targeting the specific worker-recycle-spawns-a-
-   container mechanism, verified structurally sound — `get_worker_pool()` is a genuine singleton) did
-   not hold either — container count still reached 287 (same order of magnitude as the original
-   111), and grew far faster (143 within ~15-25s of load) than that mechanism alone predicts for 4
-   workers not yet due for their first 500-task recycle. Net status: **two existing env knobs tried,
-   neither sufficient**; this is now a "blocks nvcc-lane measurement work" severity finding needing a
-   source-level fix, not a "robustness gap" retry loop.
+   has no equivalent fallback and can still hard-crash the whole process on a transport failure. Same
+   class of gap T4.27_NOTES.md §3 already flagged for `_try_compile`'s broad `except Exception`, just
+   at a different call site. **Still true after T4.31** — T4.31 fixed the container leak, not this gap;
+   Cell 4's OOM and Cell 5's device fault both still hard-crashed the whole process rather than
+   degrading gracefully, because both happened outside `beam_search`'s own protected loop (Cell 4's
+   fatal allocation was in the final real-kernel path; Cell 5's fatal one was in `hcq.py`'s
+   `synchronize`, also outside `_try_compile`).
+2. **RESOLVED by T4.31.** The docker container-per-candidate leak (root-caused by the main session as
+   `Renderer.__reduce__` rebuilding a fresh `Compiler`, hence a fresh `docker run`, on every
+   multiprocessing unpickle of a live-Renderer-embedding task) is fixed. Confirmed directly: Cells 3, 4,
+   and 5 (both attempts) all held container counts in the single digits (0-7) throughout, including the
+   two forced-fresh, full-model qwen3.6 searches that previously would have produced hundreds. Both env
+   knobs tried earlier this session (`BEAM_MAX_TASKS_PER_CHILD`, `PARALLEL`) were addressing a
+   plausible-sounding but ultimately wrong mechanism (worker recycling); the real fix required a source
+   change, exactly as this task's own mitigation-attempt findings anticipated.
+3. **NEW:** a genuinely fresh (`IGNORE_BEAM_CACHE=1`) `JITBEAM=1` search on the qwen3.6-35B all-NV
+   config can OOM (Cell 4) — previously only `JITBEAM=2` was documented as VRAM-constrained on this
+   config. The live search's own candidate-timing execution needs real GPU buffers, a cost a cache-hit
+   replay never pays, so this ceiling was invisible until this task's forced-fresh methodology exposed
+   it.
+4. **NEW:** the qwen3.6 split's `JITBEAM=1` config hit a real, deterministically-reproducing NV device
+   fault (109 occurrences, identical both attempts) partway through a forced-fresh warmup. Each
+   individual respawn clears it immediately (health check passes right after), but the fault recurs
+   once heavy sustained work resumes — a real-hardware/driver reliability question distinct from every
+   other finding in this file, worth its own investigation before this cell is trusted at `JITBEAM=1`
+   under forced-fresh search.
 
-## STOP condition invoked
+## STOP condition invoked (final)
 
-Read in spirit rather than letter: the brief's "GPU wedge not cleared by a server respawn → stop,
-commit, report" names the GPU/TinyGPU bridge specifically, and that bridge stayed proven-healthy
-throughout, across both passes (repeated `DEV=NV` Tensor health checks all passed, `TinyGPU.*server`
-count never strayed from 1 after cleanup, including through 4 more docker-transport crashes in the
-retry pass). What actually wedged — the docker/nvcc compile transport — has the identical practical
-effect (total, non-transient block on every remaining required cell) and, per this task's own explicit
-constraint ("never stop/start colima"), has no in-scope clearing mechanism analogous to a server
-respawn. It also reproduced immediately after the main session's own colima restart, so a second
-restart mid-task would not be expected to hold any better than the first. Stopping here per protocol
-after the coordinator-directed retry pass: captured verbatim above, committing now, reporting back.
+Two different STOP triggers fired at different points this task, both handled per protocol:
+- **Docker transport (Cells 2-5, before T4.31):** read in spirit rather than letter — the brief's "GPU
+  wedge not cleared by a server respawn" names the GPU/TinyGPU bridge specifically, which stayed
+  proven-healthy throughout every docker-transport crash. The docker/nvcc compile transport itself had
+  no in-scope clearing mechanism (colima restart forbidden) until the main session fixed it at the
+  source (T4.31). Resolved — see finding 2 above.
+- **Cell 5's GPU device fault (after T4.31):** this one **is** the literal STOP condition — a genuine
+  NV device fault, cleared by a respawn, reproduced identically on the permitted one retry. Per this
+  fork's own established protocol (TD.2c, T4.15 §1.4) and the brief's explicit "retry once, stop if it
+  recurs": stopped after the second identical failure, did not attempt a third time, left the GPU in a
+  clean, healthy state for whoever picks this up next.
 
 ## Environment / stability
 
-Swap held at 1.2-1.4 GB throughout both passes (well under the 4 GB abort threshold). `TinyGPU.*server`
-count: 12 (pre-existing, cleared) → 1 → 8 (self-inflicted by the Cell 2 attempt-1 tooling mistake,
-cleared) → 1 (stable from then on, including through the original Cell 2 crash, the main session's
-colima restart, and all 4 retry-pass crashes, to the final report). NV device itself never faulted or
-needed a respawn this session, across either pass. The docker/colima host-side transport is the only
-subsystem that was ever unhealthy, and it remains so (confirmed unreachable) as of this report, having
-now failed identically both before and immediately after an external colima restart.
+Swap held at 1.0-1.4 GB throughout every pass this task (well under the 4 GB abort threshold).
+`TinyGPU.*server` count: 12 (pre-existing, cleared) → 1 → 8 (self-inflicted tooling mistake, cleared)
+→ 1 (stable) → 0 → 1 (Cell 5's device-fault respawn) → 1 (final, post-retry respawn) — every individual
+respawn was clean and immediate; the two departures from "stays at 1" were both diagnosed causes (a
+tooling mistake, and Cell 5's real device fault), never an unexplained regression. The docker/colima
+transport was the only subsystem broken across most of this task, confirmed fixed by T4.31 (bounded
+container counts on every cell run after it landed); the two remaining open items (Cell 4's OOM, Cell
+5's device fault) are new, independent findings, not transport issues.
 
 ## Exact commands (T4.30)
 
@@ -2191,4 +2293,26 @@ DEV=NV JITBEAM=2 PARALLEL=4 BEAM_MAX_TASKS_PER_CHILD=500 IGNORE_BEAM_CACHE=1 NO_
 docker ps -aq | wc -l                                   # 0 (daemon reachable again, reset)
 pgrep -fl "TinyGPU.*server" | wc -l                      # 1
 DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"  # 6.0
+
+# --- T4.31 lands (05d6347b9 cherry-picked as b6040133c) -- Cells 3-5 ---
+git log --oneline -2   # confirms b6040133c HEAD before running anything
+
+# Cell 2: not re-run, attributed to T4.31's own acceptance test (46.87 -> 47.905, containers 0->5-7->0, warm 1196.0s -> 449.6s)
+
+# Cell 3 -- DONE: 60.85 -> 62.819 tok/s, warm 728.6s -> 179.225s, containers bounded 1->6-7 throughout
+DEV=NV JITBEAM=2 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $GPTOSS --prompt-tokens 512 --decode-tokens 128
+
+# Cell 4 -- BLOCKED: VRAM MemoryError (not docker), containers stayed bounded 0->1->6-7
+DEV=NV JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $MXFP4 --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+
+# Cell 5 -- BLOCKED: NV device fault (109 occurrences), containers bounded; cleared by respawn, retried once, recurred identically (109 again), stopped per protocol
+DEV='METAL;NV' JITBEAM=1 PARALLEL=6 IGNORE_BEAM_CACHE=1 NO_COLOR=1 PYTHONPATH=. $PY extra/benchmark_llm.py \
+  --model $MXFP4 --device-map "0-7:METAL,8-39:NV" --max-context 4096 --prompt-tokens 512 --decode-tokens 128
+pkill -f "TinyGPU.*server"   # respawn between attempt 1 and 2, and again for final clean handoff
+DEV=NV PYTHONPATH=. $PY -c "from tinygrad import Tensor; print(Tensor([1.,2.,3.]).sum().item())"   # 6.0 every time
+
+# container-count sampling used for every Cell 3-5 run (15s interval, alongside the blocking wait)
+# while ! grep -q "^EXIT_CODE=" out.log; do docker ps -aq | wc -l; sleep 15; done
 ```
