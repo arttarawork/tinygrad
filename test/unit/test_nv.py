@@ -308,6 +308,15 @@ class TestNVQuiesceOnFault(unittest.TestCase):
     PCIIface.device_fini(fake)
     assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER)
 
+  def test_device_fini_clears_bus_master_even_if_fini_raises(self):
+    # Seen live (T4.37 step A): fini() -> rpc_unloading_guest_driver() times out against a dead GSP and raises BEFORE the
+    # clear -- the clear must still run (try/finally) or a quiet exit with a live fault leaves a bus-mastering GPU.
+    pci_dev = _FakePCIConfig()
+    def fini_raises(): raise RuntimeError("Timeout waiting for RPC response for command 47")
+    fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=fini_raises, is_err_state=True))
+    with self.assertRaisesRegex(RuntimeError, "command 47"): PCIIface.device_fini(fake)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), "MASTER must be cleared even when fini() raises"
+
   def test_device_fini_leaves_bus_master_when_clean(self):
     pci_dev = _FakePCIConfig()
     fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=lambda: None, is_err_state=False))

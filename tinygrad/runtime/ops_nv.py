@@ -613,11 +613,13 @@ class PCIIface(PCIIfaceBase):
   def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
 
   def device_fini(self):
-    self.dev_impl.fini()
-    # T4.37: fini_hw() above still needs GSP alive to answer its RPC, so clear bus-master only after -- a normal exit
-    # with a live fault must not leave a still-bus-mastering GPU once this client's mappings are torn down on disconnect.
-    if self.dev_impl.is_err_state:
-      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+    # T4.37: fini_hw() needs GSP alive to answer its RPC, so clear bus-master only after -- but in a `finally`: on a faulted
+    # GPU that RPC times out (seen live: "Timeout waiting for RPC response for command 47"), and the clear must still run so a
+    # normal exit with a live fault never leaves a bus-mastering GPU once this client's mappings are torn down on disconnect.
+    try: self.dev_impl.fini()
+    finally:
+      if self.dev_impl.is_err_state:
+        self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
 
   def sleep(self, timeout):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
