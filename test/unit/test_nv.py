@@ -223,11 +223,14 @@ class TestNVKernargsPoolSlab(unittest.TestCase):
     assert (n:=self._alloc_free_n(is_remote=False, n=40)) == 40, f"local kernargs alloc must keep one alloc per call (unchanged), got {n}"
 
 class _FakePCIConfig:
-  """In-memory PCI config space: just enough of PCIDevice's read_config/write_config_flush for T4.37's bus-master tests."""
+  """In-memory PCI config space: just enough of PCIDevice's read_config/write_config_flush (T4.37) plus pcibus/map_bar
+  (T4.40b, for driving the real NVDev.__init__) for the bus-master tests."""
   def __init__(self, command:int=pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER):
     self.space = {pci.PCI_COMMAND: command}
+    self.pcibus = "0000:66:00.0"
   def read_config(self, offset:int, size:int) -> int: return self.space.get(offset, 0)
   def write_config_flush(self, offset:int, value:int, size:int) -> None: self.space[offset] = value
+  def map_bar(self, *a, **k): return None
 
 def _fake_pciiface_self(is_remote:bool) -> SimpleNamespace:
   """Minimal stand-in for a PCIIface `self`, faulted: enough of dev_impl/pci_dev for sleep()'s quiesce-then-raise path."""
@@ -317,11 +320,79 @@ class TestNVQuiesceOnFault(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "command 47"): PCIIface.device_fini(fake)
     assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), "MASTER must be cleared even when fini() raises"
 
+  def test_device_fini_clears_bus_master_when_fini_raises_without_err_state(self):
+    # T4.40b (closes an A1 hole): is_err_state is set only by a GSP-delivered fault event (support/nv/ip.py) -- a wedge
+    # that never delivered one but whose fini() unload RPC itself times out/raises must still clear MASTER. Pre-fix this
+    # exited with MASTER on: the old `finally: if is_err_state` guard never fires when is_err_state is False.
+    pci_dev = _FakePCIConfig()
+    def fini_raises(): raise TimeoutError("Timeout waiting for RPC response for command 47")
+    fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=fini_raises, is_err_state=False))
+    with self.assertRaisesRegex(TimeoutError, "command 47"): PCIIface.device_fini(fake)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), \
+      "MASTER must be cleared when fini() raises even without is_err_state"
+
   def test_device_fini_leaves_bus_master_when_clean(self):
     pci_dev = _FakePCIConfig()
     fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=lambda: None, is_err_state=False))
     PCIIface.device_fini(fake)
     assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "a clean exit must not touch bus-master"
+
+class TestNVQuiesceOnInitFailure(unittest.TestCase):
+  """T4.40b (RCA T4.40_RCA.md fix 40-1 / mechanism A2): _early_ip_init() sets PCI bus-master partway through
+  NVDev.__init__, before flcn/gsp ever boot (nvdev.py:113-137, MASTER set at :127). A boot-time RPC timeout raising
+  anywhere after that point -- the confirmed real trigger is a get_available_devices() probe during pytest collection
+  -- left GSP-RM armed with bus-master on and never unloaded, because a device whose __init__ raises is never
+  registered (device.py never calls fini()/device_fini() for it): the armed session lingers until process exit tears
+  down its DMA mappings. This is panic 2's best-fit mechanism.
+
+  These drive the REAL NVDev.__init__ (not a copy) against a fake pci_dev with _early_ip_init/_early_mmu_init/flcn/gsp
+  stubbed out -- proving the try/except placement across both seams (inside _early_ip_init, e.g. wait_for_reset()'s
+  wait_cond; and after it returns, in init_sw()/init_hw()), not re-testing _early_ip_init's own register decode logic
+  (already exercised by TestNVPTEBatching's FakeNVDev)."""
+
+  def _fake_target(self, pci_dev, early_ip_init, flcn=None, gsp=None) -> SimpleNamespace:
+    fake = SimpleNamespace()
+    fake._early_ip_init = early_ip_init
+    fake._early_mmu_init = lambda: None
+    fake.flcn = flcn if flcn is not None else SimpleNamespace(init_sw=lambda: None, init_hw=lambda: None)
+    fake.gsp = gsp if gsp is not None else SimpleNamespace(init_sw=lambda: None, init_hw=lambda: None)
+    return fake
+
+  def _set_master(self, pci_dev): pci_dev.write_config_flush(pci.PCI_COMMAND, pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
+
+  def test_init_clears_bus_master_when_early_ip_init_raises_after_master_set(self):
+    # Mirrors the real seam exactly: nvdev.py sets MASTER partway through _early_ip_init, then calls wait_for_reset()
+    # (a wait_cond, same 10s-timeout-then-raise primitive as the RPC waits) before that method returns to __init__.
+    pci_dev = _FakePCIConfig()
+    def early_ip_init_raises_after_master():
+      self._set_master(pci_dev)
+      raise TimeoutError("waiting for reset")
+    fake = self._fake_target(pci_dev, early_ip_init_raises_after_master)
+    with self.assertRaisesRegex(TimeoutError, "waiting for reset"): NVDev.__init__(fake, pci_dev)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), \
+      "MASTER must be cleared when _early_ip_init raises after setting it (a narrower fix that only wraps the code " \
+      "AFTER _early_ip_init() returns would miss this and fail here)"
+
+  def test_init_clears_bus_master_when_a_later_boot_step_raises(self):
+    # init_sw()/init_hw() run AFTER _early_ip_init() returns -- the other seam the fix must cover (RCA's "confirmed
+    # real trigger": a boot-time RPC timeout during this phase).
+    pci_dev = _FakePCIConfig()
+    def early_ip_init_ok(): self._set_master(pci_dev)
+    def init_hw_raises(): raise TimeoutError("Timeout waiting for RPC response for command 12")
+    fake = self._fake_target(pci_dev, early_ip_init_ok, gsp=SimpleNamespace(init_sw=lambda: None, init_hw=init_hw_raises))
+    with self.assertRaisesRegex(TimeoutError, "command 12"): NVDev.__init__(fake, pci_dev)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), \
+      "MASTER must be cleared when a later boot step (init_sw/init_hw) raises"
+
+  def test_init_leaves_bus_master_set_when_boot_succeeds(self):
+    # Negative control (the #16536 guard): a healthy boot must leave MASTER exactly as _early_ip_init set it, and
+    # must not raise.
+    pci_dev = _FakePCIConfig()
+    def early_ip_init_ok(): self._set_master(pci_dev)
+    fake = self._fake_target(pci_dev, early_ip_init_ok)
+    NVDev.__init__(fake, pci_dev)
+    assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "a healthy boot must not touch bus-master"
+    assert fake.is_booting is False, "healthy __init__ must still run to completion (not swallowed by the new except)"
 
 class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
   """T4.25: APLRemotePCIDevice.__init__'s connect-or-spawn loop (support/system.py) had no cross-process

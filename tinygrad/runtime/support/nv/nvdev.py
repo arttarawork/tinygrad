@@ -92,14 +92,25 @@ class NVDev:
     self.pci_dev, self.devfmt, self.mmio = pci_dev, pci_dev.pcibus, pci_dev.map_bar(0, fmt='I')
 
     self.smi_dev, self.is_booting, self.is_err_state = False, True, False
-    self._early_ip_init()
-    self._early_mmu_init()
+    try:
+      self._early_ip_init()
+      self._early_mmu_init()
 
-    # No booting state, gsp client is reinited every run.
-    self.is_booting = False
+      # No booting state, gsp client is reinited every run.
+      self.is_booting = False
 
-    for ip in [self.flcn, self.gsp]: ip.init_sw()
-    for ip in [self.flcn, self.gsp]: ip.init_hw()
+      for ip in [self.flcn, self.gsp]: ip.init_sw()
+      for ip in [self.flcn, self.gsp]: ip.init_hw()
+    except BaseException:
+      # T4.40b (closes RCA mechanism A2): _early_ip_init() sets PCI bus-master partway through (nvdev.py, before flcn/gsp
+      # ever boot); any exception past that point -- a boot-time RPC timeout (wait_for_reset/init_sw/init_hw) is the
+      # confirmed real trigger -- must not leave GSP-RM armed with bus-master on. A device whose __init__ raises is never
+      # registered (device.py never calls fini()/device_fini() for it), so without this the armed session lingers,
+      # bus-mastering, until process exit tears down its DMA mappings -> DART panic. Wrapping the whole call (not just the
+      # tail) is deliberate: a failure BEFORE the MASTER write (still inside _early_ip_init) hits this same handler and
+      # clears a bit that's already 0 -- a no-op (AND with an already-clear bit) -- so this is safe wherever it raises.
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+      raise
 
   def fini(self):
     for ip in [self.gsp, self.flcn]: ip.fini_hw()
