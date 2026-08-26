@@ -1,4 +1,5 @@
 import math, time, traceback, signal
+from collections import Counter
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
@@ -55,12 +56,12 @@ def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
   raise TimeoutException()
 
-def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
+def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, str|None]:
   if hasattr(signal, "alarm"):
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
     signal.alarm(getenv("BEAM_TIMEOUT_SEC", 10))
-  ret = None
+  ret, exc_name = None, None
   try:
     st = time.perf_counter()
     ast, dev = x[1].copy().get_optimized_ast(name_override="test"), x[1].ren.target.device
@@ -71,13 +72,15 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
       if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
       raise RuntimeError("too many uops")
     ret = (prg, et)
-  except RuntimeError:
+  except RuntimeError as e:
+    exc_name = type(e).__name__
     if DEBUG >= 4: traceback.print_exc()
   except Exception as e:
+    exc_name = type(e).__name__
     if getenv("BEAM_STRICT_MODE"): raise e
   finally:
     if hasattr(signal, "alarm"): signal.alarm(0)
-  return x[0], ret
+  return x[0], ret, exc_name
 
 def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]
 
@@ -133,9 +136,12 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     while not exiting:
       candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
       timed: list[tuple[Scheduler, float]] = []
+      fails: Counter[str] = Counter()
       least_compute_ops = math.inf
-      for i, proc in ((map if pool is None else pool.imap_unordered)(_try_compile, enumerate(candidates))):
-        if proc is None: continue
+      for i, proc, exc_name in ((map if pool is None else pool.imap_unordered)(_try_compile, enumerate(candidates))):
+        if proc is None:
+          fails[exc_name or "unknown"] += 1
+          continue
         prg, compile_et = proc
         if (lib:=prg.src[3].arg) in seen_libs: continue
         # filter out kernels that use 1000x more compute than the smallest
@@ -150,7 +156,9 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
                                  dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
         except Exception as e:
           if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
-          if isinstance(e, RuntimeError): continue
+          if isinstance(e, RuntimeError):
+            fails[type(e).__name__] += 1
+            continue
           raise
         timed.append((candidates[i], min(tms)))
         if BEAM_DEBUG > 1:
@@ -163,6 +171,9 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
 
       # done
       opts = sorted(timed, key=lambda x: x[1])
+      if candidates and not opts:
+        print(colored(f"WARNING: BEAM found no viable candidate this round ({len(candidates)} tried, {sum(fails.values())} failed: "
+                       f"{dict(fails)}) for {beam[0][0].colored_shape()}", "red"))
       exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
       if not exiting: beam = opts[:amt]
       elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
@@ -173,6 +184,12 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     terminate_worker_pool()
     raise e
 
+  if beam[0][0] is s and candidates:
+    # every round found zero viable candidates (see the per-round WARNING above): don't hand back an untuned kernel silently,
+    # apply the same heuristics used when BEAM isn't requested at all (postrange.apply_opts' beam==0 path)
+    print(colored(f"WARNING: BEAM found no working action for {s.colored_shape()}, falling back to hand_coded_optimizations", "red"))
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    beam[0] = (hand_coded_optimizations(beam[0][0].copy()), beam[0][1])
   if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
   if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(beam[0][1], w=0)}, applied_opts={beam[0][0].applied_opts}")
   return beam[0][0]
