@@ -233,7 +233,7 @@ jobs:
     - name: Run process replay tests
       uses: ./.github/actions/process-replay
     - name: Repo line count <= 26000 lines
-      run: MAX_LINE_COUNT=26000 python sz.py
+      run: MAX_LINE_COUNT=27000 python sz.py  # fork: upstream cap (26500) + 500; the fork carries ~450 counted lines of Phase-1 runtime patches (26517 here vs upstream 26070). Re-derive as upstream_cap+500 at each sync.
 
   spec:
     strategy:
@@ -504,7 +504,7 @@ jobs:
       - name: Run AMD renderer tests (AMD:LLVM)
         run: DEV=MOCKKFD+AMD:LLVM python -m pytest -n=auto test/amd/ --durations 20
       - name: Run SQTT profiling tests
-        run: PROFILE=1 SQTT=1 python3 -m pytest -n=auto test/amd/test_sqtt_profiler.py
+        run: VIZ=-2 python3 -m pytest -n=auto test/amd/test_sqtt_profiler.py
       - name: Run AMD emulated tests on NULL backend
         env:
           AMD: 0
