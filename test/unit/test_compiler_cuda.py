@@ -15,9 +15,10 @@ import tinygrad.device as device_mod
 class _FakeProc:
   """stands in for a subprocess.Popen: alive until killed."""
   def __init__(self, pid:int):
-    self.pid, self._alive = pid, True
+    self.pid, self._alive, self.killed, self.waited = pid, True, False, False
   def poll(self): return None if self._alive else 1
-  def kill(self): self._alive = False
+  def kill(self): self._alive, self.killed = False, True
+  def wait(self): self.waited = True
 
 class FakeCompiler:
   """duck-types what _get_server/_compile_with_retry touch on a real Compiler: .server(), .compiler_process, .compile_server()."""
@@ -81,6 +82,28 @@ class TestCompileWithRetry(unittest.TestCase):
     c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
     self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
     self.assertEqual(FakeCompiler.spawn_count, 2)  # exactly one respawn after the simulated dead transport
+
+  def test_evicted_process_is_reaped_on_retry(self):
+    # T4.45: _compile_with_retry used to _server_cache.pop() the dead entry and drop it on the floor --
+    # never kill()/wait()-ed, so a process that's still alive at the OS level (e.g. the docker CLI
+    # client up but the container inside it dead) leaked until atexit's _reap_servers ran.
+    c = FakeCompiler(fail_times=1)
+    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
+    dead_proc = c.compiler_process
+    self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
+    self.assertTrue(dead_proc.killed)
+    self.assertTrue(dead_proc.waited)
+
+  def test_already_dead_evicted_process_is_still_reaped_not_double_killed(self):
+    # the evicted process may have already exited on its own (poll() != None) -- must still wait() it
+    # (avoid a zombie) but must NOT call kill() again on an already-reclaimed pid.
+    c = FakeCompiler(fail_times=1)
+    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
+    dead_proc = c.compiler_process
+    dead_proc._alive = False  # simulate the process having already exited on its own
+    self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
+    self.assertFalse(dead_proc.killed)
+    self.assertTrue(dead_proc.waited)
 
   def test_does_not_retry_or_respawn_on_genuine_compile_error(self):
     # must never paper over a real compile error by retrying it
@@ -219,6 +242,52 @@ class TestCompileCachedRetryPath(_FakeDiskCacheTestCase):
     with self.assertRaises(CompileTransportError):
       c.compile_cached("src_retry_fail")
     self.assertEqual(self.cache.store, {})
+class _ShortWriteProc:
+  """simulates a raw unbuffered pipe (bufsize=0) whose write() legitimately accepts at most `chunk`
+  bytes per call -- captures everything actually delivered so a test can tell "looped until the whole
+  message got through" apart from "returned after a single short write". Its read() hands back a fixed
+  canned reply regardless of what/how much was written, so the test never blocks on a real deadlock
+  (T4.42 NOTES.md Sec3b: the real deadlock is the server never getting the rest of the message and the
+  client then blocking on the read that follows -- this fake's read is not gated on the write at all,
+  by design, so the test stays a plain, fast unit test of the write loop)."""
+  def __init__(self, reply:bytes, chunk:int, pid:int=9001):
+    self.stdin = self.stdout = self
+    self.reply, self.chunk, self.pid = reply, chunk, pid
+    self.written, self.write_calls = b"", 0
+    self._reply_pos = 0
+  def write(self, data:bytes) -> int:
+    self.write_calls += 1
+    n = min(self.chunk, len(data))
+    self.written += data[:n]
+    return n
+  def read(self, n:int) -> bytes:
+    end = min(self._reply_pos + n, len(self.reply))
+    ret, self._reply_pos = self.reply[self._reply_pos:end], end
+    return ret
+
+class TestCompileServerWrite(unittest.TestCase):
+  def test_short_write_delivers_every_byte(self):
+    # T4.45: compile_server()'s outbound write ignored write()'s return value -- a legitimate short
+    # write (bufsize=0 pipes can return short per Python's own subprocess docs) silently sent only a
+    # prefix of the message. Proven failing pre-fix: with the single unlooped `.write(data)` call, only
+    # the first `chunk` bytes ever reach the fake, so `proc.written` falls short of `expected_wire`.
+    src = "x" * 5000  # large enough that chunk=7 needs hundreds of write() calls to deliver it all
+    payload = b"ok"
+    proc = _ShortWriteProc(struct.pack("I", len(payload)) + payload, chunk=7)
+    self.assertEqual(Compiler().compile_server(src, proc), payload)
+    expected_wire = struct.pack("I", len(src.encode())) + src.encode()
+    self.assertEqual(proc.written, expected_wire)
+
+  def test_full_single_write_unchanged(self):
+    # negative control: a healthy write that fully lands in one call -- must still take exactly one
+    # write() call (the loop's first iteration exhausts `data` and returns), same as before the fix.
+    src = "small"
+    payload = b"ok"
+    proc = _ShortWriteProc(struct.pack("I", len(payload)) + payload, chunk=10_000)
+    self.assertEqual(Compiler().compile_server(src, proc), payload)
+    expected_wire = struct.pack("I", len(src.encode())) + src.encode()
+    self.assertEqual(proc.written, expected_wire)
+    self.assertEqual(proc.write_calls, 1)
 
 if __name__ == "__main__":
   unittest.main()

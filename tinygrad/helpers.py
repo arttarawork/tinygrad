@@ -554,8 +554,12 @@ def amdgpu_disassemble(lib:bytes):
 
 def wait_cond(cb, *args, value=True, timeout_ms=10000, msg="") -> bool:
   start_time = int(time.perf_counter() * 1000)
-  while int(time.perf_counter() * 1000) - start_time < timeout_ms:
+  while True:
+    # T4.45: check cb() before the deadline, not the other way around -- guarantees at least one call
+    # (and `val` bound) even if the deadline has already passed by the time we get here, so the raise
+    # below always has a real value instead of an UnboundLocalError on an unset `val` (found by T4.40c).
     if (val:=cb(*args)) == value: return val
+    if int(time.perf_counter() * 1000) - start_time >= timeout_ms: break
   raise TimeoutError(f"{msg}. Timed out after {timeout_ms} ms, condition not met: {val} != {value}")
 
 # *** ctypes helpers

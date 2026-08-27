@@ -33,7 +33,13 @@ def _compile_with_retry(compiler, src:str, cmd:str, arch:str, *args) -> bytes:
   # (CompileError proper, not the CompileTransportError subclass), which propagates immediately.
   try: return compiler.compile_server(src, compiler.compiler_process)
   except CompileTransportError:
-    _server_cache.pop((type(compiler).__name__, arch, args), None)
+    if (dead:=_server_cache.pop((type(compiler).__name__, arch, args), None)) is not None:
+      # T4.45: reap the evicted process instead of leaking it -- guard kill() with poll() (mirrors
+      # _reap_servers above) since killing an already-exited pid can raise; wait() unconditionally so
+      # a process that's merely pipe-dead (container alive, transport broken) doesn't zombie until the
+      # atexit handler eventually runs.
+      if dead.poll() is None: dead.kill()
+      dead.wait()
     compiler.compiler_process = _get_server(compiler, cmd, arch, *args)
     return compiler.compile_server(src, compiler.compiler_process)
 
