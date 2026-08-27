@@ -246,7 +246,21 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     # apply the same heuristics used when BEAM isn't requested at all (postrange.apply_opts' beam==0 path)
     print(colored(f"WARNING: BEAM found no working action for {s.colored_shape()}, falling back to hand_coded_optimizations", "red"))
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
-    beam[0] = (hand_coded_optimizations(beam[0][0].copy()), beam[0][1])
+    hc, hc_tm = hand_coded_optimizations(beam[0][0].copy()), beam[0][1]
+    # T4.57: a wipeout where EVERY candidate tripped the uop cap is structural (deterministic per AST), yet with an inf score
+    # T4.39 below rightly refuses to persist it -- so the doomed search replayed on every capture (2x per warmup, every server
+    # start; ~minutes on the chunked DeltaNet scan kernel). Time the fallback kernel itself instead: a finite measurement makes
+    # it exactly the empirically-validated result the cache is for. Any other failure mix (timeouts, runtime errors) may be
+    # environmental and keeps re-searching as before.
+    if set(fails) == {"BeamUopLimit"} and (proc:=_try_compile((0, hc))[1]) is not None:
+      try:
+        hc_tm = min(_time_program(proc[0], var_vals, rawbufs, early_stop=1.0, allow_test_size=allow_test_size,
+                                  clear_l2=hasattr(dev, 'invalidate_caches'), dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1)))
+      except Exception as e:
+        if isinstance(e, RuntimeError) and _device_faulted(dev):
+          raise RuntimeError(f"BEAM: device fault detected while timing the hand-coded fallback for {s.colored_shape()}. Original error: {e}") from e
+        if BEAM_DEBUG: print(f"BEAM fallback timing failed (result stays uncached): {e}")
+    beam[0] = (hc, hc_tm)
   # T4.39: an inf best time means the search never produced an empirically-validated winner -- either the
   # total-failure fallback above (whose score is still the untouched seed's inf) or a candidate whose only
   # timing attempt hit _time_program's AssertionError path (search.py:50). Don't persist that: a later run
