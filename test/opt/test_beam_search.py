@@ -6,7 +6,10 @@ from tinygrad import Device, Tensor
 from tinygrad.codegen.opt.postrange import Scheduler, args_from_ast
 from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
 from tinygrad.codegen.opt import search as search_mod
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import Context
+from tinygrad.renderer import Renderer
+from tinygrad.helpers import Target
 
 # T4.27: beam_search used to silently return the untouched, unoptimized seed kernel whenever every
 # candidate in a round failed to compile/time (_try_compile swallows the exception and returns None).
@@ -184,6 +187,28 @@ class TestBeamSearchSyncsBeforeReturn(unittest.TestCase):
     msg = str(ctx.exception)
     self.assertIn("search", msg.lower())
     self.assertIn("Device fault detected.", msg)  # original error preserved, not swallowed into an opaque one
+
+class TestSecondGroupReduceDeniedOnNV(unittest.TestCase):
+  # T4.53: two INDEPENDENT reduce axes (not one axis re-split) both turned into GROUP_REDUCE reproducibly
+  # faulted NV silicon (2/2 repros). A kernel with a real ast/2 reduce dims (NULL device -- no hardware),
+  # opt-applied through a fake renderer so this needs no live NV/Metal device either.
+  def _two_reduce_ast(self):
+    with Context(ALLOW_DEVICE_USAGE=1):
+      a, b = Tensor.rand(16, 16, device="NULL"), Tensor.rand(16, 16, device="NULL")
+      return (a.sum(0) + b.sum(1)).schedule_linear().src[-1].src[0]
+
+  def test_second_group_denied_on_nv(self):
+    ast = self._two_reduce_ast()
+    s = Scheduler(ast, Renderer(target=Target(device="NV")))
+    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # 1st GROUP_REDUCE: fine
+    with self.assertRaises(KernelOptError):
+      s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # 2nd, independent one: denied
+
+  def test_second_group_still_allowed_off_nv(self):
+    ast = self._two_reduce_ast()
+    s = Scheduler(ast, Renderer(target=Target(device="METAL")))  # same has_local capability, different device
+    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))
+    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # doesn't raise -- guard is NV-only
 
 if __name__ == "__main__":
   unittest.main()
