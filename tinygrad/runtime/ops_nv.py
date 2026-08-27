@@ -25,9 +25,27 @@ PMA = ContextVar("PMA", abs(VIZ.value)>=2)
 class ProfilePMAEvent(ProfileEvent): device:str; kern:str; blob:bytes; exec_tag:int; profile_key:bytes|None=None # noqa: E702
 
 class NVSignal(HCQSignal):
+  # T4.48 F2 (T4.47_RCA.md): "no wait observed yet" sentinel for the first-call-of-a-wait detection in _sleep
+  # below -- deliberately higher than any real elapsed-ms value so a signal's very first-ever _sleep() call
+  # also counts as a wait-start, not just later ones.
+  _last_elapsed_ms: float = float('inf')
+
   def _sleep(self, time_spent_since_last_sleep_ms:int):
     # Reasonable to sleep for long workloads (which take more than 200ms) and only timeline signals.
-    if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
+    # T4.48 F2 (T4.47_RCA.md): also drain on the FIRST _sleep() of every wait, not only once >200ms has
+    # accumulated -- BEAM's per-candidate device timeout (BEAM_DEV_TIMEOUT) is typically 1-3ms, far under the
+    # old gate, so a GSP fault event from an earlier abandoned candidate could sit undrained for an entire
+    # search. "First call of a wait" is detected as "elapsed time just went backwards": hcq.py's wait() resets
+    # its start_time -- and so the elapsed-ms this method is called with -- at the start of every wait() and
+    # again on every progress event within one; _sleep has no other signal of that, and hcq.py is explicitly
+    # out of scope for this fix. Cost: at most one extra iface.sleep(0) round trip per such reset (a local
+    # stat_q memory read when direct-PCI, one RPC round trip when remote) -- never per spin iteration, since
+    # elapsed is monotonically non-decreasing between resets.
+    wait_start = time_spent_since_last_sleep_ms < self._last_elapsed_ms
+    self._last_elapsed_ms = time_spent_since_last_sleep_ms
+    if self.owner is None: return
+    if time_spent_since_last_sleep_ms > 200: self.owner.iface.sleep(200)
+    elif wait_start: self.owner.iface.sleep(0)
 
 def get_error_str(status): return f"{status}: {nv_gpu.nv_status_codes.get(status, 'Unknown error')}"
 
