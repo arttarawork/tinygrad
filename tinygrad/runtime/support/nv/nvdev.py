@@ -158,9 +158,16 @@ class NVDev:
         self.include("dev_falcon_v4", "ga102")
         self.include("dev_riscv_pri", "ga102")
         self.flcn.falcon = 0x00110000
+        # T4.40c hardware-session instrumentation (env-gated, off by default): active_stat here = AFTER the FLR
+        # but BEFORE the falcon engine reset. If it reads 0, the FLR alone already halted the previous GSP-RM
+        # core (RCA Sec7 H2, the open question); if 1, the falcon reset below is load-bearing. Read-only.
+        if getenv("NV_HALT_DEBUG"):
+          print(f"nv {self.devfmt}: [T4.40c H2] active_stat after FLR, pre-falcon-reset = "
+                f"{self.reg('NV_PRISCV_RISCV_CPUCTL').with_base(self.flcn.falcon).read_bitfields()['active_stat']}", flush=True)
         self.flcn.reset(self.flcn.falcon)
         wait_cond(lambda: self.reg("NV_PRISCV_RISCV_CPUCTL").with_base(self.flcn.falcon).read_bitfields()['active_stat'],
                   value=0, msg="previous GSP-RM core did not halt after FLR + falcon engine reset")
+        if getenv("NV_HALT_DEBUG"): print(f"nv {self.devfmt}: [T4.40c H2] active_stat after falcon reset = 0 (verify passed)", flush=True)
 
     self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.flcn.wait_for_reset()
