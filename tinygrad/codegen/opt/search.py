@@ -120,6 +120,12 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
   kernel_actions = actions.copy()
 
   for i,a in enumerate(kernel_actions):
+    # T4.53 (relocated here from postrange.apply_opt after upstream's test_two_grouped_stores_local -- which
+    # hand-applies this combo on NV -- failed CI): a 2nd INDEPENDENT GROUP_REDUCE axis reproducibly faulted NV
+    # silicon (2/2, T4.50/T4.53: the MoE expert-gather; Metal renders the same AST clean). Exclude it from the
+    # SEARCH SPACE only; hand-applied opts stay legal everywhere. Renderer root cause = T4.54.
+    if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" \
+       and AxisType.GROUP_REDUCE in s.axis_types: continue
     if a.axis is not None and a.op is not OptOps.TC:
       try: ax = s.real_axis(a.op, a.axis)
       except KernelOptError: continue

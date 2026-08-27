@@ -265,27 +265,37 @@ class TestBeamSearchDoesNotCacheUnvalidatedResults(unittest.TestCase):
       result2 = search_mod.beam_search(s, rawbufs, var_vals, 1)
       self.assertEqual(result2.applied_opts, result1.applied_opts)
 
-class TestSecondGroupReduceDeniedOnNV(unittest.TestCase):
-  # T4.53: two INDEPENDENT reduce axes (not one axis re-split) both turned into GROUP_REDUCE reproducibly
-  # faulted NV silicon (2/2 repros). A kernel with a real ast/2 reduce dims (NULL device -- no hardware),
-  # opt-applied through a fake renderer so this needs no live NV/Metal device either.
+class TestSecondGroupReduceExcludedFromNVSearch(unittest.TestCase):
+  # T4.53 (relocated): two INDEPENDENT reduce axes both turned into GROUP_REDUCE reproducibly faulted NV
+  # silicon (2/2 repros). The deny lives in get_kernel_actions (search space) -- NOT apply_opt: upstream's
+  # test_two_grouped_stores_local hand-applies the combo on NV and must keep passing (it broke CI once).
   def _two_reduce_ast(self):
     with Context(ALLOW_DEVICE_USAGE=1):
       a, b = Tensor.rand(16, 16, device="NULL"), Tensor.rand(16, 16, device="NULL")
       return (a.sum(0) + b.sum(1)).schedule_linear().src[-1].src[0]
 
-  def test_second_group_denied_on_nv(self):
-    ast = self._two_reduce_ast()
-    s = Scheduler(ast, Renderer(target=Target(device="NV")))
-    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # 1st GROUP_REDUCE: fine
-    with self.assertRaises(KernelOptError):
-      s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # 2nd, independent one: denied
+  def _grouped_scheduler(self, device:str):
+    s = Scheduler(self._two_reduce_ast(), Renderer(target=Target(device=device)))
+    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # 1st GROUP_REDUCE
+    return s
 
-  def test_second_group_still_allowed_off_nv(self):
-    ast = self._two_reduce_ast()
-    s = Scheduler(ast, Renderer(target=Target(device="METAL")))  # same has_local capability, different device
-    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))
-    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # doesn't raise -- guard is NV-only
+  def _extra_group_candidates(self, s):
+    from tinygrad.codegen.opt.search import get_kernel_actions
+    base = s.axis_types.count(AxisType.GROUP_REDUCE)
+    return [c for c in get_kernel_actions(s, include_0=False).values() if c.axis_types.count(AxisType.GROUP_REDUCE) > base]
+
+  def test_second_group_excluded_from_nv_search_space(self):
+    self.assertEqual(self._extra_group_candidates(self._grouped_scheduler("NV")), [])
+
+  def test_second_group_in_search_space_off_nv(self):
+    # same capability, different device: the combo must still be explorable (proves the filter is NV-only)
+    self.assertNotEqual(self._extra_group_candidates(self._grouped_scheduler("METAL")), [])
+
+  def test_hand_applied_second_group_stays_legal_on_nv(self):
+    # the exact regression that failed CI's Linux (nv): upstream test_two_grouped_stores_local hand-applies
+    # two grouped reductions on the default (NV) device -- apply_opt must NOT deny it.
+    s = self._grouped_scheduler("NV")
+    s.apply_opt(Opt(OptOps.GROUP, axis=0, arg=0))  # no KernelOptError
 
 if __name__ == "__main__":
   unittest.main()
