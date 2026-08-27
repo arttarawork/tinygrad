@@ -2,6 +2,9 @@ import ctypes, struct, platform, pathlib, shutil
 from tinygrad.device import Compiler
 from tinygrad.helpers import DEBUG, system, fetch
 from tinygrad.runtime.support.compiler_mesa import disas_adreno
+# T4.43: process-local compile-server cache, shared with compiler_cuda.py's OSX docker path (T4.31)
+# -- see compiler_server_cache.py's docstring for why this exists.
+from tinygrad.runtime.support.compiler_server_cache import _get_server, _compile_with_retry
 # see https://github.com/sirhcm/tinydreno
 from tinygrad.runtime.autogen import llvm_qcom
 
@@ -15,12 +18,16 @@ class QCOMCompiler(Compiler):
       # extract once into the download cache, all processes share the rootfs (extract=True)
       self.arch, self.chip_id = arch, 0x6030001
       fs, root = fetch('https://git.tinygrad.win/sirhcm/images/releases/download/v2/qcomcl.tar.gz', extract=True), pathlib.Path(__file__).parents[3]
-      self.compiler_process = self.server(f"{qemu} -cpu max,pauth=off -L {fs} {fs}/usr/bin/python3" if (qemu:=shutil.which("qemu-aarch64-static"))
-                                          else (f"docker run --rm -i --platform linux/aarch64 -v {fs}/usr:/usr -v {root}:{root} "
-                                                f"-e PYTHONPATH={root} -e QEMU_CPU=max,pauth=off gcr.io/distroless/static python3"), arch)
+      self.compiler_cmd = (f"{qemu} -cpu max,pauth=off -L {fs} {fs}/usr/bin/python3" if (qemu:=shutil.which("qemu-aarch64-static"))
+                            else (f"docker run --rm -i --platform linux/aarch64 -v {fs}/usr:/usr -v {root}:{root} "
+                                  f"-e PYTHONPATH={root} -e QEMU_CPU=max,pauth=off gcr.io/distroless/static python3"))
+      self.compiler_process = _get_server(self, self.compiler_cmd, arch)
     super().__init__(f"compile_qcomcl_{arch}")
 
-  def __del__(self): llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst) if platform.machine() == "aarch64" else self.compiler_process.kill()
+  def __del__(self):
+    # non-aarch64: the process is shared via _server_cache (T4.43) -- reaped by its atexit hook, not
+    # per-instance, so a GC'd instance must never kill the server out from under a cached reuse.
+    if platform.machine() == "aarch64": llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst)
 
   def __reduce__(self): return QCOMCompiler, (self.arch,)
 
@@ -32,7 +39,7 @@ class QCOMCompiler(Compiler):
     return handle
 
   def compile(self, src) -> bytes:
-    if platform.machine() != "aarch64": return self.compile_server(src, self.compiler_process)
+    if platform.machine() != "aarch64": return _compile_with_retry(self, src, self.compiler_cmd, self.arch)
     ch = self.checked(llvm_qcom.cl_compiler_compile_source(self.llvm_inst, self.chip_id, llvm_qcom.CL_MODE_64BIT, b"", 0, 0, 0, src.encode(), 0,
                                                            llvm_qcom.CL_SRC_STR, None))
     if DEBUG >= 8: print(system("llvm-dis", input=ctypes.string_at((comp:=ch.contents.compiled.contents).llvm_bitcode, comp.llvm_bitcode_size)))
