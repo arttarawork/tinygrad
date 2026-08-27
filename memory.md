@@ -396,6 +396,23 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   `HANDOFF_2026-08-27.md`** (TD.5-oriented), CLAUDE.md + TASKS RESUME repointed, review sweep clean (all doc
   SHAs current-or-historical), worktree prune list prepared (~26 worktrees + ~40 agent branches, awaiting OK).
 
+- **2026-08-27 PM (TD.5 session — wired end-to-end; the prefill story):** Reading, not measuring, found the blocker: `generate()`
+  pinned `chunk_size=1` for recurrent models off RDNA3 (`model.py:761`, from the original qwen3.5 commit) → the hybrids prefilled at
+  decode speed (pooled Q8_0: 46 tok/s, bandwidth-bound) against 13.5-18k-token Hermes prompts. **T4.55** `GDN_CHUNK` (default 32) uses
+  the existing unrolled scan: METAL 0.8b 77 → 168 no-BEAM / 99 → 346 BEAM'd; pooled Q8_0 46 → 158-173 @2k, tokens identical,
+  decode unchanged; a 1 h 43 min fresh nvcc search, 0 faults. **T4.56** serve.py: generated-id splice cache (hits verified on the
+  real model), `chat_template_kwargs`, SIGTERM → normal exit (validated). **T4.57** BEAM caches the timed hand-coded fallback after
+  an all-`BeamUopLimit` wipeout (two fixes: cap off, then alarm off — the fallback compile was being killed by the 30 s candidate
+  alarm). **Then the second finding:** the T0.3 harness's 2048-token convention hides an O(n²) attention term — 156 tok/s @2k →
+  55.9 @8k; the first real `hermes -z` (18,140 tokens) sat >14 min with the Apple GPU at 96%. Moving all 10 attention blocks to the
+  3090 (`0-2:METAL,3:NV,…,23-39:NV`, same layer counts, no new kernels) gave 88.4 @8k (+58%) and decode 25.6 (+28%) → adopted.
+  TD.5 wiring complete (config entry, `pooled-serve.sh`, `hermes-aux-swap.py`, ~/CLAUDE.md ritual); fluid for follow-up turns,
+  ~3-4 min for a cold session → **T4.58 (NV attention-prefill kernel) is the next lever**. Lessons: (1) measure prefill at the
+  prompt length the consumer actually sends; (2) a Metal `waitUntilCompleted` with the GPU at 96% is slow, not hung — `sample` +
+  ioreg `Device Utilization` settle it in a minute; (3) T4.56's SIGTERM handler only fires between C calls — fine for chunks,
+  but a truly hung Metal wait would need the default disposition. Hermes facts: 64k minimum `context_length`; echoes
+  `reasoning_content` verbatim; one-shot = `hermes -z … --provider custom:<name-lowercased-hyphenated> -m <model>`.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
