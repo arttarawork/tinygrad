@@ -3,9 +3,9 @@
 This is Artur's fork of tinygrad for making the NVIDIA/TinyGPU eGPU path fast for local LLMs
 and pooling the MacBook (Metal) with an RTX 3090. Before doing any work, read in order:
 
-1. `HANDOFF_2026-08-26.md` — the complete handoff after the 2026-08-26 dock incidents; then
-   `TASKS.md` — **start with the "RESUME HERE" section** (state of play, where the artifacts
-   live, dock ops quickstart, next-task recommendation), then the task list + Status log.
+1. **`HANDOFF_2026-08-27.md` — THE entry point** (state, master contents, the TD.5 Hermes goal,
+   standing rules/grants, verification gotchas, open board); then `TASKS.md` — the "RESUME HERE"
+   section, then the task list + Status log. (`HANDOFF_2026-08-26.md` is the panic-era history.)
 2. `NV_LLM_DESIGN.md` — the design doc; **§1.5 has the post-dock results and supersedes the
    pre-dock framing** in §1-§2.
 3. `memory.md` — context, decision history, external research, supplementary repo findings.
@@ -18,9 +18,10 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
 
 ## Machine roles
 - **MacBook M3 Pro 36 GB** (`ENV:MAC`): Metal perf work, mock-NV, METAL+CPU pooling rehearsal.
-  The eGPU dock (AOOSTAR AG02) + RTX 3090 went live 2026-08-24 (TD.1→TD.3 done, truth table measured) —
-  but **ALL DOCK WORK IS HARD-STOPPED since 2026-08-26 after two host kernel panics** (HANDOFF §2/§5):
-  no `DEV=NV*`, no NV-opening pytest, no `pkill` of a TinyGPU server, until Artur's §5.1 decision.
+  The eGPU dock (AOOSTAR AG02) + RTX 3090 is **LIVE with autonomous `DEV=NV` granted** (the 08-26
+  panics are fully remediated + hardware-verified; M3 achieved: Q8_0 pooled 31.1 tok/s). Standing
+  protocol in HANDOFF_2026-08-27 §4 — above all: **never kill an NV process or TinyGPU server**.
+  **Current long-term goal: TD.5 — the pooled model selectable in Hermes** (HANDOFF_2026-08-27 §2).
 - **Bazzite box, RX 9070 XT** (`ENV:AMD`): descoped 2026-08-18 (AMD is not a target; shared-HCQ
   validation goes via mock-NV + rented 3090 instead — see TASKS.md T0.2/T2.1). If ever revived:
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.

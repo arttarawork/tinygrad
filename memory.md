@@ -389,6 +389,13 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   Open: T4.45/T4.52 (GPU-free fixes), T4.53 (name the culprit kernel), T4.51 (optional), PR #7 (diagnosability →
   fork master, Artur's click), TD.4 demo decision. 3 agents parked on background runs (HANDOFF §7 lesson 8).
 
+- **2026-08-27 ~03:15 (close-out):** PR #8 opened (T4.42/43/45/52/53 assembled; reap ported into the shared
+  cache module; gates green). T4.52 verified (teardown echo wall → ~3 lines); T4.53 verified (culprit = the
+  MoE expert-gather `weight[sel]`, 256 experts — DeltaNet REFUTED; NV-only deny-guard; T4.54 parked for the
+  compile-only renderer RCA). llama-server RESTORED 02:44; colima stopped. Docs overhauled: **new entry point
+  `HANDOFF_2026-08-27.md`** (TD.5-oriented), CLAUDE.md + TASKS RESUME repointed, review sweep clean (all doc
+  SHAs current-or-historical), worktree prune list prepared (~26 worktrees + ~40 agent branches, awaiting OK).
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth

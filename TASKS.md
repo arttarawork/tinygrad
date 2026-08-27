@@ -539,8 +539,14 @@ rows are not strictly date-sorted — **the latest row for a task wins.**
 
 ## RESUME HERE
 
-> **→ READ `HANDOFF_2026-08-26.md` FIRST** — the complete post-panic handoff (state, branch map,
-> loose ends, Artur's pending decisions). Parts of this section predate it; the banners below stand.
+> **→ READ `HANDOFF_2026-08-27.md` FIRST** — the current entry point: panic era CLOSED (remediation +
+> diagnosability merged & silicon-verified), **M3 ACHIEVED** (Q8_0 36.9 GB pooled 31.1 tok/s BEAM'd),
+> storm culprit named+guarded (MoE expert-gather), autonomous `DEV=NV` granted under the standing
+> protocol, **next goal = TD.5 (Hermes-served pooled model)**. Open: PR #8 merge, T4.51/T4.54 parked,
+> TD.4 decision, sync #5 ~Sep 2, worktree prune (Artur's OK).
+>
+> *Everything below this line predates 2026-08-27 03:00 and is historical context; the 08-26 panic
+> banners describe a RESOLVED incident (see `T4.40_RCA.md`).*
 
 > **⚠ 2026-08-26: KERNEL PANIC — ALL DOCK RUNS PAUSED.** macOS panicked at 01:15 in `AppleT8110DART`
 > (the eGPU path's IOMMU) during a real-model NV run — a device DMA to an unmapped host address.
