@@ -4,8 +4,10 @@ from unittest.mock import patch
 from tinygrad import Tensor, UOp
 from tinygrad.nn.state import get_state_dict
 from tinygrad.schedule import schedule_cache
-from tinygrad.llm.model import Transformer, TransformerConfig
-from tinygrad.llm.serve import StreamRouter
+from tinygrad.helpers import Context
+from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig
+from tinygrad.llm.serve import StreamRouter, splice_ids
+from tinygrad.llm.cli import SimpleTokenizer, FallbackTemplate
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                            norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
@@ -82,7 +84,7 @@ class TestTransformerGenerate(unittest.TestCase):
     # prefill/chunk_size proliferation and no double-capture from the new chunk_size keying.
     model = Transformer(TEST_CONFIG)
     model.has_recurrent_block = True
-    model.warmup()
+    with Context(GDN_CHUNK=1): model.warmup()
     self.assertEqual(set(model.jit.keys()), {(False, True, None), (False, False, None)})
     for key, jit in model.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
@@ -308,6 +310,75 @@ class TestTransformerGenerate(unittest.TestCase):
       gen = model.generate([1, 2, 3], temperature=0.6)
       next(gen)
     self.assertAlmostEqual(captured_temps[-1], 0.6, places=5)
+
+SSM_CFG = TransformerConfig(num_blocks=2, dim=32, hidden_dim=64, n_heads=2, n_kv_heads=2, norm_eps=1e-5, vocab_size=100, head_dim=16,
+                            rope_theta=10000.0, rope_dim=16, v_head_dim=16, max_context=64,
+                            ssm=SSMConfig(conv_kernel=4, state_size=8, group_count=2, time_step_rank=4, inner_size=32), ssm_layers=(True, False))
+
+class TestRecurrentChunkedPrefill(unittest.TestCase):
+  # T4.55: GDN_CHUNK>1 runs the unrolled T_pad scan for a whole chunk on devices without a fused scan kernel
+  def _run(self, chunk:int, prompt:list[int], n:int=4):
+    Tensor.manual_seed(7)
+    m = Transformer(SSM_CFG)
+    with Context(GDN_CHUNK=chunk): out = [t for _, t in zip(range(n), m.generate(list(prompt)))]
+    return out, [b.recurrent_state.numpy() for b in m.blk if hasattr(b, "recurrent_state")], m
+
+  def test_chunked_matches_one_token_prefill(self):
+    prompt = list(range(1, 10))  # 9 tokens at chunk 4 -> 4+4+1, two chunk boundaries plus a partial chunk
+    (o1, s1, _), (o4, s4, m4) = self._run(1, prompt), self._run(4, prompt)
+    self.assertEqual(o1, o4)
+    for a, b in zip(s1, s4): np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
+    self.assertIn((True, True, 4), m4.jit)  # the prefill jit really was captured at the chunk width
+
+  def test_warmup_captures_chunked_prefill(self):
+    m = Transformer(SSM_CFG)
+    with Context(GDN_CHUNK=4): m.warmup()
+    self.assertEqual(set(m.jit.keys()), {(False, True, None), (False, False, None), (True, True, 4), (True, False, 4)})
+    for key, jit in m.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
+
+def _byte_tok() -> SimpleTokenizer:
+  # byte-level vocab (no merges) in the GPT-2 byte-encoder alphabet: printable ASCII maps to itself, 'Ġ' = space, 'Ċ' = newline
+  normal = {chr(b): b for b in range(33, 127)} | {'Ġ': 32, 'Ċ': 10}
+  return SimpleTokenizer(normal, {"<|im_start|>": 200, "<|im_end|>": 201, "<|endoftext|>": 202}, "qwen2", bos_id=None, eos_id=201, eot_id=201)  # qwen: eos = eot = <|im_end|>
+
+class TestSpliceIds(unittest.TestCase):
+  def setUp(self):
+    self.tok, self.tmpl = _byte_tok(), FallbackTemplate(_byte_tok())
+    self.render = lambda msgs, gen: self.tmpl.render(messages=msgs, add_generation_prompt=gen)
+    self.hist = [{"role":"system","content":"be brief"}, {"role":"user","content":"hi"}]
+    self.prev_rendered = self.render(self.hist, True)
+    self.prev_ids = self.tok.encode(self.prev_rendered)
+    self.gen = self.tok.encode("ok then")  # what the model generated, up to (not including) its <|im_end|>
+    self.last = (self.prev_rendered, self.prev_ids, len(self.hist), self.gen)
+
+  def _splice(self, msgs):
+    return splice_ids(self.last, self.render(msgs, True), msgs, self.render, self.tok)
+
+  def test_splices_generated_ids(self):
+    msgs = self.hist + [{"role":"assistant","content":"ok   then"}, {"role":"user","content":"more"}]  # client copy re-rendered with other whitespace
+    ids = self._splice(msgs)
+    self.assertIsNotNone(ids)
+    self.assertEqual(ids[:len(self.prev_ids)+len(self.gen)], self.prev_ids + self.gen)  # the model's own ids, not a re-tokenization
+    self.assertEqual(self.tok.decode(ids[len(self.prev_ids)+len(self.gen):]), "<|im_end|>\n<|im_start|>user\nmore<|im_end|>\n<|im_start|>assistant\n")
+    self.assertNotEqual(ids, self.tok.encode(self.render(msgs, True)))  # a plain encode would have taken the client's whitespace
+
+  def test_tool_call_turn_without_content(self):
+    last = (*self.last[:3], self.tok.encode('<tool_call>{"name":"f"}</tool_call>'))
+    msgs = self.hist + [{"role":"assistant","content":None,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+                        {"role":"tool","content":"42","tool_call_id":"c1"}]
+    ids = splice_ids(last, self.render(msgs, True), msgs, self.render, self.tok)
+    self.assertEqual(ids[:len(self.prev_ids)+len(last[3])], self.prev_ids + last[3])
+    self.assertTrue(self.tok.decode(ids[len(self.prev_ids)+len(last[3]):]).startswith("<|im_end|>\n<|im_start|>tool\n42<|im_end|>\n"))
+
+  def test_edited_reply_falls_back(self):
+    self.assertIsNone(self._splice(self.hist + [{"role":"assistant","content":"something else"}, {"role":"user","content":"more"}]))
+
+  def test_changed_history_falls_back(self):
+    msgs = [{"role":"system","content":"be verbose"}] + self.hist[1:] + [{"role":"assistant","content":"ok then"}, {"role":"user","content":"more"}]
+    self.assertIsNone(self._splice(msgs))
+
+  def test_no_assistant_turn_falls_back(self):
+    self.assertIsNone(self._splice(self.hist + [{"role":"user","content":"more"}]))
 
 if __name__ == '__main__':
   unittest.main()
