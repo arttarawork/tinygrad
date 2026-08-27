@@ -1,6 +1,6 @@
 from __future__ import annotations
 import array, time, functools, tinygrad.runtime.autogen.nv_regs
-from tinygrad.helpers import getenv, DEBUG, getbits, round_up
+from tinygrad.helpers import getenv, DEBUG, getbits, round_up, wait_cond
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
@@ -129,13 +129,10 @@ class NVDev:
     self.include("dev_fb", "tu102")
     self.include("dev_gc6_island", "ga102")
 
-    if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
-      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
-      if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
-      self.pci_dev.reset()
-      time.sleep(0.1) # wait until device can respond again
-
-    self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
+    # Chip identity is pure MMIO (needs PCI MEMORY space, not bus-master; see the T4.40c comment below) and
+    # is invariant across an FLR, so reading it here -- before the WPR2 check/FLR -- is safe. Moved up (was
+    # previously read after the unconditional MASTER-set below) so the WPR2-up branch can build self.flcn
+    # and use it for the halt-verify without a second, redundant chip-id detection.
     self.chip_id = self.reg("NV_PMC_BOOT_0").read()
     self.chip_details = self.reg("NV_PMC_BOOT_42").read_bitfields()
     self.chip_name = {0x17: "GA1", 0x19: "AD1", 0x1b: "GB2"}[self.chip_details['architecture']] + f"{self.chip_details['implementation']:02d}"
@@ -145,6 +142,27 @@ class NVDev:
     self.flcn:NV_FLCN|NV_FLCN_COT = NV_FLCN_COT(self) if self.fmc_boot else NV_FLCN(self)
     self.gsp:NV_GSP = NV_GSP(self)
 
+    if self.reg("NV_PFB_PRI_MMU_WPR2_ADDR_HI").read() != 0:
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+      if DEBUG >= 2: print(f"nv {self.devfmt}: WPR2 is up. Issuing a full reset.", flush=True)
+      self.pci_dev.reset()
+      time.sleep(0.1) # wait until device can respond again (MMIO needs PCI MEMORY space, not MASTER -- see T4.40c_NOTES.md)
+
+      # T4.40c (RCA T4.40_RCA.md Sec5 "M-C" / Sec6 fix 3): the FLR alone is not proven to halt a *previous*
+      # GSP-RM's riscv core. Reuse init_hw's own falcon engine reset here (ip.py NV_FLCN.reset(), pure MMIO,
+      # no bus-master needed) and verify the core is inactive before MASTER goes back on -- see
+      # T4.40c_NOTES.md for the full reasoning (why init_hw's own reset() call is left as-is, COT scoping,
+      # the hardware-verification checklist).
+      if isinstance(self.flcn, NV_FLCN):
+        self.include("dev_gsp", "ga102")
+        self.include("dev_falcon_v4", "ga102")
+        self.include("dev_riscv_pri", "ga102")
+        self.flcn.falcon = 0x00110000
+        self.flcn.reset(self.flcn.falcon)
+        wait_cond(lambda: self.reg("NV_PRISCV_RISCV_CPUCTL").with_base(self.flcn.falcon).read_bitfields()['active_stat'],
+                  value=0, msg="previous GSP-RM core did not halt after FLR + falcon engine reset")
+
+    self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
     self.flcn.wait_for_reset()
 
   def _early_mmu_init(self):

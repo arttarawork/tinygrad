@@ -1,9 +1,10 @@
-import os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
+import itertools, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from tinygrad.helpers import getenv
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
+from tinygrad.runtime.support.nv.ip import NV_FLCN
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.autogen import pci
@@ -393,6 +394,157 @@ class TestNVQuiesceOnInitFailure(unittest.TestCase):
     NVDev.__init__(fake, pci_dev)
     assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "a healthy boot must not touch bus-master"
     assert fake.is_booting is False, "healthy __init__ must still run to completion (not swallowed by the new except)"
+
+class _RegProbe:
+  """Throwaway stand-in for resolving a register's real NVReg (address + fields) through NVDev's own
+  include()/reg(), independent of any live mmio/pci_dev -- so fixtures below never hand-copy offsets out
+  of the autogen tables."""
+  include, reg = NVDev.include, NVDev.reg
+
+def _reg(group:str, arch:str, name:str):
+  probe = _RegProbe()
+  probe.include(group, arch)
+  return probe.reg(name)
+
+class _FakeIpInitDev:
+  """Drives the REAL NVDev._early_ip_init() (T4.40c) against a fake BAR0 register file + fake PCI config
+  space. Reuses NVDev's own include()/reg()/wreg()/rreg() unmodified -- they're pure Python dict bookkeeping
+  over self.mmio, nothing to fake there -- and fakes only the two real I/O boundaries: self.mmio (BAR0
+  MMIO, see _EventBar0) and self.pci_dev (config space + the FLR, see _FakeFLRPCIConfig)."""
+  include, reg, wreg, rreg = NVDev.include, NVDev.reg, NVDev.wreg, NVDev.rreg
+  def __init__(self, pci_dev, mmio):
+    self.pci_dev, self.devfmt, self.mmio = pci_dev, pci_dev.pcibus, mmio
+
+class _FakeFLRPCIConfig(_FakePCIConfig):
+  """_FakePCIConfig plus an FLR hook and event-ordered write_config_flush, so a test can assert MASTER
+  isn't set until after the verify step's register reads (see _EventBar0, which appends into the same
+  `events` list). reset() is a pure log entry: T4.40c's fix does not -- and per the RCA, cannot yet --
+  assume anything about what an FLR itself does to a wedged core; that unknown is exactly what the fix
+  works around instead of relying on."""
+  def __init__(self, events:list, mmio, command:int=pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER):
+    super().__init__(command)
+    self.events, self._mmio = events, mmio
+  def write_config_flush(self, offset:int, value:int, size:int) -> None:
+    self.events.append(("cfg", offset, value))
+    super().write_config_flush(offset, value, size)
+  def reset(self) -> None: self.events.append(("flr",))
+  def map_bar(self, *a, **k): return self._mmio
+
+class _EventBar0:
+  """Word-addressed (matches NVDev.rreg/wreg's `addr // 4`) fake BAR0 register file. Every access appends
+  to the same ordered `events` list _FakeFLRPCIConfig writes into, so a test can assert real happens-before
+  ordering between MMIO reads and PCI_COMMAND config writes.
+
+  Models the RCA's M-C hypothesis instead of just asserting it: riscv CPUCTL.active_stat (bit 7) reads back
+  1 (active) until the GSP falcon engine reset actually completes -- NV_PGSP_FALCON_ENGINE reset=1 then
+  reset=0, ip.py NV_FLCN.reset()'s own unmodified primitive -- then reads 0. That proves the fix's verify
+  step is watching a real consequence of calling reset(), not a register that merely starts at 0.
+  `wedged=True` makes the engine reset have no effect on it at all: a core neither the FLR nor a falcon
+  engine reset brings down (T4.40_RCA.md Sec5's open worst case)."""
+  def __init__(self, events:list, wedged:bool=False):
+    self.events, self.wedged, self.words, self.engine_reset_done = events, wedged, {}, False
+    self.engine_addr = self.cpuctl_addr = -1  # filled in by _make_fake_hw once addresses are resolved
+
+  def __getitem__(self, idx):
+    if idx == self.cpuctl_addr: val = 0 if (self.engine_reset_done and not self.wedged) else (1 << 7)
+    else: val = self.words.get(idx, 0)
+    self.events.append(("r", idx, val))
+    return val
+
+  def __setitem__(self, idx, val):
+    self.words[idx] = val
+    if idx == self.engine_addr and (val & 1) == 0: self.engine_reset_done = True
+    self.events.append(("w", idx, val))
+
+def _poke(mmio:_EventBar0, r, raw:int|None=None, **fields):
+  mmio.words[(r.base + r.off) // 4] = raw if raw is not None else r.encode(**fields)
+
+def _make_fake_hw(wedged:bool) -> tuple[list, _FakeFLRPCIConfig, _EventBar0]:
+  """Common fixture for TestNVHaltVerifyBeforeMaster: primes exactly the registers _early_ip_init()'s new
+  code path touches -- GA102/non-COT chip identity (so self.flcn is a real NV_FLCN, matching the actual
+  target hardware), WPR2 up (a previous GSP-RM session -- the FLR branch this fix changes), and
+  wait_for_reset()'s post-boot scratch sentinel (unrelated to this fix, but still on the unconditional tail
+  of _early_ip_init() that every test here runs through whenever it doesn't raise first)."""
+  events:list = []
+  mmio = _EventBar0(events, wedged=wedged)
+  pci_dev = _FakeFLRPCIConfig(events, mmio)
+
+  eng, cpuctl = _reg("dev_gsp", "ga102", "NV_PGSP_FALCON_ENGINE"), _reg("dev_riscv_pri", "ga102", "NV_PRISCV_RISCV_CPUCTL").with_base(0x00110000)
+  mmio.engine_addr, mmio.cpuctl_addr = (eng.base + eng.off) // 4, (cpuctl.base + cpuctl.off) // 4
+
+  _poke(mmio, _reg("nv_ref", "", "NV_PMC_BOOT_42"), architecture=0x17, implementation=2)          # GA102 (non-COT, exercises NV_FLCN)
+  _poke(mmio, _reg("dev_fb", "tu102", "NV_PFB_PRI_MMU_WPR2_ADDR_HI"), val=1)                       # a previous session -> take the FLR branch
+  _poke(mmio, _reg("dev_gc6_island", "ga102", "NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK"), read_protection_level0=1)
+  _poke(mmio, _reg("dev_gc6_island", "ga102", "NV_PGC6_AON_SECURE_SCRATCH_GROUP_05")[0], raw=0xff)
+  return events, pci_dev, mmio
+
+def _fast_timeout_clock():
+  """time.perf_counter() replacement that advances the mocked clock 50ms (0.05s -- perf_counter() returns
+  SECONDS; wait_cond does int(perf_counter()*1000) to get ms) per call: a wait_cond() that never meets its
+  condition hits the (unmodified, real) 10s default timeout in ~200 fast calls instead of a real 10s
+  busy-spin -- while still letting every loop iteration actually run at least once (wait_cond's `val` is
+  only bound inside the loop body; a clock that jumps straight past the timeout on the first check would
+  skip the body entirely and crash on an unrelated UnboundLocalError instead of raising the TimeoutError
+  under test)."""
+  counter = itertools.count(0, 0.05)
+  return lambda: next(counter)
+
+class TestNVHaltVerifyBeforeMaster(unittest.TestCase):
+  """T4.40c (RCA T4.40_RCA.md Sec5 "M-C" / Sec6 fix 3): _early_ip_init() cleared MASTER for the FLR, then
+  unconditionally set it back on a blind 0.1s sleep -- nothing ever verified the *previous* GSP-RM's riscv
+  core actually halted, so a core an FLR doesn't halt would be live, bus-mastering, during the ~1-1.5s
+  init_sw()/init_hw() preamble that follows (RCA Sec2). The fix reuses ip.py's NV_FLCN.reset() (pure MMIO)
+  and verifies NV_PRISCV_RISCV_CPUCTL.active_stat == 0 before MASTER goes back on.
+
+  These drive the REAL NVDev._early_ip_init()/NVDev.__init__ (not copies) against a fake register file that
+  models the halt as a genuine consequence of calling reset() (see _EventBar0), not an assumption."""
+
+  def test_master_not_set_before_core_verified_halted(self):
+    # Proven failing pre-fix: pre-T4.40c code never reads CPUCTL at all before setting MASTER, so
+    # `halted_reads` below would be empty and the first assert would fail.
+    events, pci_dev, mmio = _make_fake_hw(wedged=False)
+    dev = _FakeIpInitDev(pci_dev, mmio)
+    NVDev._early_ip_init(dev)
+
+    master_writes = [i for i,e in enumerate(events) if e[0] == "cfg" and e[1] == pci.PCI_COMMAND and e[2] & pci.PCI_COMMAND_MASTER]
+    halted_reads = [i for i,e in enumerate(events) if e[0] == "r" and e[1] == mmio.cpuctl_addr and e[2] == 0]
+    assert halted_reads, "fixture/fix bug: the halt-verify step never observed active_stat == 0"
+    assert master_writes, "the healthy path must still set MASTER"
+    assert min(master_writes) > min(halted_reads), \
+      "MASTER must not be set until AFTER the verify step has observed the previous core halted"
+
+  def test_healthy_fake_boots_exactly_as_before_master_ends_set(self):
+    # Negative control (the #16536 guard): a core that halts as soon as the code does the right thing about
+    # it must still boot straight through _early_ip_init(), ending with MASTER set, same as pre-fix.
+    events, pci_dev, mmio = _make_fake_hw(wedged=False)
+    dev = _FakeIpInitDev(pci_dev, mmio)
+    NVDev._early_ip_init(dev)  # must not raise
+    assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "a healthy boot must end with MASTER set"
+    assert isinstance(dev.flcn, NV_FLCN) and dev.flcn.falcon == 0x00110000, "fixture bug: not exercising the NV_FLCN (GA102) path"
+
+  def test_never_halting_core_raises_and_master_stays_clear(self):
+    # T4.40_RCA.md Sec5's open worst case: a core neither the FLR nor a falcon engine reset brings down.
+    events, pci_dev, mmio = _make_fake_hw(wedged=True)
+    dev = _FakeIpInitDev(pci_dev, mmio)
+    with patch("time.perf_counter", side_effect=_fast_timeout_clock()):
+      with self.assertRaisesRegex(TimeoutError, "did not halt"):
+        NVDev._early_ip_init(dev)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), \
+      "MASTER must stay clear when the previous core never halts"
+    assert not any(e[0] == "cfg" and e[1] == pci.PCI_COMMAND and e[2] & pci.PCI_COMMAND_MASTER for e in events), \
+      "MASTER must never have been set at all on this path"
+
+  def test_composes_with_t440b_wrap_master_stays_clear_through_full_init(self):
+    # T4.40b wraps the whole NVDev.__init__ body in `try/except BaseException: clear MASTER; raise`. Drive
+    # the REAL NVDev.__init__ (not just _early_ip_init) to prove the two fixes compose: no double-clear
+    # breakage (the inherited AND-with-~MASTER clear is idempotent whether or not this fix already cleared
+    # it), and the exception still propagates to the caller instead of being swallowed.
+    events, pci_dev, mmio = _make_fake_hw(wedged=True)
+    with patch("time.perf_counter", side_effect=_fast_timeout_clock()):
+      with self.assertRaisesRegex(TimeoutError, "did not halt"):
+        NVDev(pci_dev)
+    assert not (pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER), \
+      "MASTER must stay clear after NVDev.__init__ propagates the halt-verify timeout"
 
 class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
   """T4.25: APLRemotePCIDevice.__init__'s connect-or-spawn loop (support/system.py) had no cross-process
