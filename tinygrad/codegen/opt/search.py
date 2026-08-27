@@ -51,10 +51,14 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
     if early_stop is not None and early_stop < min(tms): break
   return tms
 
-class TimeoutException(Exception): pass
+# T4.46: distinguishable failure-cause names for beam_search's WARNING/Counter (previously every cause here
+# collapsed onto a generic exception name). Both stay RuntimeError subclasses so the existing
+# `except RuntimeError` branch in _try_compile keeps catching them exactly as it already catches plain RuntimeError.
+class BeamCompileTimeout(RuntimeError): pass  # SIGALRM fired before to_program finished (see timeout_handler)
+class BeamUopLimit(RuntimeError): pass        # candidate's uop count >= BEAM_UOPS_MAX
 def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
-  raise TimeoutException()
+  raise BeamCompileTimeout()
 
 def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, str|None]:
   if hasattr(signal, "alarm"):
@@ -70,7 +74,7 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, s
     uops = prg.src[1].src
     if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
       if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
-      raise RuntimeError("too many uops")
+      raise BeamUopLimit("too many uops")
     ret = (prg, et)
   except RuntimeError as e:
     exc_name = type(e).__name__
@@ -83,6 +87,24 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, s
   return x[0], ret, exc_name
 
 def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]
+
+def _device_faulted(dev) -> bool:
+  """T4.48 F1 (T4.47_RCA.md): duck-typed device-fault check. Only NV/AMD's HCQ ifaces model a GPU fault at all,
+  always at iface.dev_impl.is_err_state -- every other backend (CPU/METAL/CUDA/NULL/...) has no `iface`, or an
+  iface with no `dev_impl.is_err_state`, so the chained getattr below degrades to a plain False there, never an
+  AttributeError. Drains first via iface.sleep(0) where the iface exposes it: NV's PCIIface.sleep (ops_nv.py)
+  is ALSO T4.37's clear-bus-master-on-fault site, so calling it (instead of re-deriving a second drain here)
+  reuses that safety-critical logic rather than duplicating it. sleep(0), not sleep(200): NV's `timeout` arg is
+  entirely unused (it just drains+checks unconditionally) but AMD's iface honors it as a real IRQ-poll timeout,
+  so 0 keeps this a probe -- never a wait -- on every backend that might reach it. iface.sleep() itself already
+  raises RuntimeError on a real fault, so that's treated as "faulted" too rather than letting its generic
+  message escape here; the caller composes the richer, candidate-naming message.
+  """
+  iface = getattr(dev, "iface", None)
+  if iface is not None and hasattr(iface, "sleep"):
+    try: iface.sleep(0)
+    except RuntimeError: return True
+  return bool(getattr(getattr(iface, "dev_impl", None), "is_err_state", False))
 
 # *** external API ***
 
@@ -157,7 +179,24 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
         except Exception as e:
           if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
           if isinstance(e, RuntimeError):
-            fails[type(e).__name__] += 1
+            # coordinator fold-in (T4.48, same code region as F1): hcq.py's HCQSignal.wait raises a bare
+            # RuntimeError("Wait timeout: ...") that was otherwise indistinguishable from every other
+            # RuntimeError in this Counter. String-matched, not a bespoke exception class -- hcq.py:296 is
+            # generic runtime code shared far outside BEAM, out of scope to touch here (T4.46 instead added
+            # real subclasses at its own two call sites inside this file, _try_compile's; this one can't
+            # follow that pattern without editing hcq.py). Fragile if that message wording ever changes;
+            # low blast radius -- only renames a Counter/WARNING entry, nothing branches on the name itself.
+            fails["BeamDeviceTimeout" if str(e).startswith("Wait timeout") else type(e).__name__] += 1
+            # T4.48 F1 (T4.47_RCA.md): beam_search abandons a slow candidate here by design -- nothing
+            # cancels its still-running kernel, so a candidate that FAULTS the GPU (its completion signal
+            # never fires, same as a merely-slow one) raises this identical exception and was previously
+            # swallowed identically. Check now, right after the failure, whether the device is actually
+            # faulted (not just slow) and abort the whole search immediately if so, instead of grinding out
+            # the remaining rounds against a dead device producing all-inf results.
+            if _device_faulted(dev):
+              raise RuntimeError(f"BEAM: device fault detected during search -- aborting rather than "
+                                  f"continuing against a faulted device. Failing candidate's applied_opts: "
+                                  f"{candidates[i].applied_opts}. Original error: {e}") from e
             continue
           raise
         timed.append((candidates[i], min(tms)))
@@ -190,6 +229,18 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     print(colored(f"WARNING: BEAM found no working action for {s.colored_shape()}, falling back to hand_coded_optimizations", "red"))
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     beam[0] = (hand_coded_optimizations(beam[0][0].copy()), beam[0][1])
-  if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
+  # T4.39: an inf best time means the search never produced an empirically-validated winner -- either the
+  # total-failure fallback above (whose score is still the untouched seed's inf) or a candidate whose only
+  # timing attempt hit _time_program's AssertionError path (search.py:50). Don't persist that: a later run
+  # would otherwise silently replay an unvalidated kernel forever with none of the WARNINGs above.
+  if CACHELEVEL >= 1 and not math.isinf(beam[0][1]): diskcache_put("beam_search", key, beam[0][0].applied_opts)
   if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(beam[0][1], w=0)}, applied_opts={beam[0][0].applied_opts}")
+  # T4.48 F3 (T4.47_RCA.md): bound the lifetime of any candidate this search abandoned-but-never-cancelled (see
+  # the RuntimeError handler above) -- wait for the device's timeline to fully drain before handing the winning
+  # kernel back, so a caller that immediately frees/evicts rawbufs can never race a still-running abandoned
+  # kernel. A fault surfacing only now (never during the search loop's own per-candidate check) would otherwise
+  # raise HCQCompiled.synchronize's bare message; name it as search cleanup instead.
+  try: dev.synchronize()
+  except RuntimeError as e: raise RuntimeError(f"BEAM: device faulted during search cleanup (synchronize after "
+                                                f"search) for {s.colored_shape()}: {e}") from e
   return beam[0][0]
