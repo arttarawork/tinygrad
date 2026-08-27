@@ -169,6 +169,9 @@ class Scheduler:
         check(all(x.op is not OptOps.TC for x in self.applied_opts), "no grouping with tensor cores")  # TODO: why is this wrong?
         check(not self.dont_use_locals, "can't use locals")
         check(rng.arg[-1] == AxisType.REDUCE, "group is for reduce")
+        # T4.53: the 2nd-independent-GROUP_REDUCE-on-NV deny lives in search.py's get_kernel_actions (SEARCH
+        # SPACE only) -- a hand-applied combo must stay legal (upstream test_two_grouped_stores_local runs it
+        # on NV in CI). Full story: T4.53_NOTES.md; renderer root cause = T4.54.
       ret = self.shift_to(rng, amt, opt_to_at[opt.op], top=opt.op in {OptOps.GROUPTOP, OptOps.THREAD})
     elif opt.op is OptOps.TC:
       check(len(self.applied_opts) == 0, "tensor core opts must be first") # TODO: remove the need for this by having warps

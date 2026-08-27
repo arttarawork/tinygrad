@@ -310,6 +310,17 @@ def _read_exactly(f, n:int) -> bytes:
     buf += chunk
   return buf
 
+def _write_exactly(f, data:bytes) -> None:
+  # mirror of _read_exactly: raw pipes (bufsize=0) can legitimately short-write below len(data) on a
+  # single call (Python docs: "bufsize=0 means unbuffered ... write are one system call and can return
+  # short"); loop until every byte is sent. write() returning None means "would block" on a non-blocking
+  # stream -- doesn't apply to a blocking subprocess pipe (what bufsize=0 actually gives us here), so
+  # treat it as fully sent rather than looping forever on a duck-typed fake that doesn't report a count.
+  while data:
+    if (n := f.write(data)) is None: return
+    if n == 0: raise CompileError("compile server write stalled: 0 bytes accepted with data still pending")
+    data = data[n:]
+
 class Compiler:
   def __init__(self, cachekey:str|None=None): self.cachekey = cachekey if CCACHE else None
   def compile(self, src:str) -> bytes: return src.encode()   # NOTE: empty compiler is the default
@@ -328,7 +339,7 @@ class Compiler:
     # keep that distinct from the "Compilation Error" below (a real compile failure, always a fully-formed reply) so callers can
     # retry the former (respawn the server) but must never silently retry/swallow the latter (T4.31).
     try:
-      unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+      _write_exactly(unwrap(proc.stdin), struct.pack("I", len(src.encode())) + src.encode())
       sz = struct.unpack("I", _read_exactly(unwrap(proc.stdout), 4))[0]
       lib = _read_exactly(unwrap(proc.stdout), sz)
     except (OSError, CompileError) as e:  # BrokenPipeError is an OSError

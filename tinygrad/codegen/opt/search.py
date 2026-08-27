@@ -38,6 +38,12 @@ def get_test_global_size(global_size, max_global_size, var_vals):
 
 def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_stop:float|None=None,
                   allow_test_size:int=True, max_global_size:int|None=65536, clear_l2=False, cnt=3, name="test", dev_timeout=False) -> list[float]:
+  # T4.53: per-candidate LAUNCH log, off by default. `name` was a dead param (no call site ever passed it,
+  # always defaulted to "test") -- reused here rather than adding a new kwarg. beam_search's call site packs
+  # in the AST id + shape + applied_opts; this print fires right before the candidate's actual GPU launch,
+  # so the last LAUNCH lines before a fault-abort name the launches that immediately preceded it (the true
+  # faulting candidate may be one of these, not just the one the abort exception names -- see T4.47_RCA.md).
+  if BEAM_LAUNCH_LOG: print(f"LAUNCH {time.time():.3f} {name}", flush=True)
   timeout = int(early_stop * 1e3) if dev_timeout and early_stop is not None and early_stop < math.inf else None
   factor = 1
   if allow_test_size and max_global_size is not None:
@@ -114,6 +120,12 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
   kernel_actions = actions.copy()
 
   for i,a in enumerate(kernel_actions):
+    # T4.53 (relocated here from postrange.apply_opt after upstream's test_two_grouped_stores_local -- which
+    # hand-applies this combo on NV -- failed CI): a 2nd INDEPENDENT GROUP_REDUCE axis reproducibly faulted NV
+    # silicon (2/2, T4.50/T4.53: the MoE expert-gather; Metal renders the same AST clean). Exclude it from the
+    # SEARCH SPACE only; hand-applied opts stay legal everywhere. Renderer root cause = T4.54.
+    if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" \
+       and AxisType.GROUP_REDUCE in s.axis_types: continue
     if a.axis is not None and a.op is not OptOps.TC:
       try: ax = s.real_axis(a.op, a.axis)
       except KernelOptError: continue
@@ -133,6 +145,7 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
   return acted
 
 BEAM_DEBUG = getenv("BEAM_DEBUG")
+BEAM_LAUNCH_LOG = getenv("BEAM_LAUNCH_LOG", 0)  # T4.53: gate for _time_program's per-candidate LAUNCH log
 def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:int, allow_test_size=True, disable_cache=IGNORE_BEAM_CACHE.value):
   key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.target.device, "suffix": s.ren.suffix}
   if not disable_cache and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
@@ -175,7 +188,12 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
         seen_libs.add(lib)
         try: tms = _time_program(prg, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
                                  allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
-                                 dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
+                                 dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1),
+                                 # T4.53: AST id (structural hash, stable across all candidates/rounds of THIS
+                                 # kernel) + the kernel's pre-search shape (recognizable at a glance) + this
+                                 # candidate's applied_opts. Conditional (not computed when the log is off) so
+                                 # this costs nothing in the default/hot path.
+                                 name=f"{s.ast.key.hex()[:12]} {s.colored_shape()} {candidates[i].applied_opts}" if BEAM_LAUNCH_LOG else "test")
         except Exception as e:
           if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
           if isinstance(e, RuntimeError):
