@@ -408,7 +408,11 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   3090 (`0-2:METAL,3:NV,…,23-39:NV`, same layer counts, no new kernels) gave 88.4 @8k (+58%) and decode 25.6 (+28%) → adopted.
   TD.5 wiring complete (config entry, `pooled-serve.sh`, `hermes-aux-swap.py`, ~/CLAUDE.md ritual) and **verified with real
   Hermes**: 19,006-token cold prompt → 5.3 min (59 tok/s), a tool-loop follow-up → 3.9 s (splice hit `in: 19037 +66`), decode
-  15-20 tok/s at 19k context → **T4.58 (NV attention-prefill kernel) is the next lever**. Lessons: (1) measure prefill at the
+  15-20 tok/s at 19k context → T4.58. **T4.58 (same afternoon):** attribution before coding paid off again — the SDPA kernels
+  were cheap; the O(N²) term was the causal mask's `arange(start_pos+T)` lowering to a single-stage cumsum (an N×N reduce with
+  no inputs, 48 ms/layer/chunk at 16k). A cached position buffer + `causal_mask()` made one layer's replay linear (50.6 → 9.4 ms
+  at 16k). Lesson: a `DEBUG=2` per-kernel table on a one-layer replica (random weights, production head geometry so the SDPA
+  ASTs hit the BEAM cache) answers 'which kernel scales with position' in minutes; watch the `tm` unit flip us→ms. Lessons: (1) measure prefill at the
   prompt length the consumer actually sends; (2) a Metal `waitUntilCompleted` with the GPU at 96% is slow, not hung — `sample` +
   ioreg `Device Utilization` settle it in a minute; (3) T4.56's SIGTERM handler only fires between C calls — fine for chunks,
   but a truly hung Metal wait would need the default disposition. Hermes facts: 64k minimum `context_length`; echoes
