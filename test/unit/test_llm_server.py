@@ -339,7 +339,8 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
 def _byte_tok() -> SimpleTokenizer:
   # byte-level vocab (no merges) in the GPT-2 byte-encoder alphabet: printable ASCII maps to itself, 'Ġ' = space, 'Ċ' = newline
   normal = {chr(b): b for b in range(33, 127)} | {'Ġ': 32, 'Ċ': 10}
-  return SimpleTokenizer(normal, {"<|im_start|>": 200, "<|im_end|>": 201, "<|endoftext|>": 202}, "qwen2", bos_id=None, eos_id=201, eot_id=201)  # qwen: eos = eot = <|im_end|>
+  # qwen: eos = eot = <|im_end|>
+  return SimpleTokenizer(normal, {"<|im_start|>": 200, "<|im_end|>": 201, "<|endoftext|>": 202}, "qwen2", bos_id=None, eos_id=201, eot_id=201)
 
 class TestSpliceIds(unittest.TestCase):
   def setUp(self):
