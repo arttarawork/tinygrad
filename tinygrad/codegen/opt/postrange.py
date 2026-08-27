@@ -169,6 +169,14 @@ class Scheduler:
         check(all(x.op is not OptOps.TC for x in self.applied_opts), "no grouping with tensor cores")  # TODO: why is this wrong?
         check(not self.dont_use_locals, "can't use locals")
         check(rng.arg[-1] == AxisType.REDUCE, "group is for reduce")
+        # T4.53: a 2nd, INDEPENDENT GROUP_REDUCE axis (this kernel's 2nd separate reduce dim also grouped, not
+        # the same one re-split) reproducibly faulted NV silicon (2/2 repros -- T4.50, T4.53; T4.53_NOTES.md):
+        # LOCAL(1,16),GROUP(2,0),UNROLL(2,0),UNROLL(2,4),UPCAST(1,2),GROUP(1,0) on an MoE expert-gather kernel,
+        # "Timeout waiting for RPC response" during the wait). Root cause unconfirmed (renderer- or shared-mem-
+        # specific to NV -- the exact opts/AST re-render clean on Metal); deny it there as a search-space guard
+        # until it is. Other backends (Metal verified clean) are untouched.
+        check(self.ren is None or self.ren.target.device != "NV" or AxisType.GROUP_REDUCE not in self.axis_types,
+              "T4.53: a 2nd independent GROUP_REDUCE axis is denied on NV (reproducibly faults silicon)")
       ret = self.shift_to(rng, amt, opt_to_at[opt.op], top=opt.op in {OptOps.GROUPTOP, OptOps.THREAD})
     elif opt.op is OptOps.TC:
       check(len(self.applied_opts) == 0, "tensor core opts must be first") # TODO: remove the need for this by having warps
