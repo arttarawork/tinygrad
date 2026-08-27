@@ -103,7 +103,9 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
 - Chunked prefill `chunk_size=32`; prefix caching via `get_start_pos` (`model.py:456-462`) reuses
   KV when a new prompt extends the cached prefix (SSM blocks: strict prefix only).
 - `serve.py` is a single-threaded `socketserver.TCPServer` — one request at a time, one KV cache.
-  Zero occurrences of paged/continuous-batching/speculative anywhere in the repo.
+  Zero occurrences of paged/continuous-batching/speculative anywhere in the repo. **CORRECTION 2026-08-27:**
+  it is otherwise full-featured now — renders the chat template WITH `tools`, parses `<tool_call>` into OpenAI
+  `tool_calls` (streaming deltas incl.), SSE, `/v1/models` — Hermes-compatible interface (→ TD.5 goal).
 - Load path: whole GGUF → one device blob (`gguf.py:134 tensor.to(None).realize()`) → lazy
   per-tensor slices; ~2x model size transient; dominant startup cost over TB.
 - `REALIZE=1` materializes dequantized fp16 weights — currently *faster* per token but costs full
