@@ -38,7 +38,7 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   fork), `upstream` = tinygrad/tinygrad. Rebase docs branch weekly and **push `memory` + unmerged evidence
   branches after each session** (backup; see TASKS.md conventions).
 - Python: there is **no bare `python`** on this Mac and Homebrew `python3` (3.14) has no test deps.
-  Use the repo venv: `DEV=CPU PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q` (serial; `-n12` only under
+  Use the repo venv: `CHECK_OOB=1 DEV=CPU PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q` (CI sets `CHECK_OOB=1`; serial; `-n12` only under
   `DEV=CPU` — with the METAL default `-n` spawns one real TinyGPU server per worker, T4.38; `DEV=CPU` gates never
   open NV except `test/device/test_hcq.py`, which opens `Device["NV"]` unconditionally);
   typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .`
