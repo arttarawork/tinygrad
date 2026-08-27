@@ -51,10 +51,14 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
     if early_stop is not None and early_stop < min(tms): break
   return tms
 
-class TimeoutException(Exception): pass
+# T4.46: distinguishable failure-cause names for beam_search's WARNING/Counter (previously every cause here
+# collapsed onto a generic exception name). Both stay RuntimeError subclasses so the existing
+# `except RuntimeError` branch in _try_compile keeps catching them exactly as it already catches plain RuntimeError.
+class BeamCompileTimeout(RuntimeError): pass  # SIGALRM fired before to_program finished (see timeout_handler)
+class BeamUopLimit(RuntimeError): pass        # candidate's uop count >= BEAM_UOPS_MAX
 def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
-  raise TimeoutException()
+  raise BeamCompileTimeout()
 
 def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, str|None]:
   if hasattr(signal, "alarm"):
@@ -70,7 +74,7 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, s
     uops = prg.src[1].src
     if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
       if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
-      raise RuntimeError("too many uops")
+      raise BeamUopLimit("too many uops")
     ret = (prg, et)
   except RuntimeError as e:
     exc_name = type(e).__name__
