@@ -9,7 +9,6 @@ from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, NVSignal, _fault_recovery_hint
-from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, _fault_recovery_hint
 from tinygrad.runtime.support.hcq import HCQAllocatorBase, HCQBuffer, _dev_already_faulted
 
 class CountingMMIOInterface:
