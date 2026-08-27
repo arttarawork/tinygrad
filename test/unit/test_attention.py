@@ -612,5 +612,32 @@ class TestTunedAttentionKernelFallback(unittest.TestCase):
     out = tuned_decode_attention(q, k, v, None).numpy()  # must fall back to SDPA, not crash in gpudims
     np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
 
+class TestCausalMask(unittest.TestCase):
+  # T4.58: causal_mask must equal the Tensor.full(...).triu(start_pos+1) [+ .tril(start_pos-window)] expression it replaced -- which built
+  # arange(start_pos+T) and, for a symbolic key length, lowered to an N x N cumsum reduce per attention layer per prefill chunk
+  def _old(self, T, start_pos, window=0):
+    m = Tensor.full((1, 1, T, start_pos+T), float("-inf"), buffer=False).triu(start_pos+1)
+    if window: m = m + Tensor.full((1, 1, T, start_pos+T), float("-inf"), buffer=False).tril(start_pos - window)
+    return m
+
+  def test_matches_triu_tril(self):
+    from tinygrad.llm.model import causal_mask, positions
+    from tinygrad import dtypes
+    pos = positions(64)
+    for T, start_pos, window in [(1, 0, 0), (4, 0, 0), (4, 5, 0), (8, 3, 0), (1, 9, 4), (4, 9, 4), (4, 2, 4), (8, 20, 6)]:
+      got, want = causal_mask(pos, T, start_pos, dtypes.float32, window).numpy(), self._old(T, start_pos, window).numpy()
+      np.testing.assert_array_equal(got, want, err_msg=f"{T=} {start_pos=} {window=}")
+
+  def test_symbolic_shapes(self):
+    # the production call: symbolic T (chunk) and start_pos, bound like generate() binds them
+    from tinygrad.llm.model import causal_mask, positions
+    from tinygrad import dtypes
+    pos = positions(64)
+    v_sp, v_t = UOp.variable("start_pos", 0, 63), UOp.variable("toks", 1, 8)
+    for start_pos, T in [(0, 8), (5, 4), (20, 8), (11, 1)]:
+      # a symbolic-shaped tensor has no .numpy(): pad to a fixed shape (pad value 0) and compare the live region
+      got = causal_mask(pos, v_t.bind(T), v_sp.bind(start_pos), dtypes.float32).pad_to((1, 1, 8, 64)).numpy()[:, :, :T, :start_pos+T]
+      np.testing.assert_array_equal(got, self._old(T, start_pos).numpy(), err_msg=f"{T=} {start_pos=}")
+
 if __name__ == '__main__':
   unittest.main()
