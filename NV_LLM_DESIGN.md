@@ -38,6 +38,11 @@ its DMA mappings torn down under a live GSP-RM). Client-side remediation is ship
 master + T4.40a/b branches); dock measurement is paused pending HANDOFF §5.1 and a supervised hardware pass
 (fix 40-3). All numbers below predate the panics and stand.
 
+**M3 ACHIEVED (2026-08-27): Qwen3.6-35B-A3B Q8_0 (36.9 GB — fits neither device alone) pooled
+`0-17:METAL,18-39:NV` decodes at 31.1 tok/s with `JITBEAM=2` (target was ≥15) — 140 GB/s effective,
+4.5 GB/token ≈ analytic, full residency, zero faults. The pooled shape delivers llama.cpp-Metal-class
+speed at a quant the Mac cannot hold.**
+
 **G1 — single-eGPU speed: MET, ahead of target.** Best config is `DEV=NV` (nvcc) + BEAM.
 Decode tok/s: llama3.2:1b **149.1** (above the llama.cpp-CUDA 110-130 reference band),
 qwen3:8b **46.9** (1.73x llama.cpp-Metal's 27.1), gpt-oss:20b **60.9** (~4x our Metal BEAM),
@@ -238,7 +243,7 @@ to fork `master` via PR #1; fork CI green (53/53 real checks) + clean ultra-revi
 | **M0** (days) | Baseline truth table + bottleneck attribution | top-3 costs named in ms; MATVEC + BAR hypotheses confirmed/refuted |
 | **M1** (~weeks) | fp16 KV, MATVEC fix, beam defaults, sync trims | ≥5x current public eGPU decode (≥30 tok/s Qwen3-8B Q4); 27B usable |
 | **M2** | Fused attention + transport tuning | ≥60–80% of native-CUDA llama.cpp on 8B/27B; prefill ≥ native Metal |
-| **M3** | Pipeline device map, Metal+NV pooled | 35B-A3B Q8 ≥15 tok/s; 40 GB dense runs; demo posted to exo #1904 / tinygrad Discord |
+| **M3** | Pipeline device map, Metal+NV pooled | **✅ 2026-08-27: Q8_0 pooled 31.1 tok/s (2.07x the ≥15 bar)**; 40 GB dense + demo remain TD.4-gated |
 | **M4** (stretch) | Zero-copy bridge, gpt-oss-120b attempt, upstream Stage C groundwork | pooled overhead <10% vs single-device extrapolation |
 
 ## 6. Risks

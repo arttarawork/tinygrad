@@ -376,6 +376,17 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   PR #5 merge click; the supervised hardware session (T4.40c checklist + RCA §7) → T4.35 runs 2-3 → T4.34
   capture → T4.29 nvcc row → M3 flagship (Q6_K_XL/Q8_0 pooled); T4.45 optional; TD.4 demo still open.
 
+- **2026-08-27 night (dock reopened; M3 ACHIEVED):** hardware session H1-H4 verified the remediation on silicon
+  (FLR alone halts the core; M-C exonerated) → PR #6; measurements: T4.35 closed (warm-cache-only, structural),
+  T4.34 fully closed (storm = ONE OOB-class candidate fault + ~121 deterministic teardown echoes — the '109/123'
+  counts were teardown ops, never fault events; candidate named by T4.50), T4.29 nvcc row closed (storm 2/2);
+  RCA chain T4.47 (fault pre-exists the OOM; 200 ms drain gate) → T4.46/T4.48 (cause names + F1/F2/F3, silicon-
+  validated 9m48s vs 64 min) → T4.49 (no timing interference; `BEAM_DEV_TIMEOUT` inert on NV — `can_recover`).
+  **FLAGSHIP: Q8_0 36.9 GB pooled = 8.0 tok/s no-BEAM, 31.1 tok/s JITBEAM=2 (M3 target ≥15 — beaten 2.07x),**
+  full residency, zero faults either leg. Remediation survived 3 live storms + 6 deliberate fault events tonight.
+  Open: T4.45/T4.52 (GPU-free fixes), T4.53 (name the culprit kernel), T4.51 (optional), PR #7 (diagnosability →
+  fork master, Artur's click), TD.4 demo decision. 3 agents parked on background runs (HANDOFF §7 lesson 8).
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
