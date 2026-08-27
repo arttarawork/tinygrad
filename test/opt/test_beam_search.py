@@ -1,3 +1,4 @@
+import os
 import io, contextlib, unittest, signal, time
 from types import SimpleNamespace
 from unittest import mock
@@ -8,7 +9,7 @@ from tinygrad.codegen.opt.postrange import Scheduler, args_from_ast
 from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
 from tinygrad.codegen.opt import search as search_mod
 from tinygrad.codegen.opt import Opt, OptOps
-from tinygrad.helpers import Context
+from tinygrad.helpers import getenv, Context
 from tinygrad.renderer import Renderer
 from tinygrad.helpers import Target
 
@@ -265,6 +266,59 @@ class TestBeamSearchDoesNotCacheUnvalidatedResults(unittest.TestCase):
       search_mod._try_compile = boom
       result2 = search_mod.beam_search(s, rawbufs, var_vals, 1)
       self.assertEqual(result2.applied_opts, result1.applied_opts)
+
+# T4.57: the T4.39 rule above kept re-running a *deterministic* wipeout (every candidate over the uop cap -- the chunked
+# DeltaNet scan kernel is the real-world case) on every capture, because the hand-coded fallback carried the seed's inf score.
+# beam_search now times that fallback kernel when the wipeout was all-BeamUopLimit, so it becomes a validated, cacheable result.
+class TestBeamSearchCachesStructuralWipeoutFallback(unittest.TestCase):
+  def setUp(self):
+    self.real_try_compile = search_mod._try_compile
+    self.real_get, self.real_put = search_mod.diskcache_get, search_mod.diskcache_put
+    self.cache = _FakeDiskCache()
+    search_mod.diskcache_get, search_mod.diskcache_put = self.cache.get, self.cache.put
+
+  def tearDown(self):
+    search_mod._try_compile = self.real_try_compile
+    search_mod.diskcache_get, search_mod.diskcache_put = self.real_get, self.real_put
+
+  def test_all_uop_limit_fallback_is_timed_and_cached(self):
+    # real _try_compile, with the search-time uop cap set so low that EVERY candidate trips it -- and so would the hand-coded
+    # fallback if the cap applied to it (it doesn't: beam_search compiles the fallback with the cap off, else nothing is cached)
+    s, rawbufs, var_vals = _build_seed()
+    key, hc_opts = _key_for(s), hand_coded_optimizations(s.copy()).applied_opts
+    os.environ["BEAM_UOPS_MAX"] = "1"
+    getenv.cache_clear()  # type: ignore[attr-defined]
+    try:
+      with Context(ALLOW_DEVICE_USAGE=1, PARALLEL=0, CACHELEVEL=1):
+        buf1 = io.StringIO()
+        with contextlib.redirect_stdout(buf1): result1 = search_mod.beam_search(s, rawbufs, var_vals, 1)
+        self.assertIn("BeamUopLimit", buf1.getvalue())
+        self.assertEqual(result1.applied_opts, hc_opts)
+        self.assertEqual(self.cache.get("beam_search", key), hc_opts)  # timed for real -> persisted (T4.39's finite-score rule holds)
+
+        def boom(x, **kw): raise AssertionError("beam_search should replay from the cache, not re-search")
+        search_mod._try_compile = boom
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2): result2 = search_mod.beam_search(s, rawbufs, var_vals, 1)
+        self.assertNotIn("WARNING", buf2.getvalue())
+        self.assertEqual(result2.applied_opts, hc_opts)
+    finally:
+      os.environ.pop("BEAM_UOPS_MAX", None)
+      getenv.cache_clear()  # type: ignore[attr-defined]
+
+  def test_mixed_wipeout_still_not_cached(self):
+    # a wipeout with any non-structural cause (here a compile timeout beside the cap hits) may be environmental: keep T4.39's behavior
+    s, rawbufs, var_vals = _build_seed()
+    n = 0
+    def mixed(x):
+      nonlocal n
+      n += 1
+      return x[0], None, ("BeamCompileTimeout" if n % 2 else "BeamUopLimit")
+    search_mod._try_compile = mixed
+    with Context(ALLOW_DEVICE_USAGE=1, PARALLEL=0, CACHELEVEL=1), contextlib.redirect_stdout(io.StringIO()):
+      result = search_mod.beam_search(s, rawbufs, var_vals, 1)
+    self.assertEqual(result.applied_opts, hand_coded_optimizations(s.copy()).applied_opts)
+    self.assertIsNone(self.cache.get("beam_search", _key_for(s)))
 
 class TestSecondGroupReduceExcludedFromNVSearch(unittest.TestCase):
   # T4.53 (relocated): two INDEPENDENT reduce axes both turned into GROUP_REDUCE reproducibly faulted NV

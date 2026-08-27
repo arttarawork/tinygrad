@@ -66,8 +66,11 @@ def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
   raise BeamCompileTimeout()
 
-def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, str|None]:
-  if hasattr(signal, "alarm"):
+def _try_compile(x:tuple[int,Scheduler], uops_max:int|None=None, timeout:bool=True) -> tuple[int, tuple[UOp, float]|None, str|None]:
+  # uops_max / timeout: the search-time uop cap (BEAM_UOPS_MAX, 0 = off) and the BEAM_TIMEOUT_SEC alarm. T4.57 compiles the
+  # hand-coded fallback with both off: it is not a candidate, the JIT compiles that exact kernel next anyway (compile cache),
+  # and the kernels that end up here are precisely the ones too big for either limit.
+  if timeout and hasattr(signal, "alarm"):
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
     signal.alarm(getenv("BEAM_TIMEOUT_SEC", 10))
@@ -78,7 +81,7 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, s
     prg = to_program(ast.substitute({p: p.replace(arg=replace(p.arg, device=dev)) for p in ast.toposort() if p.op is Ops.PARAM}), x[1].ren)
     et = time.perf_counter() - st
     uops = prg.src[1].src
-    if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
+    if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000) if uops_max is None else uops_max) > 0:
       if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
       raise BeamUopLimit("too many uops")
     ret = (prg, et)
@@ -89,7 +92,7 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, s
     exc_name = type(e).__name__
     if getenv("BEAM_STRICT_MODE"): raise e
   finally:
-    if hasattr(signal, "alarm"): signal.alarm(0)
+    if timeout and hasattr(signal, "alarm"): signal.alarm(0)
   return x[0], ret, exc_name
 
 def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]
@@ -246,7 +249,21 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     # apply the same heuristics used when BEAM isn't requested at all (postrange.apply_opts' beam==0 path)
     print(colored(f"WARNING: BEAM found no working action for {s.colored_shape()}, falling back to hand_coded_optimizations", "red"))
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
-    beam[0] = (hand_coded_optimizations(beam[0][0].copy()), beam[0][1])
+    hc, hc_tm = hand_coded_optimizations(beam[0][0].copy()), beam[0][1]
+    # T4.57: a wipeout where EVERY candidate tripped the uop cap is structural (deterministic per AST), yet with an inf score
+    # T4.39 below rightly refuses to persist it -- so the doomed search replayed on every capture (2x per warmup, every server
+    # start; ~minutes on the chunked DeltaNet scan kernel). Time the fallback kernel itself instead: a finite measurement makes
+    # it exactly the empirically-validated result the cache is for. Any other failure mix (timeouts, runtime errors) may be
+    # environmental and keeps re-searching as before.
+    if set(fails) == {"BeamUopLimit"} and (proc:=_try_compile((0, hc), uops_max=0, timeout=False)[1]) is not None:
+      try:
+        hc_tm = min(_time_program(proc[0], var_vals, rawbufs, early_stop=1.0, allow_test_size=allow_test_size,
+                                  clear_l2=hasattr(dev, 'invalidate_caches'), dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1)))
+      except Exception as e:
+        if isinstance(e, RuntimeError) and _device_faulted(dev):
+          raise RuntimeError(f"BEAM: device fault detected while timing the hand-coded fallback for {s.colored_shape()}. Original error: {e}") from e
+        if BEAM_DEBUG: print(f"BEAM fallback timing failed (result stays uncached): {e}")
+    beam[0] = (hc, hc_tm)
   # T4.39: an inf best time means the search never produced an empirically-validated winner -- either the
   # total-failure fallback above (whose score is still the untouched seed's inf) or a candidate whose only
   # timing attempt hit _time_program's AssertionError path (search.py:50). Don't persist that: a later run

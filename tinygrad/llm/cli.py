@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time
+import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time, signal
 from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
@@ -132,7 +132,7 @@ class FallbackTemplate:
     if self.tok.preset == 'glm4': return ""
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
-  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
+  def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False, **kwargs) -> str:
     out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
     for msg in messages:
       out += self.role(msg["role"])
@@ -189,7 +189,11 @@ def main():
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  if args.serve:
+    # SIGTERM is the documented stop: make it a normal exit so atexit -> Device.finalize() (the GSP unload on NV) runs;
+    # python's default disposition would skip it
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:

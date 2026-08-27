@@ -60,6 +60,24 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+def splice_ids(last:tuple[str, list[int], int, list[int]], rendered:str, messages:list[dict],
+               render:typing.Callable[[list[dict], bool], str], tok:SimpleTokenizer) -> list[int]|None:
+  """Tokenize a follow-up request by splicing the model's own generated ids in place of the client's re-rendered assistant turn.
+  Clients re-render that turn (tool_calls as JSON, think blocks trimmed, whitespace) so re-tokenizing its text rarely reproduces the ids
+  the KV/recurrent state was built on -- and a recurrent model reuses its state only for an exact token-prefix extension (get_start_pos).
+  The template's end-of-turn marker is a special token, so encoding from it onward is boundary-exact. None = fall back to a plain encode."""
+  prev_rendered, prev_ids, n, gen = last
+  if len(messages) <= n or messages[n].get("role") != "assistant" or not rendered.startswith(prev_rendered): return None
+  upto = render(messages[:n+1], False)  # history through our assistant turn, as the client's copy of it re-renders
+  if not (upto.startswith(prev_rendered) and rendered.startswith(upto)): return None
+  content = messages[n].get("content")
+  def norm(t:str) -> str: return " ".join(t.split())
+  if isinstance(content, str) and norm(content) and norm(content) not in norm(tok.decode(gen)): return None  # the client edited our reply
+  # the end-of-turn marker must decode to real text (a special token): an empty marker would 'match' at the end of any turn
+  turn, ends = upto[len(prev_rendered):], [e for e in (tok.decode([t]) for t in (tok.eos_id, tok.eot_id) if t is not None) if e]
+  if not ends or (idx := max(turn.rfind(e) for e in ends)) < 0: return None
+  return prev_ids + gen + tok.encode(turn[idx:] + rendered[len(upto):])
+
 class Handler(HTTPRequestHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -67,7 +85,7 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+                reasoning:bool=False, record:tuple[str, list[int], int]|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -110,6 +128,7 @@ class Handler(HTTPRequestHandler):
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"
       completed = True
+      if record is not None: self.server.last = (*record, out)  # what the model state now holds, for splice_ids on the next turn
       yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
       if include_usage:
         yield {"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(out),
@@ -128,8 +147,13 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # render and tokenize
       normalize_messages(body["messages"])
-      rendered = self.server.template.render(messages=body["messages"], tools=body.get("tools"), add_generation_prompt=True, preserve_thinking=True)
-      ids: list[int] = self.server.tok.encode(rendered)
+      # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does
+      kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
+      def render(messages:list[dict], add_generation_prompt:bool) -> str:
+        return self.server.template.render(messages=messages, tools=body.get("tools"), add_generation_prompt=add_generation_prompt, **kwargs)
+      rendered = render(body["messages"], True)
+      ids: list[int] = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
+        or self.server.tok.encode(rendered)
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
@@ -141,7 +165,7 @@ class Handler(HTTPRequestHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
+                              reasoning=rendered.rstrip().endswith("<think>"), record=(rendered, ids, len(body["messages"])))
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
@@ -164,4 +188,5 @@ class Handler(HTTPRequestHandler):
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.last: tuple[str, list[int], int, list[int]]|None = None  # (rendered prompt, ids, message count, generated ids) of the last completed request
     super().__init__(server_address, Handler)
