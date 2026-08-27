@@ -9,7 +9,10 @@ from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar
 
-GDN_CHUNK = ContextVar("GDN_CHUNK", 1)  # T4.55: prefill chunk width for recurrent models without a fused scan kernel (see generate)
+# T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 32 measured best on
+# METAL (qwen3.5:0.8b: 77 -> 168 tok/s no-BEAM, 99 -> 346 BEAM'd) and on the METAL+NV pooled qwen3.6-35B Q8_0 (46 -> 158-173
+# tok/s BEAM'd, decode unchanged); 64 falls off a cliff (28 tok/s on METAL). GDN_CHUNK=1 restores one-token-per-step prefill.
+GDN_CHUNK = ContextVar("GDN_CHUNK", 32)
 
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
@@ -763,7 +766,7 @@ class Transformer:
       "-- raise it via --max_context (cli.py) or Transformer.from_gguf(max_context=...)"
     # T4.55: recurrent blocks have a fused scan kernel only on RDNA3 (llm/kernels/amd.py); everywhere else the unrolled T_pad scan
     # in GatedDeltaNetBlock._attention handles a chunk, but generate() historically pinned chunk_size=1 (one token per step, i.e.
-    # prefill at decode speed -- ~55 tok/s on the pooled qwen3.6). GDN_CHUNK=N caps the chunk width for those devices instead.
+    # prefill at decode speed -- 46 tok/s on the pooled qwen3.6-35B). GDN_CHUNK caps the chunk width for those devices instead.
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
       chunk_size = min(chunk_size, GDN_CHUNK.value)
     drain_every = max(1, drain_every)
