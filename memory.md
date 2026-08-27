@@ -365,6 +365,17 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   raise, not just `is_err_state`), with the #16536 healthy-path negative control. Remaining for the dock: 40-3
   (halt-before-mastering, needs a hardware pass with Artur) + the §5.1 decision + the tinygpu_releases report (RCA §8 draft).
 
+- **2026-08-26 night (route decided; GPU-free backlog cleared):** Artur DECIDED: **no upstream PRs (#14615), no
+  tinygpu_releases report (#16086 — third-party AG02)**; all fixes fork-local; A3 permanently uncovered ⇒
+  never-kill is standing law; `TINYGPU_REPORT_DRAFT.md` retained unfiled. **PR #4 merged** (upstream sync #4 →
+  master `a770d485a`; fork line-cap 27000 = upstream+500, re-derive each sync). **PR #5 opened** (T4.40a+b,
+  51/51 green, awaiting merge). Batch results: T4.42 exonerated (no flake reaches the compile cache; 6 pinning
+  tests) → filed T4.45 (write-short deadlock, retry proc leak, wait_cond UnboundLocalError); T4.43 CONFIRMED+
+  fixed (qcom per-unpickle server spawn — bites every non-Linux host; shared `compiler_server_cache.py`);
+  T4.40c code-complete (`5d3d8fa70`, halt-verify before mastering, HARDWARE-GATED, DO NOT MERGE). Remaining:
+  PR #5 merge click; the supervised hardware session (T4.40c checklist + RCA §7) → T4.35 runs 2-3 → T4.34
+  capture → T4.29 nvcc row → M3 flagship (Q6_K_XL/Q8_0 pooled); T4.45 optional; TD.4 demo still open.
+
 ## 7. Sources
 
 - lucebox eGPU benchmarks: https://www.lucebox.com/blog/egpu-myth
