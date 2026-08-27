@@ -413,7 +413,7 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   no inputs, 48 ms/layer/chunk at 16k). A cached position buffer + `causal_mask()` made one layer's replay linear (50.6 → 9.4 ms
   at 16k). Lesson: a `DEBUG=2` per-kernel table on a one-layer replica (random weights, production head geometry so the SDPA
   ASTs hit the BEAM cache) answers 'which kernel scales with position' in minutes; watch the `tm` unit flip us→ms. Verified with
-  real Hermes: 19k cold turn 320 → 203 s, tool-loop follow-up 3.9 → 2.1 s (PR #10, stacked on #9). Lessons: (1) measure prefill at the
+  real Hermes: 19k cold turn 320 → 203 s, tool-loop follow-up 3.9 → 2.1 s. **Both PRs merged the same evening (master `3d24ffd8c`).** Lessons: (1) measure prefill at the
   prompt length the consumer actually sends; (2) a Metal `waitUntilCompleted` with the GPU at 96% is slow, not hung — `sample` +
   ioreg `Device Utilization` settle it in a minute; (3) T4.56's SIGTERM handler only fires between C calls — fine for chunks,
   but a truly hung Metal wait would need the default disposition. Hermes facts: 64k minimum `context_length`; echoes

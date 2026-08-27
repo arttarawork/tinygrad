@@ -22,14 +22,14 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   panics are fully remediated + hardware-verified; M3 achieved: Q8_0 pooled 31.1 tok/s). Standing
   protocol in HANDOFF_2026-08-27 §4 — above all: **never kill an NV process or TinyGPU server**.
   **TD.5 (pooled model selectable in Hermes) is WIRED as of 2026-08-27 PM** — ritual in `~/CLAUDE.md` "Pooled model",
-  state + the remaining prefill lever (T4.58) in HANDOFF_2026-08-27 §2. Serving tree = `tinygrad-td5` (`integration/td5`).
+  state + the next levers in HANDOFF_2026-08-27 §2/§3. Serving tree = `tinygrad-td5` (on fork master).
 - **Bazzite box, RX 9070 XT** (`ENV:AMD`): descoped 2026-08-18 (AMD is not a target; shared-HCQ
   validation goes via mock-NV + rented 3090 instead — see TASKS.md T0.2/T2.1). If ever revived:
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off fork `master` = **`318c03102`** (the PR #9 merge, 2026-08-27: T4.55/56/57 on top of PR #8; PR #10 =
-  T4.58 pending). `integration/phase1b`
+- Branch `task/T<id>-<slug>` off fork `master` = **`3d24ffd8c`** (the PR #10 merge, 2026-08-27: T4.58 on top of PR #9's T4.55/56/57).
+  `integration/phase1b`
   RETIRED; dock trees = master or a descendant — plus `task/T4.40c-halt-verify` once hardware-verified. There is no local `master`, and **`origin/*` tracking refs are STALE by construction** (SSH `origin`
   is interactive-only; agents fetch/push via the explicit HTTPS URL `https://github.com/arttarawork/tinygrad.git`,
   which never updates `origin/*`) — **never branch off `origin/master`** (it sits at the 08-21 sync `b37d80fc9`);
