@@ -43,6 +43,12 @@ master + T4.40a/b branches); dock measurement is paused pending HANDOFF §5.1 an
 4.5 GB/token ≈ analytic, full residency, zero faults. The pooled shape delivers llama.cpp-Metal-class
 speed at a quant the Mac cannot hold.**
 
+**TD.5 (2026-08-27 PM): the pooled Q8_0 serves Hermes** (`llm/serve.py` on :8081, provider "Pooled (localhost:8081)"). The
+unexamined axis was **prefill**: recurrent models prefilled one token per step (`chunk_size=1`, 46 tok/s pooled) until T4.55's
+`GDN_CHUNK=32` (156 tok/s @2k); the remaining term is unfused attention over `start_pos+T` keys — 88 tok/s @8k, 59 @19k on the
+attention-on-NV map — so a cold ~19k-token Hermes turn is ~5 min while in-session follow-ups are seconds (serve.py splices the
+model's own generated ids). Next lever: an NV attention-prefill kernel (T4.58). Details: HANDOFF_2026-08-27 §2, TASKS rows.
+
 **G1 — single-eGPU speed: MET, ahead of target.** Best config is `DEV=NV` (nvcc) + BEAM.
 Decode tok/s: llama3.2:1b **149.1** (above the llama.cpp-CUDA 110-130 reference band),
 qwen3:8b **46.9** (1.73x llama.cpp-Metal's 27.1), gpt-oss:20b **60.9** (~4x our Metal BEAM),
