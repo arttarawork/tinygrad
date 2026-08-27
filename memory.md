@@ -406,8 +406,9 @@ Verified at `af2a43c85`; the design doc has the load-bearing items, these are th
   alarm). **Then the second finding:** the T0.3 harness's 2048-token convention hides an O(n²) attention term — 156 tok/s @2k →
   55.9 @8k; the first real `hermes -z` (18,140 tokens) sat >14 min with the Apple GPU at 96%. Moving all 10 attention blocks to the
   3090 (`0-2:METAL,3:NV,…,23-39:NV`, same layer counts, no new kernels) gave 88.4 @8k (+58%) and decode 25.6 (+28%) → adopted.
-  TD.5 wiring complete (config entry, `pooled-serve.sh`, `hermes-aux-swap.py`, ~/CLAUDE.md ritual); fluid for follow-up turns,
-  ~3-4 min for a cold session → **T4.58 (NV attention-prefill kernel) is the next lever**. Lessons: (1) measure prefill at the
+  TD.5 wiring complete (config entry, `pooled-serve.sh`, `hermes-aux-swap.py`, ~/CLAUDE.md ritual) and **verified with real
+  Hermes**: 19,006-token cold prompt → 5.3 min (59 tok/s), a tool-loop follow-up → 3.9 s (splice hit `in: 19037 +66`), decode
+  15-20 tok/s at 19k context → **T4.58 (NV attention-prefill kernel) is the next lever**. Lessons: (1) measure prefill at the
   prompt length the consumer actually sends; (2) a Metal `waitUntilCompleted` with the GPU at 96% is slow, not hung — `sample` +
   ioreg `Device Utilization` settle it in a minute; (3) T4.56's SIGTERM handler only fires between C calls — fine for chunks,
   but a truly hung Metal wait would need the default disposition. Hermes facts: 64k minimum `context_length`; echoes
