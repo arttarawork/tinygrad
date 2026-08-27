@@ -330,6 +330,15 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
     for a, b in zip(s1, s4): np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
     self.assertIn((True, True, 4), m4.jit)  # the prefill jit really was captured at the chunk width
 
+  def test_auto_chunk_is_device_aware(self):
+    # auto (GDN_CHUNK=0): 32 only on the GPU backends it was measured on; CPU keeps the one-token-per-step prefill (x86 clang 18
+    # crashes on the unrolled 32-step scan kernel -- CI's Test LLM job); an explicit GDN_CHUNK wins everywhere
+    from tinygrad.llm.model import gdn_chunk_for
+    with Context(GDN_CHUNK=0):
+      self.assertEqual([gdn_chunk_for(d) for d in ("METAL", "NV", "NV:1", "CUDA", ("METAL", "NV"))], [32, 32, 32, 32, 32])
+      self.assertEqual([gdn_chunk_for(d) for d in ("CPU", "CPU:1", "NULL", "AMD", ("CPU", "METAL"))], [1, 1, 1, 1, 1])
+    with Context(GDN_CHUNK=16): self.assertEqual([gdn_chunk_for(d) for d in ("CPU", "METAL")], [16, 16])
+
   def test_warmup_captures_chunked_prefill(self):
     m = Transformer(SSM_CFG)
     with Context(GDN_CHUNK=4): m.warmup()
@@ -377,6 +386,13 @@ class TestSpliceIds(unittest.TestCase):
   def test_changed_history_falls_back(self):
     msgs = [{"role":"system","content":"be verbose"}] + self.hist[1:] + [{"role":"assistant","content":"ok then"}, {"role":"user","content":"more"}]
     self.assertIsNone(self._splice(msgs))
+
+  def test_empty_end_marker_falls_back(self):
+    # a tokenizer whose end-of-turn token decodes to "" (test doubles do this) must not splice: "" would match at the end of any turn
+    from unittest.mock import Mock
+    tok = Mock(eos_id=999, eot_id=None, decode=Mock(return_value=""), encode=Mock(return_value=[7]))
+    msgs = self.hist + [{"role":"assistant","content":None}, {"role":"user","content":"more"}]
+    self.assertIsNone(splice_ids(self.last, self.render(msgs, True), msgs, self.render, tok))
 
   def test_no_assistant_turn_falls_back(self):
     self.assertIsNone(self._splice(self.hist + [{"role":"user","content":"more"}]))

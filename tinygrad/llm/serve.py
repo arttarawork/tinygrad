@@ -73,8 +73,9 @@ def splice_ids(last:tuple[str, list[int], int, list[int]], rendered:str, message
   content = messages[n].get("content")
   def norm(t:str) -> str: return " ".join(t.split())
   if isinstance(content, str) and norm(content) and norm(content) not in norm(tok.decode(gen)): return None  # the client edited our reply
-  turn, ends = upto[len(prev_rendered):], [tok.decode([t]) for t in (tok.eos_id, tok.eot_id) if t is not None]
-  if (idx := max(turn.rfind(e) for e in ends)) < 0: return None
+  # the end-of-turn marker must decode to real text (a special token): an empty marker would 'match' at the end of any turn
+  turn, ends = upto[len(prev_rendered):], [e for e in (tok.decode([t]) for t in (tok.eos_id, tok.eot_id) if t is not None) if e]
+  if not ends or (idx := max(turn.rfind(e) for e in ends)) < 0: return None
   return prev_ids + gen + tok.encode(turn[idx:] + rendered[len(upto):])
 
 class Handler(HTTPRequestHandler):

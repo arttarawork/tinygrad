@@ -9,10 +9,16 @@ from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar
 
-# T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 32 measured best on
-# METAL (qwen3.5:0.8b: 77 -> 168 tok/s no-BEAM, 99 -> 346 BEAM'd) and on the METAL+NV pooled qwen3.6-35B Q8_0 (46 -> 158-173
-# tok/s BEAM'd, decode unchanged); 64 falls off a cliff (28 tok/s on METAL). GDN_CHUNK=1 restores one-token-per-step prefill.
-GDN_CHUNK = ContextVar("GDN_CHUNK", 32)
+# T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 0 = auto: 32 on the GPU
+# backends it was measured on -- METAL (qwen3.5:0.8b: 77 -> 168 tok/s no-BEAM, 99 -> 346 BEAM'd) and NV (the METAL+NV pooled
+# qwen3.6-35B Q8_0: 46 -> 158-173 tok/s BEAM'd, decode unchanged) -- and 1 (the pre-T4.55 one-token-per-step prefill) elsewhere:
+# the unrolled 32-step scan is one huge kernel, and x86 clang 18 crashes compiling it (CI's CPU "Test LLM" job on qwen3.5:0.8b).
+# 64 falls off a cliff even on METAL (28 tok/s). Set GDN_CHUNK explicitly to override either way.
+GDN_CHUNK = ContextVar("GDN_CHUNK", 0)
+def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
+  if GDN_CHUNK.value > 0: return GDN_CHUNK.value
+  dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
+  return 32 if dev.split(":")[0] in ("METAL", "NV", "CUDA") else 1
 
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
@@ -768,7 +774,7 @@ class Transformer:
     # in GatedDeltaNetBlock._attention handles a chunk, but generate() historically pinned chunk_size=1 (one token per step, i.e.
     # prefill at decode speed -- 46 tok/s on the pooled qwen3.6-35B). GDN_CHUNK caps the chunk width for those devices instead.
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
-      chunk_size = min(chunk_size, GDN_CHUNK.value)
+      chunk_size = min(chunk_size, gdn_chunk_for(self.token_embd.weight.device))
     drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
