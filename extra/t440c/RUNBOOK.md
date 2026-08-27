@@ -1,6 +1,6 @@
 # T4.40c / RCA §7 — supervised hardware verification runbook
 
-**Run ONLY with Artur present. Every `DEV=NV*` command is his to approve/run. Tiny model / trivial ops
+**Artur authorized autonomous `DEV=NV*` execution (2026-08-26 ~20:45): Claude runs this protocol and reports; Artur is reachable during the run. Tiny model / trivial ops
 only. Abort the whole session on ANY unexpected fault: stop, touch nothing, `pkill NOTHING`, collect the
 unified log (`/usr/bin/log show --last 5m --predicate 'eventMessage CONTAINS[c] "tinygpu"'`), and read the
 RCA before the next step.** All work is committed+pushed first (this branch `task/T4.40c-halt-verify`).
