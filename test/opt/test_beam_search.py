@@ -3,10 +3,11 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 from tinygrad import Device, Tensor
+from tinygrad.uop.ops import AxisType
 from tinygrad.codegen.opt.postrange import Scheduler, args_from_ast
 from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
 from tinygrad.codegen.opt import search as search_mod
-from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.helpers import Context
 from tinygrad.renderer import Renderer
 from tinygrad.helpers import Target
