@@ -8,7 +8,7 @@ from tinygrad.runtime.support.nv.ip import NV_FLCN
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.autogen import pci
-from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, _fault_recovery_hint
+from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, NVSignal, _fault_recovery_hint
 
 class CountingMMIOInterface:
   """Fake MMIOInterface: one __getitem__/__setitem__ call == one socket-RPC message in the real RemoteMMIOInterface (system.py), so
@@ -756,6 +756,61 @@ class TestAPLRemotePCIDeviceSpawn(unittest.TestCase):
       _FakeAPL("NV", "0000:00:00.0")  # must not raise
 
     assert len(self.spawned_servers) == 0, f"an xdist worker must never spawn even while waiting, got {len(self.spawned_servers)} new spawn(s)"
+
+class _FakeSleepIface:
+  """Counts calls to sleep(tm) the way NVSignal._sleep makes them -- a faithful proxy for "one drain", whether
+  that's a local stat_q memory read (PCIIface, direct) or one RPC round trip (remote): CountingMMIOInterface
+  above already establishes that convention for MMIO reads/writes, this is the same idea for iface.sleep()."""
+  def __init__(self): self.calls:list[int] = []
+  def sleep(self, tm:int): self.calls.append(tm)
+
+def _fake_nv_signal(iface) -> NVSignal:
+  sig = NVSignal.__new__(NVSignal)  # skip HCQSignal.__init__: no real buffer needed, _sleep only reads self.owner
+  sig.owner, sig.should_return = SimpleNamespace(iface=iface), False  # should_return=False: keeps __del__ a no-op on this bufferless fake
+  return sig
+
+class TestNVSignalSleepFaultDrain(unittest.TestCase):
+  """T4.48 F2 (T4.47_RCA.md): NVSignal._sleep used to drain the GSP status queue (owner.iface.sleep) only once
+  time_spent_since_last_sleep_ms had accumulated past 200ms. BEAM's device-side per-candidate timeout
+  (BEAM_DEV_TIMEOUT) is typically 1-3ms -- far under that gate -- so a fault from an earlier abandoned
+  candidate (search.py's beam_search abandons slow candidates by design, T4.48 F1) could sit undrained,
+  invisible, for an entire search. Fixed to also drain on the first _sleep() call of every wait, detected as
+  "elapsed time just went backwards" since hcq.py's wait() resets its timer at the start of every wait() and
+  again on every progress event within one."""
+  def test_drains_on_first_sleep_of_a_wait(self):
+    # pre-fix: 0 > 200 is False, so the old body never called iface.sleep() at all here.
+    iface = _FakeSleepIface()
+    _fake_nv_signal(iface)._sleep(0)
+    assert iface.calls == [0], f"must drain (a probe, not a sleep -- passes 0) on the first _sleep() of a wait, got {iface.calls}"
+
+  def test_drains_at_most_once_across_a_whole_sub_200ms_wait(self):
+    # simulates one wait()'s busy-spin progression that never crosses the 200ms gate: must NOT drain per iteration.
+    iface = _FakeSleepIface()
+    sig = _fake_nv_signal(iface)
+    for elapsed in (0, 1, 2, 5, 10, 50, 100, 150, 199): sig._sleep(elapsed)
+    assert len(iface.calls) == 1, f"expected exactly one drain across a whole sub-200ms wait, got {len(iface.calls)}"
+
+  def test_still_drains_past_200ms_unchanged(self):
+    iface = _FakeSleepIface()
+    sig = _fake_nv_signal(iface)
+    sig._sleep(0)    # new: first-call probe
+    sig._sleep(250)  # pre-existing: long-wait drain, unchanged
+    assert iface.calls == [0, 200], f"first-call probe passes 0, long-wait drain still passes 200 unchanged, got {iface.calls}"
+
+  def test_drains_again_when_a_new_wait_starts(self):
+    # a signal (e.g. the device's timeline_signal) is reused across many wait() calls over its life -- each
+    # fresh wait (elapsed resetting back toward 0) must get its own first-call drain, not just the first ever.
+    iface = _FakeSleepIface()
+    sig = _fake_nv_signal(iface)
+    for elapsed in (0, 5, 10): sig._sleep(elapsed)  # wait #1, ends without ever hitting 200ms
+    assert len(iface.calls) == 1
+    for elapsed in (0, 5, 10): sig._sleep(elapsed)  # wait #2, same signal instance (mirrors timeline_signal reuse)
+    assert len(iface.calls) == 2, f"a fresh wait must get its own first-call drain, got {iface.calls}"
+
+  def test_noop_without_owner(self):
+    sig = NVSignal.__new__(NVSignal)
+    sig.owner, sig.should_return = None, False
+    sig._sleep(0)  # must not raise
 
 if __name__ == "__main__":
   unittest.main()
