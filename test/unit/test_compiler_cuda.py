@@ -13,8 +13,6 @@ from tinygrad.helpers import Context
 import tinygrad.device as device_mod
 # T4.43: compiler_qcom.py's non-aarch64 path had the identical bug shape, so this cache now lives in
 # compiler_server_cache.py and is shared by both -- see test_compiler_qcom.py for the QCOM-side proof.
-import unittest
-from tinygrad.device import CompileError, CompileTransportError
 from tinygrad.runtime.support import compiler_server_cache as cc
 
 class _FakeProc:

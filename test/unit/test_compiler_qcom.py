@@ -23,6 +23,7 @@ class _FakeProc:
   def __init__(self, *a, **kw): self._alive = True
   def poll(self): return None if self._alive else 1
   def kill(self): self._alive = False
+  def wait(self, timeout=None): return 0  # T4.45's reap wait()s the evicted proc; real Popen always has this
 
 class TestQCOMCompilerServerCache(unittest.TestCase):
   def setUp(self):
