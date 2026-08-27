@@ -9,6 +9,7 @@ from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, _fault_recovery_hint
+from tinygrad.runtime.support.hcq import HCQAllocatorBase, HCQBuffer, _dev_already_faulted
 
 class CountingMMIOInterface:
   """Fake MMIOInterface: one __getitem__/__setitem__ call == one socket-RPC message in the real RemoteMMIOInterface (system.py), so
@@ -337,6 +338,86 @@ class TestNVQuiesceOnFault(unittest.TestCase):
     fake = SimpleNamespace(pci_dev=pci_dev, dev_impl=SimpleNamespace(fini=lambda: None, is_err_state=False))
     PCIIface.device_fini(fake)
     assert pci_dev.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER, "a clean exit must not touch bus-master"
+
+def _fake_dev_for_free(sync_calls:list, is_err_state:bool, raise_on_sync:bool=False) -> SimpleNamespace:
+  """Minimal HCQCompiled-device stand-in for HCQAllocatorBase._free's per-buffer loop: enough of
+  iface.dev_impl.is_err_state for _dev_already_faulted, plus a synchronize() spy. raise_on_sync mirrors the
+  real fault path (ops_nv.py:655's "Device fault detected") so a broken guard shows up as a raised exception,
+  not just a miscounted call."""
+  def synchronize(timeout=None):
+    sync_calls.append(1)
+    if raise_on_sync: raise RuntimeError("Device fault detected. NV device is in an unrecoverable fault state.")
+  return SimpleNamespace(iface=SimpleNamespace(dev_impl=SimpleNamespace(is_err_state=is_err_state)), synchronize=synchronize)
+
+class TestNVFastFaultedTeardown(unittest.TestCase):
+  """T4.52 (T4.47_RCA.md follow-up; T4.50 named the storm anatomy): once is_err_state is set, bus-master is
+  already cleared (T4.37/T4.40b) and the mappings die with the process regardless, so a per-buffer
+  synchronize() during teardown -- LRU free_cache, Buffer.__del__, HCQCompiled.finalize's cache sweep, all of
+  which funnel through HCQAllocatorBase._free -- is pointless. Pre-fix it re-raised "Device fault detected"
+  once per still-cached buffer: an observed ~120-buffer echo storm, ~490s of teardown. These prove _free skips
+  the sync (and thus the raise) once the fault is already known, while a healthy device's teardown -- and the
+  first, not-yet-discovered fault on any device -- is untouched."""
+
+  def _fake_allocator(self, do_free_calls:list) -> SimpleNamespace:
+    return SimpleNamespace(_do_free=lambda buf, options: do_free_calls.append((buf, options)))
+
+  def test_free_skips_sync_on_already_faulted_device(self):
+    sync_calls:list = []
+    dev = _fake_dev_for_free(sync_calls, is_err_state=True, raise_on_sync=True)
+    buf = HCQBuffer(va_addr=0x1000, size=0x1000, owner=dev)
+    do_free_calls:list = []
+    HCQAllocatorBase._free(self._fake_allocator(do_free_calls), buf, None) # must not raise
+    assert sync_calls == [], "a known-faulted device must not be synchronized per buffer"
+    assert do_free_calls == [(buf, None)], "client-side bookkeeping (_do_free) must still run"
+
+  def test_free_skips_sync_for_n_buffers_zero_echoes(self):
+    # T4.50's storm anatomy: ~120 near-identical per-buffer echoes for one fault. Proves the guard holds across
+    # a whole teardown sweep (LRU free_cache's shape: many buffers freed off one faulted device in a row), not
+    # just a single buffer.
+    sync_calls:list = []
+    dev = _fake_dev_for_free(sync_calls, is_err_state=True, raise_on_sync=True)
+    do_free_calls:list = []
+    alloc = self._fake_allocator(do_free_calls)
+    for i in range(120): HCQAllocatorBase._free(alloc, HCQBuffer(va_addr=0x1000 * i, size=0x1000, owner=dev), None)
+    assert sync_calls == [], f"expected zero sync RPCs across 120 buffer frees on a faulted device, got {len(sync_calls)}"
+    assert len(do_free_calls) == 120, "every buffer must still get its client-side free"
+
+  def test_free_still_synchronizes_healthy_device(self):
+    # Negative control: a healthy device's teardown must be byte-identical to pre-fix -- synchronize() still
+    # runs exactly once per buffer.
+    sync_calls:list = []
+    dev = _fake_dev_for_free(sync_calls, is_err_state=False)
+    buf = HCQBuffer(va_addr=0x1000, size=0x1000, owner=dev)
+    do_free_calls:list = []
+    HCQAllocatorBase._free(self._fake_allocator(do_free_calls), buf, None)
+    assert sync_calls == [1], "a healthy device must still be synchronized exactly once per buffer"
+    assert do_free_calls == [(buf, None)]
+
+  def test_free_still_raises_on_first_undiscovered_fault(self):
+    # The first fault surfacing must stay loud: is_err_state False (not yet discovered) means the guard must
+    # not fire, so synchronize() runs and a genuine failure there still raises out of _free normally.
+    sync_calls:list = []
+    dev = _fake_dev_for_free(sync_calls, is_err_state=False, raise_on_sync=True)
+    buf = HCQBuffer(va_addr=0x1000, size=0x1000, owner=dev)
+    do_free_calls:list = []
+    with self.assertRaises(RuntimeError):
+      HCQAllocatorBase._free(self._fake_allocator(do_free_calls), buf, None)
+    assert sync_calls == [1], "an undiscovered fault must still be probed via a real synchronize() call"
+    assert do_free_calls == [], "the buffer's client-side bookkeeping never runs once synchronize() raises (pre-existing _free ordering, unchanged)"
+
+  def test_dev_already_faulted_true_when_err_state_set(self):
+    assert _dev_already_faulted(SimpleNamespace(iface=SimpleNamespace(dev_impl=SimpleNamespace(is_err_state=True))))
+
+  def test_dev_already_faulted_false_when_healthy(self):
+    assert not _dev_already_faulted(SimpleNamespace(iface=SimpleNamespace(dev_impl=SimpleNamespace(is_err_state=False))))
+
+  def test_dev_already_faulted_false_with_no_iface(self):
+    # CPU and other non-HCQ backends have no `iface` attribute at all -- must degrade to False, never AttributeError.
+    assert not _dev_already_faulted(SimpleNamespace())
+
+  def test_dev_already_faulted_false_with_no_dev_impl(self):
+    # NVKIface/MOCKIface-shaped: has `iface` but no `dev_impl` (only PCIIface sets one) -- must degrade to False.
+    assert not _dev_already_faulted(SimpleNamespace(iface=SimpleNamespace()))
 
 class TestNVQuiesceOnInitFailure(unittest.TestCase):
   """T4.40b (RCA T4.40_RCA.md fix 40-1 / mechanism A2): _early_ip_init() sets PCI bus-master partway through

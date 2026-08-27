@@ -526,6 +526,17 @@ class HCQBuffer:
   @property
   def mapped_devs(self): return self._devs if self._base is None else self._base._devs
 
+def _dev_already_faulted(dev) -> bool:
+  """T4.52: passive duck-typed fault check for _free's per-buffer teardown loop (no drain -- see below). Only
+  NV/AMD's HCQ ifaces model a GPU fault, always at iface.dev_impl.is_err_state (ops_nv.py/ops_amd.py); every
+  other backend (CPU/METAL/CUDA/NULL/...), and an undiscovered fault (is_err_state still False), degrades to
+  plain False, never an AttributeError -- so this is a no-op for a healthy device or a backend with no concept
+  of a fault at all. Deliberately does NOT drain (unlike codegen/opt/search.py's T4.48 _device_faulted, which
+  probes via iface.sleep(0)): draining here would itself be a new per-buffer RPC on a HEALTHY device, exactly
+  the cost this guard exists to avoid. A not-yet-discovered fault is still found and raised normally the first
+  time dev.synchronize() actually runs below -- this only silences buffers freed AFTER that discovery."""
+  return bool(getattr(getattr(getattr(dev, "iface", None), "dev_impl", None), "is_err_state", False))
+
 class HCQAllocatorBase(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
   """
   A base allocator class compatible with the HCQ (Hardware Command Queue) API.
@@ -551,7 +562,14 @@ class HCQAllocatorBase(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
 
   @suppress_finalizing
   def _free(self, buf:HCQBuffer, options:BufferSpec|None=None):
-    for dev in buf.mapped_devs: dev.synchronize()
+    # T4.52: a device already known to be in an unrecoverable fault state can never complete a wait -- every
+    # remaining cached buffer would otherwise redo the same failing wait and re-raise "Device fault detected"
+    # from scratch (an observed ~120-buffer echo storm, ~490s of teardown). Bus-master is already cleared by
+    # then (T4.37/T4.40b) and the mappings die with the process regardless, so skip the pointless sync and free
+    # only client-side bookkeeping below (_unmap/_do_free are local VA/mmap bookkeeping, not device RPCs).
+    for dev in buf.mapped_devs:
+      if _dev_already_faulted(dev): continue
+      dev.synchronize()
     for d, mb in buf.mappings.items(): d.allocator._unmap(mb)
     if hasattr(self, '_do_free'): self._do_free(buf, options)
 
