@@ -8,12 +8,11 @@
 # through a duck-typed fake compiler -- no OSX, Docker, or GPU required.
 import unittest, struct
 from tinygrad.device import CompileError, CompileTransportError, Compiler
-from tinygrad.runtime.support import compiler_cuda as cc
 from tinygrad.helpers import Context
 import tinygrad.device as device_mod
 # T4.43: compiler_qcom.py's non-aarch64 path had the identical bug shape, so this cache now lives in
 # compiler_server_cache.py and is shared by both -- see test_compiler_qcom.py for the QCOM-side proof.
-from tinygrad.runtime.support import compiler_server_cache as cc
+from tinygrad.runtime.support import compiler_server_cache as csc
 
 class _FakeProc:
   """stands in for a subprocess.Popen: alive until killed."""
@@ -42,48 +41,48 @@ class AlwaysBadCompiler(FakeCompiler):
 
 class TestServerCache(unittest.TestCase):
   def setUp(self):
-    cc._server_cache.clear()
+    csc._server_cache.clear()
     FakeCompiler.spawn_count = 0
 
   def test_reused_across_constructions(self):
     # the actual T4.31 bug: two separate (freshly-unpickled) Compiler objects of the same class/
     # arch/args must share ONE spawned process, not spawn one each.
-    p1 = cc._get_server(FakeCompiler(), "cmd", "sm_86", True)
-    p2 = cc._get_server(FakeCompiler(), "cmd", "sm_86", True)
+    p1 = csc._get_server(FakeCompiler(), "cmd", "sm_86", True)
+    p2 = csc._get_server(FakeCompiler(), "cmd", "sm_86", True)
     self.assertIs(p1, p2)
     self.assertEqual(FakeCompiler.spawn_count, 1)
 
   def test_different_key_gets_different_server(self):
     c = FakeCompiler()
-    p_ptx, p_cubin = cc._get_server(c, "cmd", "sm_86", True), cc._get_server(c, "cmd", "sm_86", False)
-    p_other_arch = cc._get_server(c, "cmd", "sm_90", True)
+    p_ptx, p_cubin = csc._get_server(c, "cmd", "sm_86", True), csc._get_server(c, "cmd", "sm_86", False)
+    p_other_arch = csc._get_server(c, "cmd", "sm_90", True)
     self.assertIsNot(p_ptx, p_cubin)
     self.assertIsNot(p_ptx, p_other_arch)
     self.assertEqual(FakeCompiler.spawn_count, 3)
 
   def test_dead_server_is_respawned_not_reused(self):
     c = FakeCompiler()
-    p1 = cc._get_server(c, "cmd", "sm_86", True)
+    p1 = csc._get_server(c, "cmd", "sm_86", True)
     p1.kill()
-    p2 = cc._get_server(c, "cmd", "sm_86", True)
+    p2 = csc._get_server(c, "cmd", "sm_86", True)
     self.assertIsNot(p1, p2)
     self.assertEqual(FakeCompiler.spawn_count, 2)
 
 class TestCompileWithRetry(unittest.TestCase):
   def setUp(self):
-    cc._server_cache.clear()
+    csc._server_cache.clear()
     FakeCompiler.spawn_count = 0
 
   def test_succeeds_first_try_no_respawn(self):
     c = FakeCompiler(fail_times=0)
-    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
-    self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
+    self.assertEqual(csc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
     self.assertEqual(FakeCompiler.spawn_count, 1)
 
   def test_retries_once_on_transport_error(self):
     c = FakeCompiler(fail_times=1)
-    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
-    self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
+    self.assertEqual(csc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
     self.assertEqual(FakeCompiler.spawn_count, 2)  # exactly one respawn after the simulated dead transport
 
   def test_evicted_process_is_reaped_on_retry(self):
@@ -91,9 +90,9 @@ class TestCompileWithRetry(unittest.TestCase):
     # never kill()/wait()-ed, so a process that's still alive at the OS level (e.g. the docker CLI
     # client up but the container inside it dead) leaked until atexit's _reap_servers ran.
     c = FakeCompiler(fail_times=1)
-    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
     dead_proc = c.compiler_process
-    self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
+    self.assertEqual(csc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
     self.assertTrue(dead_proc.killed)
     self.assertTrue(dead_proc.waited)
 
@@ -101,19 +100,19 @@ class TestCompileWithRetry(unittest.TestCase):
     # the evicted process may have already exited on its own (poll() != None) -- must still wait() it
     # (avoid a zombie) but must NOT call kill() again on an already-reclaimed pid.
     c = FakeCompiler(fail_times=1)
-    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
     dead_proc = c.compiler_process
     dead_proc._alive = False  # simulate the process having already exited on its own
-    self.assertEqual(cc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
+    self.assertEqual(csc._compile_with_retry(c, "src", "cmd", "sm_86", True), b"compiled")
     self.assertFalse(dead_proc.killed)
     self.assertTrue(dead_proc.waited)
 
   def test_does_not_retry_or_respawn_on_genuine_compile_error(self):
     # must never paper over a real compile error by retrying it
     c = AlwaysBadCompiler()
-    c.compiler_process = cc._get_server(c, "cmd", "sm_86", True)
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
     with self.assertRaises(CompileError):
-      cc._compile_with_retry(c, "src", "cmd", "sm_86", True)
+      csc._compile_with_retry(c, "src", "cmd", "sm_86", True)
     self.assertEqual(FakeCompiler.spawn_count, 1)  # no respawn attempted
 
 # T4.42: does a flaky compile-server round trip ever let a bad/truncated/empty blob -- or a poisoned
@@ -171,14 +170,14 @@ class _RetryCompiler(Compiler):
     self.compiler_process = self._procs.pop(0)
     super().__init__(cachekey)
   def server(self, cmd, arch, *args): return self._procs.pop(0)
-  def compile(self, src:str) -> bytes: return cc._compile_with_retry(self, src, "fake-cmd", "fake-arch")
+  def compile(self, src:str) -> bytes: return csc._compile_with_retry(self, src, "fake-cmd", "fake-arch")
 
 class _FakeDiskCacheTestCase(unittest.TestCase):
   # shared setUp/tearDown: monkeypatch tinygrad.device's diskcache_get/_put to an in-memory fake, and
   # force CCACHE on (so Compiler.__init__ actually sets a cachekey -- otherwise compile_cached's cache
   # branch is a no-op regardless of what device.py does, and every assertion below would pass vacuously).
   def setUp(self):
-    cc._server_cache.clear()
+    csc._server_cache.clear()
     self.cache = _FakeDiskCache()
     self.real_get, self.real_put = device_mod.diskcache_get, device_mod.diskcache_put
     device_mod.diskcache_get, device_mod.diskcache_put = self.cache.get, self.cache.put
@@ -188,7 +187,7 @@ class _FakeDiskCacheTestCase(unittest.TestCase):
   def tearDown(self):
     self.ctx.__exit__(None, None, None)
     device_mod.diskcache_get, device_mod.diskcache_put = self.real_get, self.real_put
-    cc._server_cache.clear()
+    csc._server_cache.clear()
 
 class TestCompileCachedTransportFlakes(_FakeDiskCacheTestCase):
   def test_eof_mid_body_not_cached(self):
