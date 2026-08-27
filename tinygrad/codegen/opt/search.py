@@ -66,7 +66,8 @@ def timeout_handler(signum, frame):
   if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
   raise BeamCompileTimeout()
 
-def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, str|None]:
+def _try_compile(x:tuple[int,Scheduler], uops_max:int|None=None) -> tuple[int, tuple[UOp, float]|None, str|None]:
+  # uops_max: the search-time cap (BEAM_UOPS_MAX, 0 = off); T4.57 passes 0 to compile the hand-coded fallback the cap must not reject
   if hasattr(signal, "alarm"):
     signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
     # set timeout
@@ -78,7 +79,7 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None, s
     prg = to_program(ast.substitute({p: p.replace(arg=replace(p.arg, device=dev)) for p in ast.toposort() if p.op is Ops.PARAM}), x[1].ren)
     et = time.perf_counter() - st
     uops = prg.src[1].src
-    if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
+    if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000) if uops_max is None else uops_max) > 0:
       if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
       raise BeamUopLimit("too many uops")
     ret = (prg, et)
@@ -252,7 +253,7 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     # start; ~minutes on the chunked DeltaNet scan kernel). Time the fallback kernel itself instead: a finite measurement makes
     # it exactly the empirically-validated result the cache is for. Any other failure mix (timeouts, runtime errors) may be
     # environmental and keeps re-searching as before.
-    if set(fails) == {"BeamUopLimit"} and (proc:=_try_compile((0, hc))[1]) is not None:
+    if set(fails) == {"BeamUopLimit"} and (proc:=_try_compile((0, hc), uops_max=0)[1]) is not None:  # the fallback itself may exceed the cap
       try:
         hc_tm = min(_time_program(proc[0], var_vals, rawbufs, early_stop=1.0, allow_test_size=allow_test_size,
                                   clear_l2=hasattr(dev, 'invalidate_caches'), dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1)))

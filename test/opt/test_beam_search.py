@@ -1,3 +1,4 @@
+import os
 import io, contextlib, unittest, signal, time
 from types import SimpleNamespace
 from unittest import mock
@@ -8,7 +9,7 @@ from tinygrad.codegen.opt.postrange import Scheduler, args_from_ast
 from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
 from tinygrad.codegen.opt import search as search_mod
 from tinygrad.codegen.opt import Opt, OptOps
-from tinygrad.helpers import Context
+from tinygrad.helpers import getenv, Context
 from tinygrad.renderer import Renderer
 from tinygrad.helpers import Target
 
@@ -281,26 +282,29 @@ class TestBeamSearchCachesStructuralWipeoutFallback(unittest.TestCase):
     search_mod.diskcache_get, search_mod.diskcache_put = self.real_get, self.real_put
 
   def test_all_uop_limit_fallback_is_timed_and_cached(self):
+    # real _try_compile, with the search-time uop cap set so low that EVERY candidate trips it -- and so would the hand-coded
+    # fallback if the cap applied to it (it doesn't: beam_search compiles the fallback with the cap off, else nothing is cached)
     s, rawbufs, var_vals = _build_seed()
     key, hc_opts = _key_for(s), hand_coded_optimizations(s.copy()).applied_opts
-    real, calls = self.real_try_compile, 0
-    def uop_cap_every_candidate(x):  # only the fallback kernel itself (hand-coded opts) compiles; every search candidate trips the cap
-      nonlocal calls
-      calls += 1
-      return real(x) if x[1].applied_opts == hc_opts else (x[0], None, "BeamUopLimit")
-    search_mod._try_compile = uop_cap_every_candidate
-    with Context(ALLOW_DEVICE_USAGE=1, PARALLEL=0, CACHELEVEL=1):
-      buf1 = io.StringIO()
-      with contextlib.redirect_stdout(buf1): result1 = search_mod.beam_search(s, rawbufs, var_vals, 1)
-      self.assertIn("BeamUopLimit", buf1.getvalue())
-      self.assertEqual(result1.applied_opts, hc_opts)
-      self.assertEqual(self.cache.get("beam_search", key), hc_opts)  # timed for real -> persisted (T4.39's finite-score rule holds)
+    os.environ["BEAM_UOPS_MAX"] = "1"
+    getenv.cache_clear()  # type: ignore[attr-defined]
+    try:
+      with Context(ALLOW_DEVICE_USAGE=1, PARALLEL=0, CACHELEVEL=1):
+        buf1 = io.StringIO()
+        with contextlib.redirect_stdout(buf1): result1 = search_mod.beam_search(s, rawbufs, var_vals, 1)
+        self.assertIn("BeamUopLimit", buf1.getvalue())
+        self.assertEqual(result1.applied_opts, hc_opts)
+        self.assertEqual(self.cache.get("beam_search", key), hc_opts)  # timed for real -> persisted (T4.39's finite-score rule holds)
 
-      calls_before, buf2 = calls, io.StringIO()
-      with contextlib.redirect_stdout(buf2): result2 = search_mod.beam_search(s, rawbufs, var_vals, 1)
-      self.assertEqual(calls, calls_before)  # replayed from the cache: no re-search, no re-warn
-      self.assertNotIn("WARNING", buf2.getvalue())
-      self.assertEqual(result2.applied_opts, hc_opts)
+        def boom(x, **kw): raise AssertionError("beam_search should replay from the cache, not re-search")
+        search_mod._try_compile = boom
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2): result2 = search_mod.beam_search(s, rawbufs, var_vals, 1)
+        self.assertNotIn("WARNING", buf2.getvalue())
+        self.assertEqual(result2.applied_opts, hc_opts)
+    finally:
+      os.environ.pop("BEAM_UOPS_MAX", None)
+      getenv.cache_clear()  # type: ignore[attr-defined]
 
   def test_mixed_wipeout_still_not_cached(self):
     # a wipeout with any non-structural cause (here a compile timeout beside the cap hits) may be environmental: keep T4.39's behavior
