@@ -183,7 +183,10 @@ class Handler(HTTPRequestHandler):
         self.send_data(json.dumps({**c, "object":"chat.completion",
           "choices":[{"index":0, "message":message, "finish_reason":finish_reason}]}).encode())
     else:
-      raise RuntimeError(f"unhandled path {self.path}")
+      # a clean 404, not an exception: local tooling probes other servers' APIs on this port (Ollama's /api/show and
+      # friends), and raising here tears down the connection and spams a traceback per probe
+      self.send_data(json.dumps({"error": {"message": f"unknown path {self.path}", "type": "invalid_request_error"}}).encode(),
+                     status_code=404)
 
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
