@@ -1,11 +1,14 @@
 from __future__ import annotations
 import json, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
-from tinygrad.helpers import DEBUG, colored, stderr_log
+from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
+
+# T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag.
+SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
 
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
@@ -103,9 +106,16 @@ class Handler(HTTPRequestHandler):
       stderr_log(f"gen:{len(out)/(et-pt) if len(out) > 1 else 0:4.0f} tok/s  {colored('--', 'BLACK')}  "
                  f"out:{len(out):5d}  {colored('--', 'BLACK')}  {colored(total, 'red') if interrupted else total}\n")
     completed = False
+    # T4.65: --mtp routes chat completions through MTP speculative decoding when the loaded model actually
+    # has an mtp_head (Transformer.from_gguf under MTP=1) -- absent either condition, this is model.generate,
+    # byte-identical to before --mtp existed. speculative_generate(temperature=temperature) already picks
+    # its own greedy (temperature<=0) vs sampled (>0) path internally, so no extra branching is needed here.
+    use_spec = self.server.mtp and model.mtp_head is not None
+    gen = model.speculative_generate(ids, k=self.server.spec_k, temperature=temperature) if use_spec \
+      else model.generate(ids, temperature=temperature)
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in model.generate(ids, temperature=temperature):
+      for next_id in gen:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
@@ -186,7 +196,9 @@ class Handler(HTTPRequestHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any):
+  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
+               mtp:bool=False, spec_k:int=SPEC_TOKENS):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
+    self.mtp, self.spec_k = mtp, spec_k  # T4.65: --mtp/SPEC_TOKENS -- see Handler.run_model's use_spec
     self.last: tuple[str, list[int], int, list[int]]|None = None  # (rendered prompt, ids, message count, generated ids) of the last completed request
     super().__init__(server_address, Handler)

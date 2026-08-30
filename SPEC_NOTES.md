@@ -128,3 +128,80 @@ position (not just the last), so ACCEPT can slice position `m`'s hidden directly
 output instead of re-forwarding — trading one extra forward for keeping `k_eff+1` hidden states alive
 instead of 1 per VERIFY call. Also candidate for T4.66: binding `MTPHead.draft`'s `start_pos` to a
 Variable (§4) to stop paying a fresh compile per drafted position on GPU.
+
+## 6. T4.65 — logits-returning `forward(spec=True)`, sampled acceptance, serve wiring
+
+**`forward(spec=True)` now returns `(per_position_logits, last_hidden)`**, not `(per_position_argmax_ids,
+last_hidden)`. `per_position_logits` is `(B,T,vocab)` — `self.output(self.output_norm(x))` over the whole
+(unsliced) `x`, unchanged from what T4.64 already computed there except the trailing `.argmax(-1)` is gone.
+No `.contiguous()` needed on it (unlike `x[:, -1:]`, which still needs one — see §3): it's a fresh matmul
+over the whole `x`, real computed output that owns its buffer, the same reason `tok_all` never needed one
+either. `forward()` itself still only ever traces greedy here (`assert temperature is None` unchanged) —
+sampled acceptance is pure host-side numpy over these logits, so there's no in-graph RNG to add regardless
+of `speculative_generate`'s own `temperature`. `speculative_generate`'s greedy path (`temperature<=0`, the
+default) now derives every id by `.argmax(-1)` on the returned logits *outside* `forward()` instead of
+inside it — same computation, same values, one eager op later — so it stays token-identical to
+`generate(temperature=0.0)` and to every existing T4.64 test, unchanged. Host-sync count per iteration is
+unaffected: still exactly two `.tolist()` pulls (`chunk_ids` after DRAFT, `verify_ids` after VERIFY).
+
+**Sampled acceptance** (`temperature>0`) implements Leviathan et al., "Fast Inference from Transformers via
+Speculative Decoding" (2023). New module-level pure functions in `model.py`:
+
+- `_softmax_np(logits:np.ndarray, temperature:float) -> np.ndarray` — numerically-stable softmax in
+  float64 (host logits may be fp16/fp32; float64 gives `rng.choice`'s sum-to-1 tolerance headroom).
+- `spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng:np.random.Generator) ->
+  tuple[list[int], int]` — `q_probs` is `(k_eff, vocab)` (draft softmax per drafted position), `p_probs` is
+  `(k_eff+1, vocab)` (verify softmax per verify position, row `k_eff` being the bonus position). Accepts
+  drafted token `i` with probability `min(1, p_i[d_i]/q_i[d_i])`; at the first rejection `m`, resamples from
+  `normalize(max(0, p_m - q_m))`; on full accept, samples the bonus token from `p_{k_eff}`. Returns
+  `(accepted_ids, m)` with `len(accepted_ids) == m+1`, mirroring the greedy path's `(accepted, m)` exactly —
+  `chunk_ids[1:1+m]` is always `== draft_ids[:m]` regardless of which path produced `draft_ids`, so the
+  post-ACCEPT bookkeeping (GDN checkpoint/restore, REDO, `start_pos += m+1`, the yield loop) is **shared,
+  unbranched code** between the greedy and sampled paths — only DRAFT-id-production and the ACCEPT
+  derivation of `(accepted, m)` itself differ. Full derivation and proof sketch are in `spec_accept`'s
+  docstring; empirically verified by `test_spec_decode.py::TestSpecAccept.test_statistical_marginal_matches_p`
+  (a seeded generator, 20000 trials on a 5-token vocab, `atol=0.02` — about 7σ even at the target
+  distribution's largest entry, loose enough to never flake, tight enough to catch a wrong formula).
+
+**Why DRAFT sampling is host-side per drafted token, not batched.** Speculative sampling's proof requires
+`draft_ids[i]` to be an actual ancestral sample from `q_i`, not `argmax(q_i)` — sampling with the wrong
+mechanism breaks the marginal-equals-`p` guarantee (§ above), so the greedy path's `.argmax(-1)` swap-out
+doesn't carry over to the sampled path's draft chain. Sampling from a seeded `np.random.Generator` (required
+for testability — a device-side Gumbel-max draw, like the one `Transformer.forward`'s own non-spec path
+uses, would consume tinygrad's RNG stream instead, not this function's `rng` argument, defeating the point
+of threading a seeded one through) means the draft chain pulls one `(vocab,)` logits vector to host *per
+drafted token* instead of the greedy chain's single batched pull at the end. `# ponytail:` this trades
+`k_eff` extra host round-trips per iteration (vs. greedy's 0 extra) for keeping sampling host-side, seedable,
+and directly testable against `spec_accept`'s hand-computed cases — fine at `k`'s default (3) and the
+`temperature>0` gate, revisit only if a real serving benchmark ever shows `--mtp` sampled mode is sync-bound.
+`speculative_generate(temperature=..., rng=...)`: `temperature<=0` is greedy (byte-identical, as above);
+`temperature>0` is sampled. `rng` defaults to a fresh `np.random.default_rng()` (materialized unconditionally
+at the top of the call — negligible cost, one object per *request* not per token — so every branch can rely
+on it being non-`None` without per-branch `assert`s or `Optional` plumbing). **Sampled output is
+distribution-equal to `generate(temperature=t)` but not sequence-equal** to any one `generate()` run — it's
+a different, independently-valid sample from the same distribution, verified statistically (above), not
+reproduced token-for-token; `test_spec_decode.py`'s sampled end-to-end test therefore checks *state*
+integrity (KV/GDN cache, `_cached_tokens`) via a from-scratch-model comparison, not token equality (see
+`test_sampled_state_integrity_continues_like_a_fresh_generate`'s docstring).
+
+**serve.py wiring.** `LLMServer.__init__` gains `mtp:bool=False, spec_k:int=SPEC_TOKENS` (`SPEC_TOKENS =
+getenv("SPEC_TOKENS", 3)`, module-level in `serve.py`), stored as `self.mtp`/`self.spec_k`. `cli.py` gains a
+`--mtp` store-true flag, threaded through as `LLMServer(..., mtp=args.mtp)` (`spec_k` uses `LLMServer`'s own
+`SPEC_TOKENS`-derived default — no separate cli.py plumbing needed). `Handler.run_model`'s routing condition
+(exact):
+
+```python
+use_spec = self.server.mtp and model.mtp_head is not None
+gen = model.speculative_generate(ids, k=self.server.spec_k, temperature=temperature) if use_spec \
+  else model.generate(ids, temperature=temperature)
+```
+
+`temperature` is already `float(body.get("temperature", 0.0))` from `do_POST`, so a request with no/zero
+temperature takes `speculative_generate`'s greedy path and one with `temperature>0` takes its sampled path —
+no separate greedy/sampled branch is needed in `serve.py` itself, `speculative_generate` already picks.
+Absent `--mtp`, or present but `model.mtp_head is None`, `use_spec` is `False` and behavior is byte-identical
+to pre-T4.65 serving (this is exactly what `test/null/test_llm_server_mtp.py`'s `TestLLMServerMTPFallback`
+gates). The splice/`_cached_tokens` path (`splice_ids`, `self.server.last`) is untouched by any of this —
+both generators mutate the same `tokens`/`self._cached_tokens` the same way (`speculative_generate` already
+mirrored `generate()`'s bookkeeping exactly since T4.64), so which one produced a given turn's tokens is
+invisible to it.

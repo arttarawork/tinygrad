@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import Mock
+import numpy as np
 from tinygrad import Tensor
 from tinygrad.helpers import Context
-from tinygrad.llm.model import Transformer
+from tinygrad.llm.model import Transformer, spec_accept
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB
 
 # T4.64: speculative_generate must be TOKEN-IDENTICAL to generate(temperature=0.0) regardless of draft
@@ -98,6 +100,105 @@ class TestSpeculativeGenerate(unittest.TestCase):
 
         full_ref = _run(_load(seed=seed), prompt, 30, spec=False)
         self.assertEqual(got_first + got_second, full_ref, f"{k=} {seed=} {prompt=}")
+
+  def test_sampled_state_integrity_continues_like_a_fresh_generate(self):
+    # T4.65: temperature>0 output isn't reference-comparable token-for-token (it's genuinely random), but
+    # the STATE speculative_generate leaves behind must be exactly as if the sampled tokens had really been
+    # part of the prompt all along. Verified by comparing a follow-up greedy generate() (continuing model_a
+    # in place -- exercising the KV/GDN-cache-reuse path) against a from-scratch greedy generate() on a
+    # FRESH model with the same weights (same seed), given the resulting prefix as its prompt: if
+    # speculative_generate had left any stale/incorrect state behind, these would diverge.
+    rng = np.random.default_rng(12345)
+    for k in (1, 2, 3):
+      for seed, prompt in enumerate(PROMPTS):
+        model_a = _load(seed=seed)
+        tokens_so_far = list(prompt)
+        got_first = [v for _, v in zip(range(15), model_a.speculative_generate(tokens_so_far, k=k, temperature=1.0, rng=rng))]
+        self.assertEqual(len(got_first), 15, f"{k=} {seed=} {prompt=}")
+        self.assertTrue(all(0 <= tid < VOCAB for tid in got_first), f"{k=} {seed=} {prompt=}")
+        self.assertEqual(len(tokens_so_far), len(prompt) + 15, f"{k=} {seed=} {prompt=}")
+        # bookkeeping invariant generate() maintains too (see its own tokens.append/self._cached_tokens lines)
+        self.assertEqual(model_a._cached_tokens, tokens_so_far[:-1], f"{k=} {seed=} {prompt=}")
+
+        # snapshot BEFORE calling generate() on either model: generate() mutates its `tokens` list argument
+        # in place (appends as it yields, same as speculative_generate) -- model_a and model_b must each
+        # get their OWN copy, or model_a's own continuation would silently extend the list model_b then
+        # (wrongly) treats as its prompt.
+        prefix_snapshot = list(tokens_so_far)
+        got_second = [v for _, v in zip(range(8), model_a.generate(tokens_so_far, temperature=0.0))]
+
+        model_b = _load(seed=seed)
+        ref_continuation = [v for _, v in zip(range(8), model_b.generate(prefix_snapshot, temperature=0.0))]
+        self.assertEqual(got_second, ref_continuation, f"{k=} {seed=} {prompt=}")
+
+class TestSpecAccept(unittest.TestCase):
+  """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-
+  sampling accept/reject/resample test T4.65 wires into speculative_generate's temperature>0 path."""
+
+  def test_identical_distributions_always_accept(self):
+    # q==p exactly -> accept_prob=min(1,p/q)=1 everywhere -> ALWAYS accept, regardless of the random draw
+    # (rng.random() in [0,1) is always < 1.0). Stress it with the draw pushed right up against 1.
+    probs = np.array([0.1, 0.5, 0.1, 0.2, 0.1])
+    q_probs, p_probs = np.stack([probs, probs]), np.stack([probs, probs, probs])  # k_eff=2, +1 bonus row
+    rng = Mock()
+    rng.random = Mock(return_value=0.999999999)
+    rng.choice = Mock(return_value=4)  # only consulted for the bonus token, on full accept
+    accepted, m = spec_accept([1, 3], q_probs, p_probs, rng)
+    self.assertEqual((accepted, m), ([1, 3, 4], 2))
+    rng.choice.assert_called_once()
+    args, kwargs = rng.choice.call_args
+    self.assertEqual(args[0], 5)
+    np.testing.assert_allclose(kwargs["p"], probs)  # bonus sampled straight from p_probs[k_eff] (== probs here)
+
+  def test_excluded_token_always_rejects_with_correct_resample_support(self):
+    # q puts mass on token 0, p excludes it entirely (p[0]=0) -> ratio=0 -> ALWAYS reject regardless of the
+    # random draw (rng.random() in [0,1) is never < 0) -- and the resample distribution passed to rng.choice
+    # must equal EXACTLY normalize(max(0, p-q)), not just "excludes token 0".
+    q0 = np.array([0.5, 0.3, 0.1, 0.1, 0.0])
+    p0 = np.array([0.0, 0.4, 0.2, 0.2, 0.2])
+    q_probs, p_probs = q0[None, :], np.stack([p0, np.full(5, 0.2)])  # k_eff=1; bonus row unused here
+    rng = Mock()
+    rng.random = Mock(return_value=1e-9)  # smallest-possible draw -- still must reject (ratio is exactly 0)
+    rng.choice = Mock(return_value=4)
+    accepted, m = spec_accept([0], q_probs, p_probs, rng)
+    self.assertEqual((accepted, m), ([4], 0))
+    residual = np.clip(p0 - q0, 0, None)
+    expected = residual / residual.sum()  # the docstring's exact formula, computed independently here
+    self.assertEqual(expected[0], 0.0)  # token 0 (excluded by p) must never get resample mass
+    args, kwargs = rng.choice.call_args
+    self.assertEqual(args[0], 5)
+    np.testing.assert_allclose(kwargs["p"], expected)
+
+  def test_zero_drafts_samples_bonus_directly(self):
+    # k_eff=0 (speculative_generate's max_context boundary degrades to this, see SPEC_NOTES.md's position
+    # ledger): no drafts to test at all, straight to a bonus sample from p_probs[0] -- rng.random() (the
+    # accept test) is never even called.
+    p0 = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
+    rng = Mock()
+    rng.choice = Mock(return_value=3)
+    accepted, m = spec_accept([], np.empty((0, 5)), p0[None, :], rng)
+    self.assertEqual((accepted, m), ([3], 0))
+    rng.random.assert_not_called()
+
+  def test_statistical_marginal_matches_p(self):
+    # the theorem spec_accept's whole correctness rests on (Leviathan et al., Theorem 1): if draft_ids are
+    # drawn by ancestral sampling from q, the emitted token at that drafted position is marginally
+    # distributed as p -- REGARDLESS of q (draft quality only ever affects the accept RATE). Checked
+    # empirically over ~20k trials on a 5-token vocab, since this is exactly the guarantee the sampled
+    # speculative-decoding path (and its "distribution-equal to generate(temperature=t)" claim) relies on.
+    rng = np.random.default_rng(42)
+    q = np.array([0.10, 0.50, 0.05, 0.30, 0.05])
+    p = np.array([0.40, 0.10, 0.20, 0.05, 0.25])
+    q_probs = q[None, :]                                    # k_eff=1
+    p_probs = np.stack([p, np.full(5, 0.2)])                # + an (unused-here) valid bonus row
+    n_trials = 20000
+    counts = np.zeros(5)
+    for _ in range(n_trials):
+      d = int(rng.choice(5, p=q))                           # ancestral draft sample: d ~ q
+      accepted, _m = spec_accept([d], q_probs, p_probs, rng)
+      counts[accepted[0]] += 1                               # accepted[0] is the token AT the drafted position
+    empirical = counts / n_trials
+    np.testing.assert_allclose(empirical, p, atol=0.02)      # loose: ~7 sigma even at p's largest entry (0.40)
 
 if __name__ == '__main__':
   unittest.main()
