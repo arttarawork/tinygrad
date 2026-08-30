@@ -628,17 +628,34 @@ class Transformer:
       self._placed_devices = frozenset(Device.canonicalize(d) for d in dmap + ([experts_dev] if experts_dev is not None else []))
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # we specialize the JIT for prefill/rollout and sampled/greedy; prefill also keys on chunk_size (T4.12) --
-    # created lazily in __call__ since chunk_size isn't known until generate() picks one
-    self.jit: dict[tuple[bool, bool, int|None], Callable[..., Tensor]] = {}
+    # we specialize the JIT for prefill/rollout, sampled/greedy, and spec (T4.64); prefill also keys on
+    # chunk_size (T4.12) -- created lazily in __call__ since chunk_size isn't known until generate() picks one
+    self.jit: dict[tuple[bool, bool, int|None, bool], Callable[..., Tensor|tuple[Tensor, Tensor]]] = {}
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, Tensor]:
     # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
     for block in self.blk: x = block(x.to(block.device), start_pos)
+    if spec:
+      # T4.64: speculative_generate's verify/prefill-tail path needs (a) the greedy id at EVERY position (to
+      # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
+      # hidden state at the last position (to seed the next draft chain -- the same `x[:, -1:]` the default path
+      # below slices before norm+head). Applying output_norm+output to every position instead of just the last
+      # is strictly more work, never less, and this whole branch is behind a flag every EXISTING caller leaves
+      # False -- so the default path below stays byte-for-byte what it was.
+      assert temperature is None, "speculative decoding is greedy-only (see speculative_generate)"
+      # .contiguous(): x[:, -1:] is a zero-copy VIEW into x's own buffer at an offset that depends on the
+      # bound `toks` variable -- fine for the default path below, which consumes it inline in the SAME jit
+      # call that produced it, but this hidden state is carried OUT of this call (into speculative_generate's
+      # next-iteration draft) and read back only after further replays of this same jit graph have reused
+      # x's buffer for a new chunk. Without materializing it into its own buffer here (same as tok_all's
+      # argmax result already is, being real computed output rather than a view), that later read sees
+      # whatever the intervening replays overwrote instead of this call's own hidden state -- confirmed by
+      # a byte-level cache_kv diff between with/without .contiguous() on this line (see SPEC_NOTES.md).
+      return self.output(self.output_norm(x)).argmax(-1), x[:, -1:].contiguous()  # (B,T) ids, (B,1,D) hidden
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
@@ -647,16 +664,18 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None) -> Tensor:
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, Tensor]:
     is_prefill = bool(resolve(tokens.shape[1] != 1))
     # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
     # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
     # generate() at a different chunk_size replay a jit captured with the wrong Variable range -> JitError
     # ("args mismatch in JIT"). Decode/rollout steps feed a plain (1,1) tensor (no bound Variable, chunk_size-
     # independent), so only the prefill variants need the extra key; None keeps the rollout jit singular.
+    # T4.64: `spec` also joins the key -- it picks a python branch inside forward() that changes the traced
+    # graph (and its return arity), so a spec=True call must never replay a spec=False capture or vice versa.
     chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
-    return self.jit.setdefault((is_prefill, temperature is None, chunk_size), TinyJit(self.forward))(
-      tokens.contiguous(), start_pos, temperature)
+    return self.jit.setdefault((is_prefill, temperature is None, chunk_size, spec), TinyJit(self.forward))(
+      tokens.contiguous(), start_pos, temperature, spec)
 
   def realize_placement(self):
     """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --
@@ -888,7 +907,7 @@ class Transformer:
     while virtual_len < self.max_context:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      out = cast(Tensor, self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp)).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < virtual_len: continue
@@ -914,3 +933,140 @@ class Transformer:
           self._cached_tokens = tokens[:-1]
           yield tokens[-1]
         pending = []
+
+  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int=32):
+    """T4.64: greedy-only MTP speculative decoding -- TOKEN-IDENTICAL to generate(temperature=0.0), just
+    drafting up to `k` tokens per iteration via self.mtp_head and verifying all of them in one extra
+    main-model forward instead of paying one forward per token. See SPEC_NOTES.md for the full position
+    ledger and the causal-mask argument for why neither the main model's nor the MTP block's attention KV
+    cache ever needs a snapshot/restore -- only the main model's GatedDeltaNet state does.
+
+    Mirrors generate()'s own bookkeeping exactly (the `tokens` list, self._cached_tokens, one token
+    yielded at a time) -- generate() itself is untouched by this; see Transformer.__call__'s optional
+    `spec=` return path. No sampled acceptance here (that's T4.65): every model call below passes
+    temperature=None, the same greedy trigger generate(temperature=0.0) already normalizes to.
+    """
+    assert self.mtp_head is not None, "speculative_generate needs an MTP-enabled model (Transformer.from_gguf under MTP=1)"
+    assert k >= 1, "k=0 has nothing to draft -- use generate() directly"
+    assert len(tokens) < self.max_context, \
+      f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
+      "-- raise it via Transformer.from_gguf(max_context=...)"
+    # T4.55: same recurrent-chunk cap generate() applies (see there); then widen so the verify/re-forward
+    # chunk (1..k+1 tokens) fits inside the SAME v_toks bound as the prefill chunks below -- one shared
+    # Variable, one JIT capture per (is_prefill, spec) pair reused at every length, instead of one capture
+    # per distinct length (which would also crash: see SPEC_NOTES.md's JIT-shape section).
+    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
+      chunk_size = min(chunk_size, gdn_chunk_for(self.token_embd.weight.device))
+    chunk_size = max(chunk_size, k + 1)
+    gdn_blocks = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
+    dev = self.blk[0].device
+
+    v_start_pos = UOp.variable("start_pos", 0, self.max_context - 1)
+    v_toks = UOp.variable("toks", 1, chunk_size)
+
+    # --- prefill: identical mechanics to generate() (same kind of v_start_pos/v_toks vars, same
+    # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
+    # modified; this is a self-contained copy of just its chunking loop, small enough not to be worth
+    # threading through a shared helper. Only the FINAL chunk asks for spec=True, to also recover the
+    # pre-norm hidden state at the last prompt position (h_last) beside the sampled token (tok_last).
+    prompt_len = len(tokens)
+    t = Tensor(tokens + [0] * (self.max_context - prompt_len), dtype="int32", device=dev).reshape(1, self.max_context)
+    start_pos = self.get_start_pos(tokens)
+    tok_all: Tensor|None = None
+    h_last: Tensor|None = None
+    while start_pos < prompt_len:
+      n_toks = min(chunk_size, prompt_len - start_pos)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      if start_pos + n_toks >= prompt_len:
+        tok_all, h_last = cast(tuple[Tensor, Tensor], self(t[:, sp:sp + nt], sp, None, spec=True))
+      else:
+        cast(Tensor, self(t[:, sp:sp + nt], sp, None, spec=False)).realize()
+      start_pos += n_toks
+    # get_start_pos always returns < prompt_len (a fresh/attention model can reuse at most prompt_len-1
+    # positions -- tokens[:-1] -- and a recurrent one's cache-hit branch requires it strictly), so the loop
+    # above always runs >=1 time and both are set; the assert is only for mypy's narrowing.
+    assert tok_all is not None and h_last is not None
+    tok_last = tok_all[:, -1:]  # (B,1): sampled token predicting the first post-prompt position
+    # this is exactly the token generate() itself would yield first (its own last-prefill-chunk sample) --
+    # it's about to become chunk_ids[0]/the draft anchor below, but it's ALSO real output and must be
+    # emitted now, same as generate()'s own drain loop emits it, or every later position is off by one.
+    tokens.append(int(tok_last.item()))
+    self._cached_tokens = tokens[:-1]
+    yield tokens[-1]
+
+    while len(tokens) < self.max_context:
+      k_eff = min(k, self.max_context - 1 - len(tokens))
+
+      # (a) DRAFT: chain mtp_head.draft k_eff times. h_last is reused UNCHANGED across the whole chain --
+      # MTPHead.draft's signature only takes one hidden-state argument, so it's the one anchor into the
+      # main model's context available without changing that (fixed, already-tested) signature; only
+      # tok_ids and start_pos advance per call, and `block`'s own KV cache (see MTPHead.draft's docstring)
+      # is what actually carries the chain's positional continuity from call to call. This never touches
+      # the MAIN model's state -- mtp_head.block is always attention-only, never GatedDeltaNet (see
+      # from_gguf's MTP branch) -- so drafting alone never needs the GDN checkpoint below; only verify does.
+      # Draft quality has zero effect on correctness (see the forced-mismatch test in test_spec_decode.py);
+      # a richer per-step hidden (threading the block's own pre-norm output between calls) is a quality-only
+      # lever for later, not something this task's gate depends on.
+      dtok, dpos = tok_last, start_pos
+      draft_tensors: list[Tensor] = []
+      for _ in range(k_eff):
+        dtok = self.mtp_head.draft(self, h_last, dtok, dpos).argmax(-1)  # (B,1)
+        draft_tensors.append(dtok)
+        dpos += 1
+      # one host round-trip for tok_last + every drafted id (mirrors generate()'s own batched-drain sync
+      # a few lines up) -- chunk_ids[0] is tok_last (already-confirmed real), chunk_ids[1:] are the drafts.
+      chunk_ids: list[int] = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
+      n = len(chunk_ids)  # k_eff + 1
+
+      # (b) CHECKPOINT: GatedDeltaNet conv/recurrent state is a single read-modify-written accumulator, not
+      # a position-indexed cache -- once the verify forward below mixes a wrong draft token into it there is
+      # no slice to discard, the mixing is irreversible (unlike attention KV, see the mask argument in
+      # SPEC_NOTES.md). Snapshot it device-side (one batched realize) so a partial accept can restore it.
+      gdn_snap = [(b, b.conv_state.clone(), b.recurrent_state.clone()) for b in gdn_blocks]
+      if gdn_snap: Tensor.realize(*(s for _, c, r in gdn_snap for s in (c, r)))
+
+      # (c) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
+      # start_pos, returning the per-position greedy id (what the real model says comes next from every one
+      # of those positions) plus the hidden state at the chunk's last position.
+      buf = Tensor(chunk_ids + [0] * (chunk_size - n), dtype="int32", device=dev).reshape(1, chunk_size)
+      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n)
+      verify_tok, verify_h = cast(tuple[Tensor, Tensor], self(buf[:, :nt], sp, None, spec=True))
+      # verify_tok's own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
+      # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
+      # TestCausalMask.test_symbolic_shapes in test_attention.py for the same pad-then-slice idiom): pad up
+      # to the fixed chunk_size buffer width first, then take just the first n (live) values back on host.
+      verify_ids: list[int] = cast(list[list[int]], verify_tok.pad_to((1, chunk_size)).tolist())[0][:n]  # verify_ids[i] predicts start_pos+1+i
+
+      # (d) ACCEPT: verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to
+      # draft d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
+      # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
+      # matching prefix, 0..k_eff.
+      m = 0
+      while m < k_eff and chunk_ids[m + 1] == verify_ids[m]: m += 1
+      accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
+      tok_last = verify_tok[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
+
+      if m == k_eff:
+        # full accept: every input verify saw (tok_last, d0..d_{k_eff-1}) really was correct, so its forward
+        # legitimately advanced every state through position start_pos+k_eff -- nothing to roll back, and
+        # its own last-position hidden IS the next h_last.
+        h_last = verify_h
+      else:
+        # partial accept: verify's forward also advanced state through the wrong tokens d_m..d_{k_eff-1}.
+        # Roll GDN back to before this call and redo exactly the m+1 confirmed-correct tokens as one chunk
+        # to rebuild the true state and get the next h_last. Attention KV needs no restore for the same
+        # reason it never needed a snapshot: this redo overwrites positions [start_pos, start_pos+m+1) with
+        # the SAME values verify already wrote there (a harmless recompute), and the discarded wrong
+        # positions start_pos+m+1..start_pos+k_eff are never read before the next iteration overwrites them
+        # too. This re-forward is the v1 cost T4.66 would remove (see SPEC_NOTES.md).
+        if gdn_snap: Tensor.realize(*(x for b, c, r in gdn_snap for x in (b.conv_state.assign(c), b.recurrent_state.assign(r))))
+        redo_ids = chunk_ids[:m + 1]
+        buf2 = Tensor(redo_ids + [0] * (chunk_size - len(redo_ids)), dtype="int32", device=dev).reshape(1, chunk_size)
+        sp2, nt2 = v_start_pos.bind(start_pos), v_toks.bind(len(redo_ids))
+        _, h_last = cast(tuple[Tensor, Tensor], self(buf2[:, :nt2], sp2, None, spec=True))
+
+      start_pos += m + 1
+      for v in accepted:
+        tokens.append(v)
+        self._cached_tokens = tokens[:-1]
+        yield tokens[-1]
