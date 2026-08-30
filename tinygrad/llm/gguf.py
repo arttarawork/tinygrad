@@ -254,7 +254,11 @@ def _gguf_parse(tensor: Tensor, device_map:str|dict[int|str,str]|None=None) -> t
         if not name.startswith("blk."): return dmap[0] if name == "token_embd.weight" else dmap[-1]
         if experts_dev is not None and any(f".ffn_{w}_exps." in name for w in ("gate", "up", "down")): return experts_dev
         idx = int(name.split(".", 2)[1])
-        return dmap[idx] if idx < len(dmap) else dmap[-1]  # e.g. qwen3.6's unreferenced MTP nextn block
+        # the MTP nextn block beyond num_blocks: unreferenced when model.py's MTP=0 (default) -- dropped
+        # after load with a warning -- but consumed into Transformer.mtp_head when MTP=1 (T4.63). Either
+        # way it lands on the LAST block's device: model.py's MTP=1 path places mtp_head there too (see
+        # from_gguf), so this clamp already stages its blob exactly where that load will look for it.
+        return dmap[idx] if idx < len(dmap) else dmap[-1]
       dev_for = _dev_for
 
   # sort by on-disk offset and greedily merge adjacent tensors (bounded by _STAGE_BATCH, and -- when
