@@ -205,7 +205,7 @@ jobs:
   unittest:
     name: Unit Tests
     runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
     - name: Checkout Code
@@ -242,7 +242,7 @@ jobs:
         group: [1, 2]
     name: SPEC=2 (${{ matrix.group }})
     runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
     - name: Checkout Code
       uses: actions/checkout@v6
