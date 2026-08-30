@@ -323,29 +323,37 @@ class TestGatedDeltaNetHeadGroups(unittest.TestCase):
     with Context(GDN_HEAD_GROUPS=groups): out = block._attention(x_norm, start_pos).realize().numpy()
     return out
 
-  def test_head_groups_match_g1_exactly(self):
-    for num_v_heads in (32, 48):  # 32: even split at G=2/3; 48: even at G=2, uneven (16,16,16 vs 11,11,10) at G=3
-      config = self._make_config(num_v_heads)
-      for chunk in (1, 4, 32):
-        for groups in (2, 3):
-          block1, blockN = self._make_block(config), self._make_block(config)  # identical deterministic weights
-          x = self._tensor_linspace(-0.5, 0.5, (1, chunk, config.dim))
-          out1, outN = self._attend(block1, x, 0, 1), self._attend(blockN, x, 0, groups)
-          np.testing.assert_array_equal(outN, out1, err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill output")
-          np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
-                                        err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill state")
-
-          # start_pos>0 continuation: state carried from the prefill above must keep matching exactly
-          x2 = self._tensor_linspace(0.3, -0.3, (1, chunk, config.dim))
-          out1b, outNb = self._attend(block1, x2, chunk, 1), self._attend(blockN, x2, chunk, groups)
-          np.testing.assert_array_equal(outNb, out1b, err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation output")
-          np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
-                                        err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation state")
+  def _check_match_g1(self, num_v_heads:int, chunk:int, groups:int):
+    config = self._make_config(num_v_heads)
+    block1, blockN = self._make_block(config), self._make_block(config)  # identical deterministic weights
+    x = self._tensor_linspace(-0.5, 0.5, (1, chunk, config.dim))
+    out1, outN = self._attend(block1, x, 0, 1), self._attend(blockN, x, 0, groups)
+    np.testing.assert_array_equal(outN, out1, err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill output")
+    np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
+                                  err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill state")
+    # start_pos>0 continuation: state carried from the prefill above must keep matching exactly
+    x2 = self._tensor_linspace(0.3, -0.3, (1, chunk, config.dim))
+    out1b, outNb = self._attend(block1, x2, chunk, 1), self._attend(blockN, x2, chunk, groups)
+    np.testing.assert_array_equal(outNb, out1b, err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation output")
+    np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
+                                  err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation state")
 
   def test_auto_picks_g1_at_32_heads_g2_at_48(self):
     with Context(GDN_HEAD_GROUPS=0):
       self.assertEqual(gdn_head_groups_for(32), 1)
       self.assertEqual(gdn_head_groups_for(48), 2)
+
+# T4.62 CI fix: the original single test method ran all 12 (H, chunk, groups) combos -- 48 heavy unrolled-scan
+# graph builds -- in one test; CI's xdist worker crashed natively partway through (deep _PyEval frames = C-stack/
+# resource blowout; not reproducible serially or under -n 2 locally). One generated method per combo caps the
+# per-test peak and makes any recurrence name its exact combo. 32: even split at G=2/3; 48: even at G=2,
+# uneven (11,11,10... vs 16,16,16) at G=3.
+for _hg_h in (32, 48):
+  for _hg_c in (1, 4, 32):
+    for _hg_g in (2, 3):
+      def _hg_test(self, _h=_hg_h, _c=_hg_c, _g=_hg_g): self._check_match_g1(_h, _c, _g)
+      _hg_test.__name__ = f"test_match_g1_h{_hg_h}_c{_hg_c}_g{_hg_g}"
+      setattr(TestGatedDeltaNetHeadGroups, _hg_test.__name__, _hg_test)
 
 class TestPairwiseTopk(unittest.TestCase):
   def test_basic_topk(self):
