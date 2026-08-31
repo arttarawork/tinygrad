@@ -146,7 +146,7 @@ class FallbackTemplate:
       out += self.end_turn()
     return out + self.role("assistant") if add_generation_prompt else out
 
-from tinygrad.llm.serve import LLMServer
+from tinygrad.llm.serve import LLMServer, STATE_CACHE_MB
 
 def main():
   parser = argparse.ArgumentParser()
@@ -157,6 +157,9 @@ def main():
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--mtp", action="store_true", help="Route chat completions through MTP speculative decoding "
                        "(needs MTP=1 at load time so the model actually has an mtp_head; k is the SPEC_TOKENS env var, default 3)")
+  parser.add_argument("--state-cache", action="store_true", help="Cache each request's post-prefill sequence state "
+                       "(KV/recurrent) so a later request whose tokens exactly extend an earlier one only prefills "
+                       "the new tail, even across sessions (size: STATE_CACHE_MB env var, default 2048 MB)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
@@ -195,7 +198,8 @@ def main():
     # SIGTERM is the documented stop: make it a normal exit so atexit -> Device.finalize() (the GSP unload on NV) runs;
     # python's default disposition would skip it
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    LLMServer(('', args.serve), model, model_name, tok, template, mtp=args.mtp).serve_forever()
+    LLMServer(('', args.serve), model, model_name, tok, template, mtp=args.mtp,
+              state_cache_mb=STATE_CACHE_MB if args.state_cache else 0).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
