@@ -3,6 +3,7 @@ from unittest.mock import Mock
 import numpy as np
 from tinygrad import Tensor
 from tinygrad.helpers import Context
+from tinygrad.schedule import schedule_cache
 from tinygrad.llm.model import Transformer, spec_accept
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB
 
@@ -80,7 +81,10 @@ class TestSpeculativeGenerate(unittest.TestCase):
         def fake_draft(owner, h, tok_ids, start_pos, _ref=ref_tokens):
           nonlocal calls
           calls += 1
-          return _wrong_logits(_ref[start_pos + 1])  # "wrong" only in name -- here it's the true next token
+          # T4.66: speculative_generate now passes a bound Variable here, not a plain int (see SPEC_NOTES.md
+          # §4) -- unbind() recovers the concrete position for this host-side lookup either way.
+          pos = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
+          return _wrong_logits(_ref[pos + 1])  # "wrong" only in name -- here it's the true next token
 
         model = _load(seed=seed)
         model.mtp_head.draft = fake_draft
@@ -89,6 +93,25 @@ class TestSpeculativeGenerate(unittest.TestCase):
         self.assertEqual(got, ref[:N_GEN], f"{k=} {seed=} {prompt=}")
         expected_iters = -(-N_GEN // (k + 1))  # ceil(N_GEN / (k+1))
         self.assertEqual(calls, k * expected_iters, f"{k=} {seed=} {prompt=}")
+
+  def test_draft_reuses_schedule_across_positions(self):
+    # T4.66: a drafted position never repeats across a speculative_generate() run. Before this task,
+    # MTPHead.draft's start_pos reached it as a plain python int (dpos) -- see SPEC_NOTES.md's old §4 --
+    # so every DRAFT call baked a fresh literal into mtp_head.block's @function(precompile=True) trace,
+    # growing tinygrad's schedule/program caches without bound over a long generation (confirmed by
+    # temporarily reverting the fix locally: schedule_cache grew by a steady +2 EVERY subsequent token,
+    # 7 -> 72 over 30 tokens on this same tiny model/settings, never stabilizing -- vs. the fixed code's
+    # 7 -> 17 -> 19 then flat for the remaining 27). speculative_generate now binds start_pos to a
+    # Variable (v_draft_pos) instead, so the SAME compiled schedule replays at every drafted position --
+    # this test fails on the old int-path behavior and passes on the fixed one.
+    model = _load(seed=0, max_context=64)
+    gen = model.speculative_generate([1, 2, 3], k=2)
+    list(zip(range(4), gen))  # warm up: prefill plus this run's first drafted/verified/(maybe) redone shapes
+    size_after_warmup = len(schedule_cache)
+    list(zip(range(20), gen))  # 20 more tokens' worth of draft/verify/redo at positions never seen before
+    self.assertEqual(size_after_warmup, len(schedule_cache),
+      f"drafting at new positions added {len(schedule_cache) - size_after_warmup} schedule cache entries "
+      "(expected 0 -- MTPHead.draft's start_pos must replay one compiled schedule, not retrace per position)")
 
   def test_state_integrity_continues_like_a_fresh_generate(self):
     # after speculative_generate stops (mid- or between-iteration), a plain generate() on the SAME model
