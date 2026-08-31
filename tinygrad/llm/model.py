@@ -1,7 +1,10 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
-from typing import Callable, cast
+from typing import Callable, cast, TYPE_CHECKING
+if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays numpy-free at import time -- the minimal
+# CI lanes (Test LLM, SPEC=2) have no numpy installed. The sampled speculative path imports it lazily inside the
+# functions that actually need it; annotations are lazy via `from __future__ import annotations`.
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
@@ -623,6 +626,56 @@ class MTPHead:
     x = self.block(x, start_pos)
     return owner.output(self.shared_head_norm(x).to(owner.output.weight.device))
 
+def _softmax_np(logits:np.ndarray, temperature:float) -> np.ndarray:
+  """Numerically-stable softmax(logits/temperature), float64. speculative_generate's sampled path (T4.65)
+  pulls model logits to host and does all its acceptance math in numpy (the vectors are tiny -- at most
+  k_eff+1 rows of vocab_size floats per iteration); float64 gives rng.choice's sum-to-1 tolerance headroom
+  a fp16/fp32 model output doesn't reliably leave it."""
+  import numpy as np
+  z = logits.astype(np.float64) / temperature
+  z = z - z.max(axis=-1, keepdims=True)
+  e = np.exp(z)
+  return e / e.sum(axis=-1, keepdims=True)
+
+def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng:np.random.Generator) -> tuple[list[int], int]:
+  """Leviathan et al. ("Fast Inference from Transformers via Speculative Decoding", 2023) speculative-sampling
+  accept/resample test -- pure, host-side (numpy; see _softmax_np), used by speculative_generate's
+  temperature>0 path (T4.65 -- see SPEC_NOTES.md §6 for how this wires into the position ledger).
+
+  draft_ids: the k_eff drafted token ids. THE CALLER must have drawn them by ancestral sampling from
+  q_probs (draft_ids[i] ~ q_probs[i]) -- this function only implements the accept/reject/resample test; the
+  distribution-preservation proof below assumes, but does not check, that draft_ids came from q_probs.
+  q_probs: (k_eff, vocab) draft softmax at each drafted position, softmax(draft_logits/temperature).
+  p_probs: (k_eff+1, vocab) verify (main-model) softmax at each of the k_eff+1 verify positions,
+  softmax(verify_logits/temperature) -- row k_eff is the "bonus" position, sampled only on full accept.
+
+  Returns (accepted_ids, m): m in 0..k_eff is how many drafted tokens were accepted; accepted_ids has length
+  m+1 (== draft_ids[:m] + one more token): on full accept (m==k_eff) that extra token is a fresh sample from
+  p_probs[k_eff] (the bonus position); on rejection at position m (m<k_eff) it's a resample from
+  normalize(max(0, p_probs[m]-q_probs[m])) (the "residual" distribution) instead of the rejected draft_ids[m].
+
+  Proof this reproduces p exactly (Leviathan et al., Theorem 1): accept x with probability min(1,p(x)/q(x)),
+  so P(emit x, accepted) = q(x)*min(1,p(x)/q(x)) = min(p(x),q(x)). P(reject) = 1 - sum_y min(p(y),q(y)), and
+  sum_y max(0,p(y)-q(y)) = sum_y [p(y) - min(p(y),q(y))] = 1 - sum_y min(p(y),q(y)) = P(reject) too, so
+  normalize(max(0,p-q)) is a valid distribution and P(emit x, rejected) = P(reject) * max(0,p(x)-q(x))/P(reject)
+  = max(0,p(x)-q(x)). Total: P(emit x) = min(p(x),q(x)) + max(0,p(x)-q(x)) = p(x) (either p(x)<=q(x), giving
+  p(x)+0, or p(x)>q(x), giving q(x)+(p(x)-q(x))) -- true for every x regardless of q, which is why draft
+  quality only ever affects the acceptance RATE, never correctness. test_spec_decode.py's statistical test
+  checks this empirically since it's the theorem the whole sampled path's correctness rests on."""
+  import numpy as np
+  assert q_probs.shape[0] == len(draft_ids) and p_probs.shape[0] == len(draft_ids) + 1, "q_probs/p_probs row count must match draft_ids"
+  k_eff = len(draft_ids)
+  for m in range(k_eff):
+    d = draft_ids[m]
+    accept_prob = min(1.0, p_probs[m, d] / max(q_probs[m, d], 1e-12))
+    if rng.random() < accept_prob: continue
+    residual = np.clip(p_probs[m] - q_probs[m], 0, None)
+    total = residual.sum()
+    correction = int(rng.choice(len(residual), p=residual / total)) if total > 0 else int(np.argmax(p_probs[m]))
+    return draft_ids[:m] + [correction], m
+  bonus = int(rng.choice(p_probs.shape[1], p=p_probs[k_eff]))
+  return draft_ids + [bonus], k_eff
+
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
@@ -671,22 +724,32 @@ class Transformer:
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
     for block in self.blk: x = block(x.to(block.device), start_pos)
     if spec:
-      # T4.64: speculative_generate's verify/prefill-tail path needs (a) the greedy id at EVERY position (to
+      # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
       # hidden state at the last position (to seed the next draft chain -- the same `x[:, -1:]` the default path
       # below slices before norm+head). Applying output_norm+output to every position instead of just the last
       # is strictly more work, never less, and this whole branch is behind a flag every EXISTING caller leaves
       # False -- so the default path below stays byte-for-byte what it was.
-      assert temperature is None, "speculative decoding is greedy-only (see speculative_generate)"
+      # T4.65: this used to return the per-position ARGMAX id (greedy-only). It now returns the raw per-position
+      # LOGITS instead -- speculative_generate derives the greedy id from them (argmax, moved to the caller,
+      # same value either way) and, for its sampled-acceptance path (temperature>0), the full softmax
+      # distributions Leviathan et al.'s accept/resample test needs (see spec_accept below, SPEC_NOTES.md §6).
+      # forward() itself still never samples here: it always traces greedy (enforced by the assert below), since
+      # sampled acceptance is pure host-side numpy math over these logits -- no RNG kernel to capture either way.
+      assert temperature is None, "spec=True always traces greedy -- speculative_generate's sampled path (T4.65) " \
+        "computes acceptance host-side from these logits, it never needs forward() itself to sample"
+      # no .contiguous() on the logits (unlike x[:, -1:] below): self.output(...) is a fresh matmul over the
+      # whole (unsliced) x, real computed output that owns its buffer, not a view into a larger scratch buffer
+      # -- same reasoning SPEC_NOTES.md §3 already gives for why the old argmax result never needed this either.
       # .contiguous(): x[:, -1:] is a zero-copy VIEW into x's own buffer at an offset that depends on the
       # bound `toks` variable -- fine for the default path below, which consumes it inline in the SAME jit
       # call that produced it, but this hidden state is carried OUT of this call (into speculative_generate's
       # next-iteration draft) and read back only after further replays of this same jit graph have reused
-      # x's buffer for a new chunk. Without materializing it into its own buffer here (same as tok_all's
-      # argmax result already is, being real computed output rather than a view), that later read sees
-      # whatever the intervening replays overwrote instead of this call's own hidden state -- confirmed by
-      # a byte-level cache_kv diff between with/without .contiguous() on this line (see SPEC_NOTES.md).
-      return self.output(self.output_norm(x)).argmax(-1), x[:, -1:].contiguous()  # (B,T) ids, (B,1,D) hidden
+      # x's buffer for a new chunk. Without materializing it into its own buffer here (same as the logits
+      # already are, being real computed output rather than a view), that later read sees whatever the
+      # intervening replays overwrote instead of this call's own hidden state -- confirmed by a byte-level
+      # cache_kv diff between with/without .contiguous() on this line (see SPEC_NOTES.md).
+      return self.output(self.output_norm(x)), x[:, -1:].contiguous()  # (B,T,vocab) logits, (B,1,D) hidden
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
@@ -965,23 +1028,46 @@ class Transformer:
           yield tokens[-1]
         pending = []
 
-  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int=32):
-    """T4.64: greedy-only MTP speculative decoding -- TOKEN-IDENTICAL to generate(temperature=0.0), just
-    drafting up to `k` tokens per iteration via self.mtp_head and verifying all of them in one extra
-    main-model forward instead of paying one forward per token. See SPEC_NOTES.md for the full position
-    ledger and the causal-mask argument for why neither the main model's nor the MTP block's attention KV
-    cache ever needs a snapshot/restore -- only the main model's GatedDeltaNet state does.
+  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int=32, temperature:float=0.0,
+                            rng:np.random.Generator|None=None):
+    """T4.64/T4.65: MTP speculative decoding -- drafts up to `k` tokens per iteration via self.mtp_head and
+    verifies all of them in one extra main-model forward instead of paying one forward per token. See
+    SPEC_NOTES.md for the full position ledger, the causal-mask argument for why neither the main model's
+    nor the MTP block's attention KV cache ever needs a snapshot/restore (only the main model's GatedDeltaNet
+    state does), and §6 for the sampled-acceptance math this docstring summarizes.
+
+    temperature<=0 (the default): TOKEN-IDENTICAL to generate(temperature=0.0) -- every verify id is a plain
+    argmax over forward(spec=True)'s per-position logits, exactly reproducing T4.64's behavior (which used to
+    compute that same argmax INSIDE forward() -- see forward()'s spec branch). Draft quality never affects
+    correctness here, only how many iterations it takes (see test_spec_decode.py's forced-mismatch/
+    forced-perfect tests).
+
+    temperature>0 (T4.65): distribution-preserving SAMPLED speculative decoding (Leviathan et al., "Fast
+    Inference from Transformers via Speculative Decoding", 2023 -- see spec_accept). Draft tokens are drawn
+    by ancestral sampling from the draft model's own softmax(logits/temperature) ("q"), then accepted or
+    resampled against the main model's softmax(logits/temperature) ("p") so the marginal distribution of
+    every emitted token equals p exactly (test_spec_decode.py verifies this empirically -- it's the theorem
+    the whole path relies on). The output is distribution-equal to generate(temperature=t) but NOT
+    sequence-equal to any particular generate() run -- it's a different (also p-distributed) sample, not a
+    reproduction. `rng` defaults to a fresh np.random.default_rng() when omitted; pass a seeded one for
+    reproducible/testable sampling.
 
     Mirrors generate()'s own bookkeeping exactly (the `tokens` list, self._cached_tokens, one token
     yielded at a time) -- generate() itself is untouched by this; see Transformer.__call__'s optional
-    `spec=` return path. No sampled acceptance here (that's T4.65): every model call below passes
-    temperature=None, the same greedy trigger generate(temperature=0.0) already normalizes to.
+    `spec=` return path.
     """
     assert self.mtp_head is not None, "speculative_generate needs an MTP-enabled model (Transformer.from_gguf under MTP=1)"
     assert k >= 1, "k=0 has nothing to draft -- use generate() directly"
     assert len(tokens) < self.max_context, \
       f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
       "-- raise it via Transformer.from_gguf(max_context=...)"
+    # temperature<=0 is greedy, same convention generate() itself uses (see there). rng is unused on that
+    # path but still materialized here unconditionally (cheap -- one object per REQUEST, not per token) so
+    # every branch below can rely on it being a concrete Generator, never None (mypy narrows this cleanly;
+    # threading `rng: Generator|None = None` through per-branch asserts instead would be more code for it).
+    greedy = temperature <= 0
+    import numpy as np  # lazy (function-local): the numpy-less CI lanes import this MODULE but never call this method
+    if rng is None: rng = np.random.default_rng()
     # T4.55: same recurrent-chunk cap generate() applies (see there); then widen so the verify/re-forward
     # chunk (1..k+1 tokens) fits inside the SAME v_toks bound as the prefill chunks below -- one shared
     # Variable, one JIT capture per (is_prefill, spec) pair reused at every length, instead of one capture
@@ -999,7 +1085,7 @@ class Transformer:
     # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
     # modified; this is a self-contained copy of just its chunking loop, small enough not to be worth
     # threading through a shared helper. Only the FINAL chunk asks for spec=True, to also recover the
-    # pre-norm hidden state at the last prompt position (h_last) beside the sampled token (tok_last).
+    # pre-norm hidden state at the last prompt position (h_last) beside the per-position logits.
     prompt_len = len(tokens)
     t = Tensor(tokens + [0] * (self.max_context - prompt_len), dtype="int32", device=dev).reshape(1, self.max_context)
     start_pos = self.get_start_pos(tokens)
@@ -1017,10 +1103,17 @@ class Transformer:
     # positions -- tokens[:-1] -- and a recurrent one's cache-hit branch requires it strictly), so the loop
     # above always runs >=1 time and both are set; the assert is only for mypy's narrowing.
     assert tok_all is not None and h_last is not None
-    tok_last = tok_all[:, -1:]  # (B,1): sampled token predicting the first post-prompt position
-    # this is exactly the token generate() itself would yield first (its own last-prefill-chunk sample) --
-    # it's about to become chunk_ids[0]/the draft anchor below, but it's ALSO real output and must be
-    # emitted now, same as generate()'s own drain loop emits it, or every later position is off by one.
+    anchor_logits = tok_all[:, -1:, :]  # (B,1,vocab): forward(spec=True) returns logits now, not ids (T4.65)
+    # the first post-prompt token: no draft/accept here, it's a plain (greedy or sampled) draw from the real
+    # model's own distribution -- exactly the token generate() itself would yield first (its own
+    # last-prefill-chunk sample). It's about to become chunk_ids[0]/the draft anchor below, but it's ALSO
+    # real output and must be emitted now, same as generate()'s own drain loop emits it, or every later
+    # position is off by one.
+    if greedy:
+      tok_last = anchor_logits.argmax(-1)  # (B,1)
+    else:
+      anchor_probs = _softmax_np(anchor_logits.numpy()[0, 0], temperature)  # (vocab,)
+      tok_last = Tensor([[int(rng.choice(len(anchor_probs), p=anchor_probs))]], dtype="int32", device=dev)
     tokens.append(int(tok_last.item()))
     self._cached_tokens = tokens[:-1]
     yield tokens[-1]
@@ -1038,15 +1131,38 @@ class Transformer:
       # Draft quality has zero effect on correctness (see the forced-mismatch test in test_spec_decode.py);
       # a richer per-step hidden (threading the block's own pre-norm output between calls) is a quality-only
       # lever for later, not something this task's gate depends on.
+      #
+      # T4.65 sampled path: draft_ids[i] must be an ANCESTRAL SAMPLE from q_i = softmax(draft_logits/temp),
+      # not argmax -- spec_accept's distribution-preservation proof assumes this (see its docstring). That
+      # needs the actual q_i vector on host to sample from (rng is a seeded np.random.Generator, not a
+      # device RNG, precisely so this is reproducible/testable), so the sampled chain pulls one small
+      # (vocab,) logits vector to host per drafted token instead of the greedy chain's single batched pull
+      # below. ponytail: k is small (default 3) and this only runs when temperature>0, so k_eff extra host
+      # round-trips per iteration is a fine trade for keeping the sampling host-side/seedable; revisit only
+      # if a real serving benchmark ever shows --mtp sampled mode is sync-bound.
       dtok, dpos = tok_last, start_pos
+      draft_ids: list[int] = []
       draft_tensors: list[Tensor] = []
+      q_list: list[np.ndarray] = []
       for _ in range(k_eff):
-        dtok = self.mtp_head.draft(self, h_last, dtok, dpos).argmax(-1)  # (B,1)
-        draft_tensors.append(dtok)
+        dlogits = self.mtp_head.draft(self, h_last, dtok, dpos)  # (B,1,vocab)
+        if greedy:
+          dtok = dlogits.argmax(-1)  # (B,1)
+          draft_tensors.append(dtok)
+        else:
+          q_i = _softmax_np(dlogits[:, -1, :].numpy()[0], temperature)  # (vocab,)
+          d_i = int(rng.choice(len(q_i), p=q_i))
+          draft_ids.append(d_i)
+          q_list.append(q_i)
+          dtok = Tensor([[d_i]], dtype="int32", device=dev)
         dpos += 1
-      # one host round-trip for tok_last + every drafted id (mirrors generate()'s own batched-drain sync
-      # a few lines up) -- chunk_ids[0] is tok_last (already-confirmed real), chunk_ids[1:] are the drafts.
-      chunk_ids: list[int] = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
+      chunk_ids: list[int]
+      if greedy:
+        # one host round-trip for tok_last + every drafted id (mirrors generate()'s own batched-drain sync
+        # a few lines up) -- chunk_ids[0] is tok_last (already-confirmed real), chunk_ids[1:] are the drafts.
+        chunk_ids = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
+      else:
+        chunk_ids = [int(tok_last.item())] + draft_ids  # draft_ids were already pulled to host per-step above
       n = len(chunk_ids)  # k_eff + 1
 
       # (b) CHECKPOINT: GatedDeltaNet conv/recurrent state is a single read-modify-written accumulator, not
@@ -1057,25 +1173,42 @@ class Transformer:
       if gdn_snap: Tensor.realize(*(s for _, c, r in gdn_snap for s in (c, r)))
 
       # (c) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
-      # start_pos, returning the per-position greedy id (what the real model says comes next from every one
+      # start_pos, returning the per-position logits (what the real model actually predicts from every one
       # of those positions) plus the hidden state at the chunk's last position.
       buf = Tensor(chunk_ids + [0] * (chunk_size - n), dtype="int32", device=dev).reshape(1, chunk_size)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n)
-      verify_tok, verify_h = cast(tuple[Tensor, Tensor], self(buf[:, :nt], sp, None, spec=True))
-      # verify_tok's own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
-      # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
-      # TestCausalMask.test_symbolic_shapes in test_attention.py for the same pad-then-slice idiom): pad up
-      # to the fixed chunk_size buffer width first, then take just the first n (live) values back on host.
-      verify_ids: list[int] = cast(list[list[int]], verify_tok.pad_to((1, chunk_size)).tolist())[0][:n]  # verify_ids[i] predicts start_pos+1+i
+      verify_logits, verify_h = cast(tuple[Tensor, Tensor], self(buf[:, :nt], sp, None, spec=True))
 
-      # (d) ACCEPT: verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to
-      # draft d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
-      # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
-      # matching prefix, 0..k_eff.
-      m = 0
-      while m < k_eff and chunk_ids[m + 1] == verify_ids[m]: m += 1
-      accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
-      tok_last = verify_tok[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
+      # (d) ACCEPT: how many of the k_eff drafts hold up (m, 0..k_eff), and the one extra token this
+      # iteration emits beyond them -- either the greedy exact-match bonus/correction id, or (T4.65,
+      # temperature>0) a sampled accept/resample per spec_accept. Both branches produce `accepted`
+      # (== chunk_ids[1:1+m] + [that extra token], always m+1 long) and `tok_last` (the new chain anchor).
+      if greedy:
+        # verify_logits' own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
+        # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
+        # TestCausalMask.test_symbolic_shapes in test_attention.py for the same pad-then-slice idiom): argmax
+        # it down to ids first (the same op forward() used to do internally, pre-T4.65), then pad up to the
+        # fixed chunk_size buffer width, then take just the first n (live) values back on host.
+        verify_ids_tensor = verify_logits.argmax(-1)  # (1, nt) ids
+        verify_ids: list[int] = cast(list[list[int]], verify_ids_tensor.pad_to((1, chunk_size)).tolist())[0][:n]  # [i] predicts start_pos+1+i
+        # verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to draft
+        # d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
+        # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
+        # matching prefix, 0..k_eff.
+        m = 0
+        while m < k_eff and chunk_ids[m + 1] == verify_ids[m]: m += 1
+        accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
+        tok_last = verify_ids_tensor[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
+      else:
+        # same symbolic-shape reasoning as the greedy branch (pad before pulling to host), but here we need
+        # the full per-position distributions, not just the argmax -- pad_to is a no-op on the already-fixed
+        # vocab axis, only the symbolic `nt` axis actually gets padded.
+        vocab = int(verify_logits.shape[-1])  # never symbolic (only the T axis is) -- int() just satisfies mypy's sint=int|UOp
+        verify_np = verify_logits.pad_to((1, chunk_size, vocab)).numpy()[0][:n]  # (n, vocab)
+        p_probs = _softmax_np(verify_np, temperature)
+        q_probs = np.stack(q_list) if q_list else np.empty((0, vocab))
+        accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
+        tok_last = Tensor([[accepted[-1]]], dtype="int32", device=dev)
 
       if m == k_eff:
         # full accept: every input verify saw (tok_last, d0..d_{k_eff-1}) really was correct, so its forward

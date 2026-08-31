@@ -155,6 +155,8 @@ def main():
   parser.add_argument("--device-map", default=None, help='Per-block device placement: "0-15:CPU:0,16-31:CPU:1" or "CPU:0,CPU:1" (even split); '
                        'optional "experts:<device>" segment routes MoE routed-expert weights to a separate device')
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
+  parser.add_argument("--mtp", action="store_true", help="Route chat completions through MTP speculative decoding "
+                       "(needs MTP=1 at load time so the model actually has an mtp_head; k is the SPEC_TOKENS env var, default 3)")
   parser.add_argument("--warmup", action="store_true", help="warmup the JIT")
   parser.add_argument("--benchmark", nargs='?', type=int, const=20, metavar="COUNT", help="Benchmark tok/s (optional count, default 20)")
   args = parser.parse_args()
@@ -193,7 +195,7 @@ def main():
     # SIGTERM is the documented stop: make it a normal exit so atexit -> Device.finalize() (the GSP unload on NV) runs;
     # python's default disposition would skip it
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+    LLMServer(('', args.serve), model, model_name, tok, template, mtp=args.mtp).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:
