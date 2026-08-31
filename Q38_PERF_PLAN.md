@@ -98,3 +98,10 @@ Splitting each matmul's weight across both devices makes the reads concurrent: c
 1. PRs #14 + #17 merge (user) → 2. fire T4.67 + T4.68 + T4.69a agents in parallel (worktrees off new master) →
 3. Fable GPU windows: T4.68 A/B (cheap) → T4.69b → T4.67 real-prompt measurement → 4. T4.70a design when the above
 settle (or earlier if commissioned). MTP hardware validation (P1) rides the first post-merge window alongside T4.68.
+
+---
+## STATUS 2026-08-31 (post-battery — supersedes the sequencing above)
+P1 MTP: built+merged; GPU-BLOCKED on per-position draft traces → **T4.66a in flight** (then re-measure). P2 state cache: SHIPPED + measured
+working (snapshot hit `in: 5872 +26`); standing integration pending a 35B-scale measurement. P3 chunk-64: CLOSED (identical perf,
+token-identical). P4 WY scan: prefill +27-29% measured; **T4.69b (decode gate) in flight** → re-measure → auto-flip decision. P5 TP: design
+pending (Fable). Full numbers: HANDOFF_2026-08-31.md §2.

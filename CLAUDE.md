@@ -3,7 +3,7 @@
 This is Artur's fork of tinygrad for making the NVIDIA/TinyGPU eGPU path fast for local LLMs
 and pooling the MacBook (Metal) with an RTX 3090. Before doing any work, read in order:
 
-1. **`HANDOFF_2026-08-27.md` — THE entry point** (state, master contents, the TD.5 Hermes goal,
+1. **`HANDOFF_2026-08-31.md` — THE entry point** (08-27 = TD.5-era history) (state, master contents, the TD.5 Hermes goal,
    standing rules/grants, verification gotchas, open board); then `TASKS.md` — the "RESUME HERE"
    section, then the task list + Status log. (`HANDOFF_2026-08-26.md` is the panic-era history.)
 2. `NV_LLM_DESIGN.md` — the design doc; **§1.5 has the post-dock results and supersedes the
