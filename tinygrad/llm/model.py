@@ -17,6 +17,7 @@ from tinygrad.helpers import ContextVar
 # qwen3.6-35B Q8_0: 46 -> 158-173 tok/s BEAM'd, decode unchanged) -- and 1 (the pre-T4.55 one-token-per-step prefill) elsewhere:
 # the unrolled 32-step scan is one huge kernel, and x86 clang 18 crashes compiling it (CI's CPU "Test LLM" job on qwen3.5:0.8b).
 # 64 falls off a cliff even on METAL (28 tok/s). Set GDN_CHUNK explicitly to override either way.
+# T4.68: 64 is explicit-only (never auto-selected above); CPU scan-parity now covers both geometries (test_gdn_scan_parity.py).
 GDN_CHUNK = ContextVar("GDN_CHUNK", 0)
 def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   if GDN_CHUNK.value > 0: return GDN_CHUNK.value
