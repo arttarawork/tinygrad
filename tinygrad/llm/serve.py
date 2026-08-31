@@ -1,7 +1,8 @@
 from __future__ import annotations
-import json, pathlib, re, time, typing, uuid
+import collections, json, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
+from tinygrad.llm.model import snapshot_matches, snapshot_nbytes
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
   from tinygrad.llm.cli import SimpleTokenizer
@@ -9,6 +10,12 @@ if TYPE_CHECKING:
 
 # T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag.
 SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
+# T4.67: MB cap for the cross-session prefill state cache (LLMServer.snapshots) when enabled -- see
+# LLMServer.store_snapshot and cli.py's --state-cache flag. Mirrors SPEC_TOKENS/--mtp above: this constant is
+# only the MAGNITUDE: LLMServer.__init__'s own default is 0 (off), so a caller who doesn't ask for this
+# (e.g. every existing test/null/test_llm_server*.py, constructing LLMServer with no state_cache_mb= kwarg)
+# gets byte-identical pre-T4.67 behavior -- snapshot_state/restore_state are never called (see Handler.run_model).
+STATE_CACHE_MB = getenv("STATE_CACHE_MB", 2048)
 
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
@@ -92,6 +99,13 @@ class Handler(HTTPRequestHandler):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
+    # T4.67: (a) the splice/live-cache path above found nothing to reuse -- before falling back to a fully cold
+    # prefill (c), try the cross-session state cache (b): the longest snapshot whose ids exactly prefix this
+    # request's. Skipped entirely when the cache is off (state_cache_mb<=0), so snapshot_state/restore_state are
+    # then never called -- byte-identical to pre-T4.67 behavior.
+    if cache_start_pos == 0 and self.server.state_cache_mb > 0 and (snap := self.server.find_snapshot(ids)) is not None:
+      model.restore_state(snap)
+      cache_start_pos = model.get_start_pos(ids)
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     def chunk(d:dict): return {"choices": [{"index":0, "delta":d, "finish_reason":None}], **tmpl}
@@ -118,6 +132,9 @@ class Handler(HTTPRequestHandler):
       for next_id in gen:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
+          # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
+          # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
+          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids)
         if tok.is_end(next_id): break
         out.append(next_id)
         for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
@@ -200,8 +217,36 @@ class Handler(HTTPRequestHandler):
 
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
-               mtp:bool=False, spec_k:int=SPEC_TOKENS):
+               mtp:bool=False, spec_k:int=SPEC_TOKENS, state_cache_mb:int=0):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
     self.mtp, self.spec_k = mtp, spec_k  # T4.65: --mtp/SPEC_TOKENS -- see Handler.run_model's use_spec
     self.last: tuple[str, list[int], int, list[int]]|None = None  # (rendered prompt, ids, message count, generated ids) of the last completed request
+    # T4.67: cross-session state cache -- self.last above only ever remembers ONE (the most recent) sequence;
+    # this keyed, MB-capped, LRU dict lets a later request reuse ANY previously-snapshotted sequence whose
+    # tokens it exactly extends, not just the immediately preceding one. Default 0 = off (byte-identical to
+    # pre-T4.67 -- see Handler.run_model); pass state_cache_mb=STATE_CACHE_MB (or cli.py's --state-cache) to enable.
+    self.state_cache_mb = state_cache_mb
+    self.snapshots: collections.OrderedDict[tuple[int, ...], dict] = collections.OrderedDict()  # insertion/touch order == LRU order
     super().__init__(server_address, Handler)
+
+  def find_snapshot(self, ids:list[int]) -> dict|None:
+    """The longest stored snapshot whose tokens are an exact prefix of `ids` (snapshot_matches), touched for
+    LRU on a hit. None if no stored snapshot applies."""
+    best_key = max((k for k in self.snapshots if snapshot_matches(self.snapshots[k], ids)), key=len, default=None)
+    if best_key is None: return None
+    self.snapshots.move_to_end(best_key)
+    return self.snapshots[best_key]
+
+  def store_snapshot(self, ids:list[int]) -> None:
+    """Snapshot self.model's current state -- assumed to have just finished prefilling exactly `ids` (see
+    Handler.run_model) -- under key tuple(ids), LRU-evicting the oldest entries to stay under state_cache_mb
+    (always keeping at least the just-stored entry, even if it alone exceeds the cap)."""
+    key = tuple(ids)
+    if key in self.snapshots:
+      self.snapshots.move_to_end(key)
+      return
+    self.snapshots[key] = self.model.snapshot_state()
+    cap = self.state_cache_mb * 1024 * 1024
+    total = sum(snapshot_nbytes(s) for s in self.snapshots.values())
+    while total > cap and len(self.snapshots) > 1:
+      total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])
