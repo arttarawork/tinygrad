@@ -23,7 +23,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, nn
 from tinygrad.helpers import Context
-from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig
+from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig, GDN_SCAN_LOOP, GDN_SCAN_WY, gdn_scan_impl_for
 
 GEOMETRIES = {
   # qwen3.6-35B-A3B (qwen3next hybrid; the pooled server model, CLAUDE.md "Pooled model")
@@ -36,10 +36,15 @@ DIM = 8            # residual width: doesn't affect the scan's own shapes, kept 
 MAX_CONTEXT = 128  # generous vs. every start_pos used below (BIG64 reaches start_pos=64 -- the internal
                    # start_pos UOp.variable bind requires start_pos <= max_context-1)
 
-SMALL_TOKENS, SMALL_CHUNKS = 9, (2, 4, 8)   # 9-1=8 divisible by 2,4,8 -> every chunking's remainder is T=1
+SMALL_TOKENS, SMALL_CHUNKS = 9, (1, 2, 4, 8)  # 9-1=8 divisible by 1,2,4,8 -> every chunking's remainder is T=1
 BIG_TOKENS, BIG_CHUNK = 33, 32              # 33-1=32 -> remainder is again T=1
 BIG64_TOKENS, BIG64_CHUNK = 65, 64          # T4.68: GDN_CHUNK=64 CPU coverage; 65-1=64 -> remainder is again T=1
 PREFIX, CONT_CHUNK = 5, 8                   # continuation: resume from a real (non-zero) state at start_pos=5
+
+# T4.69a: both scan implementations run this whole matrix (chunks include 1, 4, and 32 -- BIG_CHUNK/CONT_CHUNK
+# cover 32, SMALL_CHUNKS covers 1 and 4). GDN_SCAN_LOOP is the pre-T4.69a else-branch loop (unchanged);
+# GDN_SCAN_WY is gdn_scan_wy's chunkwise WY-form (model.py) -- see its docstring for the algorithm.
+IMPLS = (GDN_SCAN_LOOP, GDN_SCAN_WY)
 
 # Empirically (see T4.61 report): chunked vs. sequential differ by ~1e-6 absolute at this geometry (float32
 # rounding: a multi-step unrolled scan is one fused graph, a sequential run is separately-scheduled calls
@@ -47,6 +52,20 @@ PREFIX, CONT_CHUNK = 5, 8                   # continuation: resume from a real (
 # differently at the ULP level). Not an approximation in the scan itself, just float non-associativity, so
 # this is tight -- 10x looser than the worst observed diff, but 10x tighter than the codebase's existing
 # chunk-parity convention (test_attention.py's TestGatedDeltaNetBlock uses rtol=atol=1e-3).
+#
+# T4.69a addendum: GDN_SCAN_WY reassociates the float math much more than a mere chunking-boundary change
+# (a (T,T) triangular solve + matmuls instead of T sequential FMAs), so a bigger gap than loop-vs-loop
+# chunking is expected in principle -- but measured at this file's real geometries (num_v_heads 32/48,
+# head_k_dim=head_v_dim=128, chunk<=32) it comes in at ~1e-7 (see the T4.69a report's evidence-script-adjacent
+# standalone check), i.e. still within the SAME RTOL/ATOL as the loop-vs-loop comparison below -- no separate,
+# looser WY tolerance was needed. Known characteristic (not a bug, and not specific to this implementation --
+# inherent to the decay-normalized chunked/WY delta-rule form, same as the reference FLA/Gated-DeltaNet
+# implementations): the algorithm divides by the chunk's cumulative decay product, so a head with VERY
+# aggressive per-step decay (e.g. a trained ssm_a with much larger magnitude than this file's randn*0.1 init
+# produces) compounded over a full 32-token chunk could underflow that product towards 0 and blow up to inf/nan
+# where the loop -- which never explicitly forms 1/decay -- would just quietly (and correctly) forget the old
+# state. Not triggered anywhere in this file's geometries; if it ever is, the fix is a smaller GDN_CHUNK for
+# WY, not a change to this tolerance.
 RTOL, ATOL = 1e-4, 1e-4
 
 # T4.68: chunk=64 doubles this file's unrolled-scan depth (vs. BIG_CHUNK=32 above), so recurrent_state's
@@ -99,25 +118,30 @@ def chunked(block: GatedDeltaNetBlock, x: Tensor, chunk: int, start_pos: int = 0
 
 @functools.lru_cache(maxsize=None)
 def small_reference(name: str) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
-  """chunk=1 sequential ground truth over SMALL_TOKENS tokens from start_pos=0 (covers SMALL_CHUNKS)."""
-  block = make_block(GEOMETRIES[name])
-  x = (Tensor.randn(1, SMALL_TOKENS, DIM) * 0.1).realize()
-  ref_out = sequential(block, x)
-  return x.numpy(), ref_out, snapshot(block)
+  """chunk=1 sequential ground truth over SMALL_TOKENS tokens from start_pos=0 (covers SMALL_CHUNKS).
+  Pinned to GDN_SCAN_LOOP explicitly (not just the auto default) so this lru_cached ground truth is the same
+  regardless of which impl's test happens to trigger the cache miss first."""
+  with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP):
+    block = make_block(GEOMETRIES[name])
+    x = (Tensor.randn(1, SMALL_TOKENS, DIM) * 0.1).realize()
+    ref_out = sequential(block, x)
+    return x.numpy(), ref_out, snapshot(block)
 
 @functools.lru_cache(maxsize=None)
 def big_reference(name: str) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
   """chunk=1 sequential ground truth over BIG_TOKENS tokens from start_pos=0 (covers BIG_CHUNK), plus a
   state snapshot at start_pos=PREFIX (covers the start_pos>0 continuation case) captured along the way --
-  one sequential pass serves both checks instead of two (see the perf note above)."""
-  block = make_block(GEOMETRIES[name])
-  x = (Tensor.randn(1, BIG_TOKENS, DIM) * 0.1).realize()
-  outs, mid_state = [], None
-  for t in range(BIG_TOKENS):
-    outs.append(run_attention(block, x[:, t:t + 1], t))
-    if t == PREFIX - 1: mid_state = snapshot(block)
-  assert mid_state is not None
-  return x.numpy(), np.concatenate(outs, axis=1), mid_state, snapshot(block)
+  one sequential pass serves both checks instead of two (see the perf note above). Pinned to GDN_SCAN_LOOP,
+  same reason as small_reference above."""
+  with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP):
+    block = make_block(GEOMETRIES[name])
+    x = (Tensor.randn(1, BIG_TOKENS, DIM) * 0.1).realize()
+    outs, mid_state = [], None
+    for t in range(BIG_TOKENS):
+      outs.append(run_attention(block, x[:, t:t + 1], t))
+      if t == PREFIX - 1: mid_state = snapshot(block)
+    assert mid_state is not None
+    return x.numpy(), np.concatenate(outs, axis=1), mid_state, snapshot(block)
 
 @functools.lru_cache(maxsize=None)
 def big64_reference(name: str) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
@@ -134,30 +158,35 @@ def big64_reference(name: str) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray
     return x.numpy(), ref_out, snapshot(block)
 
 class TestGDNScanChunkParity(unittest.TestCase):
-  """T4.61: the unrolled per-t scan (model.py GatedDeltaNetBlock._attention, non-AMD else-branch) must give
-  the same outputs and final recurrent state no matter how its input token stream is split into chunks."""
+  """T4.61: the scan (model.py GatedDeltaNetBlock._attention, non-AMD else-branch) must give the same outputs
+  and final recurrent state no matter how its input token stream is split into chunks. T4.69a: this now runs
+  under both GDN_SCAN_IMPL values (the pre-existing per-token loop, and gdn_scan_wy's chunkwise WY-form) --
+  the ground truth (small_reference/big_reference) is always the GDN_SCAN_LOOP sequential run; each impl's
+  chunked reconstruction is checked against that same ground truth via Context(GDN_SCAN_IMPL=impl)."""
 
   def test_small_chunk_sizes_match_sequential(self):
-    for name in GEOMETRIES:
-      x_np, ref_out, (ref_conv, ref_rec) = small_reference(name)
-      x = Tensor(x_np)
-      for chunk in SMALL_CHUNKS:
-        block = make_block(GEOMETRIES[name])  # fresh block: starts at start_pos=0 with zeroed state already
-        out = chunked(block, x, chunk)
-        conv, rec = snapshot(block)
-        np.testing.assert_allclose(out, ref_out, rtol=RTOL, atol=ATOL, err_msg=f"{name=} {chunk=} output")
-        np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{name=} {chunk=} conv_state")
-        np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{name=} {chunk=} recurrent_state")
+    for impl in IMPLS:
+      for name in GEOMETRIES:
+        x_np, ref_out, (ref_conv, ref_rec) = small_reference(name)
+        x = Tensor(x_np)
+        for chunk in SMALL_CHUNKS:
+          block = make_block(GEOMETRIES[name])  # fresh block: starts at start_pos=0 with zeroed state already
+          with Context(GDN_SCAN_IMPL=impl): out = chunked(block, x, chunk)
+          conv, rec = snapshot(block)
+          np.testing.assert_allclose(out, ref_out, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} {chunk=} output")
+          np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} {chunk=} conv_state")
+          np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} {chunk=} recurrent_state")
 
   def test_large_chunk_matches_sequential(self):
-    for name in GEOMETRIES:
-      x_np, ref_out, _, (ref_conv, ref_rec) = big_reference(name)
-      block = make_block(GEOMETRIES[name])
-      out = chunked(block, Tensor(x_np), BIG_CHUNK)
-      conv, rec = snapshot(block)
-      np.testing.assert_allclose(out, ref_out, rtol=RTOL, atol=ATOL, err_msg=f"{name=} output")
-      np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{name=} conv_state")
-      np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{name=} recurrent_state")
+    for impl in IMPLS:
+      for name in GEOMETRIES:
+        x_np, ref_out, _, (ref_conv, ref_rec) = big_reference(name)
+        block = make_block(GEOMETRIES[name])
+        with Context(GDN_SCAN_IMPL=impl): out = chunked(block, Tensor(x_np), BIG_CHUNK)
+        conv, rec = snapshot(block)
+        np.testing.assert_allclose(out, ref_out, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} output")
+        np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} conv_state")
+        np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} recurrent_state")
 
   def _check_chunk64(self, name):
     # T4.68: GDN_CHUNK=64 was historically a perf cliff pre-head-grouping (see gdn_chunk_for's comment in
@@ -184,16 +213,25 @@ class TestGDNScanChunkParity(unittest.TestCase):
     # non-zero, previously-computed) recurrent_state at start_pos=PREFIX must match resuming one token at
     # a time from that same state -- covers a case test_large_chunk_matches_sequential can't (there, every
     # chunked run's FIRST call is always at start_pos=0, i.e. the state-reset branch; here it isn't).
-    for name in GEOMETRIES:
-      x_np, ref_out, mid_state, (ref_conv, ref_rec) = big_reference(name)
-      block = make_block(GEOMETRIES[name])
-      block._init_state(Tensor.zeros(1, 1, DIM))  # allocate conv_state/recurrent_state so restore() can assign into them
-      restore(block, mid_state)
-      out = chunked(block, Tensor(x_np[:, PREFIX:]), CONT_CHUNK, start_pos=PREFIX)
-      conv, rec = snapshot(block)
-      np.testing.assert_allclose(out, ref_out[:, PREFIX:], rtol=RTOL, atol=ATOL, err_msg=f"{name=} continuation output")
-      np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{name=} continuation conv_state")
-      np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{name=} continuation recurrent_state")
+    for impl in IMPLS:
+      for name in GEOMETRIES:
+        x_np, ref_out, mid_state, (ref_conv, ref_rec) = big_reference(name)
+        block = make_block(GEOMETRIES[name])
+        block._init_state(Tensor.zeros(1, 1, DIM))  # allocate conv_state/recurrent_state so restore() can assign into them
+        restore(block, mid_state)
+        with Context(GDN_SCAN_IMPL=impl): out = chunked(block, Tensor(x_np[:, PREFIX:]), CONT_CHUNK, start_pos=PREFIX)
+        conv, rec = snapshot(block)
+        np.testing.assert_allclose(out, ref_out[:, PREFIX:], rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} continuation output")
+        np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} continuation conv_state")
+        np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} continuation recurrent_state")
+
+  def test_auto_resolves_to_loop(self):
+    # T4.69a: GDN_SCAN_IMPL=0 (auto, the default) must resolve to GDN_SCAN_LOOP -- flipping the default to
+    # WY is a later, measured decision (see extra/gdn_wy_evidence.py), so today's graph stays byte-identical
+    # for anyone not explicitly opting in. Explicit 1/2 must resolve to themselves.
+    with Context(GDN_SCAN_IMPL=0): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_LOOP)
+    with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_LOOP)
+    with Context(GDN_SCAN_IMPL=GDN_SCAN_WY): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_WY)
 
 if __name__ == "__main__":
   unittest.main()
