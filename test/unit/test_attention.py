@@ -2,11 +2,12 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable, TinyJit, Device
 from tinygrad.dtype import AddrSpace
+from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
 from tinygrad.llm import model
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
-  apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
+  apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, gdn_head_groups_for,
 )
 from tinygrad.llm.attn_kernel import tuned_decode_attention, CHUNK
 from test.helpers import assert_kernel_count, assert_jit_cache_len
@@ -278,6 +279,83 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     restarted = self._run_attention(block, x[:, :2], 0)
     fresh = self._run_attention(self._make_block(config), x[:, :2], 0)
     np.testing.assert_allclose(restarted, fresh, rtol=1e-3, atol=1e-3)
+
+class TestGatedDeltaNetHeadGroups(unittest.TestCase):
+  """T4.62: GDN_HEAD_GROUPS splits the else-branch's unrolled per-t scan into G sequential head groups so the
+  lowered kernel's UOp count doesn't scale with num_v_heads on wide-head geometries (qwen3.8-27B, H=48 blows
+  BEAM_UOPS_MAX at G=1 -- see extra/gdn_headgroup_evidence.py). The split has no cross-head reduction, so
+  output and final recurrent_state must match G=1 EXACTLY (not just numerically close) at every chunk size
+  and across a start_pos>0 continuation. Deliberately NOT a TestGatedDeltaNetBlock subclass -- unittest would
+  rediscover and re-run every inherited test_* method under this class name too -- so its tiny-block
+  construction (deterministic linspace weights: two blocks built from the same config are bit-identical, no
+  seeding needed) is copied from there instead of inherited. Toggling pattern follows TestRecurrentChunkedPrefill
+  (test/unit/test_llm_server.py, T4.55)'s Context(GDN_...=value).
+  """
+  def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:
+    return Tensor.linspace(start, stop, int(np.prod(shape)), dtype=dtypes.float32).reshape(*shape)
+
+  def _make_block(self, config:TransformerConfig) -> GatedDeltaNetBlock:
+    block = GatedDeltaNetBlock(config, config.ssm)
+    block.attn_norm.weight = self._tensor_linspace(0.8, 1.2, (config.dim,))
+    block.attn_qkv.weight = self._tensor_linspace(-0.15, 0.2, (block.conv_channels, config.dim))
+    block.attn_gate.weight = self._tensor_linspace(-0.1, 0.15, (config.ssm.inner_size, config.dim))
+    block.ssm_alpha.weight = self._tensor_linspace(-0.08, 0.12, (block.num_v_heads, config.dim))
+    block.ssm_beta.weight = self._tensor_linspace(-0.12, 0.07, (block.num_v_heads, config.dim))
+    block.ssm_conv1d["weight"] = self._tensor_linspace(-0.05, 0.05, (block.conv_channels, block.ssm_conv_kernel))
+    block.ssm_dt["bias"] = self._tensor_linspace(-0.1, 0.1, (block.num_v_heads,))
+    block.ssm_a = self._tensor_linspace(-0.1, -0.05, (block.num_v_heads,))
+    block.ssm_norm.weight = self._tensor_linspace(0.9, 1.1, (block.head_v_dim,))
+    block.ssm_out.weight = self._tensor_linspace(-0.2, 0.18, (config.dim, config.ssm.inner_size))
+    return block
+
+  def _make_config(self, num_v_heads:int, num_k_heads:int=16, head_dim:int=16) -> TransformerConfig:
+    # H=32,K_heads=16 and H=48,K_heads=16 (task geometries); tiny head_k_dim=head_v_dim=16 -- group-split
+    # logic slices along the head axis only, so it's dim-independent and these small dims are fine.
+    ssm = SSMConfig(conv_kernel=2, state_size=head_dim, group_count=num_k_heads, time_step_rank=num_v_heads,
+                     inner_size=head_dim*num_v_heads)
+    return TransformerConfig(num_blocks=1, dim=32, hidden_dim=64, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=32,
+                              head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=64,
+                              ssm_layers=(True,), ssm=ssm)
+
+  def _attend(self, block:GatedDeltaNetBlock, x:Tensor, start_pos:int, groups:int) -> np.ndarray:
+    x_norm = block.attn_norm(x)
+    block._init_state(x_norm)
+    with Context(GDN_HEAD_GROUPS=groups): out = block._attention(x_norm, start_pos).realize().numpy()
+    return out
+
+  def _check_match_g1(self, num_v_heads:int, chunk:int, groups:int):
+    config = self._make_config(num_v_heads)
+    block1, blockN = self._make_block(config), self._make_block(config)  # identical deterministic weights
+    x = self._tensor_linspace(-0.5, 0.5, (1, chunk, config.dim))
+    out1, outN = self._attend(block1, x, 0, 1), self._attend(blockN, x, 0, groups)
+    np.testing.assert_array_equal(outN, out1, err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill output")
+    np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
+                                  err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill state")
+    # start_pos>0 continuation: state carried from the prefill above must keep matching exactly
+    x2 = self._tensor_linspace(0.3, -0.3, (1, chunk, config.dim))
+    out1b, outNb = self._attend(block1, x2, chunk, 1), self._attend(blockN, x2, chunk, groups)
+    np.testing.assert_array_equal(outNb, out1b, err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation output")
+    np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
+                                  err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation state")
+
+  def test_auto_picks_g1_at_32_heads_g2_at_48(self):
+    with Context(GDN_HEAD_GROUPS=0):
+      self.assertEqual(gdn_head_groups_for(32), 1)
+      self.assertEqual(gdn_head_groups_for(48), 2)
+
+# T4.62 CI: grouped-vs-G1 equality is tested at chunks 1 and 4 ONLY. Chunk-32 grouped combos are excluded as a
+# CLASS: across four CI rounds, chunk-32 grouped tests crashed xdist workers natively (deep _PyEval frames =
+# C-stack exhaustion lowering 2-3 sequential 32-step group subgraphs under CHECK_OOB) -- first h32_c32_g{2,3},
+# then, with those excluded, h48_c32_g{2,3} which had previously PASSED: nondeterministic across workers on the
+# fork's small Linux/macOS runners, while every combo passes serially and under -n locally. The equality property
+# is chunk-independent (pure head-axis slicing); chunk-32 depth is covered by test_gdn_scan_parity's c32 run,
+# extra/gdn_headgroup_evidence.py's DEV=NULL lowering, and the T4.62b hardware serving of the grouped path.
+for _hg_h in (32, 48):
+  for _hg_c in (1, 4):
+    for _hg_g in (2, 3):
+      def _hg_test(self, _h=_hg_h, _c=_hg_c, _g=_hg_g): self._check_match_g1(_h, _c, _g)
+      _hg_test.__name__ = f"test_match_g1_h{_hg_h}_c{_hg_c}_g{_hg_g}"
+      setattr(TestGatedDeltaNetHeadGroups, _hg_test.__name__, _hg_test)
 
 class TestPairwiseTopk(unittest.TestCase):
   def test_basic_topk(self):

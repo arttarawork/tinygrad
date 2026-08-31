@@ -20,6 +20,17 @@ def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
   return 32 if dev.split(":")[0] in ("METAL", "NV", "CUDA") else 1
 
+# T4.62: on wide-head geometries (e.g. qwen3.8-27B, num_v_heads=48) the unrolled per-t scan in
+# GatedDeltaNetBlock._attention's else-branch -- one python loop building the whole chunk's graph, fused into
+# a single kernel by its final .contiguous() -- lowers to more UOps than BEAM_UOPS_MAX (codegen/opt/search.py)
+# for every BEAM candidate; narrower geometries (e.g. qwen3.6-35B's 32 heads) fit fine. The scan has no
+# cross-head dependency (each head's (V,K) state slice evolves independently), so split it into G sequential
+# head groups, each narrow enough to lower under the cap on its own -- see gdn_headgroup_evidence.py.
+GDN_HEAD_GROUPS = ContextVar("GDN_HEAD_GROUPS", 0)
+def gdn_head_groups_for(num_v_heads:int) -> int:
+  if GDN_HEAD_GROUPS.value > 0: return GDN_HEAD_GROUPS.value
+  return -(-num_v_heads // 32)  # auto: smallest G with ceil(num_v_heads/G) <= 32 == ceil(num_v_heads/32)
+
 # T4.63: qwen3.5-family GGUFs carry a DeepSeek-style MTP ("nextn") block beyond the main num_blocks
 # (nextn_predict_layers, already excluded from num_blocks -- see from_gguf). 0 (default): today's
 # behavior, byte-identical -- gguf.py parses the block, from_gguf drops it (unused-weights warning).
@@ -471,16 +482,36 @@ class GatedDeltaNetBlock(FFNBlock):
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
       alpha = alpha.unsqueeze(-1)
       state = initial.where(0, state.float())
-      outs = []
-      for t in range(T_pad):
-        s1 = state * alpha[:, :, t]  # decay the state
-        delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
-        state = s1 + delta * k[:, :, t]
-        outs.append((state * q[:, :, t]).sum(-1))
+
+      def scan(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
+        outs = []
+        for t in range(T_pad):
+          s1 = state * alpha[:, :, t]  # decay the state
+          delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
+          state = s1 + delta * k[:, :, t]
+          outs.append((state * q[:, :, t]).sum(-1))
+        return state, outs[0].stack(*outs[1:], dim=1)
+
+      # T4.62: split the scan into G sequential head groups when the geometry needs it (see
+      # gdn_head_groups_for above) -- each group's own .contiguous() forces a separate, narrower kernel,
+      # then a single cat reassembles the full state/output. G=1 (unchanged geometries) skips all of this
+      # and lowers to exactly the same graph as before.
+      if (G := gdn_head_groups_for(self.num_v_heads)) <= 1:
+        state, stacked = scan(state, q, k, v, beta, alpha)
+      else:
+        gsize = -(-self.num_v_heads // G)  # ceil(H/G): only the last group is smaller when H % G != 0
+        group_states, group_outs = [], []
+        for lo in range(0, self.num_v_heads, gsize):
+          hi = min(lo + gsize, self.num_v_heads)
+          g_state, g_outs = scan(state[:, lo:hi], q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], beta[:, lo:hi], alpha[:, lo:hi])
+          group_states.append(g_state.contiguous())
+          group_outs.append(g_outs.contiguous())
+        state = group_states[0].cat(*group_states[1:], dim=1) if len(group_states) > 1 else group_states[0]
+        stacked = group_outs[0].cat(*group_outs[1:], dim=2) if len(group_outs) > 1 else group_outs[0]
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
-      core = Tensor(outs[0].stack(*outs[1:], dim=1).contiguous().uop.after(state_store))
+      core = Tensor(stacked.contiguous().uop.after(state_store))
 
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
