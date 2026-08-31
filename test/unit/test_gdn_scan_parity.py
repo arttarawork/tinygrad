@@ -23,7 +23,9 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, nn
 from tinygrad.helpers import Context
-from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig, GDN_SCAN_LOOP, GDN_SCAN_WY, gdn_scan_impl_for
+from tinygrad.llm.model import (
+  GatedDeltaNetBlock, SSMConfig, TransformerConfig, GDN_SCAN_LOOP, GDN_SCAN_WY, gdn_scan_impl_for, gdn_last_scan_impl,
+)
 
 GEOMETRIES = {
   # qwen3.6-35B-A3B (qwen3next hybrid; the pooled server model, CLAUDE.md "Pooled model")
@@ -232,6 +234,44 @@ class TestGDNScanChunkParity(unittest.TestCase):
     with Context(GDN_SCAN_IMPL=0): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_LOOP)
     with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_LOOP)
     with Context(GDN_SCAN_IMPL=GDN_SCAN_WY): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_WY)
+
+class TestGDNScanSingleStepGate(unittest.TestCase):
+  """T4.69b: GDN_SCAN_IMPL=2 (WY) must fall back to the per-token loop when a call's scan only covers one
+  step (T_pad==1, e.g. a decode step) -- see run_scan's comment in model.py for the measured motivation and
+  why T_pad, not T, is the gate. gdn_last_scan_impl (model.py, test-introspection only) records the impl
+  run_scan actually dispatched to, so the gate is directly assertable instead of inferred from output alone."""
+
+  def _dispatched_impl(self, block: GatedDeltaNetBlock, x: Tensor, start_pos: int) -> int:
+    gdn_last_scan_impl.clear()
+    run_attention(block, x, start_pos)
+    self.assertTrue(gdn_last_scan_impl, "run_scan recorded no dispatch")
+    # every entry recorded during this one _attention call belongs to some GDN_HEAD_GROUPS head group, all
+    # sharing the same T_pad (the "38" geometry auto-picks G=2) -- they must all agree with each other
+    self.assertEqual(len(set(gdn_last_scan_impl)), 1, f"head groups disagreed: {gdn_last_scan_impl}")
+    return gdn_last_scan_impl[-1]
+
+  def test_multi_token_records_wy_single_step_records_loop(self):
+    for name in GEOMETRIES:
+      block = make_block(GEOMETRIES[name])
+      x = (Tensor.randn(1, 4, DIM) * 0.1).realize()
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_WY):
+        self.assertEqual(self._dispatched_impl(block, x[:, :3], 0), GDN_SCAN_WY, f"{name=} T_pad=3 chunk")
+        self.assertEqual(self._dispatched_impl(block, x[:, 3:4], 3), GDN_SCAN_LOOP, f"{name=} T_pad=1 step")
+
+  def test_single_step_output_matches_loop_exactly(self):
+    # at T_pad==1 the WY *request* is silently downgraded to the loop internally, so from an identical fresh
+    # (zeroed, deterministic -- see make_block) starting state the two requests must produce bit-identical
+    # results, not merely close ones -- assert_array_equal, not allclose.
+    for name in GEOMETRIES:
+      x = (Tensor.randn(1, 1, DIM) * 0.1).realize()
+      block_wy, block_loop = make_block(GEOMETRIES[name]), make_block(GEOMETRIES[name])
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_WY): out_wy = run_attention(block_wy, x, 0)
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP): out_loop = run_attention(block_loop, x, 0)
+      np.testing.assert_array_equal(out_wy, out_loop, err_msg=f"{name=} output")
+      conv_wy, rec_wy = snapshot(block_wy)
+      conv_loop, rec_loop = snapshot(block_loop)
+      np.testing.assert_array_equal(conv_wy, conv_loop, err_msg=f"{name=} conv_state")
+      np.testing.assert_array_equal(rec_wy, rec_loop, err_msg=f"{name=} recurrent_state")
 
 if __name__ == "__main__":
   unittest.main()
