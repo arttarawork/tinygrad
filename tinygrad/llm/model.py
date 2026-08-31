@@ -1,5 +1,5 @@
 from __future__ import annotations
-import enum, functools, itertools, math, pathlib
+import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from typing import Callable, cast, TYPE_CHECKING
 if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays numpy-free at import time -- the minimal
@@ -259,6 +259,15 @@ class TransformerConfig:
   yarn_beta_fast: float = 32.0
   yarn_beta_slow: float = 1.0
   yarn_attn_factor: float|None = None
+  # T4.70b: FFN tensor-parallel shard spec -- (device, fraction) pairs, ordered, fractions summing to 1.0;
+  # () (default) is the byte-identical no-TP path. Set by Transformer.__init__ from device_map's "tp:"
+  # segment (see parse_tp_spec) -- never touched by from_gguf's own `config` local (so MTPHead's inner
+  # block, built from that object, stays whole-device -- see from_gguf's MTP branch). Lives on
+  # TransformerConfig (like max_context, another construction-time-not-architecture knob) rather than as
+  # a separate FFNBlock.__init__ parameter because it changes the STRUCTURE FFNBlock.__init__ builds
+  # (N shard Linears instead of one), unlike device_map's experts_dev (a pure post-construction placement
+  # override that never needed to reach FFNBlock.__init__ at all).
+  tp: tuple[tuple[str, float], ...] = ()
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -280,6 +289,23 @@ class FFNBlock:
         self.ffn_up_shexp = Linear(config.dim, config.shared_expert_dim, bias=False)
         self.ffn_down_shexp = Linear(config.shared_expert_dim, config.dim, bias=False)
         if config.shared_expert_gate: self.ffn_gate_inp_shexp = {"weight": Tensor.zeros(config.dim)}
+    elif config.tp:
+      # T4.70b: Megatron-style FFN tensor-parallel, dense blocks only (the MoE branch above is out of
+      # scope -- Transformer.__init__ asserts num_experts==0 whenever tp is set, before any block is
+      # built). ffn_gate/ffn_up are COLUMN-parallel: shard d owns OUTPUT rows [lo:hi) of the logical
+      # (hidden_dim, dim) weight, so each device computes a full h_d = silu(gate_d(x)) * up_d(x) from its
+      # own copy of x with zero cross-device traffic in between. ffn_down is ROW-parallel: shard d owns
+      # the matching INPUT columns [lo:hi) of its (dim, hidden_dim) weight (same split points, so its
+      # input width matches h_d's), producing a (dim,)-wide PARTIAL sum that _feed_forward adds across
+      # shards after one hop back to the block's own device -- see _tp_split_sizes for the 32-alignment
+      # rounding and tinygrad/llm/gguf.py's ggml_data_to_tensor for why it's needed (GGUF quant blocks are
+      # 32-wide along a tensor's last/input axis). No full-size ffn_gate/ffn_up/ffn_down is ever built here
+      # (unlike experts_dev, which only overrides PLACEMENT after ExpertWeights is built at full size --
+      # tp changes STRUCTURE, so it has to happen here, at construction, not as a later override).
+      sizes = _tp_split_sizes(config.hidden_dim, config.tp)
+      self.ffn_gate_tp = [Linear(config.dim, sz, bias=False) for sz in sizes]
+      self.ffn_up_tp   = [Linear(config.dim, sz, bias=False) for sz in sizes]
+      self.ffn_down_tp = [Linear(sz, config.dim, bias=False) for sz in sizes]
     else:
       self.ffn_gate    = Linear(config.dim, config.hidden_dim, bias=False)
       self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
@@ -325,6 +351,22 @@ class FFNBlock:
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
+    if hasattr(self, 'ffn_gate_tp'):
+      # T4.70b Megatron FFN-TP forward: one broadcast of x per shard device (column-parallel gate/up
+      # consume it directly, no further cross-device traffic to compute h_d), then one partial-sum hop
+      # back per shard (row-parallel down already produced the full (B,T,dim) shape, just a PARTIAL sum)
+      # -- the hidden state h_d itself (the whole point of splitting hidden_dim) never leaves its device.
+      primary = self.device
+      partials = []
+      # named g_lin/u_lin/d_lin, not gate/up/down: those names are already bound (to Tensors) in the MoE
+      # branch above -- mypy infers one type per function-scoped variable name across ALL branches, so
+      # reusing them here (now Linear-typed) would read as a type conflict even though the branches are
+      # mutually exclusive at runtime.
+      for g_lin, u_lin, d_lin in zip(self.ffn_gate_tp, self.ffn_up_tp, self.ffn_down_tp):
+        xd = x.to(g_lin.weight.device)  # .to() is a no-op when x is already on this shard's device
+        h_d = g_lin(xd).silu().contiguous() * u_lin(xd)
+        partials.append(d_lin(h_d).to(primary))
+      return functools.reduce(lambda a, b: a + b, partials)
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
@@ -650,13 +692,22 @@ def parse_device_map(dm:str|dict[int|str,str], num_blocks:int) -> tuple[list[str
   """Per-block device: "0-15:CPU:0,16-31:CPU:1" (inclusive ranges), "CPU:0,CPU:1" (even split), or {block_idx: device}.
   An optional "experts:<device>" segment (str form) or "experts" key (dict form) routes MoE routed-expert weight
   tensors (ffn_{gate,up,down}_exps) to a separate device, independent of their block's device. The router
-  (ffn_gate_inp) always stays with its block. Returns (per-block devices, experts device or None)."""
+  (ffn_gate_inp) always stays with its block. Returns (per-block devices, experts device or None).
+
+  A str `dm` may also carry a trailing "tp:<device>=<fraction>[,<device>=<fraction>...]" segment requesting
+  FFN tensor-parallel sharding -- see parse_tp_spec, which parses it from this same string. This function
+  only strips it out before doing its own block/experts parsing (same idea as "experts:", but tp's own
+  device=fraction list is itself comma-separated, so unlike experts: it can't be isolated as a single
+  comma-split token -- it must be the LAST segment in `dm`) and otherwise ignores its content entirely: it
+  never appears in this function's own return value, which stays the plain 2-tuple above in every case,
+  tp: segment or not -- existing callers that only ever pass a plain (no-tp) `dm` see zero change here."""
   if isinstance(dm, dict):
     experts_dev = dm.get("experts")
     blocks = {k: v for k, v in dm.items() if k != "experts"}
     assert all(i in blocks for i in range(num_blocks)), f"device_map must cover all {num_blocks} blocks: {dm}"
     return [blocks[i] for i in range(num_blocks)], experts_dev
 
+  dm = re.split(r',\s*tp:', dm, maxsplit=1)[0]
   parts = [s.strip() for s in dm.split(",")]
   experts_parts = [p for p in parts if p.startswith("experts:")]
   assert len(experts_parts) <= 1, f"device_map has more than one 'experts:' segment: {dm}"
@@ -682,6 +733,85 @@ def parse_device_map(dm:str|dict[int|str,str], num_blocks:int) -> tuple[list[str
     for i in range(lo, hi+1): out[i] = dev
   assert all(out), f"device_map must cover all {num_blocks} blocks: {dm}"
   return out, experts_dev  # type: ignore[return-value]
+
+def parse_tp_spec(dm:str|dict[int|str,str]) -> tuple[tuple[str, float], ...]|None:
+  """Parses the optional "tp:<device>=<fraction>[,<device>=<fraction>...]" segment from a device_map
+  string requesting FFN tensor-parallel sharding (T4.70b) -- see parse_device_map, which strips this same
+  segment out before doing its own block/experts parsing, and FFNBlock.__init__/`_feed_forward`, which
+  consume the result via TransformerConfig.tp. Str form only: a dict-form device_map has no room for a
+  multi-pair sub-list (same asymmetry as "experts:<device>" being a string SEGMENT vs the dict form's
+  plain "experts" KEY) -- returns None for a dict `dm`.
+
+  Returns an ordered tuple of (device, fraction) pairs -- insertion order IS shard order 0,1,2,...
+  (_tp_split_sizes, FFNBlock, and _split_tp_keys all zip over this same order to line shard index up with
+  split position) -- or None when no tp: segment is present. Fractions must sum to 1.0 (a small float
+  tolerance covers e.g. three 1/3 literals).
+
+  The tp: segment must be the LAST one in `dm`: its own device=fraction list is itself comma-separated, so
+  (unlike "experts:<device>", a single token) it can't be isolated by a top-level comma-split -- splitting
+  on the first ",tp:" and keeping everything after it is the only unambiguous way to find its extent."""
+  if not isinstance(dm, str): return None
+  parts = re.split(r',\s*tp:', dm, maxsplit=1)
+  if len(parts) == 1: return None
+  pairs = []
+  for seg in parts[1].split(","):
+    dev, eq, frac_s = seg.strip().partition("=")
+    assert eq and dev and frac_s, f"device_map 'tp:' segment needs '<device>=<fraction>' pairs: {dm}"
+    pairs.append((dev, float(frac_s)))
+  total = sum(f for _, f in pairs)
+  assert abs(total - 1.0) < 1e-6, f"device_map 'tp:' fractions must sum to 1.0, got {total}: {dm}"
+  return tuple(pairs)
+
+def _tp_split_sizes(total:int, tp:tuple[tuple[str, float], ...]) -> list[int]:
+  """Splits an FFN's hidden_dim (`total`) into len(tp) contiguous shard widths proportional to each
+  device's fraction, each rounded to a multiple of 32. Every shard boundary uses the SAME split points for
+  both ffn_gate/up (column-parallel: split their OUTPUT/hidden dim) and ffn_down (row-parallel: split its
+  INPUT/hidden dim to match) -- see FFNBlock.__init__. Output-dim slices of a stored GGUF tensor are always
+  block-aligned regardless of the cut point (each output row is whole 32-wide quant blocks -- ggml packs a
+  Q8_0 block as 32 contiguous elements along a tensor's LAST/input axis, never spanning rows -- see
+  tinygrad/llm/gguf.py's ggml_data_to_tensor); ffn_down's input-dim slice is the one that actually NEEDS
+  the 32-rounding below, since that axis carries the block structure -- sharing the same split points is
+  what makes ffn_down's shard width match ffn_gate/up's h_d width in the first place.
+
+  Only the LAST shard's fraction is implicit (whatever remains after the others round) -- every other
+  shard's fraction rounds independently to the nearest block, so shards always sum to exactly `total` even
+  though independently-rounded fractions might not (a discrepancy the last shard silently absorbs)."""
+  assert total % 32 == 0, f"tp split needs an FFN hidden_dim ({total}) that's already a multiple of 32"
+  bounds = [0]
+  for _, frac in tp[:-1]: bounds.append(min(total, bounds[-1] + round(total * frac / 32) * 32))
+  bounds.append(total)
+  sizes = [hi - lo for lo, hi in zip(bounds, bounds[1:])]
+  assert all(s > 0 and s % 32 == 0 for s in sizes), \
+    f"tp split of hidden_dim={total} over fractions {[f for _, f in tp]} produced a non-positive or unaligned shard: {sizes}"
+  return sizes
+
+def _split_tp_keys(state_dict:dict[str, Tensor], tp:tuple[tuple[str, float], ...], num_blocks:int) -> None:
+  """Splits each dense block's ffn_{gate,up,down}.weight into per-shard tensors, in place -- the FFN-TP
+  counterpart to _rename_mtp_keys below (same trick: pure state-dict key/tensor surgery, no model object
+  touched, called from from_gguf right before nn.state.load_state_dict). ffn_gate/up are column-parallel:
+  shard d gets OUTPUT rows [lo:hi) of the (hidden_dim, dim)-shaped stored tensor. ffn_down is row-parallel:
+  shard d gets the matching INPUT columns [lo:hi) of its (dim, hidden_dim)-shaped stored tensor -- see
+  _tp_split_sizes for why both use the same split points. New keys (blk.{i}.ffn_{gate,up,down}_tp.{d}.weight)
+  match FFNBlock's `ffn_{gate,up,down}_tp: list[Linear]` attributes -- nn.state's list-attribute key
+  numbering (get_state_dict) lands on exactly these paths, so a plain load_state_dict finds them.
+
+  Skips any block with no ffn_gate.weight key (an MoE block, addressed via ffn_gate_exps/... instead) --
+  unreachable via from_gguf/Transformer.__init__ in practice (a tp spec together with num_experts>0
+  anywhere in the config is rejected at Transformer construction, before this ever runs), but this
+  function only has the state_dict's own keys to go by, no config, so it stays defensive rather than
+  assuming that guard was necessarily the caller."""
+  for i in range(num_blocks):
+    gate_k, up_k, down_k = f"blk.{i}.ffn_gate.weight", f"blk.{i}.ffn_up.weight", f"blk.{i}.ffn_down.weight"
+    if gate_k not in state_dict: continue
+    gate, up, down = state_dict.pop(gate_k), state_dict.pop(up_k), state_dict.pop(down_k)
+    sizes = _tp_split_sizes(cast(int, gate.shape[0]), tp)  # a loaded GGUF weight's shape is always concrete, never symbolic
+    lo = 0
+    for d, sz in enumerate(sizes):
+      hi = lo + sz
+      state_dict[f"blk.{i}.ffn_gate_tp.{d}.weight"] = gate[lo:hi]
+      state_dict[f"blk.{i}.ffn_up_tp.{d}.weight"] = up[lo:hi]
+      state_dict[f"blk.{i}.ffn_down_tp.{d}.weight"] = down[:, lo:hi]
+      lo = hi
 
 def _rename_mtp_keys(state_dict:dict[str, Tensor], num_blocks:int) -> None:
   """Renames blk.{num_blocks}.* (the nextn/MTP block a qwen3.5-family GGUF carries beyond the main
@@ -791,6 +921,19 @@ def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng
 
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
+    # T4.70b: FFN tensor-parallel spec, parsed from device_map's optional "tp:" segment (see parse_tp_spec)
+    # BEFORE dense_config/config get their usual replace()s below, so config.tp reaches every block's
+    # _cfg(i) config the same way every other field does -- no separate constructor parameter needed (see
+    # TransformerConfig.tp's own comment for why this lives on the config instead). tp is None (the
+    # overwhelmingly common case, and every existing caller) leaves `config` completely untouched here --
+    # byte-identical to pre-T4.70b behavior. MoE/shared-expert FFN sharding is explicitly out of scope
+    # (Megatron-shape column/row-parallel dense FFN only) -- raise here, at construction, rather than
+    # silently no-op or build something half-wired.
+    tp = parse_tp_spec(device_map) if device_map is not None else None
+    if tp is not None:
+      assert config.num_experts == 0, "device_map 'tp:' (FFN tensor-parallel) doesn't support MoE models " \
+        "(num_experts>0 anywhere in the config) -- dense-FFN-only, see T4.70b's scope guard"
+      config = replace(config, tp=tp)
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
     if config.ssm: config = replace(config, qk_norm=config.head_dim)
     block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
@@ -821,8 +964,18 @@ class Transformer:
         for block in self.blk:
           if hasattr(block, 'ffn_gate_exps'):
             for p in nn.state.get_parameters([block.ffn_gate_exps, block.ffn_up_exps, block.ffn_down_exps]): p.to_(experts_dev)
+      # T4.70b: FFN tensor-parallel shards move to THEIR tp device on top of the per-block placement above
+      # (same override pattern as experts_dev, one level deeper: len(tp) shards per block instead of one
+      # device) -- the generic per-block loop just moved every ffn_{gate,up,down}_tp[d] to the block's OWN
+      # device like any other param, undoing the whole point of splitting them across devices.
+      if tp is not None:
+        for block in self.blk:
+          if hasattr(block, 'ffn_gate_tp'):
+            for gate, up, down, (dev2, _) in zip(block.ffn_gate_tp, block.ffn_up_tp, block.ffn_down_tp, tp):
+              for p in nn.state.get_parameters([gate, up, down]): p.to_(dev2)
       # canonicalized so it compares equal to p.device later (e.g. "CPU:0" -> "CPU") -- realize_placement()'s footgun guard
-      self._placed_devices = frozenset(Device.canonicalize(d) for d in dmap + ([experts_dev] if experts_dev is not None else []))
+      self._placed_devices = frozenset(Device.canonicalize(d) for d in dmap + ([experts_dev] if experts_dev is not None else [])
+                                       + ([d for d, _ in tp] if tp is not None else []))
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill/rollout, sampled/greedy, and spec (T4.64); prefill also keys on
@@ -1037,6 +1190,12 @@ class Transformer:
       yarn_beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0), yarn_beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0),
       yarn_attn_factor=kv.get(f'{arch}.rope.scaling.yarn_attn_factor'))
     model = Transformer(config, device_map)  # pre-placed params make load_state_dict load each weight to its mapped device
+    # T4.70b: split each dense block's ffn_{gate,up,down}.weight into the per-device shards `model` itself
+    # already built (Transformer.__init__, from the same device_map) -- mirrors _rename_mtp_keys below:
+    # pure state_dict key/tensor surgery, done before load_state_dict ever sees it. Re-parses device_map
+    # (parse_tp_spec is cheap/pure) rather than threading Transformer's own already-parsed tp back out --
+    # `model` doesn't otherwise expose it, and adding a getter just for this one internal call isn't worth it.
+    if device_map is not None and (tp := parse_tp_spec(device_map)) is not None: _split_tp_keys(state_dict, tp, config.num_blocks)
     if MTP.value and kv.get(f'{arch}.nextn_predict_layers', 0) > 0:
       # mirror Transformer.__init__'s own full-attention block config (MTP/nextn is architecturally always a
       # plain attention block -- DeepSeek-MTP semantics -- positioned after every real block: never one of
