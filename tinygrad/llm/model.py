@@ -711,7 +711,13 @@ class MTPHead:
     tok_ids: (B,1) int, the token actually at position t+1. Returns (B,1,vocab) draft logits
     predicting position t+2. `block`'s KV cache advances with start_pos across calls, same as a
     main block's (see FFNBlock._init_state/__call__) -- so calling this again at start_pos+1
-    continues the same drafted sequence instead of overwriting it."""
+    continues the same drafted sequence instead of overwriting it.
+
+    start_pos accepts a bound UOp Variable, not just a plain int (T4.66): TransformerBlock/
+    MLATransformerBlock already handle one end-to-end (the same way the main model's own decode step
+    does), so passing one here lets mtp_head.block's @function(precompile=True) trace replay across
+    drafted positions instead of retracing per position -- see speculative_generate's `v_draft_pos`
+    and SPEC_NOTES.md §4. test_mtp_load.py exercises both calling conventions directly."""
     dev = self.block.device
     e = owner.token_embd(tok_ids.to(owner.token_embd.weight.device)).float().to(dev)
     x = self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
@@ -1218,6 +1224,25 @@ class Transformer:
 
     v_start_pos = UOp.variable("start_pos", 0, self.max_context - 1)
     v_toks = UOp.variable("toks", 1, chunk_size)
+    # T4.66: a drafted position never repeats across a speculative_generate() run, so passing MTPHead.draft's
+    # start_pos as a plain python int (pre-T4.66) baked a fresh literal into mtp_head.block's
+    # @function(precompile=True) trace every DRAFT call -- confirmed (test_spec_decode.py's schedule-cache
+    # regression test) to grow schedule_cache/to_program_cache without bound, one entry-set per drafted
+    # position ever seen. Binding a Variable instead replays ONE compiled schedule at every position, the
+    # same trick v_start_pos already gives the main model's VERIFY/REDO calls below.
+    # A separate Variable from v_start_pos, not a reuse of it: TransformerBlock never re-wraps start_pos in
+    # its own Variable (unlike GatedDeltaNetBlock, which self-converts -- see its _attention), so whatever
+    # name/bounds the caller binds is exactly what reaches mtp_head.block's compiled kernel. Reusing
+    # v_start_pos would likely be just as safe -- each .bind() is an independent, immutable node, and the
+    # DRAFT loop below always fully realizes (a host .tolist() or, sampled, a per-step .numpy()) before
+    # VERIFY ever binds v_start_pos, so there's never a live two-value-same-name overlap either way -- but
+    # that safety argument is exactly the kind of thing that stops holding the moment either call site
+    # changes. A separate name costs nothing and never needs re-justifying. Bounds match v_start_pos's:
+    # mtp_head.block's cache_kv/freqs_cis are sized off the SAME config.max_context as the main model
+    # (from_gguf's MTP branch builds mtp_cfg from the owning Transformer's own config), and k_eff already
+    # caps drafted positions at start_pos+k_eff <= max_context-2 (see k_eff's definition below) -- safely
+    # inside [0, max_context-1] with room to spare.
+    v_draft_pos = UOp.variable("draft_pos", 0, self.max_context - 1)
 
     # --- prefill: identical mechanics to generate() (same kind of v_start_pos/v_toks vars, same
     # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
@@ -1283,9 +1308,18 @@ class Transformer:
       draft_tensors: list[Tensor] = []
       q_list: list[np.ndarray] = []
       for _ in range(k_eff):
-        dlogits = self.mtp_head.draft(self, h_last, dtok, dpos)  # (B,1,vocab)
+        dlogits = self.mtp_head.draft(self, h_last, dtok, v_draft_pos.bind(dpos))  # (B,1,vocab)
         if greedy:
-          dtok = dlogits.argmax(-1)  # (B,1)
+          # T4.66: .realize() here (new -- the pre-T4.66 plain-int start_pos never needed it) is load-bearing,
+          # not a stray perf tweak: v_draft_pos is ONE named Variable rebound to a DIFFERENT concrete value
+          # each pass through this loop, and the greedy branch used to keep every dtok lazy, chaining k_eff of
+          # them into ONE combined graph only realized at chunk_ids' .tolist() below. A single realize/schedule
+          # can only carry one concrete value per variable NAME (create_linear_with_vars raises "bind mismatch
+          # on draft_pos, i != i+1" otherwise -- reproduced while building this), so each drafted step must be
+          # realized in its own scope before the next .bind() of the same name is created. Still async/non-
+          # blocking (engine/realize.py's run_linear(wait=False), same as generate()'s own per-step realize()),
+          # so this doesn't reintroduce a host sync the way the sampled branch's per-step .numpy() below does.
+          dtok = dlogits.argmax(-1).realize()  # (B,1)
           draft_tensors.append(dtok)
         else:
           q_i = _softmax_np(dlogits[:, -1, :].numpy()[0], temperature)  # (vocab,)

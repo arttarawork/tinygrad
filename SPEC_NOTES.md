@@ -109,25 +109,50 @@ intermediate.**
   confirmed while debugging: routing a T=2 VERIFY and a T=1 REDO through two *different* concrete,
   unbound shapes collides in `self.jit`'s dict key exactly the way T4.12's own docstring warns about).
   `chunk_size` is auto-widened to `max(caller's chunk_size, k+1)` so VERIFY/REDO always fit.
-- `MTPHead.draft`'s own `start_pos` is passed as a plain python int (`dpos`), matching
-  `test_mtp_load.py`'s existing calling convention and `draft`'s fixed signature — not a bound
-  Variable. `TransformerBlock`/`MLATransformerBlock` (unlike `GatedDeltaNetBlock`, which
-  self-converts) don't turn a plain int into a symbolic position, so on a real GPU target every
-  drafted position (which never repeats across a whole `speculative_generate()` run) gets its own
-  literal-shaped trace through `mtp_head.block`'s `@function(precompile=True)` body — one
-  schedule/codegen pass per drafted token, no reuse. Doesn't affect correctness or this task's tests;
-  a real perf cost on GPU that T4.66 (or later) should fix by binding `dpos` to its own Variable, the
-  same way the main model's decode path already does.
+- **(T4.66, done)** `MTPHead.draft`'s own `start_pos` is now a bound Variable, not a plain python int.
+  `speculative_generate` creates one `v_draft_pos = UOp.variable("draft_pos", 0, max_context-1)` —
+  same domain as `v_start_pos`, since `mtp_head.block`'s own `cache_kv`/`freqs_cis` are sized off the
+  SAME `config.max_context` as the main model (`from_gguf`'s MTP branch builds `mtp_cfg` from the
+  owning `Transformer`'s own config), and `k_eff` already caps drafted positions at
+  `start_pos+k_eff <= max_context-2` — and `.bind(dpos)`s it fresh per drafted step, instead of
+  passing `dpos` straight through. `TransformerBlock`/`MLATransformerBlock` already handled a bound
+  `start_pos` end-to-end before this change (unlike `GatedDeltaNetBlock`, which self-converts — see
+  its `_attention` — these two never needed to: every T=1 decode-shaped call already arrives with a
+  bound Variable from `generate()`/`speculative_generate()`'s own main-model call sites), so the fix is
+  entirely in the DRAFT loop's call site, not in `MTPHead.draft`'s signature (already `int|UOp`) or in
+  either block class. A SEPARATE Variable from `v_start_pos`, not a reuse of it — see the reasoning
+  written next to `v_draft_pos`'s definition in `speculative_generate` (reuse would likely be just as
+  safe, since DRAFT always fully resolves before VERIFY ever binds `v_start_pos`, but a separate name
+  costs nothing and never needs re-justifying if either call site changes later).
 
-## 5. What T4.66 would remove
+  One real wrinkle, not obvious up front: the greedy DRAFT loop chains `dtok` *lazily* across its
+  `k_eff` iterations by design (batching the whole chain's host read into ONE final `.tolist()`
+  alongside `tok_last`) — with `v_draft_pos` rebound to a DIFFERENT concrete value each iteration, all
+  `k_eff` of those still-unrealized binds would land in the SAME combined schedule at that final
+  `.tolist()`, and tinygrad only allows one concrete value per variable NAME per schedule
+  (`schedule/__init__.py`'s `create_linear_with_vars`: `RuntimeError: bind mismatch on draft_pos,
+  i != i+1`, reproduced while building this). Fix: `.realize()` each drafted `dtok` individually before
+  the next iteration's `.bind()` of the same name exists — still async/non-blocking
+  (`engine/realize.py`'s `run_linear(wait=False)`, same as `generate()`'s own per-step `.realize()`),
+  so this doesn't add a host sync the sampled branch's per-step `.numpy()` didn't already have. The
+  sampled branch never hit this: its per-step `.numpy()` already forced one bind resolved at a time.
+
+  Measured (tiny synthetic model, `test_spec_decode.py::test_draft_reuses_schedule_across_positions`,
+  `DEV=CPU`, greedy, `k=2`, verified by temporarily reverting the fix locally): pre-fix, tinygrad's
+  `schedule_cache` grew by a steady +2 entries on EVERY subsequent token, forever (7 → 72 over 30
+  tokens, never stabilizing); post-fix, it grows only through a short warmup (7 → 17 → 19) then stays
+  exactly flat for the remaining 27 tokens — `to_program_cache` shows the same shape (31 → 241
+  unbounded pre-fix, vs. 31 → 68 then flat post-fix).
+
+## 5. What's still left (T4.66 did not touch this)
 
 The partial-accept REDO (§1) is the acknowledged v1 cost: one extra main-model forward, purely to
 rebuild GDN state and get the correct `h_last`, on every iteration that doesn't fully accept.
 Removing it needs `forward()`'s `spec=True` path to also expose the pre-norm hidden state at *every*
 position (not just the last), so ACCEPT can slice position `m`'s hidden directly out of VERIFY's own
 output instead of re-forwarding — trading one extra forward for keeping `k_eff+1` hidden states alive
-instead of 1 per VERIFY call. Also candidate for T4.66: binding `MTPHead.draft`'s `start_pos` to a
-Variable (§4) to stop paying a fresh compile per drafted position on GPU.
+instead of 1 per VERIFY call. (This section used to also list binding `MTPHead.draft`'s `start_pos` to
+a Variable as a T4.66 candidate — that's done now, see §4; the REDO cost above is the only thing left.)
 
 ## 6. T4.65 — logits-returning `forward(spec=True)`, sampled acceptance, serve wiring
 
