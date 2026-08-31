@@ -34,6 +34,93 @@ def gdn_head_groups_for(num_v_heads:int) -> int:
   if GDN_HEAD_GROUPS.value > 0: return GDN_HEAD_GROUPS.value
   return -(-num_v_heads // 32)  # auto: smallest G with ceil(num_v_heads/G) <= 32 == ceil(num_v_heads/32)
 
+# T4.69a: chunkwise WY-form scan (gdn_scan_wy, below) as a device-agnostic alternative to
+# GatedDeltaNetBlock._attention's else-branch per-token loop -- same math (reference: that loop, and
+# kernels/amd.py's gated_delta_prefill, whose per-step algebra was checked against it -- see the T4.69a
+# report), expressed as O(log T_pad) matmul-shaped ops instead of a T_pad-deep python-unrolled chain.
+# 0 (auto, default): the loop -- flipping the default to WY is a later, measured decision (perf evidence:
+# extra/gdn_wy_evidence.py); auto must stay byte-identical to pre-T4.69a behavior. 1: force the loop.
+# 2: force gdn_scan_wy. Selection happens inside GatedDeltaNetBlock._attention's run_scan closure, so a
+# GDN_HEAD_GROUPS-sliced call composes with it for free (each group independently dispatches).
+GDN_SCAN_IMPL = ContextVar("GDN_SCAN_IMPL", 0)
+GDN_SCAN_LOOP, GDN_SCAN_WY = 1, 2
+def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.value > 0 else GDN_SCAN_LOOP
+
+def _gdn_tri_inverse(m:Tensor) -> Tensor:
+  """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
+  doubling instead of a length-C forward-substitution loop.
+
+  (First draft used block-recursive halving instead -- same O(log2 C) DEPTH, but that recursion's binary tree
+  has O(C) total nodes (1+2+4+...+C/2 calls), each contributing its own small matmuls/concats; the T4.69a
+  evidence script caught this the honest way, by measuring more/bigger lowered kernels for wy than the loop
+  at the real geometry, not by inspection. Doubling below is a straight-line loop of O(log2 C) STEPS on the
+  one full-size (C,C) matrix -- genuinely fewer, uniformly-shaped matmuls, no shrinking submatrices or cats.)
+
+  Let n := -m (also strictly lower triangular, hence nilpotent: n^C == 0 -- a C×C strictly-lower matrix has
+  no index path of length C respecting i>j). Then (I+m)^-1 = (I-n)^-1 = sum_{i=0}^{C-1} n^i =: P_C (finite
+  Neumann series). Doubling identity: P_2k = P_k + n^k @ P_k (sum_{i<k} n^i + n^k sum_{i<k} n^i =
+  sum_{i<k} n^i + sum_{k<=i<2k} n^i = sum_{i<2k} n^i). Starting P_1 = I, n^1 = n, and repeatedly setting
+  (P, n^k) -> (P + n^k@P, n^k@n^k) for ceil(log2(C)) steps gives P_{2^steps} with 2^steps >= C; every term
+  beyond n^{C-1} is exactly 0 (n^k[i,j] needs a length-k strictly-decreasing index chain from i to j, i.e.
+  i-j >= k, impossible once k >= C for a C-wide matrix -- and since each such entry's defining sum is then a
+  sum of exact-zero float products, this holds bit-for-bit, not just "negligibly small"), so P_{2^steps} ==
+  P_C exactly regardless of whether C is a power of 2 -- no padding or odd/even-split bookkeeping needed."""
+  c = m.shape[-1]
+  assert isinstance(c, int), "gdn_scan_wy always builds m from a concrete (padded-to-T_pad) chunk size"
+  idx = Tensor.arange(c, dtype=dtypes.int32).clone(m.device)
+  eye = (idx.reshape(c, 1) == idx.reshape(1, c)).float()  # (C,C), broadcasts to m's batch shape below
+  p, n_pow = Tensor.zeros_like(m) + eye, -m
+  for _ in range((c - 1).bit_length()):  # == ceil(log2(c)) for c >= 1, computed without float log2 rounding risk
+    p = p + n_pow @ p
+    n_pow = n_pow @ n_pow
+  return p
+
+def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
+  """Chunkwise WY-form gated delta rule scan: the whole (B,H,T,*) chunk in one shot via matmuls plus one
+  (T,T) triangular solve, instead of _attention's else-branch per-token loop closure (T-deep python-unrolled
+  chain). Both compute the same per-token recurrence (checked against kernels/amd.py's gated_delta_prefill,
+  which implements it as a hardware loop with an algebraically-reassociated output term, NOT this chunked
+  form -- see the T4.69a report for why "port the algorithm" ended up meaning "derive the standard
+  chunked/WY delta-rule parallelization instead of amd.py's structural shape", with amd.py and the loop
+  supplying the reference MATH only): per token i (S_{-1} = state entering the call),
+    S_i = diag(alpha_i) @ S_{i-1} @ (I - beta_i k_i k_i^T) + beta_i v_i k_i^T,   out_i = S_i @ q_i
+
+  Derivation (chunk of C=T tokens, S0 := state entering the chunk): let Abar_i = prod_{j<=i} alpha_j
+  (row-wise, i.e. per value-channel, cumulative decay through step i inclusive). Substituting the
+  decay-normalized state S~_i := diag(Abar_i)^-1 @ S_i turns the GATED recurrence into the plain (ungated)
+  delta rule in (S~, v~ := v/Abar): S~_i = S~_{i-1} + beta_i (v~_i - S~_{i-1} k_i) k_i^T. Unrolling
+  S~_i = S0 + sum_{j<=i} u_j k_j^T turns that into a strictly-lower-triangular linear system for the C
+  "pseudo-value" rows u_j (u_i + beta_i sum_{j<i} (k_j.k_i) u_j = beta_i(v~_i - S0 k_i)), i.e. in matrix form
+    (I + Beta @ tril(K K^T, -1)) @ U = Beta @ (V~ - K @ S0^T)      -- solved via _gdn_tri_inverse above.
+  Output and final state then fold the decay back in:
+    O   = Abar * (Q @ S0^T + tril(Q K^T, 0) @ U)                  -- (C,V), row i = out_i
+    S_C = Abar[-1] * (S0 + U^T @ K)                                -- state leaving the chunk
+  `alpha` may be a per-head scalar (last dim 1, broadcasts across V -- non-kda) or per-value-channel (last
+  dim V -- kda): nothing above assumes which, so kda needs no special-casing here (empirically verified:
+  test_attention.py's test_varied_chunk_sizes_match_decode(kda=True) runs under GDN_SCAN_IMPL=2 too; the
+  "38" geometry in test_gdn_scan_parity.py does NOT set kda, so that file's coverage is non-kda-only).
+
+  Shapes (all float32; T_pad is the WHOLE chunk -- one WY block, no further sub-chunking needed since
+  GDN_CHUNK's practical ceiling (32) is already tiny for a log-depth triangular solve; padded steps are
+  beta=0/alpha=1 no-ops exactly as in the loop, so trailing padding never perturbs O or S_C for real tokens):
+  state (B,H,V,K); q,k (B,H,T,K); v (B,H,T,V); beta (B,H,T); alpha (B,H,T,V|1). Returns
+  (final_state (B,H,V,K), stacked_outputs (B,T,H,V)) -- T-before-H, matching the loop's return contract
+  (outs[0].stack(*outs[1:], dim=1))."""
+  T = q.shape[2]
+  idx = Tensor.arange(T, dtype=dtypes.int32).clone(q.device)
+  row, col = idx.reshape(T, 1), idx.reshape(1, T)
+  strict_lower, lower_incl = (col < row).float(), (col <= row).float()
+  a_bar = alpha.cumprod(axis=2)                                          # (B,H,T,V|1), decay through step i
+  v_tilde = v / a_bar                                                    # decay-normalized values
+  kkt = (k @ k.transpose(-1, -2)) * strict_lower                         # (B,H,T,T), strictly lower
+  m = beta.unsqueeze(-1) * kkt                                           # row i scaled by beta_i (Beta @ T)
+  rhs = beta.unsqueeze(-1) * (v_tilde - k @ state.transpose(-1, -2))     # (B,H,T,V)
+  u = _gdn_tri_inverse(m) @ rhs                                          # (B,H,T,V) pseudo-values
+  qk = (q @ k.transpose(-1, -2)) * lower_incl                            # (B,H,T,T), lower incl. diagonal
+  out = a_bar * (q @ state.transpose(-1, -2) + qk @ u)                   # (B,H,T,V)
+  final_state = a_bar[:, :, T-1, :].unsqueeze(-1) * (state + u.transpose(-1, -2) @ k)  # (B,H,V,K)
+  return final_state, out.transpose(1, 2)                                # (B,T,H,V)
+
 # T4.63: qwen3.5-family GGUFs carry a DeepSeek-style MTP ("nextn") block beyond the main num_blocks
 # (nextn_predict_layers, already excluded from num_blocks -- see from_gguf). 0 (default): today's
 # behavior, byte-identical -- gguf.py parses the block, from_gguf drops it (unused-weights warning).
@@ -482,11 +569,15 @@ class GatedDeltaNetBlock(FFNBlock):
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
-      q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
-      alpha = alpha.unsqueeze(-1)
       state = initial.where(0, state.float())
 
-      def scan(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
+      def run_scan(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
+        # T4.69a: GDN_SCAN_IMPL picks the per-token loop (default/auto) or the chunkwise WY-form gdn_scan_wy
+        # (device-agnostic, matmul-shaped -- see its docstring). Dispatch lives here, inside the per-group
+        # call site below, so a GDN_HEAD_GROUPS split composes with it for free.
+        if gdn_scan_impl_for() == GDN_SCAN_WY: return gdn_scan_wy(state, q, k, v, beta, alpha)
+        q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
+        alpha = alpha.unsqueeze(-1)
         outs = []
         for t in range(T_pad):
           s1 = state * alpha[:, :, t]  # decay the state
@@ -500,13 +591,13 @@ class GatedDeltaNetBlock(FFNBlock):
       # then a single cat reassembles the full state/output. G=1 (unchanged geometries) skips all of this
       # and lowers to exactly the same graph as before.
       if (G := gdn_head_groups_for(self.num_v_heads)) <= 1:
-        state, stacked = scan(state, q, k, v, beta, alpha)
+        state, stacked = run_scan(state, q, k, v, beta, alpha)
       else:
         gsize = -(-self.num_v_heads // G)  # ceil(H/G): only the last group is smaller when H % G != 0
         group_states, group_outs = [], []
         for lo in range(0, self.num_v_heads, gsize):
           hi = min(lo + gsize, self.num_v_heads)
-          g_state, g_outs = scan(state[:, lo:hi], q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], beta[:, lo:hi], alpha[:, lo:hi])
+          g_state, g_outs = run_scan(state[:, lo:hi], q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], beta[:, lo:hi], alpha[:, lo:hi])
           group_states.append(g_state.contiguous())
           group_outs.append(g_outs.contiguous())
         state = group_states[0].cat(*group_states[1:], dim=1) if len(group_states) > 1 else group_states[0]

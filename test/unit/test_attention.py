@@ -8,6 +8,7 @@ from tinygrad.llm import model
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, gdn_head_groups_for,
+  GDN_SCAN_LOOP, GDN_SCAN_WY,
 )
 from tinygrad.llm.attn_kernel import tuned_decode_attention, CHUNK
 from test.helpers import assert_kernel_count, assert_jit_cache_len
@@ -259,18 +260,24 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
           p.replace(self._tensor_linspace(-0.05, 0.05, p.shape) if len(p.shape) > 1 else self._tensor_linspace(0.05, 0.1, p.shape))
       else: block = self._make_block(config)
       x = self._tensor_linspace(-0.5, 0.5, (1, 4, config.dim))
-      decode = np.concatenate([self._run_attention(block, x[:, i:i+1], i) for i in range(4)], axis=1)
-      decode_conv, decode_recurrent = self._cache_views(block)
-      for chunking in ([4], [2, 2], [1, 3], [3, 1], [2, 1, 1]):
-        self._reset_state(block)
-        outs, start = [], 0
-        for size in chunking:
-          outs.append(self._run_attention(block, x[:, start:start+size], start))
-          start += size
-        chunked_conv, chunked_recurrent = self._cache_views(block)
-        np.testing.assert_allclose(np.concatenate(outs, axis=1), decode, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
-        np.testing.assert_allclose(chunked_conv, decode_conv, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
-        np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP):  # ground truth is always the plain per-token loop
+        decode = np.concatenate([self._run_attention(block, x[:, i:i+1], i) for i in range(4)], axis=1)
+        decode_conv, decode_recurrent = self._cache_views(block)
+      # T4.69a: this is the file's cheapest kda-covering matrix, so it doubles as "does gdn_scan_wy handle
+      # kda" verification -- its derivation never special-cases kda (alpha's shape is just broadcast
+      # generically, whether per-head-scalar or per-value-channel), and this confirms that empirically too.
+      for impl in (GDN_SCAN_LOOP, GDN_SCAN_WY):
+        for chunking in ([4], [2, 2], [1, 3], [3, 1], [2, 1, 1]):
+          self._reset_state(block)
+          outs, start = [], 0
+          with Context(GDN_SCAN_IMPL=impl):
+            for size in chunking:
+              outs.append(self._run_attention(block, x[:, start:start+size], start))
+              start += size
+          chunked_conv, chunked_recurrent = self._cache_views(block)
+          np.testing.assert_allclose(np.concatenate(outs, axis=1), decode, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {impl=} {chunking=}")
+          np.testing.assert_allclose(chunked_conv, decode_conv, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {impl=} {chunking=}")
+          np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {impl=} {chunking=}")
 
   def test_start_zero_resets_realized_state(self):
     config, x = self._make_config(max_context=3), self._tensor_linspace(-1, 1, (1, 3, 32))
