@@ -233,6 +233,15 @@ class TestLLMToolCalls(unittest.TestCase):
     return [{"type":"function", "function":{"name":"read", "description":"Read a file",
       "parameters":{"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]}}}]
 
+  def test_unknown_path_returns_404_not_traceback(self):
+    # Ollama-style probes (/api/show etc.) from local tooling must get a JSON 404, not a dropped connection + stderr traceback
+    import urllib.request, urllib.error, json as _json
+    req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/show", data=b"{}", headers={"Content-Type":"application/json"})
+    with self.assertRaises(urllib.error.HTTPError) as cm:
+      urllib.request.urlopen(req, timeout=5)
+    self.assertEqual(cm.exception.code, 404)
+    self.assertIn("unknown path", _json.loads(cm.exception.read())["error"]["message"])
+
   def test_streaming_tool_call(self):
     self.set_output('before<tool_call>{"name":"read","arguments":{"path":"README.md"}}</tool_call>')
     chunks = list(self.client.chat.completions.create(model="tool-model", messages=[{"role":"user", "content":"Read README.md"}],
