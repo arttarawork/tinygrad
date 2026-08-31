@@ -1,8 +1,10 @@
 from __future__ import annotations
 import enum, functools, itertools, math, pathlib
 from dataclasses import dataclass, replace
-from typing import Callable, cast
-import numpy as np
+from typing import Callable, cast, TYPE_CHECKING
+if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays numpy-free at import time -- the minimal
+# CI lanes (Test LLM, SPEC=2) have no numpy installed. The sampled speculative path imports it lazily inside the
+# functions that actually need it; annotations are lazy via `from __future__ import annotations`.
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
@@ -598,6 +600,7 @@ def _softmax_np(logits:np.ndarray, temperature:float) -> np.ndarray:
   pulls model logits to host and does all its acceptance math in numpy (the vectors are tiny -- at most
   k_eff+1 rows of vocab_size floats per iteration); float64 gives rng.choice's sum-to-1 tolerance headroom
   a fp16/fp32 model output doesn't reliably leave it."""
+  import numpy as np
   z = logits.astype(np.float64) / temperature
   z = z - z.max(axis=-1, keepdims=True)
   e = np.exp(z)
@@ -628,6 +631,7 @@ def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng
   p(x)+0, or p(x)>q(x), giving q(x)+(p(x)-q(x))) -- true for every x regardless of q, which is why draft
   quality only ever affects the acceptance RATE, never correctness. test_spec_decode.py's statistical test
   checks this empirically since it's the theorem the whole sampled path's correctness rests on."""
+  import numpy as np
   assert q_probs.shape[0] == len(draft_ids) and p_probs.shape[0] == len(draft_ids) + 1, "q_probs/p_probs row count must match draft_ids"
   k_eff = len(draft_ids)
   for m in range(k_eff):
@@ -1031,7 +1035,9 @@ class Transformer:
     # every branch below can rely on it being a concrete Generator, never None (mypy narrows this cleanly;
     # threading `rng: Generator|None = None` through per-branch asserts instead would be more code for it).
     greedy = temperature <= 0
-    if rng is None: rng = np.random.default_rng()
+    if not greedy or rng is not None:
+      import numpy as np  # lazy: only the sampled path needs numpy (see the TYPE_CHECKING note at the top)
+      if rng is None: rng = np.random.default_rng()
     # T4.55: same recurrent-chunk cap generate() applies (see there); then widen so the verify/re-forward
     # chunk (1..k+1 tokens) fits inside the SAME v_toks bound as the prefill chunks below -- one shared
     # Variable, one JIT capture per (is_prefill, spec) pair reused at every length, instead of one capture
