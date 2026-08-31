@@ -20,6 +20,13 @@ def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
   return 32 if dev.split(":")[0] in ("METAL", "NV", "CUDA") else 1
 
+# T4.63: qwen3.5-family GGUFs carry a DeepSeek-style MTP ("nextn") block beyond the main num_blocks
+# (nextn_predict_layers, already excluded from num_blocks -- see from_gguf). 0 (default): today's
+# behavior, byte-identical -- gguf.py parses the block, from_gguf drops it (unused-weights warning).
+# 1: build + load it as Transformer.mtp_head (see MTPHead) -- loading + forward only; T4.64 wires it
+# into speculative decoding.
+MTP = ContextVar("MTP", 0)
+
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
   the dominant decode-memory cost). KV_F32=1 reverts to dtypes.default_float, e.g. to isolate an accuracy
@@ -535,6 +542,56 @@ def parse_device_map(dm:str|dict[int|str,str], num_blocks:int) -> tuple[list[str
   assert all(out), f"device_map must cover all {num_blocks} blocks: {dm}"
   return out, experts_dev  # type: ignore[return-value]
 
+def _rename_mtp_keys(state_dict:dict[str, Tensor], num_blocks:int) -> None:
+  """Renames blk.{num_blocks}.* (the nextn/MTP block a qwen3.5-family GGUF carries beyond the main
+  num_blocks) onto MTPHead's attribute paths, in place -- see MTPHead's docstring for the forward
+  semantics. blk.{n}.nextn.X -> mtp_head.X (the 4 MTP-specific tensors); every other blk.{n}.X ->
+  mtp_head.block.X (X unchanged: the inner block's attribute names already match a main block's, e.g.
+  attn_q, ffn_gate -- from_gguf's post_attention_norm->ffn_norm rename runs first and applies here too).
+  Pure key manipulation -- never touches a tensor's value, so this is cheap to exercise against just a
+  real GGUF's tensor-name list (no data realized) as well as against a real load.
+  # ponytail: only the first nextn layer (blk.{num_blocks}) is modeled -- nextn_predict_layers>1 (not
+  # seen in any real qwen3.5-family checkpoint so far) would need mtp_head to be a list of these."""
+  prefix = f"blk.{num_blocks}."
+  for k in [k for k in state_dict if k.startswith(prefix)]:
+    rest = k[len(prefix):]
+    new_k = f"mtp_head.{rest[len('nextn.'):]}" if rest.startswith("nextn.") else f"mtp_head.block.{rest}"
+    state_dict[new_k] = state_dict.pop(k)
+
+class MTPHead:
+  """DeepSeek-style multi-token-prediction ("nextn") head (qwen3.5-family GGUFs -- see from_gguf's
+  MTP=1 branch and _rename_mtp_keys for how blk.{num_blocks}.* lands here). llama.cpp-compatible
+  forward: eh_proj(concat(enorm(embed(next_tok)), hnorm(last_hidden))) -> `block` (a real attention
+  block, built the same way the main Transformer builds one for this arch/config -- see from_gguf;
+  it keeps its OWN KV cache over drafted positions, separate from the main model's blocks) ->
+  shared_head_norm -> the OWNING Transformer's output head. That last step is output-norm-free: this
+  head has its own learned final norm (shared_head_norm) instead of reusing the main model's
+  output_norm, same as llama.cpp's DeepSeek-MTP implementation. One token of lookahead per call;
+  T4.64 chains calls (start_pos, start_pos+1, ...), feeding each call's own sampled token back in.
+
+  `draft` takes the owning Transformer as an explicit argument rather than storing it on self: this
+  object hangs off Transformer.mtp_head, and nn/state.py's get_state_dict recurses through every plain
+  attribute with no cycle guard -- a stored back-reference would make it walk
+  model -> mtp_head -> owner -> model -> ... forever the moment anything asks for this model's
+  state/parameters (load_state_dict, realize_placement, get_parameters, ...)."""
+  def __init__(self, config:TransformerConfig, block_cls:type[FFNBlock]=TransformerBlock):
+    self.enorm, self.hnorm = nn.RMSNorm(config.dim, config.norm_eps), nn.RMSNorm(config.dim, config.norm_eps)
+    self.eh_proj = Linear(2 * config.dim, config.dim, bias=False)
+    self.block = block_cls(config)
+    self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
+
+  def draft(self, owner:Transformer, h:Tensor, tok_ids:Tensor, start_pos:int|UOp) -> Tensor:
+    """h: (B,1,dim) the main model's last-layer hidden state (pre-output-norm) at position t.
+    tok_ids: (B,1) int, the token actually at position t+1. Returns (B,1,vocab) draft logits
+    predicting position t+2. `block`'s KV cache advances with start_pos across calls, same as a
+    main block's (see FFNBlock._init_state/__call__) -- so calling this again at start_pos+1
+    continues the same drafted sequence instead of overwriting it."""
+    dev = self.block.device
+    e = owner.token_embd(tok_ids.to(owner.token_embd.weight.device)).float().to(dev)
+    x = self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
+    x = self.block(x, start_pos)
+    return owner.output(self.shared_head_norm(x).to(owner.output.weight.device))
+
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     dense_config = replace(config, num_experts=0, num_experts_per_tok=0, shared_expert_dim=0, hidden_dim=config.dense_hidden_dim or config.hidden_dim)
@@ -550,6 +607,7 @@ class Transformer:
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
+    self.mtp_head: MTPHead|None = None  # set by from_gguf when MTP=1 and the GGUF has a nextn block (T4.63)
     self.max_context = config.max_context
     # set by the device_map branch below; None means "no device_map", the fast/no-op path for realize_placement()
     self._placed_devices: frozenset[str]|None = None
@@ -753,6 +811,16 @@ class Transformer:
       yarn_beta_fast=kv.get(f'{arch}.rope.scaling.yarn_beta_fast', 32.0), yarn_beta_slow=kv.get(f'{arch}.rope.scaling.yarn_beta_slow', 1.0),
       yarn_attn_factor=kv.get(f'{arch}.rope.scaling.yarn_attn_factor'))
     model = Transformer(config, device_map)  # pre-placed params make load_state_dict load each weight to its mapped device
+    if MTP.value and kv.get(f'{arch}.nextn_predict_layers', 0) > 0:
+      # mirror Transformer.__init__'s own full-attention block config (MTP/nextn is architecturally always a
+      # plain attention block -- DeepSeek-MTP semantics -- positioned after every real block: never one of
+      # leading_dense_blocks, never sliding (gpt-oss, the only sliding_layers arch, has no MTP block)
+      mtp_cfg = replace(config, qk_norm=config.head_dim) if config.ssm else config
+      block_cls = MLATransformerBlock if config.kv_lora_rank > 0 else TransformerBlock
+      model.mtp_head = MTPHead(mtp_cfg, block_cls)
+      last_dev = model.blk[-1].device  # gguf.py's device-map clamp already stages blk.{num_blocks}.* here too
+      for p in nn.state.get_parameters(model.mtp_head): p.to_(last_dev)
+      _rename_mtp_keys(state_dict, config.num_blocks)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
