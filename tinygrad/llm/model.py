@@ -46,6 +46,10 @@ def gdn_head_groups_for(num_v_heads:int) -> int:
 GDN_SCAN_IMPL = ContextVar("GDN_SCAN_IMPL", 0)
 GDN_SCAN_LOOP, GDN_SCAN_WY = 1, 2
 def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.value > 0 else GDN_SCAN_LOOP
+# T4.69b: test-introspection only, never read inside the model itself -- run_scan (below) appends the impl it
+# actually dispatched to (post single-step gate), so a test can assert WY vs LOOP was chosen without reaching
+# into a kernel count. Read via gdn_last_scan_impl[-1].
+gdn_last_scan_impl: list[int] = []
 
 def _gdn_tri_inverse(m:Tensor) -> Tensor:
   """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
@@ -576,7 +580,18 @@ class GatedDeltaNetBlock(FFNBlock):
         # T4.69a: GDN_SCAN_IMPL picks the per-token loop (default/auto) or the chunkwise WY-form gdn_scan_wy
         # (device-agnostic, matmul-shaped -- see its docstring). Dispatch lives here, inside the per-group
         # call site below, so a GDN_HEAD_GROUPS split composes with it for free.
-        if gdn_scan_impl_for() == GDN_SCAN_WY: return gdn_scan_wy(state, q, k, v, beta, alpha)
+        # T4.69b: WY amortizes one (T_pad,T_pad) triangular solve plus several matmuls across T_pad steps --
+        # at T_pad==1 there's nothing to amortize, just that overhead around a single-step recurrence the loop
+        # already computes directly. Measured on the 2026-08-31 GPU battery (pooled qwen3.8-27B): IMPL=2
+        # improved chunked prefill (22->28 tok/s @5.9k, 21->27 @16.2k) but made token-by-token decode
+        # pathologically slow. Gate on T_pad, not T: T is a bound symbolic Variable during chunked prefill
+        # (isinstance(T, UOp)) even for a single-real-token remainder chunk, but that chunk is still padded out
+        # to the full declared chunk_size -- T_pad, already concrete (max_shape/to_max_shape always returns
+        # plain ints) either way, is the one quantity that means "how many steps this call's scan processes"
+        # for both the symbolic/padded prefill path and a plain concrete T=1 decode step.
+        use_wy = gdn_scan_impl_for() == GDN_SCAN_WY and T_pad > 1
+        gdn_last_scan_impl.append(GDN_SCAN_WY if use_wy else GDN_SCAN_LOOP)
+        if use_wy: return gdn_scan_wy(state, q, k, v, beta, alpha)
         q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
         alpha = alpha.unsqueeze(-1)
         outs = []
