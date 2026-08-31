@@ -959,6 +959,52 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
+  # T4.67: cross-session state cache. get_start_pos/_cached_tokens above only ever remember ONE sequence -- this
+  # model instance's own most recent one (the "splice" path). snapshot_state/restore_state let a caller (serve.py)
+  # park SEVERAL sequences' complete state off to the side (keyed by token-id tuple, see snapshot_matches) and
+  # swap one back in when a new request's ids exactly extend it, instead of re-prefilling a byte-identical shared
+  # prefix (e.g. a system prompt) from scratch just because the live cache currently holds some OTHER session's
+  # state. Device-side only (Tensor.clone/.assign, one batched realize each, same idiom as speculative_generate's
+  # own GDN CHECKPOINT) -- no host round-trip for cache contents, only for the tiny token-id list.
+  def snapshot_state(self) -> dict:
+    """Snapshot this model's complete sequence state at its current token boundary (len(self._cached_tokens)):
+    every GDN block's conv_state/recurrent_state (whole tensors -- O(1) accumulators, not position-indexed) and
+    every attention/MLA block's KV cache LIVE slice only (never the full max_context-sized buffer). Precondition
+    (always true the way serve.py calls this -- right after a generate()/speculative_generate() step yields its
+    first token, i.e. prefill just completed): at least one forward pass has already run on this model, so every
+    block's cache buffers exist. restore_state is the inverse; snapshot_matches tells a caller whether it's even
+    valid to call that for a given token list. mtp_head's own (attention-only) KV cache is deliberately NOT
+    included: a stale/wrong draft never affects correctness (only iteration count), the same reason
+    speculative_generate's own CHECKPOINT never protects it either -- see its comment."""
+    pos = len(self._cached_tokens)
+    blocks: list[dict] = []
+    for b in self.blk:
+      if isinstance(b, GatedDeltaNetBlock): blocks.append({"conv_state": b.conv_state.clone(), "recurrent_state": b.recurrent_state.clone()})
+      elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
+      elif isinstance(b, TransformerBlock): blocks.append({"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()})
+      else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
+    Tensor.realize(*(t for bs in blocks for t in bs.values()))
+    return {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks}
+
+  def restore_state(self, snap:dict) -> None:
+    """Inverse of snapshot_state: writes every cloned buffer back into this model's LIVE (preallocated) caches
+    via the slice-assign idiom (`buf[...].assign(...)`, batched-realized -- generalizing speculative_generate's
+    GDN-checkpoint restore to attention/MLA KV slices too), then restores _cached_tokens so get_start_pos/
+    generate/speculative_generate see exactly the state snapshot_state captured -- a continuation is then
+    TOKEN-IDENTICAL to an uncached run over the same full token sequence. Pure mechanical apply, no validation:
+    the caller must only call this when snap is actually safe to apply (see snapshot_matches) -- restoring a
+    snapshot whose tokens are NOT an exact prefix of what comes next would silently produce wrong output, same
+    as get_start_pos's own recurrent-reuse rule would if a caller bypassed it."""
+    assert len(snap["blocks"]) == len(self.blk), "restore_state: snapshot block count doesn't match this model"
+    assigns: list[Tensor] = []
+    for b, bs in zip(self.blk, snap["blocks"]):
+      if isinstance(b, GatedDeltaNetBlock): assigns += [b.conv_state.assign(bs["conv_state"]), b.recurrent_state.assign(bs["recurrent_state"])]
+      elif isinstance(b, MLATransformerBlock): assigns.append(b.cache_k[:, :, :bs["cache_k"].shape[2], :].assign(bs["cache_k"]))
+      elif isinstance(b, TransformerBlock): assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"]))
+      else: raise TypeError(f"restore_state: unhandled block type {type(b).__name__}")
+    Tensor.realize(*assigns)
+    self._cached_tokens = list(snap["tokens"])
+
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1):
     """drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
     syncing every sampled token. drain_every=1 (default) is byte-identical to the pre-T2.5 behavior -- every
@@ -1235,3 +1281,22 @@ class Transformer:
         tokens.append(v)
         self._cached_tokens = tokens[:-1]
         yield tokens[-1]
+
+def snapshot_nbytes(snap:dict) -> int:
+  """Total device-buffer bytes a Transformer.snapshot_state() dict holds: recursively sums every Tensor's
+  size*itemsize (tokens/pos are plain python and cost nothing here). serve.py's state-cache LRU sizes its
+  MB cap against this."""
+  def walk(x:object) -> int:
+    if isinstance(x, Tensor): return math.prod(int(d) for d in x.shape) * x.dtype.itemsize
+    if isinstance(x, dict): return sum(walk(v) for v in x.values())
+    if isinstance(x, (list, tuple)): return sum(walk(v) for v in x)
+    return 0
+  return walk(snap)
+
+def snapshot_matches(snap:dict, tokens:list[int]) -> bool:
+  """True iff snap's cached tokens are a strict, exact prefix of `tokens` -- the same recurrent exact-prefix
+  rule get_start_pos enforces (see there): only then is Transformer.restore_state(snap) safe to apply before
+  continuing with `tokens`. restore_state itself performs no such check -- callers (serve.py's snapshot
+  lookup, tests) must call this first."""
+  cached = snap["tokens"]
+  return bool(cached) and len(cached) < len(tokens) and tokens[:len(cached)] == cached
