@@ -1035,9 +1035,8 @@ class Transformer:
     # every branch below can rely on it being a concrete Generator, never None (mypy narrows this cleanly;
     # threading `rng: Generator|None = None` through per-branch asserts instead would be more code for it).
     greedy = temperature <= 0
-    if not greedy or rng is not None:
-      import numpy as np  # lazy: only the sampled path needs numpy (see the TYPE_CHECKING note at the top)
-      if rng is None: rng = np.random.default_rng()
+    import numpy as np  # lazy (function-local): the numpy-less CI lanes import this MODULE but never call this method
+    if rng is None: rng = np.random.default_rng()
     # T4.55: same recurrent-chunk cap generate() applies (see there); then widen so the verify/re-forward
     # chunk (1..k+1 tokens) fits inside the SAME v_toks bound as the prefill chunks below -- one shared
     # Variable, one JIT capture per (is_prefill, spec) pair reused at every length, instead of one capture
