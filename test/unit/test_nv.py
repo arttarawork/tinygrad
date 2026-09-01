@@ -1,14 +1,14 @@
-import itertools, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
+import contextlib, io, itertools, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, Context
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
 from tinygrad.runtime.support.nv.ip import NV_FLCN
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.autogen import pci
-from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, NVSignal, _fault_recovery_hint
+from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, NVSignal, DispatchRing, _fault_recovery_hint
 from tinygrad.runtime.support.hcq import HCQAllocatorBase, HCQBuffer, _dev_already_faulted
 
 class CountingMMIOInterface:
@@ -892,6 +892,189 @@ class TestNVSignalSleepFaultDrain(unittest.TestCase):
     sig = NVSignal.__new__(NVSignal)
     sig.owner, sig.should_return = None, False
     sig._sleep(0)  # must not raise
+
+def _fake_hang_self_with_control(is_err_state:bool, rm_control, error_state=None, dispatch_ring=None) -> SimpleNamespace:
+  """Like TestNVQuiesceOnFault's _fake_hang_self, plus the is_err_state/error_state/dispatch_ring knobs T4.78's
+  on_device_hang forensics change reads. iface intentionally has no `dev_impl` for is_err_state=None (the
+  NVKIface/MOCKIface shape); is_err_state True/False models a PCIIface with dev_impl.is_err_state set."""
+  pci_dev = _FakePCIConfig()
+  iface_kwargs = dict(pci_dev=pci_dev, rm_control=rm_control)
+  if is_err_state is not None: iface_kwargs['dev_impl'] = SimpleNamespace(is_err_state=is_err_state)
+  fake = SimpleNamespace(iface=SimpleNamespace(**iface_kwargs), debugger=None, debug_channel=0, is_remote=lambda: True, is_nvd=lambda: True)
+  if error_state is not None: fake.error_state = error_state
+  if dispatch_ring is not None: fake.dispatch_ring = dispatch_ring
+  return fake
+
+class TestNVOnDeviceHangForensics(unittest.TestCase):
+  """T4.78 (T475_NV_FAULT_RCA.md S5m1): a GSP-RM already known-faulted (is_err_state) has never once answered
+  another RPC (5/5 observed) -- pre-fix, on_device_hang's own forensic RPCs burned the default 10s timeout on
+  each of up to two calls and then raised a BRAND NEW RuntimeError, discarding synchronize()'s original "Device
+  fault detected" exception entirely. These prove: (1) a confirmed-wedged device gets a short forensic timeout;
+  (2) a healthy/not-yet-confirmed hang keeps the full timeout (forensics still has a chance to succeed); (3) a
+  forensic RPC timeout is caught and reported as one clear line, never left to propagate/stall; (4) the ORIGINAL
+  exception (self.error_state -- the same object synchronize() is about to re-raise) survives with its type and
+  primary message intact, the forensic report merely appended, never replacing it."""
+
+  def test_wedged_device_gets_short_forensic_timeout(self):
+    seen = []
+    def rm_control(obj, cmd, params, timeout=10000):
+      seen.append(timeout)
+      raise RuntimeError("Timeout waiting for RPC response for command 76")
+    fake = _fake_hang_self_with_control(is_err_state=True, rm_control=rm_control, error_state=RuntimeError("Device fault detected."))
+    NVDevice.on_device_hang(fake)  # must not raise: error_state is present, so it's enriched in place and returns
+    assert seen == [2000], f"a confirmed-wedged device must use the short (~2s) forensic timeout, got {seen}"
+
+  def test_healthy_hang_keeps_default_forensic_timeout(self):
+    seen = []
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    def rm_control(obj, cmd, params, timeout=10000):
+      seen.append(timeout)
+      return no_fault
+    fake = _fake_hang_self_with_control(is_err_state=False, rm_control=rm_control, error_state=RuntimeError("some other hang"))
+    NVDevice.on_device_hang(fake)
+    assert seen == [10000], f"a not-yet-confirmed-wedged hang should keep the full forensic timeout, got {seen}"
+
+  def test_forensic_timeout_reports_one_clear_line_instead_of_propagating(self):
+    def rm_control(obj, cmd, params, timeout=10000): raise RuntimeError("Timeout waiting for RPC response for command 76")
+    orig = RuntimeError("Device fault detected. NV device is in an unrecoverable fault state.")
+    fake = _fake_hang_self_with_control(is_err_state=True, rm_control=rm_control, error_state=orig)
+    NVDevice.on_device_hang(fake)  # must not raise the RPC timeout -- it must be caught, not left to stall/propagate
+    assert "GSP-RM unresponsive (standard post-fault wedge)" in str(orig)
+
+  def test_original_exception_object_type_and_message_preserved(self):
+    def rm_control(obj, cmd, params, timeout=10000): raise RuntimeError("Timeout waiting for RPC response for command 76")
+    orig = RuntimeError("Device fault detected. NV device is in an unrecoverable fault state.")
+    fake = _fake_hang_self_with_control(is_err_state=True, rm_control=rm_control, error_state=orig)
+    NVDevice.on_device_hang(fake)
+    assert fake.error_state is orig, "must enrich the SAME exception synchronize() is about to re-raise, not a new one"
+    assert type(orig) is RuntimeError
+    assert str(orig).startswith("Device fault detected. NV device is in an unrecoverable fault state."), \
+      f"primary message must survive unchanged as a prefix, got {orig}"
+    assert str(orig) != "Device fault detected. NV device is in an unrecoverable fault state.", "context must be appended, not left off"
+
+  def test_no_original_exception_falls_back_to_a_fresh_one(self):
+    # Mirrors TestNVQuiesceOnFault's pre-existing fixture shape (no error_state at all) -- on_device_hang called
+    # standalone (not via synchronize()'s except block) must still raise, unchanged from the pre-T4.78 behavior.
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    fake = _fake_hang_self_with_control(is_err_state=False, rm_control=lambda *a, **k: no_fault)
+    with self.assertRaises(RuntimeError) as ctx: NVDevice.on_device_hang(fake)
+    assert "fresh client" in str(ctx.exception).lower(), ctx.exception
+
+  def test_dispatch_ring_dumped_before_returning(self):
+    dumps = []
+    ring = SimpleNamespace(dump=lambda: dumps.append(1))
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    fake = _fake_hang_self_with_control(is_err_state=False, rm_control=lambda *a, **k: no_fault,
+                                         error_state=RuntimeError("Device fault detected."), dispatch_ring=ring)
+    NVDevice.on_device_hang(fake)
+    assert dumps == [1], "the dispatch ring must be dumped exactly once before the exception propagates"
+
+  def test_no_dispatch_ring_attribute_is_untouched(self):
+    # NVKIface/MOCKIface-vintage fakes (like TestNVQuiesceOnFault's) predate dispatch_ring entirely -- must
+    # degrade to a no-op, never AttributeError.
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    fake = _fake_hang_self_with_control(is_err_state=None, rm_control=lambda *a, **k: no_fault)
+    with self.assertRaises(RuntimeError): NVDevice.on_device_hang(fake)  # must not raise AttributeError instead
+
+class TestNVDispatchRing(unittest.TestCase):
+  """T4.78 (T475_NV_FAULT_RCA.md S5m1): NV_DISPATCH_RING's bookkeeping factored out as a plain class with no
+  device access at all, so it's exercisable here without hardware -- the hooks that feed it (NVComputeQueue.exec,
+  NVCopyQueue.copy, NVCommandQueue._submit_to_gpfifo) are one-line call sites into this."""
+
+  def test_add_assigns_monotonic_sequence_numbers(self):
+    ring = DispatchRing(8)
+    for i in range(3): ring.add('kernel', f'k{i}', [(0x1000 + i, 64)])
+    assert [e[0] for e in ring.entries] == [0, 1, 2]
+
+  def test_ring_keeps_only_last_n_most_recent_last(self):
+    ring = DispatchRing(3)
+    for i in range(5): ring.add('kernel', f'k{i}', [])
+    # oldest of the 5 (k0, k1) must have fallen off; survivors ordered oldest-first / most-recent-last.
+    assert [e[2] for e in ring.entries] == ['k2', 'k3', 'k4']
+    assert ring.seq == 5, "the sequence counter must keep counting past the ring's capacity, not wrap/reset"
+
+  def test_drain_appends_staged_entries_and_clears_the_staging_list(self):
+    ring = DispatchRing(8)
+    staged = [('kernel', 'k0', [(0x1000, 64)]), ('copy', 'NV->NV:1', [(0x2000, 128), (0x3000, 128)])]
+    expected = list(staged)  # drain() mutates `staged` in place -- snapshot before, so this compares content, not identity
+    ring.drain(staged)
+    assert [(e[1], e[2], e[3]) for e in ring.entries] == expected
+    assert staged == [], "drain must clear the caller's staging list"
+
+  def test_drain_is_a_noop_on_an_empty_staging_list(self):
+    ring = DispatchRing(8)
+    ring.drain([])
+    assert len(ring.entries) == 0 and ring.seq == 0
+
+  def test_dump_prints_each_entry_most_recent_last(self):
+    ring = DispatchRing(2)
+    ring.add('kernel', 'first', [(0x1000, 64)])
+    ring.add('copy', 'NV->NV:1', [(0x2000, 128)])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf): ring.dump()
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 2
+    assert "first" in lines[0] and "NV->NV:1" in lines[1], f"must print most-recent-last, got {lines}"
+
+class TestNVDispatchRingSubmitChokePoint(unittest.TestCase):
+  """T4.78: NVCommandQueue._submit_to_gpfifo is the one choke point shared by compute/copy/video _submit() --
+  drives the real method (not a copy) against a minimal fake gpfifo/device to prove it drains any staged
+  NV_DISPATCH_RING dispatches into dev.dispatch_ring and clears the staging list either way."""
+
+  def _fake_submit(self, dispatch_ring):
+    q = NVCommandQueue()
+    q._q = []
+    q._dispatches = [('kernel', 'k0', [(0x1000, 64)])]
+    q.hw_page = SimpleNamespace(va_addr=0x2000, size=0, base=None)
+    # is_remote()/allocator satisfy NVCommandQueue.__del__ (mirrors TestNVBindRemoteBatching's fixture) -- otherwise
+    # GC tears this fake down with an AttributeError ignored-in-__del__ warning, unrelated to what's under test here.
+    dev = SimpleNamespace(dispatch_ring=dispatch_ring, gpu_mmio={}, synchronize=lambda: None,
+                          is_remote=lambda: False, allocator=SimpleNamespace(alloc=lambda *a, **k: None, free=lambda *a, **k: None))
+    q.binded_device = dev
+    gpfifo = SimpleNamespace(ring={}, put_value=0, entries_count=8, gpput={}, token=0x77)
+    return q, dev, gpfifo
+
+  def test_submit_drains_staged_dispatches_into_the_ring(self):
+    ring = DispatchRing(8)
+    q, dev, gpfifo = self._fake_submit(ring)
+    q._submit_to_gpfifo(dev, gpfifo)
+    assert [(e[1], e[2]) for e in ring.entries] == [('kernel', 'k0')]
+    assert q._dispatches == [], "the queue's staging list must be cleared once drained"
+
+  def test_submit_without_a_ring_still_clears_staging_and_does_not_raise(self):
+    q, dev, gpfifo = self._fake_submit(None)  # dispatch_ring=None: NV_DISPATCH_RING was off at device-init time
+    q._submit_to_gpfifo(dev, gpfifo)  # must not raise (e.g. AttributeError/NoneType has no attribute 'drain')
+    assert q._dispatches == []
+
+class TestNVEagerDrainForensics(unittest.TestCase):
+  """T4.78 NV_EAGER_DRAIN: after each dispatch submission, synchronously wait for completion so a fault
+  attributes to exactly one dispatch -- implemented via the existing wait/sleep machinery (dev.synchronize(),
+  which itself polls iface.sleep() internally), not a new draining mechanism. Drives the real
+  NVCommandQueue._submit_to_gpfifo to prove the guard: off (default) never synchronizes -- no behavior change --
+  and on synchronizes exactly once per submission."""
+
+  def _fake_submit(self):
+    q = NVCommandQueue()
+    q._q = []
+    q.hw_page = SimpleNamespace(va_addr=0x2000, size=0, base=None)
+    sync_calls:list = []
+    dev = SimpleNamespace(dispatch_ring=None, gpu_mmio={}, synchronize=lambda: sync_calls.append(1),
+                          is_remote=lambda: False, allocator=SimpleNamespace(alloc=lambda *a, **k: None, free=lambda *a, **k: None))
+    q.binded_device = dev
+    gpfifo = SimpleNamespace(ring={}, put_value=0, entries_count=8, gpput={}, token=0x77)
+    return q, dev, gpfifo, sync_calls
+
+  def test_eager_drain_off_never_synchronizes(self):
+    q, dev, gpfifo, sync_calls = self._fake_submit()
+    with Context(NV_EAGER_DRAIN=0):
+      q._submit_to_gpfifo(dev, gpfifo)
+    assert sync_calls == [], "NV_EAGER_DRAIN=0 (default) must never synchronize -- no behavior change when off"
+
+  def test_eager_drain_on_synchronizes_once_per_submit(self):
+    q, dev, gpfifo, sync_calls = self._fake_submit()
+    with Context(NV_EAGER_DRAIN=1):
+      q._submit_to_gpfifo(dev, gpfifo)
+    assert sync_calls == [1], f"NV_EAGER_DRAIN=1 must synchronize exactly once per submission, got {sync_calls}"
 
 if __name__ == "__main__":
   unittest.main()

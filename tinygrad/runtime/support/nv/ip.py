@@ -568,7 +568,9 @@ class NV_GSP(NV_IP):
       self.promote_ctx(client, self.subdevice, hParent, {k:v for k,v in self.grctx_bufs.items() if k in [0, 1, 2]}, phys_gr_ctx, phys=False)
     return obj if hClass != nv_gpu.NV1_ROOT else client
 
-  def rpc_rm_control(self, hObject:int, cmd:int, params:Any, client=None, extra=None):
+  def rpc_rm_control(self, hObject:int, cmd:int, params:Any, client=None, extra=None, timeout:int=10000):
+    # T4.78: callers doing post-fault forensics (on_device_hang) pass a short timeout once the device is already
+    # known-wedged, instead of eating wait_resp's full default here.
     if cmd == nv_gpu.NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES:
       self.rpc_rm_control(hObject, nv_gpu.NVB0CC_CTRL_CMD_INTERNAL_PERMISSIONS_INIT, nv_gpu.NVB0CC_CTRL_INTERNAL_PERMISSIONS_INIT_PARAMS(
         bAdminProfilingPermitted=1, bDevProfilingPermitted=1, bCtxProfilingPermitted=1, bVideoMemoryProfilingPermitted=1,
@@ -582,7 +584,7 @@ class NV_GSP(NV_IP):
     control_args = nv.rpc_gsp_rm_control_v(hClient=(client:=client or self.priv_root), hObject=hObject, cmd=cmd, flags=0x0,
       paramsSize=ctypes.sizeof(params) if params is not None else 0x0)
     self.cmd_q.send_rpc(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, bytes(control_args) + (bytes(params) if params is not None else b''))
-    res = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL)
+    res = self.stat_q.wait_resp(nv.NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, timeout=timeout)
     st = type(params).from_buffer_copy(res[len(bytes(control_args)):]) if params is not None else None
 
     # NOTE: gsp only fills in the channel id, the runlist id (and, on gb20x, the doorbell enable bit) are added by the driver.
