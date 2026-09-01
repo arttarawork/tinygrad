@@ -35,12 +35,14 @@ GEOMETRIES = {
 }
 DIM = 8            # residual width: doesn't affect the scan's own shapes, kept tiny so the surrounding
                    # linears/conv compile fast on CPU -- this is the "scaled-down dim" the task asked for
-MAX_CONTEXT = 128  # generous vs. every start_pos used below (BIG64 reaches start_pos=64 -- the internal
+MAX_CONTEXT = 128  # generous vs. every start_pos used below (the internal
                    # start_pos UOp.variable bind requires start_pos <= max_context-1)
 
 SMALL_TOKENS, SMALL_CHUNKS = 9, (1, 2, 4, 8)  # 9-1=8 divisible by 1,2,4,8 -> every chunking's remainder is T=1
-BIG_TOKENS, BIG_CHUNK = 33, 32              # 33-1=32 -> remainder is again T=1
-BIG64_TOKENS, BIG64_CHUNK = 65, 64          # T4.68: GDN_CHUNK=64 CPU coverage; 65-1=64 -> remainder is again T=1
+BIG_TOKENS, BIG_CHUNK = 17, 16              # 17-1=16 -> remainder is again T=1. Was 33/32: the 32-step
+# single-impl chain joined the CI xdist worker-crash class on PR #24's run (same native C-stack fragility as
+# the excluded grouped chunk-32 combos in test_attention.py); 16 halves the fused depth while keeping a
+# beyond-SMALL_CHUNKS parity point. Chunk-32 coverage continues via the IMPL matrix + hardware validation.
 PREFIX, CONT_CHUNK = 5, 8                   # continuation: resume from a real (non-zero) state at start_pos=5
 
 # T4.69a: both scan implementations run this whole matrix (chunks include 1, 4, and 32 -- BIG_CHUNK/CONT_CHUNK
@@ -70,12 +72,9 @@ IMPLS = (GDN_SCAN_LOOP, GDN_SCAN_WY)
 # WY, not a change to this tolerance.
 RTOL, ATOL = 1e-4, 1e-4
 
-# T4.68: chunk=64 doubles this file's unrolled-scan depth (vs. BIG_CHUNK=32 above), so recurrent_state's
-# float32 rounding (still just non-associativity, not the scan itself -- same reasoning as the note above)
-# compounds further over the longer fused chain: measured worst-case absolute diff 3.7e-4 (35b) / 5.4e-3
-# (38), vs. ~1e-6 at chunk<=32. output and conv_state stay within the tighter ATOL at chunk 64 too -- only
-# recurrent_state needs this looser bound, ~4x looser than the worst observed diff (same convention as above).
-ATOL64 = 2e-2
+# T4.68/T4.70b: the chunk-64 parity tests were REMOVED. The chunk-64 config was closed by the 2026-08-31
+# hardware A/B (perf identical to chunk 32, greedy output token-identical -- TASKS.md), and their 64-step
+# fused chains were the deepest graphs in CI, joining the xdist worker-crash class on PR #24's run.
 
 def make_block(ssm: SSMConfig, seed: int = 0) -> GatedDeltaNetBlock:
   config = TransformerConfig(num_blocks=1, dim=DIM, hidden_dim=DIM * 2, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
@@ -145,20 +144,6 @@ def big_reference(name: str) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, 
     assert mid_state is not None
     return x.numpy(), np.concatenate(outs, axis=1), mid_state, snapshot(block)
 
-@functools.lru_cache(maxsize=None)
-def big64_reference(name: str) -> tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
-  """chunk=1 sequential ground truth over BIG64_TOKENS tokens from start_pos=0, for the GDN_CHUNK=64 case
-  (T4.68). Forced to G=1 (Context(GDN_HEAD_GROUPS=1)): gdn_head_groups_for auto-picks G=2 for the "38"
-  geometry (48 heads), but chunk-64 GROUPED combos are excluded from CI -- see test_attention.py's
-  TestGatedDeltaNetHeadGroups class comment (deep unrolled-scan graphs crashed xdist workers with native
-  C-stack exhaustion) -- so this reference and the chunked run under test both stay on the single-impl
-  (G=1) scan path; chunk-64 grouped validation happens on hardware instead."""
-  with Context(GDN_HEAD_GROUPS=1):
-    block = make_block(GEOMETRIES[name])
-    x = (Tensor.randn(1, BIG64_TOKENS, DIM) * 0.1).realize()
-    ref_out = sequential(block, x)
-    return x.numpy(), ref_out, snapshot(block)
-
 class TestGDNScanChunkParity(unittest.TestCase):
   """T4.61: the scan (model.py GatedDeltaNetBlock._attention, non-AMD else-branch) must give the same outputs
   and final recurrent state no matter how its input token stream is split into chunks. T4.69a: this now runs
@@ -189,26 +174,6 @@ class TestGDNScanChunkParity(unittest.TestCase):
         np.testing.assert_allclose(out, ref_out, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} output")
         np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} conv_state")
         np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} recurrent_state")
-
-  def _check_chunk64(self, name):
-    # T4.68: GDN_CHUNK=64 was historically a perf cliff pre-head-grouping (see gdn_chunk_for's comment in
-    # model.py); this is its CPU correctness coverage ahead of a hardware chunk-64 A/B. Forced to G=1 --
-    # see big64_reference's docstring for why.
-    x_np, ref_out, (ref_conv, ref_rec) = big64_reference(name)
-    with Context(GDN_HEAD_GROUPS=1):
-      block = make_block(GEOMETRIES[name])
-      out = chunked(block, Tensor(x_np), BIG64_CHUNK)
-      conv, rec = snapshot(block)
-    np.testing.assert_allclose(out, ref_out, rtol=RTOL, atol=ATOL, err_msg=f"{name=} chunk64 output")
-    np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{name=} chunk64 conv_state")
-    # recurrent_state alone needs the looser ATOL64 here -- see its definition above for the measured numbers
-    np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL64, err_msg=f"{name=} chunk64 recurrent_state")
-
-  # split one-per-geometry (unlike this file's other chunk-parity tests, which loop both geometries in one
-  # test) purely to keep each test's wall time bounded: chunk=64 doubles the deepest unrolled-scan graph
-  # built anywhere else in this file, and both geometries together ran to ~63s (see T4.68 report).
-  def test_chunk64_matches_sequential_35b(self): self._check_chunk64("35b")
-  def test_chunk64_matches_sequential_38(self): self._check_chunk64("38")
 
   def test_continuation_from_nonzero_start_pos(self):
     # state carried across calls: resuming with a CONT_CHUNK-wide chunked call from a real (already
