@@ -238,5 +238,48 @@ class TestGDNScanSingleStepGate(unittest.TestCase):
       np.testing.assert_array_equal(conv_wy, conv_loop, err_msg=f"{name=} conv_state")
       np.testing.assert_array_equal(rec_wy, rec_loop, err_msg=f"{name=} recurrent_state")
 
+class TestGDNScanJitReplayRegression(unittest.TestCase):
+  """T4.73 (EXPECTED FAILURE -- tracked, not fixed): a chunked-prefill TinyJit graph captured at one bound
+  `toks` length and later REPLAYED at a mismatched one corrupts a later, unrelated call's output. Full
+  diagnosis in FIXNOTES.md at the repo root. Unlike every other test in this file, this one must go THROUGH
+  a real chunked TinyJit (`extra/wy_boundary_repro.py`'s harness) -- calling `_attention` directly, like
+  every helper above does, cannot see this bug at all (confirmed: an equivalent direct-call jit harness with
+  a lone GatedDeltaNetBlock, no second block, does NOT reproduce it).
+
+  NOT WY-specific and NOT GatedDeltaNetBlock-specific (both confirmed by direct experiment, see FIXNOTES.md):
+  forcing GDN_SCAN_IMPL to the per-token loop for the whole run reproduces the IDENTICAL wrong values, and
+  two stacked GatedDeltaNetBlocks with no attention block at all also reproduce it. The evidence points at
+  tinygrad-core's capture/replay or size-32 codegen machinery, not at a model.py usage pattern -- so there is
+  no fix landing alongside this test, only a tracked, reproducible regression case. Flip this from
+  `expectedFailure` back to a normal assertion once a core fix lands (it will then correctly fail the suite
+  if the fix regresses).
+
+  Do NOT shrink chunk_size or the chunk count "for speed" without re-reading FIXNOTES.md's parameter sweep
+  first: chunk_size 8/12/16/24 (with the same chunk count and shape of replay) and chunks<=3 (a single
+  mismatched replay immediately after capture, no prior MATCHING replay) were all directly tested and do NOT
+  reproduce this -- it needs chunk_size==32 exactly and >=4 prefill chunks (so the 3rd chunk replays a MATCH
+  and the 4th replays a MISMATCH), plus >=2 decode steps (the divergence surfaces at decode#2, the DECODE
+  jit key's own first capture -- not any prefill call)."""
+
+  @unittest.expectedFailure
+  def test_chunk32_mismatched_replay_then_decode_capture(self):
+    import argparse, random
+    from extra.wy_boundary_repro import build_config, build_stack, build_head, run_reference, run_jit, compare_step
+    args = argparse.Namespace(device="CPU", dim=16, heads=48, head_dim=8, vocab=32, chunks=4, chunk_size=32,
+                               decode_steps=3, seed=5, rtol=1e-3, atol=1e-3, warmup=False)
+    prompt_len = args.chunks * args.chunk_size - 3  # 125 -> prefill chunks 32,32,32,29: the last replay is mismatched
+    max_context = prompt_len + args.decode_steps + 8
+    cfg, ssm = build_config(args, max_context)
+    ref_blocks, jit_blocks = build_stack(cfg, ssm, args.seed, args.device), build_stack(cfg, ssm, args.seed, args.device)
+    embd, norm, out_proj = build_head(cfg, args.seed, args.device)
+    random.seed(args.seed)
+    tokens = [random.randrange(args.vocab) for _ in range(prompt_len)]
+    ref_steps = run_reference(ref_blocks, embd, norm, out_proj, tokens, args.decode_steps)
+    jit_steps = run_jit(jit_blocks, embd, norm, out_proj, tokens, args.chunk_size, max_context, args.decode_steps, warmup=False)
+    for i, (ref_out, jit_out) in enumerate(zip(ref_steps, jit_steps)):
+      step_name = "prefill(last)" if i == 0 else f"decode#{i}"
+      divergence = compare_step(step_name, ref_blocks, jit_blocks, ref_out, jit_out, args.rtol, args.atol)
+      self.assertIsNone(divergence, divergence)
+
 if __name__ == "__main__":
   unittest.main()
