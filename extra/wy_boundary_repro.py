@@ -176,13 +176,19 @@ def run_reference(blocks:list, embd, norm, out_proj, tokens:list[int], n_decode:
   return steps
 
 def run_jit(blocks:list, embd, norm, out_proj, tokens:list[int], chunk_size:int, max_context:int,
-            n_decode:int, warmup:bool=False) -> list[tuple[Tensor, Tensor]]:
+            n_decode:int, warmup:bool=False, impl:int=GDN_SCAN_WY) -> list[tuple[Tensor, Tensor]]:
   """Replicates Transformer.__call__ + Transformer.generate()'s exact jit discipline (tinygrad/llm/model.py):
   the same 4-tuple jit key (is_prefill, greedy, chunk_size, spec) keyed dict of TinyJit(forward), the same
   v_start_pos/v_toks bound UOp Variables, the same `t[:, sp:sp+nt] if is_prefill_call else out` chaining of a
-  decode step's input from the previous step's own (already-realized) output tensor. GDN_SCAN_IMPL=2 (WY)
-  active for the whole run: the T4.69b gate (T_pad>1) keeps decode on the loop impl regardless, exactly as
-  in production -- see run_scan in model.py.
+  decode step's input from the previous step's own (already-realized) output tensor. GDN_SCAN_IMPL=`impl`
+  (default 2, WY) active for the whole run: the T4.69b gate (T_pad>1) keeps decode on the loop impl
+  regardless, exactly as in production -- see run_scan in model.py.
+
+  T4.73: `impl=GDN_SCAN_LOOP` reproduces the FIRST-DIVERGENCE below byte-for-byte identically to WY (see
+  --impl loop / FIXNOTES.md) -- proof the corruption is NOT in gdn_scan_wy's math or in model.py's WY-branch
+  padding at all, it's in the shared chunked-prefill-replay-then-decode-capture machinery both impls run
+  through equally (this docstring's own claim above -- "GDN_SCAN_IMPL=2 active for the whole run" -- was true
+  before T4.73 only in the sense that WY was the only impl anyone had tried here; the mechanism doesn't care).
 
   warmup=True additionally replicates Transformer.warmup() (model.py, called by every --serve/--warmup CLI
   run -- cli.py) BEFORE the real comparison: a 1-token dummy sequence run through the SAME jit_cache twice.
@@ -209,7 +215,7 @@ def run_jit(blocks:list, embd, norm, out_proj, tokens:list[int], chunk_size:int,
   dev = blocks[0].device
   if warmup:
     warm_t = Tensor([0] * max_context, dtype="int32", device=dev).reshape(1, max_context)
-    with Context(GDN_SCAN_IMPL=GDN_SCAN_WY):
+    with Context(GDN_SCAN_IMPL=impl):
       for _ in range(2):  # Transformer.warmup()'s own `for _ in range(2)` per temperature
         a, o = call(warm_t[:, v_start_pos.bind(0):v_toks.bind(1) + v_start_pos.bind(0)], v_start_pos.bind(0))
         Tensor.realize(a, o)
@@ -222,7 +228,7 @@ def run_jit(blocks:list, embd, norm, out_proj, tokens:list[int], chunk_size:int,
   start_pos, virtual_len = 0, prompt_len
   out: Tensor|None = None
   steps: list[tuple[Tensor, Tensor]] = []
-  with Context(GDN_SCAN_IMPL=GDN_SCAN_WY):
+  with Context(GDN_SCAN_IMPL=impl):
     while len(steps) < 1 + n_decode:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
@@ -251,6 +257,10 @@ def main() -> int:
   p.add_argument("--atol", type=float, default=1e-3)
   p.add_argument("--warmup", action="store_true", help="pre-capture the decode jit key against a 1-token dummy sequence "
                   "first, replicating Transformer.warmup() -- see REPORT.md's ranked mechanism #1 and run_jit's docstring")
+  p.add_argument("--impl", choices=("wy", "loop"), default="wy", help="T4.73: GDN_SCAN_IMPL to force for the jit/replay "
+                  "path (the reference path always uses loop regardless -- see run_reference). 'loop' reproduces the "
+                  "same FIRST-DIVERGENCE as 'wy' byte-for-byte at --chunks 4+ -- proof this bug isn't in gdn_scan_wy's "
+                  "math, see FIXNOTES.md")
   args = p.parse_args()
 
   prompt_len = max(1, args.chunks) * args.chunk_size - 3
@@ -264,18 +274,19 @@ def main() -> int:
   random.seed(args.seed)
   tokens = [random.randrange(args.vocab) for _ in range(prompt_len)]
 
+  impl = GDN_SCAN_WY if args.impl == "wy" else GDN_SCAN_LOOP
   ref_steps = run_reference(ref_blocks, embd, norm, out_proj, tokens, args.decode_steps)
   jit_steps = run_jit(jit_blocks, embd, norm, out_proj, tokens, args.chunk_size, max_context, args.decode_steps,
-                       warmup=args.warmup)
+                       warmup=args.warmup, impl=impl)
   assert len(ref_steps) == len(jit_steps) == 1 + args.decode_steps
 
   for i, (ref_out, jit_out) in enumerate(zip(ref_steps, jit_steps)):
     step_name = "prefill(last)" if i == 0 else f"decode#{i}"
     if (divergence := compare_step(step_name, ref_blocks, jit_blocks, ref_out, jit_out, args.rtol, args.atol)) is not None:
-      print(f"FIRST-DIVERGENCE {divergence}")
+      print(f"FIRST-DIVERGENCE (impl={args.impl}) {divergence}")
       return 1
   print(f"PASS ({1 + args.decode_steps} steps, device={args.device}, heads={args.heads}, head_dim={args.head_dim}, "
-        f"chunk_size={args.chunk_size}, prompt_len={prompt_len}, warmup={args.warmup})")
+        f"chunk_size={args.chunk_size}, prompt_len={prompt_len}, warmup={args.warmup}, impl={args.impl})")
   return 0
 
 if __name__ == "__main__":
