@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref
+import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref, collections
 assert sys.platform != 'win32'
 from typing import cast
 from dataclasses import dataclass
@@ -21,6 +21,25 @@ if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl # noqa: F401 # pylint: d
 nv_gpu = nv_570 # default to 570
 
 PMA = ContextVar("PMA", abs(VIZ.value)>=2)
+
+# T4.78 (T475_NV_FAULT_RCA.md S5m1): ring size N; 0 (default) = off, no bookkeeping at all on the hot submit path.
+NV_DISPATCH_RING = ContextVar("NV_DISPATCH_RING", 0)
+
+class DispatchRing:
+  """T4.78: fixed-size ring of the last N NV dispatches (kernel execs + copies), for post-fault forensics. Pure
+  bookkeeping -- no device access -- so it's unit-testable without hardware. Dumped by on_device_hang() before
+  the fault exception propagates."""
+  def __init__(self, n:int):
+    self.entries:collections.deque = collections.deque(maxlen=n)
+    self.seq = 0
+  def add(self, kind:str, name:str, bufs:list[tuple[sint, int]]):
+    self.entries.append((self.seq, kind, name, bufs))
+    self.seq += 1
+  def drain(self, staged:list[tuple[str, str, list[tuple[sint, int]]]]):
+    for d in staged: self.add(*d)
+    staged.clear()
+  def dump(self):
+    for seq, kind, name, bufs in self.entries: print(f"[NV_DISPATCH_RING {seq}] {kind:6s} {name} bufs={bufs}")
 
 @dataclass(frozen=True)
 class ProfilePMAEvent(ProfileEvent): device:str; kern:str; blob:bytes; exec_tag:int; profile_key:bytes|None=None # noqa: E702
@@ -107,6 +126,7 @@ class QMD:
 class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState']):
   def __init__(self):
     self.active_qmd = None
+    self._dispatches:list[tuple[str, str, list[tuple[sint, int]]]] = [] # T4.78 NV_DISPATCH_RING staging (empty unless enabled)
     super().__init__()
 
   def __del__(self):
@@ -169,6 +189,11 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     self._q = hw_view
 
   def _submit_to_gpfifo(self, dev:NVDevice, gpfifo:GPFifo):
+    # T4.78: single choke point for compute+copy+video submission -- drain any staged NV_DISPATCH_RING entries here.
+    if self._dispatches:
+      if dev.dispatch_ring is not None: dev.dispatch_ring.drain(self._dispatches)
+      self._dispatches.clear()
+
     if dev == self.binded_device: cmdq_addr = self.hw_page.va_addr
     else:
       cmdq_addr = dev.cmdq_allocator.alloc(len(self._q) * 4, 16)
@@ -190,6 +215,8 @@ class NVComputeQueue(NVCommandQueue):
     return self
 
   def exec(self, prg:NVProgram, args_state:NVArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
+    # T4.78 NV_DISPATCH_RING: cheap (no device round-trip) -- prg.name/args_state.bufs are already in hand.
+    if NV_DISPATCH_RING.value: self._dispatches.append(('kernel', prg.name, [(b.va_addr, b.size) for b in args_state.bufs]))
     self.bind_args_state(args_state)
 
     qmd_buf = args_state.buf.offset(round_up(prg.constbufs[0][1], 1 << 8))
@@ -254,6 +281,11 @@ class NVCopyQueue(NVCommandQueue):
     super().__init__()
 
   def copy(self, dest:HCQBuffer, src:HCQBuffer, copy_size:int):
+    # T4.78 NV_DISPATCH_RING: no shared choke point with exec() at this granularity (copy has no `prg`), so hook
+    # here directly -- "name" is the src/dst device pair since a copy has no kernel name.
+    if NV_DISPATCH_RING.value:
+      self._dispatches.append(('copy', f"{getattr(src.owner, 'device', src.owner)}->{getattr(dest.owner, 'device', dest.owner)}",
+                                [(src.va_addr, src.size), (dest.va_addr, dest.size)]))
     for off in range(0, copy_size, step:=(1 << 31)):
       self.nvm(4, nv_gpu.NVC6B5_OFFSET_IN_UPPER, *data64(src.va_addr+off), *data64(dest.va_addr+off))
       self.nvm(4, nv_gpu.NVC6B5_LINE_LENGTH_IN, min(copy_size-off, step))
@@ -708,6 +740,7 @@ class NVDevice(HCQCompiled[NVSignal]):
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
     self.sizing = self._REMOTE_SIZING if self.is_remote() else self._LOCAL_SIZING
+    self.dispatch_ring:DispatchRing|None = DispatchRing(n) if (n:=NV_DISPATCH_RING.value) > 0 else None # T4.78
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -883,6 +916,9 @@ class NVDevice(HCQCompiled[NVSignal]):
             report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
     except RuntimeError:
       report += ["GSP-RM unresponsive (standard post-fault wedge)"]
+
+    # T4.78 NV_DISPATCH_RING: name what was in flight, before the exception (below) propagates.
+    if (ring:=getattr(self, 'dispatch_ring', None)) is not None: ring.dump()
 
     # T4.37: clear bus-master before raising, same as PCIIface.sleep() -- after the RPCs above, which still need GSP
     # alive. is_nvd()-gated: NVKIface/MOCKIface have no pci_dev and never reach a live GSP fault this way.

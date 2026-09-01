@@ -1,4 +1,4 @@
-import itertools, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
+import contextlib, io, itertools, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from tinygrad.helpers import getenv
@@ -8,7 +8,7 @@ from tinygrad.runtime.support.nv.ip import NV_FLCN
 from tinygrad.runtime.support.am.amdev import AMPageTableEntry
 from tinygrad.runtime.support.system import APLRemotePCIDevice, RemotePCIDevice
 from tinygrad.runtime.autogen import pci
-from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, NVSignal, _fault_recovery_hint
+from tinygrad.runtime.ops_nv import NVDevice, NVCommandQueue, PCIIface, NVSignal, DispatchRing, _fault_recovery_hint
 from tinygrad.runtime.support.hcq import HCQAllocatorBase, HCQBuffer, _dev_already_faulted
 
 class CountingMMIOInterface:
@@ -959,6 +959,92 @@ class TestNVOnDeviceHangForensics(unittest.TestCase):
     fake = _fake_hang_self_with_control(is_err_state=False, rm_control=lambda *a, **k: no_fault)
     with self.assertRaises(RuntimeError) as ctx: NVDevice.on_device_hang(fake)
     assert "fresh client" in str(ctx.exception).lower(), ctx.exception
+
+  def test_dispatch_ring_dumped_before_returning(self):
+    dumps = []
+    ring = SimpleNamespace(dump=lambda: dumps.append(1))
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    fake = _fake_hang_self_with_control(is_err_state=False, rm_control=lambda *a, **k: no_fault,
+                                         error_state=RuntimeError("Device fault detected."), dispatch_ring=ring)
+    NVDevice.on_device_hang(fake)
+    assert dumps == [1], "the dispatch ring must be dumped exactly once before the exception propagates"
+
+  def test_no_dispatch_ring_attribute_is_untouched(self):
+    # NVKIface/MOCKIface-vintage fakes (like TestNVQuiesceOnFault's) predate dispatch_ring entirely -- must
+    # degrade to a no-op, never AttributeError.
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    fake = _fake_hang_self_with_control(is_err_state=None, rm_control=lambda *a, **k: no_fault)
+    with self.assertRaises(RuntimeError): NVDevice.on_device_hang(fake)  # must not raise AttributeError instead
+
+class TestNVDispatchRing(unittest.TestCase):
+  """T4.78 (T475_NV_FAULT_RCA.md S5m1): NV_DISPATCH_RING's bookkeeping factored out as a plain class with no
+  device access at all, so it's exercisable here without hardware -- the hooks that feed it (NVComputeQueue.exec,
+  NVCopyQueue.copy, NVCommandQueue._submit_to_gpfifo) are one-line call sites into this."""
+
+  def test_add_assigns_monotonic_sequence_numbers(self):
+    ring = DispatchRing(8)
+    for i in range(3): ring.add('kernel', f'k{i}', [(0x1000 + i, 64)])
+    assert [e[0] for e in ring.entries] == [0, 1, 2]
+
+  def test_ring_keeps_only_last_n_most_recent_last(self):
+    ring = DispatchRing(3)
+    for i in range(5): ring.add('kernel', f'k{i}', [])
+    # oldest of the 5 (k0, k1) must have fallen off; survivors ordered oldest-first / most-recent-last.
+    assert [e[2] for e in ring.entries] == ['k2', 'k3', 'k4']
+    assert ring.seq == 5, "the sequence counter must keep counting past the ring's capacity, not wrap/reset"
+
+  def test_drain_appends_staged_entries_and_clears_the_staging_list(self):
+    ring = DispatchRing(8)
+    staged = [('kernel', 'k0', [(0x1000, 64)]), ('copy', 'NV->NV:1', [(0x2000, 128), (0x3000, 128)])]
+    expected = list(staged)  # drain() mutates `staged` in place -- snapshot before, so this compares content, not identity
+    ring.drain(staged)
+    assert [(e[1], e[2], e[3]) for e in ring.entries] == expected
+    assert staged == [], "drain must clear the caller's staging list"
+
+  def test_drain_is_a_noop_on_an_empty_staging_list(self):
+    ring = DispatchRing(8)
+    ring.drain([])
+    assert len(ring.entries) == 0 and ring.seq == 0
+
+  def test_dump_prints_each_entry_most_recent_last(self):
+    ring = DispatchRing(2)
+    ring.add('kernel', 'first', [(0x1000, 64)])
+    ring.add('copy', 'NV->NV:1', [(0x2000, 128)])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf): ring.dump()
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 2
+    assert "first" in lines[0] and "NV->NV:1" in lines[1], f"must print most-recent-last, got {lines}"
+
+class TestNVDispatchRingSubmitChokePoint(unittest.TestCase):
+  """T4.78: NVCommandQueue._submit_to_gpfifo is the one choke point shared by compute/copy/video _submit() --
+  drives the real method (not a copy) against a minimal fake gpfifo/device to prove it drains any staged
+  NV_DISPATCH_RING dispatches into dev.dispatch_ring and clears the staging list either way."""
+
+  def _fake_submit(self, dispatch_ring):
+    q = NVCommandQueue()
+    q._q = []
+    q._dispatches = [('kernel', 'k0', [(0x1000, 64)])]
+    q.hw_page = SimpleNamespace(va_addr=0x2000, size=0, base=None)
+    # is_remote()/allocator satisfy NVCommandQueue.__del__ (mirrors TestNVBindRemoteBatching's fixture) -- otherwise
+    # GC tears this fake down with an AttributeError ignored-in-__del__ warning, unrelated to what's under test here.
+    dev = SimpleNamespace(dispatch_ring=dispatch_ring, gpu_mmio={}, synchronize=lambda: None,
+                          is_remote=lambda: False, allocator=SimpleNamespace(alloc=lambda *a, **k: None, free=lambda *a, **k: None))
+    q.binded_device = dev
+    gpfifo = SimpleNamespace(ring={}, put_value=0, entries_count=8, gpput={}, token=0x77)
+    return q, dev, gpfifo
+
+  def test_submit_drains_staged_dispatches_into_the_ring(self):
+    ring = DispatchRing(8)
+    q, dev, gpfifo = self._fake_submit(ring)
+    q._submit_to_gpfifo(dev, gpfifo)
+    assert [(e[1], e[2]) for e in ring.entries] == [('kernel', 'k0')]
+    assert q._dispatches == [], "the queue's staging list must be cleared once drained"
+
+  def test_submit_without_a_ring_still_clears_staging_and_does_not_raise(self):
+    q, dev, gpfifo = self._fake_submit(None)  # dispatch_ring=None: NV_DISPATCH_RING was off at device-init time
+    q._submit_to_gpfifo(dev, gpfifo)  # must not raise (e.g. AttributeError/NoneType has no attribute 'drain')
+    assert q._dispatches == []
 
 if __name__ == "__main__":
   unittest.main()
