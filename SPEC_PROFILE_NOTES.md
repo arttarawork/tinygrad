@@ -189,8 +189,10 @@ real ones. T4.69b's own measurement (cited in SPEC_NOTES.md SS7) shows WY roughl
 prefill-sized (5.9k-16.2k token) chunks -- i.e. the loop is the SLOWER of the two at any chunk with real work in
 it, and `capture=True` structurally can't use the faster one. This is the **T_pad tax**: an ~8x width overhead
 (32 padded steps vs ~4 real ones) on top of forcing the intrinsically slower scan implementation, paid by EVERY
-GDN block (most of the model's ~40 blocks, per CLAUDE.md's qwen3.6/qwen3.8 hybrid architecture) on every single
-VERIFY call. It shows up inside `accept_ms` (VERIFY's real device time), not as a separate phase -- there's no
+GDN block -- most blocks in this fork's qwen3.5/qwen3.6-family hybrid architectures, per `from_gguf`'s
+`ssm_layers` pattern (`model.py:1240`); exact count for the Qwen3.8-27B checkpoint in the hardware fact isn't in
+this worktree's docs, but the mechanism doesn't depend on the exact number -- on every single VERIFY call. It
+shows up inside `accept_ms` (VERIFY's real device time), not as a separate phase -- there's no
 per-block sub-timer in this task's scope, but SS8's ranking below gives it a predicted magnitude and a way to
 test it in isolation.
 
@@ -202,11 +204,15 @@ Per outer iteration, k_eff=3, full accept, current device-placement regime (SS0)
   into `draft_ms`'s tail sync -- see SS5/SS8 for why these are not "free async dispatches."
 - **VERIFY: however many block-to-block device transitions the map has.** `forward()`'s block loop
   (`xin = x.to(block.device)`, inside `Transformer.forward`, called once per block) hops every time consecutive
-  blocks in `self.blk` sit on different devices -- for the CLAUDE.md 40-block map (`0-2:METAL,3:NV,4-6:METAL,
-  7:NV,...`), that's **8 alternations = ~14 hops** per full-model forward. This is IDENTICAL machinery to plain
-  `generate()`'s decode step (same `forward()`, same loop) -- it is not a NEW cost `speculative_generate`
-  introduces, it's the map's fixed per-forward tax, paid by VERIFY (once per iteration, over k_eff+1 tokens) at
-  roughly the same per-hop cost as plain decode pays per TOKEN (once per token). Shows up inside `accept_ms`.
+  blocks in `self.blk` sit on different devices -- illustrating with the ONE fully-documented map in this repo
+  (CLAUDE.md's 192k pooled map for the 35B model, `0-2:METAL,3:NV,4-6:METAL,7:NV,...`, 40 blocks, 8
+  alternations): that's **~14 hops** per full-model forward. The Qwen3.8-27B checkpoint in the hardware fact
+  almost certainly uses a different (not-yet-documented-in-this-worktree) map, but the STRUCTURE is the same --
+  count `sum(1 for a,b in zip(dmap, dmap[1:]) if a != b)` for whatever map that run actually used to get the
+  real number. This is IDENTICAL machinery to plain `generate()`'s decode step (same `forward()`, same loop) --
+  it is not a NEW cost `speculative_generate` introduces, it's the map's fixed per-forward tax, paid by VERIFY
+  (once per iteration, over k_eff+1 tokens) at roughly the same per-hop cost as plain decode pays per TOKEN
+  (once per token). Shows up inside `accept_ms`.
 - **FIXUP: 0.** `state_track`/`conv_window` are produced on the SAME device as their owning GDN block
   (`model.py:748-763` returns them alongside `out`, no `.to()` in between), and `block.recurrent_state`/
   `conv_state` live on that same block's device -- the `.assign()` calls in the FIXUP loop
@@ -377,8 +383,9 @@ embedding done once on `dev` via a cached/co-located copy of the embedding table
 **#2 -- The T_pad tax: VERIFY's GDN scan runs `chunk_size` (32) padded steps instead of k_eff+1 (~4), forced
 onto the slower per-token loop (never WY) by `capture=True`.**
 Predicted magnitude: **meaningful, likely hundreds of ms, probably not the whole gap alone.** SS3(c) derives
-this precisely: an ~8x width overhead on every GDN block's scan (most of the model's ~40 blocks, per the
-qwen3.6/qwen3.8 hybrid architecture), paid on every VERIFY call (once per ~3.6 emitted tokens), and T4.69b's own
+this precisely: an ~8x width overhead on every GDN block's scan (most blocks, in this fork's qwen3.5/qwen3.6-
+family hybrid architectures -- see `from_gguf`'s `ssm_layers` pattern, `model.py:1240`), paid on every VERIFY
+call (once per ~3.6 emitted tokens), and T4.69b's own
 measurement (SPEC_NOTES.md SS7) puts the loop-vs-WY gap at ~25-30% at real (prefill-sized) chunk widths -- so
 this candidate is "~8x too much scan work, on the slower of two known implementations," not a constant-factor
 tweak. Ceiling on its contribution: VERIFY only runs ONCE per iteration (not k_eff times like candidate #1), so
