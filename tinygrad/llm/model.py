@@ -132,7 +132,14 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
   # capture) must be a real owned buffer, not a lazy expression the memory planner is free to fuse or
   # reshuffle. A no-op on CPU (same values, just an earlier realize point); candidate for the METAL/NV A/B.
   final_state = final_state.contiguous()
-  return final_state, out.transpose(1, 2)                                # (B,T,H,V)
+  # T4.73-candidate-2 (HARDWARE A/B CANDIDATE for the WY prefill->decode corruption bug -- see AUDIT.md;
+  # not confirmed, defensive): out.transpose(1,2) is a bare movement op (a PERMUTE view over `out`'s own
+  # buffer), the exact shape of tensor SPEC_NOTES.md §3 warns never to hand back unmaterialized (there:
+  # forward()'s x[:, -1:] slice). Every current caller already forces its own .contiguous() on this value
+  # before use (run_scan's head-group split appends g_outs.contiguous(); the G<=1 path and the head-group
+  # cat both flow into stacked.contiguous() in _attention) -- this closes the gap at the source instead of
+  # relying on every present and future call site to remember to. A no-op on CPU; candidate for the A/B.
+  return final_state, out.transpose(1, 2).contiguous()                   # (B,T,H,V)
 
 # T4.63: qwen3.5-family GGUFs carry a DeepSeek-style MTP ("nextn") block beyond the main num_blocks
 # (nextn_predict_layers, already excluded from num_blocks -- see from_gguf). 0 (default): today's
