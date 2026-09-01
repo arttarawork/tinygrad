@@ -124,6 +124,14 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
   qk = (q @ k.transpose(-1, -2)) * lower_incl                            # (B,H,T,T), lower incl. diagonal
   out = a_bar * (q @ state.transpose(-1, -2) + qk @ u)                   # (B,H,T,V)
   final_state = a_bar[:, :, T-1, :].unsqueeze(-1) * (state + u.transpose(-1, -2) @ k)  # (B,H,V,K)
+  # T4.73-candidate-1 (HARDWARE A/B CANDIDATE for the WY prefill->decode corruption bug -- see AUDIT.md;
+  # not confirmed, defensive): materialize final_state HERE, inside the traced function, before it crosses
+  # back out to run_scan's caller. Mirrors SPEC_NOTES.md §3's fix for forward()'s spec-branch h_last: any
+  # value read again after a LATER replay of a different jit-captured graph (final_state ultimately feeds
+  # self.recurrent_state's cross-call store in _attention, read by the next decode/prefill-chunk step's own
+  # capture) must be a real owned buffer, not a lazy expression the memory planner is free to fuse or
+  # reshuffle. A no-op on CPU (same values, just an earlier realize point); candidate for the METAL/NV A/B.
+  final_state = final_state.contiguous()
   return final_state, out.transpose(1, 2)                                # (B,T,H,V)
 
 # T4.63: qwen3.5-family GGUFs carry a DeepSeek-style MTP ("nextn") block beyond the main num_blocks
