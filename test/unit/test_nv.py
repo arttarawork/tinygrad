@@ -217,7 +217,8 @@ class TestNVKernargsPoolSlab(unittest.TestCase):
       page.offset = lambda off, osz, page=page: SimpleNamespace(size=osz, base=page)
       return page
     fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=fake_alloc, _alloc=fake_alloc, _free=lambda *a, **k: None),
-                               is_remote=lambda: is_remote, _kernargs_slab=None, _kernargs_bump=None)
+                               is_remote=lambda: is_remote, _kernargs_slab=None, _kernargs_bump=None,
+                               sizing=NVDevice._REMOTE_SIZING if is_remote else NVDevice._LOCAL_SIZING)  # T4.70d: slab size now reads the knob
     bufs = [NVDevice.alloc_kernargs(fake_dev, size) for _ in range(n)]
     for b in bufs: NVDevice.free_kernargs(fake_dev, b)
     return len(allocs)
