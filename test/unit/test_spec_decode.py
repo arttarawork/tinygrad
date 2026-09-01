@@ -265,6 +265,47 @@ class TestSpeculativeGenerate(unittest.TestCase):
         full_ref = _run(_load_gdn(seed=seed), prompt, 18, spec=False)
         self.assertEqual(got_first + got_second, full_ref, f"{k=} {seed=} {prompt=}")
 
+class TestSpecTrace(unittest.TestCase):
+  """T4.66c: SPEC_TRACE=0 (default, zero overhead) is exercised implicitly by every test above running
+  unchanged with it never set -- this only covers the ON path: one line per iteration, every line parses,
+  and its phases (each a real sub-interval of the same iteration, timed with time.perf_counter()) never
+  exceed the iteration's independently-measured total. See SPEC_TRACE's own ContextVar docstring in
+  model.py for what each phase means and which ones are dispatch-only vs. end at a real host sync."""
+
+  TRACE_RE = re.compile(
+    r"^\[SPEC_TRACE\] iter=(\d+) k_eff=(\d+) m=(\d+) draft_ms=([\d.]+) draft_dispatch_ms=([\d.]+) "
+    r"verify_dispatch_ms=([\d.]+) accept_ms=([\d.]+) state_assign_ms=([\d.]+) total_ms=([\d.]+)$")
+
+  def test_trace_lines_parse_and_phases_sum_to_total(self):
+    model = _load_gdn(seed=0)  # a real (tiny) GDN block + MTPHead -- exercises the FIXUP/state_assign path too
+    buf = io.StringIO()
+    with Context(SPEC_TRACE=1), contextlib.redirect_stdout(buf):
+      got = [v for _, v in zip(range(8), model.speculative_generate([1, 2, 3], k=3))]
+    self.assertEqual(len(got), 8)
+    lines = [line for line in buf.getvalue().splitlines() if line.startswith("[SPEC_TRACE]")]
+    self.assertGreater(len(lines), 0, "SPEC_TRACE=1 printed no trace lines")
+    for i, line in enumerate(lines, start=1):
+      m_ = self.TRACE_RE.match(line)
+      self.assertIsNotNone(m_, f"trace line didn't parse: {line!r}")
+      iter_n, k_eff, m, draft_ms, draft_dispatch_ms, verify_dispatch_ms, accept_ms, state_assign_ms, total_ms = m_.groups()
+      self.assertEqual(int(iter_n), i)  # one line per iteration, in order, no skips/dupes
+      self.assertLessEqual(int(m), int(k_eff))
+      # +0.02: draft_dispatch_ms <= draft_ms is a hard invariant on the underlying floats (draft_dispatch_ms
+      # sums strict sub-intervals of the window draft_ms measures), but each is independently %.2f-rounded,
+      # which can push them to adjacent buckets in the wrong direction by up to 0.01ms each.
+      self.assertLessEqual(float(draft_dispatch_ms), float(draft_ms) + 0.02,
+                            f"draft_dispatch_ms (dispatch-only) exceeded draft_ms (dispatch+sync): {line!r}")
+      phases = float(draft_ms) + float(verify_dispatch_ms) + float(accept_ms) + float(state_assign_ms)
+      total = float(total_ms)
+      # the 4 phases are sequential, non-overlapping sub-intervals of the SAME iteration total_ms independently
+      # measures (iter_t0 to just before this line prints) -- phases <= total on the underlying floats is a
+      # hard invariant (perf_counter is monotonic), never just approximate; the only slack asserted here is
+      # each value's OWN independent %.2f rounding (up to 0.005ms each, 5 values -> 0.025ms, rounded up to
+      # 0.05ms), not measurement noise. The only untimed cost is host-only glue between phases (k_eff's min(),
+      # n=len(chunk_ids), the stats_on block), which should be tiny next to real tensor-op time.
+      self.assertLessEqual(phases, total + 0.05, f"phases summed to more than total_ms: {line!r}")
+      self.assertGreaterEqual(phases, total * 0.5, f"untimed residual ate more than half of total_ms: {line!r}")
+
 class TestSpecAccept(unittest.TestCase):
   """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-
   sampling accept/reject/resample test T4.65 wires into speculative_generate's temperature>0 path."""

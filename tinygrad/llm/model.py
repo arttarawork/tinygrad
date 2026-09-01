@@ -1,5 +1,5 @@
 from __future__ import annotations
-import enum, functools, itertools, math, pathlib, re
+import enum, functools, itertools, math, pathlib, re, time
 from dataclasses import dataclass, replace
 from typing import Callable, cast, TYPE_CHECKING
 if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays numpy-free at import time -- the minimal
@@ -142,6 +142,48 @@ MTP = ContextVar("MTP", 0)
 # given draft-head quality: a low average accept length means k is too big (wasted draft compute), the
 # histogram's shape shows whether raising/lowering k would help.
 SPEC_STATS = ContextVar("SPEC_STATS", 0)
+
+# T4.66c: per-iteration wall-clock PHASE breakdown for speculative_generate -- 0 (default): zero overhead, not
+# even a time.perf_counter() call, just one cheap `if` per outer iteration (same contract as SPEC_STATS above).
+# 1: prints one line per outer iteration with wall-clock ms for each phase below. Built to name where real
+# wall-clock goes on actual hardware (METAL+NV pooled, k=3: ~4.9s/iter observed) that a dispatch-count proxy
+# can't see -- see SPEC_PROFILE_NOTES.md for the full first-principles audit this instrumentation exists to test.
+#
+# SYNC SEMANTICS (read before trusting a number here -- tinygrad dispatch is async, so wall-clock measured at a
+# non-sync point is queuing time, not execution time; every phase below says which kind it is):
+#   draft_ms           REAL SYNC at the end (chunk_ids' .tolist() in greedy mode; the last drafted position's
+#                       own .numpy() in sampled mode). Spans all k_eff mtp_head.draft calls plus that final
+#                       pull-to-host, so this is the one number that reflects actual DEVICE time for the whole
+#                       draft chain -- execution AND any cross-device copies -- not just Python dispatch.
+#   draft_dispatch_ms  DISPATCH-ONLY in greedy mode: sum of each drafted position's own call latency. No
+#                       .tolist()/.numpy()/.item() runs inside the loop there, so this is pure Python/graph-
+#                       construction overhead (see tinygrad/function.py's _function.__call__, which reruns its
+#                       traced python body every call -- mtp_head.draft's block is never TinyJit-wrapped), not
+#                       device execution. In SAMPLED mode each drafted id needs a REAL SYNC instead (an
+#                       ancestral sample off an actual .numpy() pull -- see the sampled-DRAFT comment below), so
+#                       there draft_dispatch_ms already includes device time and draft_ms-draft_dispatch_ms is
+#                       just the tail cat+tolist. In GREEDY mode, draft_ms-draft_dispatch_ms isolates whatever's
+#                       invisible until the tail sync: device execution and any cross-device copies MTPHead.draft's
+#                       token-embedding hop makes (see SPEC_PROFILE_NOTES.md).
+#   verify_dispatch_ms DISPATCH-ONLY. Covers building the VERIFY input buffer and the self(...) call that
+#                       launches the main-model forward; nothing here calls .tolist()/.numpy()/.item(), so this
+#                       never actually waits for the forward to run -- it only measures how long it takes to
+#                       BUILD and QUEUE that work.
+#   accept_ms          REAL SYNC at the start (verify_ids/verify_np pulled to host), then the host-side
+#                       accept-length compare loop, then h_last's slice+.contiguous() (a cheap dispatch, no
+#                       further sync). The one number that reflects VERIFY's actual device time.
+#   state_assign_ms    DISPATCH-ONLY, always. Tensor.realize() defaults to wait=False (engine/realize.py's
+#                       run_linear), so this SCHEDULES the partial-accept GDN-state fixup but does not block --
+#                       its real device cost lands wherever the next real sync happens to fall (typically next
+#                       iteration's draft_ms or accept_ms). Reads ~0 whenever m==k_eff (full accept, nothing to
+#                       fix up) -- one timer, no separate branch needed, since the FIXUP block itself is a no-op then.
+#   total_ms           Independently measured wall-clock for the whole iteration body (top of the loop to just
+#                       before this line prints), NOT computed as the sum of the phases above. Compare the two:
+#                       a gap means some host round-trip in the loop escaped the phases above. Also compare
+#                       total_ms against an externally-observed per-iteration time (e.g. a bench harness's
+#                       wall-clock between emitted tokens) -- that separates "the time is IN this function" from
+#                       "the time is somewhere else entirely" (serve.py, HTTP, scheduler contention).
+SPEC_TRACE = ContextVar("SPEC_TRACE", 0)
 
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
@@ -1563,8 +1605,11 @@ class Transformer:
     stats_on = bool(SPEC_STATS.value)
     accept_hist: dict[int, int] = {}
     stats_iters = stats_drafted = stats_emitted = 0
+    trace_on = bool(SPEC_TRACE.value)  # T4.66c: see SPEC_TRACE's own ContextVar docstring for the phase list/sync semantics
+    trace_iter = 0
     try:
       while len(tokens) < self.max_context:
+        if trace_on: iter_t0 = time.perf_counter()
         k_eff = min(k, self.max_context - 1 - len(tokens))
 
         # (a) DRAFT: chain mtp_head.draft k_eff times. h_last is reused UNCHANGED across the whole chain --
@@ -1586,11 +1631,13 @@ class Transformer:
         # below. ponytail: k is small (default 3) and this only runs when temperature>0, so k_eff extra host
         # round-trips per iteration is a fine trade for keeping the sampling host-side/seedable; revisit only
         # if a real serving benchmark ever shows --mtp sampled mode is sync-bound.
+        if trace_on: draft_t0, draft_dispatch_ms = time.perf_counter(), 0.0
         dtok, dpos = tok_last, start_pos
         draft_ids: list[int] = []
         draft_tensors: list[Tensor] = []
         q_list: list[np.ndarray] = []
         for i in range(k_eff):
+          if trace_on: call_t0 = time.perf_counter()
           dlogits = self.mtp_head.draft(self, h_last, dtok, v_draft_pos[i].bind(dpos))  # (B,1,vocab)
           if greedy:
             # T4.66b: no per-step .realize() anymore -- v_draft_pos[i] is a DISTINCT Variable per draft-chain
@@ -1605,6 +1652,7 @@ class Transformer:
             draft_ids.append(d_i)
             q_list.append(q_i)
             dtok = Tensor([[d_i]], dtype="int32", device=dev)
+          if trace_on: draft_dispatch_ms += (time.perf_counter() - call_t0) * 1000
           dpos += 1
         chunk_ids: list[int]
         if greedy:
@@ -1613,6 +1661,7 @@ class Transformer:
           chunk_ids = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
         else:
           chunk_ids = [int(tok_last.item())] + draft_ids  # draft_ids were already pulled to host per-step above
+        if trace_on: draft_ms = (time.perf_counter() - draft_t0) * 1000
         n = len(chunk_ids)  # k_eff + 1
 
         # (b) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
@@ -1622,15 +1671,18 @@ class Transformer:
         # CHECKPOINT step here (a device-side clone of every GDN block's conv/recurrent state, so a partial
         # accept could restore-then-redo): reading the correct post-partial-accept state directly off THIS
         # call's own captures (in the ACCEPT step below) needs no snapshot to roll back to -- see SPEC_NOTES.md.
+        if trace_on: verify_t0 = time.perf_counter()
         buf = Tensor(chunk_ids + [0] * (chunk_size - n), dtype="int32", device=dev).reshape(1, chunk_size)
         sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n)
         verify_result = cast(tuple[Tensor, ...], self(buf[:, :nt], sp, None, spec=True))
         verify_logits, verify_h, gdn_extra = verify_result[0], verify_result[1], verify_result[2:]
+        if trace_on: verify_dispatch_ms = (time.perf_counter() - verify_t0) * 1000
 
         # (c) ACCEPT: how many of the k_eff drafts hold up (m, 0..k_eff), and the one extra token this
         # iteration emits beyond them -- either the greedy exact-match bonus/correction id, or (T4.65,
         # temperature>0) a sampled accept/resample per spec_accept. Both branches produce `accepted`
         # (== chunk_ids[1:1+m] + [that extra token], always m+1 long) and `tok_last` (the new chain anchor).
+        if trace_on: accept_t0 = time.perf_counter()
         if greedy:
           # verify_logits' own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
           # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
@@ -1664,6 +1716,8 @@ class Transformer:
         # and GatedDeltaNetBlock._attention's `capture` docstring for what's captured and why reading it back
         # is cheap (a slice + assign per GDN block, not a whole-model forward over m+1 tokens).
         h_last = verify_h[:, m:m + 1].contiguous()  # same value as the old verify_h/REDO-h_last either way
+        if trace_on: accept_ms = (time.perf_counter() - accept_t0) * 1000
+        if trace_on: assign_t0 = time.perf_counter()
         if m < k_eff:
           # partial accept only: verify's forward also advanced state through the wrong tokens d_m..d_{k_eff-1}
           # -- fix it directly from this call's own captures instead of rolling back + re-forwarding. On a
@@ -1674,12 +1728,21 @@ class Transformer:
             assigns.append(block.recurrent_state.assign(state_track[:, :, m].cast(block.recurrent_state.dtype)))
             assigns.append(block.conv_state.assign(conv_window[:, m + 1:m + 1 + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype)))
           if assigns: Tensor.realize(*assigns)
+        if trace_on: state_assign_ms = (time.perf_counter() - assign_t0) * 1000
 
         if stats_on:
           accept_hist[m] = accept_hist.get(m, 0) + 1
           stats_iters += 1
           stats_drafted += k_eff
           stats_emitted += m + 1
+
+        if trace_on:
+          trace_iter += 1
+          total_ms = (time.perf_counter() - iter_t0) * 1000
+          print(f"[SPEC_TRACE] iter={trace_iter} k_eff={k_eff} m={m} "
+                f"draft_ms={draft_ms:.2f} draft_dispatch_ms={draft_dispatch_ms:.2f} "
+                f"verify_dispatch_ms={verify_dispatch_ms:.2f} accept_ms={accept_ms:.2f} "
+                f"state_assign_ms={state_assign_ms:.2f} total_ms={total_ms:.2f}")
 
         start_pos += m + 1
         for v in accepted:
