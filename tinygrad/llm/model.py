@@ -1246,7 +1246,16 @@ class Transformer:
     block's cache buffers exist. restore_state is the inverse; snapshot_matches tells a caller whether it's even
     valid to call that for a given token list. mtp_head's own (attention-only) KV cache is deliberately NOT
     included: a stale/wrong draft never affects correctness (only iteration count), the same reason
-    speculative_generate's own CHECKPOINT never protects it either -- see its comment."""
+    speculative_generate's own CHECKPOINT never protects it either -- see its comment.
+
+    T4.74-candidate-1 (fault-hardening, see ANALYSIS.md hypothesis (c)): synchronize every device this model's
+    blocks live on before the clone burst below. generate()/speculative_generate() already host-sync (.tolist()/
+    .numpy()) before yielding a token, which should mean nothing of THEIRS is still in flight by the time
+    serve.py calls this -- but that argument rests on the device's async-dispatch signal-wait being a full queue
+    drain and not just a narrower per-buffer wait, which isn't verifiable from source alone (see ANALYSIS.md).
+    This sync is a no-op on every backend that's already idle (Device.synchronize()'s base implementation is a
+    plain no-op; HCQ backends override it) -- cheap insurance either way."""
+    for dev in {d for b in self.blk for d in (b.device if isinstance(b.device, tuple) else (b.device,)) if d}: Device[dev].synchronize()
     pos = len(self._cached_tokens)
     blocks: list[dict] = []
     for b in self.blk:
