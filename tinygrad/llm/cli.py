@@ -190,7 +190,9 @@ def main():
     except ImportError: print("warning: jinja2 is not installed, the model's chat template is disabled")
 
   # warmup the JIT
-  if args.warmup or args.serve:
+  if (args.warmup or args.serve) and not getenv("SKIP_WARMUP", 0):
+    # T4.73b: SKIP_WARMUP=1 (diagnostic only) -- lets the first REAL requests run the eager->capture->replay
+    # jit lifecycle with real data, discriminating replay-mechanism bugs from warmup-data bugs (bug-1).
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
