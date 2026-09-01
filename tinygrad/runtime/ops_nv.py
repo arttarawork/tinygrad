@@ -24,6 +24,9 @@ PMA = ContextVar("PMA", abs(VIZ.value)>=2)
 
 # T4.78 (T475_NV_FAULT_RCA.md S5m1): ring size N; 0 (default) = off, no bookkeeping at all on the hot submit path.
 NV_DISPATCH_RING = ContextVar("NV_DISPATCH_RING", 0)
+# T4.78 (T475_NV_FAULT_RCA.md S5m5): 1 = synchronize() after every dispatch submit, serializing the device so a
+# fault attributes to exactly one dispatch. Debug-only (fault-hunt windows), not for production.
+NV_EAGER_DRAIN = ContextVar("NV_EAGER_DRAIN", 0)
 
 class DispatchRing:
   """T4.78: fixed-size ring of the last N NV dispatches (kernel execs + copies), for post-fault forensics. Pure
@@ -206,6 +209,10 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     System.memory_barrier()
     dev.gpu_mmio[0x90 // 4] = gpfifo.token
     gpfifo.put_value += 1
+
+    # T4.78 NV_EAGER_DRAIN: block for completion right here so a fault attributes to exactly this dispatch, instead
+    # of surfacing later at some unrelated synchronize() call. Debug-only: fully serializes the device.
+    if NV_EAGER_DRAIN.value: dev.synchronize()
 
 class NVComputeQueue(NVCommandQueue):
   def memory_barrier(self):

@@ -1,7 +1,7 @@
 import contextlib, io, itertools, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, Context
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager, NVPageTableEntry
 from tinygrad.runtime.support.nv.ip import NV_FLCN
@@ -1045,6 +1045,36 @@ class TestNVDispatchRingSubmitChokePoint(unittest.TestCase):
     q, dev, gpfifo = self._fake_submit(None)  # dispatch_ring=None: NV_DISPATCH_RING was off at device-init time
     q._submit_to_gpfifo(dev, gpfifo)  # must not raise (e.g. AttributeError/NoneType has no attribute 'drain')
     assert q._dispatches == []
+
+class TestNVEagerDrainForensics(unittest.TestCase):
+  """T4.78 NV_EAGER_DRAIN: after each dispatch submission, synchronously wait for completion so a fault
+  attributes to exactly one dispatch -- implemented via the existing wait/sleep machinery (dev.synchronize(),
+  which itself polls iface.sleep() internally), not a new draining mechanism. Drives the real
+  NVCommandQueue._submit_to_gpfifo to prove the guard: off (default) never synchronizes -- no behavior change --
+  and on synchronizes exactly once per submission."""
+
+  def _fake_submit(self):
+    q = NVCommandQueue()
+    q._q = []
+    q.hw_page = SimpleNamespace(va_addr=0x2000, size=0, base=None)
+    sync_calls:list = []
+    dev = SimpleNamespace(dispatch_ring=None, gpu_mmio={}, synchronize=lambda: sync_calls.append(1),
+                          is_remote=lambda: False, allocator=SimpleNamespace(alloc=lambda *a, **k: None, free=lambda *a, **k: None))
+    q.binded_device = dev
+    gpfifo = SimpleNamespace(ring={}, put_value=0, entries_count=8, gpput={}, token=0x77)
+    return q, dev, gpfifo, sync_calls
+
+  def test_eager_drain_off_never_synchronizes(self):
+    q, dev, gpfifo, sync_calls = self._fake_submit()
+    with Context(NV_EAGER_DRAIN=0):
+      q._submit_to_gpfifo(dev, gpfifo)
+    assert sync_calls == [], "NV_EAGER_DRAIN=0 (default) must never synchronize -- no behavior change when off"
+
+  def test_eager_drain_on_synchronizes_once_per_submit(self):
+    q, dev, gpfifo, sync_calls = self._fake_submit()
+    with Context(NV_EAGER_DRAIN=1):
+      q._submit_to_gpfifo(dev, gpfifo)
+    assert sync_calls == [1], f"NV_EAGER_DRAIN=1 must synchronize exactly once per submission, got {sync_calls}"
 
 if __name__ == "__main__":
   unittest.main()
