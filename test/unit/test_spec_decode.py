@@ -1,22 +1,49 @@
-import unittest
+import contextlib, io, re, unittest
+from dataclasses import replace
 from unittest.mock import Mock
 import numpy as np
-from tinygrad import Tensor
+from tinygrad import Tensor, nn
 from tinygrad.helpers import Context
 from tinygrad.schedule import schedule_cache
-from tinygrad.llm.model import Transformer, spec_accept
-from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB
+from tinygrad.llm.model import (
+  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept,
+)
+from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 
 # T4.64: speculative_generate must be TOKEN-IDENTICAL to generate(temperature=0.0) regardless of draft
 # quality (correctness never depends on the MTP head guessing right -- only the accept-iteration count
 # does). Reuses test_mtp_load.py's tiny synthetic qwen35-shaped GGUF builder: full_attention_interval=1
-# there makes every real block a plain TransformerBlock (no GatedDeltaNet), so this model exercises the
-# speculative_generate GDN-checkpoint/restore code as an always-empty (no-op) list -- see SPEC_NOTES.md.
+# there makes every real block a plain TransformerBlock (no GatedDeltaNet), so this model never exercises
+# any of the GDN-specific ACCEPT-step code at all (see _load_gdn below, used by the tests that need to).
 
 def _load(seed:int=0, max_context:int=64) -> Transformer:
   with Context(MTP=1):
     model, _ = Transformer.from_gguf(_gguf_tensor(_build_tiny_qwen35_gguf(seed=seed)), max_context=max_context,
                                      device_map=None, realize=False)
+  return model
+
+# T4.66b: a version of _load() whose real blocks include a GatedDeltaNetBlock -- _load()'s GGUF-backed model
+# above never has one (see its own comment), so none of the existing tests in this file ever exercised
+# GatedDeltaNetBlock._attention's `capture` path or speculative_generate's per-GDN-block ACCEPT-step
+# reconstruction at all. Built directly (no GGUF -- test_gdn_scan_parity.py's make_block already establishes
+# this is the simpler way to get a small real GatedDeltaNetBlock for tests) with 2 real blocks (0: GDN, 1:
+# plain attention -- exercises forward()'s per-block isinstance(..., GatedDeltaNetBlock) branch both ways in
+# one model) plus an MTPHead built the same way from_gguf's own MTP branch builds one (mtp_cfg = replace(config,
+# qk_norm=config.head_dim) since config.ssm is set, block_cls=TransformerBlock -- MTPHead's own block is always
+# attention-only, never GatedDeltaNet, regardless of the owning model's architecture).
+def _load_gdn(seed:int=0, max_context:int=64) -> Transformer:
+  ssm = SSMConfig(conv_kernel=4, state_size=4, group_count=1, time_step_rank=2, inner_size=8)
+  config = TransformerConfig(num_blocks=2, dim=DIM, hidden_dim=HIDDEN, n_heads=N_HEADS, n_kv_heads=N_KV_HEADS,
+                              norm_eps=1e-5, vocab_size=VOCAB, head_dim=HEAD_DIM, rope_theta=10000.0,
+                              rope_dim=HEAD_DIM, v_head_dim=HEAD_DIM, max_context=max_context,
+                              attn_output_gate=True, ssm_layers=(True, False), ssm=ssm)
+  model = Transformer(config)
+  model.mtp_head = MTPHead(replace(config, qk_norm=config.head_dim), TransformerBlock)
+  Tensor.manual_seed(seed)
+  params = nn.state.get_parameters(model)
+  for p in params: p.replace(Tensor.randn(*p.shape) * 0.1)
+  Tensor.realize(*params)  # pin weights now -- lazy RNG counter race, see test_gdn_scan_parity.py's make_block
+  assert any(isinstance(b, GatedDeltaNetBlock) for b in model.blk) and not all(isinstance(b, GatedDeltaNetBlock) for b in model.blk)
   return model
 
 def _run(model:Transformer, prompt:list[int], n:int, spec:bool, k:int=3) -> list[int]:
@@ -157,6 +184,86 @@ class TestSpeculativeGenerate(unittest.TestCase):
         model_b = _load(seed=seed)
         ref_continuation = [v for _, v in zip(range(8), model_b.generate(prefix_snapshot, temperature=0.0))]
         self.assertEqual(got_second, ref_continuation, f"{k=} {seed=} {prompt=}")
+
+  # --- T4.66b: GDN-specific tests (_load_gdn) -- every test above uses _load()'s model, which has NO
+  # GatedDeltaNetBlock at all (see _load's own comment), so none of them ever exercised
+  # GatedDeltaNetBlock._attention's `capture` path or speculative_generate's per-GDN-block ACCEPT-step
+  # reconstruction (the REDO replacement) at all. See test_gdn_scan_parity.py's TestGDNScanCapture for a
+  # lower-level check that capture=True's returned per-position state matches sequential ground truth at
+  # every position directly; the tests below check the same thing end-to-end, through speculative_generate.
+
+  def test_matches_generate_several_prompts_and_k_gdn(self):
+    # same core gate as test_matches_generate_several_prompts_and_k above, but on a model that actually has a
+    # GatedDeltaNetBlock -- exercises the real (non-forced) mtp_head.draft against real per-position GDN
+    # state capture/reconstruction, complementing the forced-deterministic test below.
+    for k in (1, 3):
+      for seed, prompt in enumerate(PROMPTS):
+        ref = _run(_load_gdn(seed=seed), prompt, N_GEN, spec=False)
+        got = _run(_load_gdn(seed=seed), prompt, N_GEN, spec=True, k=k)
+        self.assertEqual(got, ref, f"{k=} {seed=} {prompt=}")
+
+  def test_forced_partial_accept_matches_generate_gdn(self):
+    # T4.66b's core correctness gate: forces a REAL mid-chain partial accept (0 < m < k_eff) against a model
+    # that has a GatedDeltaNetBlock, deterministically -- exercising the new REDO-free reconstruction (a
+    # capture-based recurrent_state/conv_state fixup read off the verify call itself) specifically, not just
+    # the m==0 case test_forced_mismatch_still_matches_generate above already covers (m==0 never needs to read
+    # a MIDDLE position out of state_track -- position 0 is also the fresh-checkpoint-adjacent case, and was
+    # already exercisable pre-T4.66b via the old restore-then-redo path too). fake_draft is engineered to be
+    # right about the FIRST drafted position of every chain and wrong about every later one (a fixed
+    # off-vocabulary-ish constant, VOCAB-1) -- with k_eff constant at k (max_context=64 is generous relative
+    # to N_GEN here, so the boundary-degrade case in k_eff's own definition never triggers), every iteration's
+    # m is deterministically 1, which is genuinely "0 < m < k_eff" whenever k>=2. Checked via SPEC_STATS
+    # (closing the generator to force its finally block to fire now, not whenever GC gets to it) rather than
+    # merely inferred from the call count, so this test would fail loudly if that engineering ever stopped
+    # working (e.g. a future change to draft/verify's position bookkeeping).
+    for k in (2, 3):
+      for seed, prompt in enumerate(PROMPTS):
+        lookahead = N_GEN + k + 4  # margin: the last iteration's drafts may peek a few positions past N_GEN
+        ref = _run(_load_gdn(seed=seed), prompt, lookahead, spec=False)
+        ref_tokens = list(prompt) + ref
+
+        calls = 0
+        def fake_draft(owner, h, tok_ids, start_pos, _ref=ref_tokens):
+          nonlocal calls
+          pos = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
+          first_in_chain = calls % k == 0
+          calls += 1
+          return _wrong_logits(_ref[pos + 1] if first_in_chain else VOCAB - 1)
+
+        model = _load_gdn(seed=seed)
+        model.mtp_head.draft = fake_draft
+        calls = 0
+        buf = io.StringIO()
+        with Context(SPEC_STATS=1), contextlib.redirect_stdout(buf):
+          gen = model.speculative_generate(list(prompt), k=k)
+          got = [v for _, v in zip(range(N_GEN), gen)]
+          gen.close()  # forces speculative_generate's try/finally to run (and print) right now
+        self.assertEqual(got, ref[:N_GEN], f"{k=} {seed=} {prompt=}")
+        self.assertGreater(calls, 0, f"{k=} {seed=} {prompt=}")
+
+        stats_line = buf.getvalue()
+        hist_match = re.search(r"accept_len_hist=\{([^}]*)\}", stats_line)
+        self.assertIsNotNone(hist_match, f"{k=} {seed=} {prompt=}: SPEC_STATS never printed a histogram: {stats_line!r}")
+        hist = {}
+        for pair in hist_match.group(1).split(", ") if hist_match.group(1) else []:
+          acc_len, count = pair.split(":")
+          hist[int(acc_len)] = int(count)
+        self.assertIn(1, hist, f"{k=} {seed=} {prompt=}: expected a genuine mid-chain partial accept (m=1) in {hist}")
+        self.assertEqual(hist.get(0, 0), 0, f"{k=} {seed=} {prompt=}: m==0 happened, fake_draft's position-0 wasn't honored: {hist}")
+
+  def test_state_integrity_continues_like_a_fresh_generate_gdn(self):
+    # same invariant as test_state_integrity_continues_like_a_fresh_generate above, but on the GDN model --
+    # that test's base model has no GatedDeltaNetBlock at all, so it never actually checked that
+    # speculative_generate leaves correct GDN (conv_state/recurrent_state) state behind, only KV/_cached_tokens.
+    for k in (1, 3):
+      for seed, prompt in enumerate(PROMPTS):
+        model_a = _load_gdn(seed=seed)
+        tokens_so_far = list(prompt)
+        got_first = [v for _, v in zip(range(12), model_a.speculative_generate(tokens_so_far, k=k))]
+        got_second = [v for _, v in zip(range(6), model_a.generate(tokens_so_far, temperature=0.0))]
+
+        full_ref = _run(_load_gdn(seed=seed), prompt, 18, spec=False)
+        self.assertEqual(got_first + got_second, full_ref, f"{k=} {seed=} {prompt=}")
 
 class TestSpecAccept(unittest.TestCase):
   """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-

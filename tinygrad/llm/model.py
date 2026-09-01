@@ -133,6 +133,16 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
 # into speculative decoding.
 MTP = ContextVar("MTP", 0)
 
+# T4.66b: per-request speculative-decode instrumentation for speculative_generate -- 0 (default): zero
+# overhead, nothing recorded, nothing printed (only a cheap `if` guard per outer iteration). 1: accumulate an
+# accept-length histogram (m -> iteration count) and a drafts-per-emitted-token ratio, printed once when the
+# generator's main loop ends -- either it runs out (max_context) or the caller closes/abandons it (a request
+# ending, GeneratorExit) -- via a try/finally wrapping the loop, so both paths are covered without serve.py
+# needing to know anything about this. This is the knob the hardware run uses to find the best `k` for a
+# given draft-head quality: a low average accept length means k is too big (wasted draft compute), the
+# histogram's shape shows whether raising/lowering k would help.
+SPEC_STATS = ContextVar("SPEC_STATS", 0)
+
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
   the dominant decode-memory cost). KV_F32=1 reverts to dtypes.default_float, e.g. to isolate an accuracy
@@ -566,7 +576,35 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
+    """capture=False (every caller except speculative_generate's VERIFY -- see GatedDeltaNetBlock.__call__)
+    is byte-identical to pre-T4.66b behavior: the retention branches below never run, nothing extra is ever
+    materialized. capture=True additionally returns (state_track, conv_window), which speculative_generate
+    uses to reconstruct the correct post-partial-accept state directly instead of a second ("REDO") forward
+    -- see SPEC_NOTES.md's REDO section (this replaces it) and speculative_generate's ACCEPT step.
+
+      state_track: (B,H,T_pad,V,K) -- state_track[:,:,t] is this block's recurrent_state exactly as it would
+      be immediately after consuming only this call's first t+1 real input rows (t=0..T_pad-1; t>=T is exact
+      no-op padding same as everywhere else here, so state_track[:,:,T-1] == the real final state whenever
+      T<=T_pad). The per-token loop below already computes every one of these intermediates on its way to
+      the final one -- retaining them (one more .stack(), the same way `outs` already gets stacked) is free:
+      this is the "can the scan cheaply expose per-position state" question T4.66b's task asked to
+      investigate, answered yes for this (the standing default) implementation. gdn_scan_wy's chunked/matmul
+      form is NOT free here: it only ever forms the chunk's LAST state (one (V,K) matmul over the whole
+      chunk, see its docstring's `final_state` line) -- exposing every prefix would need a cumsum-shaped
+      computation of comparable cost to the one WY already replaced the loop with, i.e. genuine extra work,
+      not retention of something already computed. The AMD fused kernel doesn't expose it either (one opaque
+      hardware-loop kernel; RDNA3 is also descoped for this fork -- CLAUDE.md). So capture=True forces the
+      plain per-token loop regardless of GDN_SCAN_IMPL/device -- correct everywhere, just not fused-kernel-
+      accelerated for the VERIFY call specifically. That's perf-neutral-or-better even on a WY-enabled build:
+      WY's own comment below already notes it has nothing to amortize at small T_pad and measured
+      pathologically slow at T_pad==1 -- VERIFY's chunk (k_eff+1 tokens, k_eff<=k, k defaulting to 3) is
+      exactly that regime.
+
+      conv_window: (B,ssm_conv_kernel-1+T_pad,conv_channels) -- this call's own conv window (already built
+      below regardless of capture). conv_window[:,p:p+ssm_conv_kernel-1] is this block's conv_state as it
+      would be after only the first p real input rows: the same slice the existing conv_state_store line
+      below already takes with p=T, generalized to an arbitrary prefix (see SPEC_NOTES.md)."""
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
@@ -612,13 +650,16 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
+    state_track: Tensor|None = None
+    # T4.66b: `capture` also excludes the fused path -- it has no per-position state to expose (see the
+    # docstring above), so capturing forces the plain loop below regardless of device.
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device) and not capture:
       # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
       state = initial.where(0, state.float())
 
-      def run_scan(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
+      def run_scan(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor, Tensor|None]:
         # T4.69a: GDN_SCAN_IMPL picks the per-token loop (default/auto) or the chunkwise WY-form gdn_scan_wy
         # (device-agnostic, matmul-shaped -- see its docstring). Dispatch lives here, inside the per-group
         # call site below, so a GDN_HEAD_GROUPS split composes with it for free.
@@ -631,35 +672,41 @@ class GatedDeltaNetBlock(FFNBlock):
         # to the full declared chunk_size -- T_pad, already concrete (max_shape/to_max_shape always returns
         # plain ints) either way, is the one quantity that means "how many steps this call's scan processes"
         # for both the symbolic/padded prefill path and a plain concrete T=1 decode step.
-        use_wy = gdn_scan_impl_for() == GDN_SCAN_WY and T_pad > 1
+        # T4.66b: `capture` also forces the loop (never WY) -- see _attention's own docstring for why.
+        use_wy = gdn_scan_impl_for() == GDN_SCAN_WY and T_pad > 1 and not capture
         gdn_last_scan_impl.append(GDN_SCAN_WY if use_wy else GDN_SCAN_LOOP)
-        if use_wy: return gdn_scan_wy(state, q, k, v, beta, alpha)
+        if use_wy: return (*gdn_scan_wy(state, q, k, v, beta, alpha), None)
         q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
         alpha = alpha.unsqueeze(-1)
-        outs = []
+        outs: list[Tensor] = []
+        states: list[Tensor]|None = [] if capture else None
         for t in range(T_pad):
           s1 = state * alpha[:, :, t]  # decay the state
           delta = (v[:, :, t] - (s1*k[:, :, t]).sum(-1, keepdim=True)) * beta[:, :, t]  # the delta rule update
           state = s1 + delta * k[:, :, t]
           outs.append((state * q[:, :, t]).sum(-1))
-        return state, outs[0].stack(*outs[1:], dim=1)
+          if states is not None: states.append(state)  # T4.66b: free retention -- `state` is already computed above
+        track = states[0].stack(*states[1:], dim=2) if states else None  # (B,H,T_pad,V,K)
+        return state, outs[0].stack(*outs[1:], dim=1), track
 
       # T4.62: split the scan into G sequential head groups when the geometry needs it (see
       # gdn_head_groups_for above) -- each group's own .contiguous() forces a separate, narrower kernel,
       # then a single cat reassembles the full state/output. G=1 (unchanged geometries) skips all of this
       # and lowers to exactly the same graph as before.
       if (G := gdn_head_groups_for(self.num_v_heads)) <= 1:
-        state, stacked = run_scan(state, q, k, v, beta, alpha)
+        state, stacked, state_track = run_scan(state, q, k, v, beta, alpha)
       else:
         gsize = -(-self.num_v_heads // G)  # ceil(H/G): only the last group is smaller when H % G != 0
-        group_states, group_outs = [], []
+        group_states, group_outs, group_tracks = [], [], []
         for lo in range(0, self.num_v_heads, gsize):
           hi = min(lo + gsize, self.num_v_heads)
-          g_state, g_outs = run_scan(state[:, lo:hi], q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], beta[:, lo:hi], alpha[:, lo:hi])
+          g_state, g_outs, g_track = run_scan(state[:, lo:hi], q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], beta[:, lo:hi], alpha[:, lo:hi])
           group_states.append(g_state.contiguous())
           group_outs.append(g_outs.contiguous())
+          if capture: group_tracks.append(cast(Tensor, g_track).contiguous())
         state = group_states[0].cat(*group_states[1:], dim=1) if len(group_states) > 1 else group_states[0]
         stacked = group_outs[0].cat(*group_outs[1:], dim=2) if len(group_outs) > 1 else group_outs[0]
+        if capture: state_track = group_tracks[0].cat(*group_tracks[1:], dim=1) if len(group_tracks) > 1 else group_tracks[0]
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
       state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
@@ -668,7 +715,32 @@ class GatedDeltaNetBlock(FFNBlock):
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
-    return self.ssm_out(z.reshape(B, T, -1))
+    out = self.ssm_out(z.reshape(B, T, -1))
+    if not capture: return out
+    assert state_track is not None, "capture=True always takes the per-token-loop branch above (never the AMD-fused or WY path)"
+    return out, state_track.contiguous(), conv_window.contiguous()
+
+  def __call__(self, x:Tensor, start_pos:int|UOp, spec:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:
+    # T4.66b: spec=False (every caller except speculative_generate's VERIFY forward -- see there) is exactly
+    # FFNBlock.__call__, unchanged -- same _run closure, same single-Tensor return, zero extra tensors ever
+    # built. spec=True additionally threads this block's captured per-position GDN state history (see
+    # _attention's `capture`) out through _run's OWN return: the only way a value survives this
+    # @function(precompile=True)-wrapped closure being invoked repeatedly (SPEC_NOTES.md's own lesson --
+    # `x[:,-1:]` needing `.contiguous()` for exactly this reason). A side-channel instance attribute set
+    # inside `_attention` would NOT work here: nothing re-runs `_attention`'s python body on a later read,
+    # so any value not threaded through the traced return is invisible to a subsequent call.
+    self._init_state(x)
+    @function(precompile=True, allow_implicit=True)
+    def _run(x:Tensor, start_pos:int|UOp) -> Tensor|tuple[Tensor, Tensor, Tensor]:
+      if not spec:
+        h = x + cast(Tensor, self._attention(self.attn_norm(x), start_pos))
+        return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      attn_out, state_track, conv_window = cast(tuple[Tensor, Tensor, Tensor],
+                                                  self._attention(self.attn_norm(x), start_pos, capture=True))
+      h = x + attn_out
+      out = (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      return out, state_track, conv_window
+    return _run(x, start_pos)
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
@@ -980,22 +1052,31 @@ class Transformer:
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill/rollout, sampled/greedy, and spec (T4.64); prefill also keys on
     # chunk_size (T4.12) -- created lazily in __call__ since chunk_size isn't known until generate() picks one
-    self.jit: dict[tuple[bool, bool, int|None, bool], Callable[..., Tensor|tuple[Tensor, Tensor]]] = {}
+    self.jit: dict[tuple[bool, bool, int|None, bool], Callable[..., Tensor|tuple[Tensor, ...]]] = {}
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, Tensor]:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, ...]:
     # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    # activations hop devices at block boundaries (.to is a no-op when the device matches)
-    for block in self.blk: x = block(x.to(block.device), start_pos)
+    # activations hop devices at block boundaries (.to is a no-op when the device matches). T4.66b: a
+    # GatedDeltaNetBlock additionally takes `spec` -- see its own __call__ -- to also capture its per-position
+    # state history (gdn_extra below); every other block type is untouched (still a bare 2-arg call).
+    gdn_extra: list[Tensor] = []
+    for block in self.blk:
+      xin = x.to(block.device)
+      if spec and isinstance(block, GatedDeltaNetBlock):
+        x, state_track, conv_window = cast(tuple[Tensor, Tensor, Tensor], block(xin, start_pos, spec=True))
+        gdn_extra += [state_track, conv_window]
+      else:
+        x = cast(Tensor, block(xin, start_pos))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
-      # hidden state at the last position (to seed the next draft chain -- the same `x[:, -1:]` the default path
-      # below slices before norm+head). Applying output_norm+output to every position instead of just the last
-      # is strictly more work, never less, and this whole branch is behind a flag every EXISTING caller leaves
-      # False -- so the default path below stays byte-for-byte what it was.
+      # hidden state (to seed the next draft chain -- the same `x` the default path below slices before
+      # norm+head). Applying output_norm+output to every position instead of just the last is strictly more
+      # work, never less, and this whole branch is behind a flag every EXISTING caller leaves False -- so the
+      # default path below stays byte-for-byte what it was.
       # T4.65: this used to return the per-position ARGMAX id (greedy-only). It now returns the raw per-position
       # LOGITS instead -- speculative_generate derives the greedy id from them (argmax, moved to the caller,
       # same value either way) and, for its sampled-acceptance path (temperature>0), the full softmax
@@ -1004,18 +1085,22 @@ class Transformer:
       # sampled acceptance is pure host-side numpy math over these logits -- no RNG kernel to capture either way.
       assert temperature is None, "spec=True always traces greedy -- speculative_generate's sampled path (T4.65) " \
         "computes acceptance host-side from these logits, it never needs forward() itself to sample"
-      # no .contiguous() on the logits (unlike x[:, -1:] below): self.output(...) is a fresh matmul over the
-      # whole (unsliced) x, real computed output that owns its buffer, not a view into a larger scratch buffer
-      # -- same reasoning SPEC_NOTES.md §3 already gives for why the old argmax result never needed this either.
-      # .contiguous(): x[:, -1:] is a zero-copy VIEW into x's own buffer at an offset that depends on the
-      # bound `toks` variable -- fine for the default path below, which consumes it inline in the SAME jit
-      # call that produced it, but this hidden state is carried OUT of this call (into speculative_generate's
-      # next-iteration draft) and read back only after further replays of this same jit graph have reused
-      # x's buffer for a new chunk. Without materializing it into its own buffer here (same as the logits
-      # already are, being real computed output rather than a view), that later read sees whatever the
-      # intervening replays overwrote instead of this call's own hidden state -- confirmed by a byte-level
-      # cache_kv diff between with/without .contiguous() on this line (see SPEC_NOTES.md).
-      return self.output(self.output_norm(x)), x[:, -1:].contiguous()  # (B,T,vocab) logits, (B,1,D) hidden
+      # no .contiguous() on the logits (unlike x below): self.output(...) is a fresh matmul over the whole
+      # (unsliced) x, real computed output that owns its buffer, not a view into a larger scratch buffer --
+      # same reasoning SPEC_NOTES.md §3 already gives for why the old argmax result never needed this either.
+      # .contiguous(): x is a zero-copy VIEW into its own buffer (an offset/width depending on the bound
+      # `toks` variable) -- fine for the default path below, which consumes it inline in the SAME jit call
+      # that produced it, but this hidden state is carried OUT of this call (into speculative_generate's next-
+      # iteration draft, or its ACCEPT step's position-m slice) and read back only after further replays of
+      # this same jit graph have reused x's buffer for a new chunk. Without materializing it into its own
+      # buffer here (same as the logits already are, being real computed output rather than a view), that
+      # later read sees whatever the intervening replays overwrote instead of this call's own hidden state --
+      # confirmed by a byte-level cache_kv diff between with/without .contiguous() on this line (SPEC_NOTES.md).
+      # T4.66b: returns the FULL per-position hidden (B,T,D), not just x[:, -1:] (B,1,D) -- speculative_generate's
+      # ACCEPT step needs the hidden state at whichever position m turns out to be the accept length, not always
+      # the last one (that's the REDO forward this replaces). Callers that only ever wanted the last position
+      # (the prefill tail, and the old REDO call site this removes) slice `[:, -1:]` themselves.
+      return self.output(self.output_norm(x)), x.contiguous(), *gdn_extra  # (B,T,vocab) logits, (B,T,D) hidden, per-GDN-block captures
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
@@ -1024,7 +1109,7 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, Tensor]:
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, ...]:
     is_prefill = bool(resolve(tokens.shape[1] != 1))
     # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
     # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
@@ -1373,6 +1458,13 @@ class Transformer:
     Mirrors generate()'s own bookkeeping exactly (the `tokens` list, self._cached_tokens, one token
     yielded at a time) -- generate() itself is untouched by this; see Transformer.__call__'s optional
     `spec=` return path.
+
+    T4.66b: a partial accept no longer pays a second ("REDO") main-model forward to rebuild GDN state and
+    h_last -- both are read directly off the SAME verify forward's own captured per-position outputs (see
+    GatedDeltaNetBlock._attention's `capture` and forward()'s spec branch). See SPEC_NOTES.md's REDO section
+    (superseded by this) for the full before/after. Draft-chain dispatch is also cheaper (distinct Variables
+    per draft position instead of one rebound k_eff times, removing a forced per-step realize -- see
+    v_draft_pos below); SPEC_STATS (a ContextVar) turns on per-request accept-length instrumentation.
     """
     assert self.mtp_head is not None, "speculative_generate needs an MTP-enabled model (Transformer.from_gguf under MTP=1)"
     assert k >= 1, "k=0 has nothing to draft -- use generate() directly"
@@ -1404,19 +1496,29 @@ class Transformer:
     # regression test) to grow schedule_cache/to_program_cache without bound, one entry-set per drafted
     # position ever seen. Binding a Variable instead replays ONE compiled schedule at every position, the
     # same trick v_start_pos already gives the main model's VERIFY/REDO calls below.
-    # A separate Variable from v_start_pos, not a reuse of it: TransformerBlock never re-wraps start_pos in
-    # its own Variable (unlike GatedDeltaNetBlock, which self-converts -- see its _attention), so whatever
-    # name/bounds the caller binds is exactly what reaches mtp_head.block's compiled kernel. Reusing
-    # v_start_pos would likely be just as safe -- each .bind() is an independent, immutable node, and the
-    # DRAFT loop below always fully realizes (a host .tolist() or, sampled, a per-step .numpy()) before
-    # VERIFY ever binds v_start_pos, so there's never a live two-value-same-name overlap either way -- but
-    # that safety argument is exactly the kind of thing that stops holding the moment either call site
-    # changes. A separate name costs nothing and never needs re-justifying. Bounds match v_start_pos's:
-    # mtp_head.block's cache_kv/freqs_cis are sized off the SAME config.max_context as the main model
-    # (from_gguf's MTP branch builds mtp_cfg from the owning Transformer's own config), and k_eff already
+    # A separate Variable (set) from v_start_pos, not a reuse of it: TransformerBlock never re-wraps start_pos
+    # in its own Variable (unlike GatedDeltaNetBlock, which self-converts -- see its _attention), so whatever
+    # name/bounds the caller binds is exactly what reaches mtp_head.block's compiled kernel. Bounds match
+    # v_start_pos's: mtp_head.block's cache_kv/freqs_cis are sized off the SAME config.max_context as the main
+    # model (from_gguf's MTP branch builds mtp_cfg from the owning Transformer's own config), and k_eff already
     # caps drafted positions at start_pos+k_eff <= max_context-2 (see k_eff's definition below) -- safely
     # inside [0, max_context-1] with room to spare.
-    v_draft_pos = UOp.variable("draft_pos", 0, self.max_context - 1)
+    #
+    # T4.66b: k DISTINCT Variables (draft_pos_0..k-1), not one name rebound k_eff times per iteration -- this
+    # is what lets the per-step .realize() T4.66 needed (see the DRAFT loop below) go away. With one shared
+    # name, k_eff different bound values could never coexist in ONE merged schedule ("bind mismatch on
+    # draft_pos, i != i+1" -- reproduced while building T4.66, see SPEC_NOTES.md §4), so every drafted token
+    # had to be individually realized/dispatched before the next .bind() of that same name was even created.
+    # k distinct names have no such conflict (each is bound at most once per iteration), so all k_eff draft
+    # calls now merge into ONE schedule, dispatched by chunk_ids' own batched .tolist() below -- same as
+    # VERIFY/REDO already did. Costs k (not 1) schedule_cache/to_program_cache entries instead of 1, still
+    # bounded/warmed-once per process (k defaults to 3 -- SPEC_TOKENS): the same "one entry-set per NAME,
+    # reused at every position" property T4.66 established, just k of them. Index i means "the i-th draft step
+    # of THIS iteration" and gets reused with a different concrete dpos across MANY outer iterations, exactly
+    # how the old single name was already reused across iterations --
+    # test_draft_reuses_schedule_across_positions' own "flat after warmup" assertion still holds, just with a
+    # bigger (k-entry, not 1-entry) flat plateau.
+    v_draft_pos = [UOp.variable(f"draft_pos_{i}", 0, self.max_context - 1) for i in range(k)]
 
     # --- prefill: identical mechanics to generate() (same kind of v_start_pos/v_toks vars, same
     # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
@@ -1432,7 +1534,10 @@ class Transformer:
       n_toks = min(chunk_size, prompt_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       if start_pos + n_toks >= prompt_len:
-        tok_all, h_last = cast(tuple[Tensor, Tensor], self(t[:, sp:sp + nt], sp, None, spec=True))
+        # T4.66b: forward(spec=True) now returns the FULL per-position hidden state (B,T,D), not just the
+        # last position -- the prefill anchor only ever wanted the last one (same value as before).
+        prefill_result = cast(tuple[Tensor, ...], self(t[:, sp:sp + nt], sp, None, spec=True))
+        tok_all, h_last = prefill_result[0], prefill_result[1][:, -1:].contiguous()
       else:
         cast(Tensor, self(t[:, sp:sp + nt], sp, None, spec=False)).realize()
       start_pos += n_toks
@@ -1455,131 +1560,142 @@ class Transformer:
     self._cached_tokens = tokens[:-1]
     yield tokens[-1]
 
-    while len(tokens) < self.max_context:
-      k_eff = min(k, self.max_context - 1 - len(tokens))
+    stats_on = bool(SPEC_STATS.value)
+    accept_hist: dict[int, int] = {}
+    stats_iters = stats_drafted = stats_emitted = 0
+    try:
+      while len(tokens) < self.max_context:
+        k_eff = min(k, self.max_context - 1 - len(tokens))
 
-      # (a) DRAFT: chain mtp_head.draft k_eff times. h_last is reused UNCHANGED across the whole chain --
-      # MTPHead.draft's signature only takes one hidden-state argument, so it's the one anchor into the
-      # main model's context available without changing that (fixed, already-tested) signature; only
-      # tok_ids and start_pos advance per call, and `block`'s own KV cache (see MTPHead.draft's docstring)
-      # is what actually carries the chain's positional continuity from call to call. This never touches
-      # the MAIN model's state -- mtp_head.block is always attention-only, never GatedDeltaNet (see
-      # from_gguf's MTP branch) -- so drafting alone never needs the GDN checkpoint below; only verify does.
-      # Draft quality has zero effect on correctness (see the forced-mismatch test in test_spec_decode.py);
-      # a richer per-step hidden (threading the block's own pre-norm output between calls) is a quality-only
-      # lever for later, not something this task's gate depends on.
-      #
-      # T4.65 sampled path: draft_ids[i] must be an ANCESTRAL SAMPLE from q_i = softmax(draft_logits/temp),
-      # not argmax -- spec_accept's distribution-preservation proof assumes this (see its docstring). That
-      # needs the actual q_i vector on host to sample from (rng is a seeded np.random.Generator, not a
-      # device RNG, precisely so this is reproducible/testable), so the sampled chain pulls one small
-      # (vocab,) logits vector to host per drafted token instead of the greedy chain's single batched pull
-      # below. ponytail: k is small (default 3) and this only runs when temperature>0, so k_eff extra host
-      # round-trips per iteration is a fine trade for keeping the sampling host-side/seedable; revisit only
-      # if a real serving benchmark ever shows --mtp sampled mode is sync-bound.
-      dtok, dpos = tok_last, start_pos
-      draft_ids: list[int] = []
-      draft_tensors: list[Tensor] = []
-      q_list: list[np.ndarray] = []
-      for _ in range(k_eff):
-        dlogits = self.mtp_head.draft(self, h_last, dtok, v_draft_pos.bind(dpos))  # (B,1,vocab)
+        # (a) DRAFT: chain mtp_head.draft k_eff times. h_last is reused UNCHANGED across the whole chain --
+        # MTPHead.draft's signature only takes one hidden-state argument, so it's the one anchor into the
+        # main model's context available without changing that (fixed, already-tested) signature; only
+        # tok_ids and start_pos advance per call, and `block`'s own KV cache (see MTPHead.draft's docstring)
+        # is what actually carries the chain's positional continuity from call to call. This never touches
+        # the MAIN model's state -- mtp_head.block is always attention-only, never GatedDeltaNet (see
+        # from_gguf's MTP branch) -- so drafting alone never touches the main model's GDN state; only verify does.
+        # Draft quality has zero effect on correctness (see the forced-mismatch test in test_spec_decode.py);
+        # a richer per-step hidden (threading the block's own pre-norm output between calls) is a quality-only
+        # lever for later, not something this task's gate depends on.
+        #
+        # T4.65 sampled path: draft_ids[i] must be an ANCESTRAL SAMPLE from q_i = softmax(draft_logits/temp),
+        # not argmax -- spec_accept's distribution-preservation proof assumes this (see its docstring). That
+        # needs the actual q_i vector on host to sample from (rng is a seeded np.random.Generator, not a
+        # device RNG, precisely so this is reproducible/testable), so the sampled chain pulls one small
+        # (vocab,) logits vector to host per drafted token instead of the greedy chain's single batched pull
+        # below. ponytail: k is small (default 3) and this only runs when temperature>0, so k_eff extra host
+        # round-trips per iteration is a fine trade for keeping the sampling host-side/seedable; revisit only
+        # if a real serving benchmark ever shows --mtp sampled mode is sync-bound.
+        dtok, dpos = tok_last, start_pos
+        draft_ids: list[int] = []
+        draft_tensors: list[Tensor] = []
+        q_list: list[np.ndarray] = []
+        for i in range(k_eff):
+          dlogits = self.mtp_head.draft(self, h_last, dtok, v_draft_pos[i].bind(dpos))  # (B,1,vocab)
+          if greedy:
+            # T4.66b: no per-step .realize() anymore -- v_draft_pos[i] is a DISTINCT Variable per draft-chain
+            # position (see its own definition above), so all k_eff of these stay lazy and merge into ONE
+            # schedule, dispatched by chunk_ids' batched .tolist() below (T4.66's own realize existed only
+            # because back then every step rebound the SAME name, which one merged schedule can't do twice).
+            dtok = dlogits.argmax(-1)  # (B,1)
+            draft_tensors.append(dtok)
+          else:
+            q_i = _softmax_np(dlogits[:, -1, :].numpy()[0], temperature)  # (vocab,)
+            d_i = int(rng.choice(len(q_i), p=q_i))
+            draft_ids.append(d_i)
+            q_list.append(q_i)
+            dtok = Tensor([[d_i]], dtype="int32", device=dev)
+          dpos += 1
+        chunk_ids: list[int]
         if greedy:
-          # T4.66: .realize() here (new -- the pre-T4.66 plain-int start_pos never needed it) is load-bearing,
-          # not a stray perf tweak: v_draft_pos is ONE named Variable rebound to a DIFFERENT concrete value
-          # each pass through this loop, and the greedy branch used to keep every dtok lazy, chaining k_eff of
-          # them into ONE combined graph only realized at chunk_ids' .tolist() below. A single realize/schedule
-          # can only carry one concrete value per variable NAME (create_linear_with_vars raises "bind mismatch
-          # on draft_pos, i != i+1" otherwise -- reproduced while building this), so each drafted step must be
-          # realized in its own scope before the next .bind() of the same name is created. Still async/non-
-          # blocking (engine/realize.py's run_linear(wait=False), same as generate()'s own per-step realize()),
-          # so this doesn't reintroduce a host sync the way the sampled branch's per-step .numpy() below does.
-          dtok = dlogits.argmax(-1).realize()  # (B,1)
-          draft_tensors.append(dtok)
+          # one host round-trip for tok_last + every drafted id (mirrors generate()'s own batched-drain sync
+          # a few lines up) -- chunk_ids[0] is tok_last (already-confirmed real), chunk_ids[1:] are the drafts.
+          chunk_ids = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
         else:
-          q_i = _softmax_np(dlogits[:, -1, :].numpy()[0], temperature)  # (vocab,)
-          d_i = int(rng.choice(len(q_i), p=q_i))
-          draft_ids.append(d_i)
-          q_list.append(q_i)
-          dtok = Tensor([[d_i]], dtype="int32", device=dev)
-        dpos += 1
-      chunk_ids: list[int]
-      if greedy:
-        # one host round-trip for tok_last + every drafted id (mirrors generate()'s own batched-drain sync
-        # a few lines up) -- chunk_ids[0] is tok_last (already-confirmed real), chunk_ids[1:] are the drafts.
-        chunk_ids = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
-      else:
-        chunk_ids = [int(tok_last.item())] + draft_ids  # draft_ids were already pulled to host per-step above
-      n = len(chunk_ids)  # k_eff + 1
+          chunk_ids = [int(tok_last.item())] + draft_ids  # draft_ids were already pulled to host per-step above
+        n = len(chunk_ids)  # k_eff + 1
 
-      # (b) CHECKPOINT: GatedDeltaNet conv/recurrent state is a single read-modify-written accumulator, not
-      # a position-indexed cache -- once the verify forward below mixes a wrong draft token into it there is
-      # no slice to discard, the mixing is irreversible (unlike attention KV, see the mask argument in
-      # SPEC_NOTES.md). Snapshot it device-side (one batched realize) so a partial accept can restore it.
-      gdn_snap = [(b, b.conv_state.clone(), b.recurrent_state.clone()) for b in gdn_blocks]
-      if gdn_snap: Tensor.realize(*(s for _, c, r in gdn_snap for s in (c, r)))
+        # (b) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
+        # start_pos, returning the per-position logits (what the real model actually predicts from every one of
+        # those positions), the per-position hidden state, and (T4.66b) each GDN block's own per-position state
+        # history -- see GatedDeltaNetBlock._attention's `capture` docstring. T4.66b removed the old (b)
+        # CHECKPOINT step here (a device-side clone of every GDN block's conv/recurrent state, so a partial
+        # accept could restore-then-redo): reading the correct post-partial-accept state directly off THIS
+        # call's own captures (in the ACCEPT step below) needs no snapshot to roll back to -- see SPEC_NOTES.md.
+        buf = Tensor(chunk_ids + [0] * (chunk_size - n), dtype="int32", device=dev).reshape(1, chunk_size)
+        sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n)
+        verify_result = cast(tuple[Tensor, ...], self(buf[:, :nt], sp, None, spec=True))
+        verify_logits, verify_h, gdn_extra = verify_result[0], verify_result[1], verify_result[2:]
 
-      # (c) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
-      # start_pos, returning the per-position logits (what the real model actually predicts from every one
-      # of those positions) plus the hidden state at the chunk's last position.
-      buf = Tensor(chunk_ids + [0] * (chunk_size - n), dtype="int32", device=dev).reshape(1, chunk_size)
-      sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n)
-      verify_logits, verify_h = cast(tuple[Tensor, Tensor], self(buf[:, :nt], sp, None, spec=True))
+        # (c) ACCEPT: how many of the k_eff drafts hold up (m, 0..k_eff), and the one extra token this
+        # iteration emits beyond them -- either the greedy exact-match bonus/correction id, or (T4.65,
+        # temperature>0) a sampled accept/resample per spec_accept. Both branches produce `accepted`
+        # (== chunk_ids[1:1+m] + [that extra token], always m+1 long) and `tok_last` (the new chain anchor).
+        if greedy:
+          # verify_logits' own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
+          # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
+          # TestCausalMask.test_symbolic_shapes in test_attention.py for the same pad-then-slice idiom): argmax
+          # it down to ids first (the same op forward() used to do internally, pre-T4.65), then pad up to the
+          # fixed chunk_size buffer width, then take just the first n (live) values back on host.
+          verify_ids_tensor = verify_logits.argmax(-1)  # (1, nt) ids
+          verify_ids: list[int] = cast(list[list[int]], verify_ids_tensor.pad_to((1, chunk_size)).tolist())[0][:n]  # [i] predicts start_pos+1+i
+          # verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to draft
+          # d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
+          # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
+          # matching prefix, 0..k_eff.
+          m = 0
+          while m < k_eff and chunk_ids[m + 1] == verify_ids[m]: m += 1
+          accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
+          tok_last = verify_ids_tensor[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
+        else:
+          # same symbolic-shape reasoning as the greedy branch (pad before pulling to host), but here we need
+          # the full per-position distributions, not just the argmax -- pad_to is a no-op on the already-fixed
+          # vocab axis, only the symbolic `nt` axis actually gets padded.
+          vocab = int(verify_logits.shape[-1])  # never symbolic (only the T axis is) -- int() just satisfies mypy's sint=int|UOp
+          verify_np = verify_logits.pad_to((1, chunk_size, vocab)).numpy()[0][:n]  # (n, vocab)
+          p_probs = _softmax_np(verify_np, temperature)
+          q_probs = np.stack(q_list) if q_list else np.empty((0, vocab))
+          accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
+          tok_last = Tensor([[accepted[-1]]], dtype="int32", device=dev)
 
-      # (d) ACCEPT: how many of the k_eff drafts hold up (m, 0..k_eff), and the one extra token this
-      # iteration emits beyond them -- either the greedy exact-match bonus/correction id, or (T4.65,
-      # temperature>0) a sampled accept/resample per spec_accept. Both branches produce `accepted`
-      # (== chunk_ids[1:1+m] + [that extra token], always m+1 long) and `tok_last` (the new chain anchor).
-      if greedy:
-        # verify_logits' own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
-        # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
-        # TestCausalMask.test_symbolic_shapes in test_attention.py for the same pad-then-slice idiom): argmax
-        # it down to ids first (the same op forward() used to do internally, pre-T4.65), then pad up to the
-        # fixed chunk_size buffer width, then take just the first n (live) values back on host.
-        verify_ids_tensor = verify_logits.argmax(-1)  # (1, nt) ids
-        verify_ids: list[int] = cast(list[list[int]], verify_ids_tensor.pad_to((1, chunk_size)).tolist())[0][:n]  # [i] predicts start_pos+1+i
-        # verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to draft
-        # d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
-        # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
-        # matching prefix, 0..k_eff.
-        m = 0
-        while m < k_eff and chunk_ids[m + 1] == verify_ids[m]: m += 1
-        accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
-        tok_last = verify_ids_tensor[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
-      else:
-        # same symbolic-shape reasoning as the greedy branch (pad before pulling to host), but here we need
-        # the full per-position distributions, not just the argmax -- pad_to is a no-op on the already-fixed
-        # vocab axis, only the symbolic `nt` axis actually gets padded.
-        vocab = int(verify_logits.shape[-1])  # never symbolic (only the T axis is) -- int() just satisfies mypy's sint=int|UOp
-        verify_np = verify_logits.pad_to((1, chunk_size, vocab)).numpy()[0][:n]  # (n, vocab)
-        p_probs = _softmax_np(verify_np, temperature)
-        q_probs = np.stack(q_list) if q_list else np.empty((0, vocab))
-        accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
-        tok_last = Tensor([[accepted[-1]]], dtype="int32", device=dev)
+        # T4.66b: h_last and every GDN block's state are read directly off THIS verify call's own per-position
+        # captures (verify_h, gdn_extra) at position m -- no second ("REDO") forward needed even on a partial
+        # accept. Replaces the old CHECKPOINT/restore/REDO-forward entirely -- see SPEC_NOTES.md's REDO section
+        # and GatedDeltaNetBlock._attention's `capture` docstring for what's captured and why reading it back
+        # is cheap (a slice + assign per GDN block, not a whole-model forward over m+1 tokens).
+        h_last = verify_h[:, m:m + 1].contiguous()  # same value as the old verify_h/REDO-h_last either way
+        if m < k_eff:
+          # partial accept only: verify's forward also advanced state through the wrong tokens d_m..d_{k_eff-1}
+          # -- fix it directly from this call's own captures instead of rolling back + re-forwarding. On a
+          # full accept (m==k_eff) verify's own in-place state write is already exactly correct (every fed
+          # token was real), so there's nothing to do here -- same fast path the old code had.
+          assigns = []
+          for block, state_track, conv_window in zip(gdn_blocks, gdn_extra[0::2], gdn_extra[1::2]):
+            assigns.append(block.recurrent_state.assign(state_track[:, :, m].cast(block.recurrent_state.dtype)))
+            assigns.append(block.conv_state.assign(conv_window[:, m + 1:m + 1 + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype)))
+          if assigns: Tensor.realize(*assigns)
 
-      if m == k_eff:
-        # full accept: every input verify saw (tok_last, d0..d_{k_eff-1}) really was correct, so its forward
-        # legitimately advanced every state through position start_pos+k_eff -- nothing to roll back, and
-        # its own last-position hidden IS the next h_last.
-        h_last = verify_h
-      else:
-        # partial accept: verify's forward also advanced state through the wrong tokens d_m..d_{k_eff-1}.
-        # Roll GDN back to before this call and redo exactly the m+1 confirmed-correct tokens as one chunk
-        # to rebuild the true state and get the next h_last. Attention KV needs no restore for the same
-        # reason it never needed a snapshot: this redo overwrites positions [start_pos, start_pos+m+1) with
-        # the SAME values verify already wrote there (a harmless recompute), and the discarded wrong
-        # positions start_pos+m+1..start_pos+k_eff are never read before the next iteration overwrites them
-        # too. This re-forward is the v1 cost T4.66 would remove (see SPEC_NOTES.md).
-        if gdn_snap: Tensor.realize(*(x for b, c, r in gdn_snap for x in (b.conv_state.assign(c), b.recurrent_state.assign(r))))
-        redo_ids = chunk_ids[:m + 1]
-        buf2 = Tensor(redo_ids + [0] * (chunk_size - len(redo_ids)), dtype="int32", device=dev).reshape(1, chunk_size)
-        sp2, nt2 = v_start_pos.bind(start_pos), v_toks.bind(len(redo_ids))
-        _, h_last = cast(tuple[Tensor, Tensor], self(buf2[:, :nt2], sp2, None, spec=True))
+        if stats_on:
+          accept_hist[m] = accept_hist.get(m, 0) + 1
+          stats_iters += 1
+          stats_drafted += k_eff
+          stats_emitted += m + 1
 
-      start_pos += m + 1
-      for v in accepted:
-        tokens.append(v)
-        self._cached_tokens = tokens[:-1]
-        yield tokens[-1]
+        start_pos += m + 1
+        for v in accepted:
+          tokens.append(v)
+          self._cached_tokens = tokens[:-1]
+          yield tokens[-1]
+    finally:
+      # T4.66b: SPEC_STATS instrumentation -- see its own ContextVar docstring. Fires once, whichever way this
+      # generator ends: the loop above exhausting max_context, or the caller closing/abandoning it (a request
+      # ending -- serve.py's Handler.run_model drops `gen` when its own generator ends or is GC'd, which
+      # raises GeneratorExit here at whatever yield this was suspended on).
+      if stats_on and stats_iters:
+        hist_str = ", ".join(f"{acc}:{cnt}" for acc, cnt in sorted(accept_hist.items()))
+        print(f"[SPEC_STATS] iters={stats_iters} emitted={stats_emitted} drafted={stats_drafted} "
+              f"avg_accept_len={stats_emitted/stats_iters:.2f} drafts_per_token={stats_drafted/stats_emitted:.2f} "
+              f"accept_len_hist={{{hist_str}}}")
 
 def snapshot_nbytes(snap:dict) -> int:
   """Total device-buffer bytes a Transformer.snapshot_state() dict holds: recursively sums every Tensor's
