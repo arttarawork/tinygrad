@@ -1,5 +1,6 @@
 import unittest
 from tinygrad import Tensor, nn
+from tinygrad.helpers import Context
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, snapshot_nbytes, snapshot_matches, kv_cache_dtype
 
 # T4.67: snapshot_state/restore_state round-trip tests. Tiny synthetic models built directly from a
@@ -47,6 +48,13 @@ class TestSnapshotRestoreRoundTrip(unittest.TestCase):
 
   def test_round_trip_attention_only(self): self._round_trip(ATTN_CFG)
   def test_round_trip_gdn_hybrid(self): self._round_trip(GDN_CFG)
+
+  def test_round_trip_attention_only_via_copy_staged_clone(self):
+    # T4.74-candidate-3: SNAPSHOT_VIA_COPY routes the attention block's clone through a same-device host
+    # round-trip (model.py's _copy_staged_kv_clone) instead of the default compute-kernel clone -- must still
+    # round-trip byte-identically (ATTN_CFG is all TransformerBlock, so this exercises every block the flag touches).
+    with Context(SNAPSHOT_VIA_COPY=1):
+      self._round_trip(ATTN_CFG)
 
   def _longer_prompt_after_restore(self, cfg:TransformerConfig):
     # a bigger extension than the round-trip test above -- proves the TAIL prefill (not just a trivial

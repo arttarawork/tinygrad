@@ -1272,7 +1272,9 @@ class Transformer:
     for b in self.blk:
       if isinstance(b, GatedDeltaNetBlock): blocks.append({"conv_state": b.conv_state.clone(), "recurrent_state": b.recurrent_state.clone()})
       elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
-      elif isinstance(b, TransformerBlock): blocks.append({"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()})
+      elif isinstance(b, TransformerBlock):
+        cache_kv = _copy_staged_kv_clone(b.cache_kv, pos) if SNAPSHOT_VIA_COPY else b.cache_kv[:, :, :, :pos, :].clone()
+        blocks.append({"cache_kv": cache_kv})
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
       Tensor.realize(*blocks[-1].values())
     return {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks}
@@ -1600,6 +1602,27 @@ class Transformer:
         tokens.append(v)
         self._cached_tokens = tokens[:-1]
         yield tokens[-1]
+
+# T4.74-candidate-3 (fault-hardening, see ANALYSIS.md hypothesis (a)/(b)): route snapshot_state's attention-block
+# cache_kv clone through a same-device host round-trip instead of its default same-device compute-kernel clone.
+# Default 0 (off): byte-identical to the pre-candidate-3 path (plain cache_kv[:, :, :, :pos, :].clone()).
+SNAPSHOT_VIA_COPY = ContextVar("SNAPSHOT_VIA_COPY", 0)
+def _copy_staged_kv_clone(cache_kv:Tensor, pos:int) -> Tensor:
+  """Clones cache_kv's live [:, :, :, :pos, :] slice one (k/v, batch, head) PLANE at a time via `.to("CPU").to(dev)`
+  instead of snapshot_state's default single strided-SHRINK compute kernel. Once the three OUTER axes (of
+  cache_kv's (2, B, n_kv_heads, max_context, head_dim)) are indexed down to a concrete int, each remaining
+  `[:pos, :]` plane is a genuinely contiguous byte range -- confirmed empirically while building this candidate:
+  such a slice schedules as Ops.COPY (engine/realize.py's exec_copy, a plain buffer transfer) with NO kernel/
+  codegen/BEAM involved, unlike the combined 5D view, which always schedules as a kernel regardless of
+  contiguity -- even speculative_generate's CHECKPOINT (a trivial whole-buffer clone, no slicing at all) does too;
+  see ANALYSIS.md's schedule audit. Trades one novel ~24 MB/block strided-copy kernel (this session's first-ever
+  exercise of that exact AST -- see ANALYSIS.md) for 2*B*n_kv_heads small, well-trodden host round-trips per
+  block -- only worth paying for if a hardware A/B shows the kernel path is the actual trigger; SNAPSHOT_VIA_COPY
+  defaults to 0 (off) precisely because this is a real performance trade, not a free hardening step like
+  candidates 1-2."""
+  dev, k_dim, b_dim, h_dim, head_dim = cache_kv.device, cache_kv.shape[0], cache_kv.shape[1], cache_kv.shape[2], cache_kv.shape[-1]
+  planes = [cache_kv[k, b, h, :pos, :].to("CPU").to(dev) for k in range(k_dim) for b in range(b_dim) for h in range(h_dim)]
+  return Tensor.stack(*planes).reshape(k_dim, b_dim, h_dim, pos, head_dim)
 
 def snapshot_nbytes(snap:dict) -> int:
   """Total device-buffer bytes a Transformer.snapshot_state() dict holds: recursively sums every Tensor's
