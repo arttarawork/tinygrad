@@ -626,7 +626,14 @@ rows are not strictly date-sorted — **the latest row for a task wins.**
 
 ## RESUME HERE
 
-> **→ READ `HANDOFF_2026-08-27.md` FIRST** — the current entry point: panic era CLOSED (remediation +
+> **→ READ `HANDOFF_2026-09-01.md` FIRST** — the current entry point: fault era CLOSED (E1-confirmed WPR overlap,
+> T4.77 ceiling kill-validated, T4.78 forensics — PRs #25/#26 both 51/51 green awaiting merge; five-fault class
+> plausibly retired ⇒ **T4.70d TP bring-up UNBLOCKED**). T4.73 = TWO bugs: bug-1 (WY NaN, replay-triggered,
+> serve-scale-only) characterized-not-fixed — WY stays OFF; bug-2 (chunk-32 capture transient) diagnosed + parked.
+> Board in the handoff §3: merges → T4.79 state-cache adoption → T4.70d → T4.73a scale-up → T4.66b/c.
+> (`HANDOFF_2026-08-31.md` = the 3.8-chain era; `HANDOFF_2026-08-27.md` = the TD.5 era.)
+
+> *(superseded 2026-09-01)* **→ old pointer: `HANDOFF_2026-08-27.md`** — the prior entry point: panic era CLOSED (remediation +
 > diagnosability merged & silicon-verified), **M3 ACHIEVED** (Q8_0 36.9 GB pooled 31.1 tok/s BEAM'd),
 > storm culprit named+guarded (MoE expert-gather), autonomous `DEV=NV` granted under the standing
 > protocol. **TD.5 WIRED 2026-08-27 PM** (rows T4.55/T4.56/T4.57 + TD.5 progress/verified): the pooled Q8_0 is a
