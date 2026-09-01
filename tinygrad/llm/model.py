@@ -1254,7 +1254,18 @@ class Transformer:
     serve.py calls this -- but that argument rests on the device's async-dispatch signal-wait being a full queue
     drain and not just a narrower per-buffer wait, which isn't verifiable from source alone (see ANALYSIS.md).
     This sync is a no-op on every backend that's already idle (Device.synchronize()'s base implementation is a
-    plain no-op; HCQ backends override it) -- cheap insurance either way."""
+    plain no-op; HCQ backends override it) -- cheap insurance either way.
+
+    T4.74-candidate-2 (fault-hardening, see ANALYSIS.md hypothesis (b)): realize PER BLOCK instead of batching
+    every block's clone into one combined Tensor.realize(*everything) at the end. At the real T4.74 shapes each
+    attention block's clone is a fresh ~24 MB allocation behind a kernel this session has never run before (see
+    ANALYSIS.md's schedule audit -- one shared compiled AST across all 16 same-shaped blocks, but each is still
+    its own allocation + dispatch); batching all 16 (+ GDN blocks' small clones) into a single realize() puts the
+    full ~370 MB/16-block burst on the queue/allocator at once with no draining in between. Draining after each
+    block bounds the burst to one block's worth and pinpoints which block (if any) a hardware fault recurs on --
+    still one .clone() per block exactly as before, just drained immediately rather than deferred. Costs one
+    extra Python-level realize() call per block, negligible next to the multi-second prefill that already ran;
+    the returned dict's contents are unchanged."""
     for dev in {d for b in self.blk for d in (b.device if isinstance(b.device, tuple) else (b.device,)) if d}: Device[dev].synchronize()
     pos = len(self._cached_tokens)
     blocks: list[dict] = []
@@ -1263,7 +1274,7 @@ class Transformer:
       elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
       elif isinstance(b, TransformerBlock): blocks.append({"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()})
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
-    Tensor.realize(*(t for bs in blocks for t in bs.values()))
+      Tensor.realize(*blocks[-1].values())
     return {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks}
 
   def restore_state(self, snap:dict) -> None:
