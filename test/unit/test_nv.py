@@ -893,5 +893,72 @@ class TestNVSignalSleepFaultDrain(unittest.TestCase):
     sig.owner, sig.should_return = None, False
     sig._sleep(0)  # must not raise
 
+def _fake_hang_self_with_control(is_err_state:bool, rm_control, error_state=None, dispatch_ring=None) -> SimpleNamespace:
+  """Like TestNVQuiesceOnFault's _fake_hang_self, plus the is_err_state/error_state/dispatch_ring knobs T4.78's
+  on_device_hang forensics change reads. iface intentionally has no `dev_impl` for is_err_state=None (the
+  NVKIface/MOCKIface shape); is_err_state True/False models a PCIIface with dev_impl.is_err_state set."""
+  pci_dev = _FakePCIConfig()
+  iface_kwargs = dict(pci_dev=pci_dev, rm_control=rm_control)
+  if is_err_state is not None: iface_kwargs['dev_impl'] = SimpleNamespace(is_err_state=is_err_state)
+  fake = SimpleNamespace(iface=SimpleNamespace(**iface_kwargs), debugger=None, debug_channel=0, is_remote=lambda: True, is_nvd=lambda: True)
+  if error_state is not None: fake.error_state = error_state
+  if dispatch_ring is not None: fake.dispatch_ring = dispatch_ring
+  return fake
+
+class TestNVOnDeviceHangForensics(unittest.TestCase):
+  """T4.78 (T475_NV_FAULT_RCA.md S5m1): a GSP-RM already known-faulted (is_err_state) has never once answered
+  another RPC (5/5 observed) -- pre-fix, on_device_hang's own forensic RPCs burned the default 10s timeout on
+  each of up to two calls and then raised a BRAND NEW RuntimeError, discarding synchronize()'s original "Device
+  fault detected" exception entirely. These prove: (1) a confirmed-wedged device gets a short forensic timeout;
+  (2) a healthy/not-yet-confirmed hang keeps the full timeout (forensics still has a chance to succeed); (3) a
+  forensic RPC timeout is caught and reported as one clear line, never left to propagate/stall; (4) the ORIGINAL
+  exception (self.error_state -- the same object synchronize() is about to re-raise) survives with its type and
+  primary message intact, the forensic report merely appended, never replacing it."""
+
+  def test_wedged_device_gets_short_forensic_timeout(self):
+    seen = []
+    def rm_control(obj, cmd, params, timeout=10000):
+      seen.append(timeout)
+      raise RuntimeError("Timeout waiting for RPC response for command 76")
+    fake = _fake_hang_self_with_control(is_err_state=True, rm_control=rm_control, error_state=RuntimeError("Device fault detected."))
+    NVDevice.on_device_hang(fake)  # must not raise: error_state is present, so it's enriched in place and returns
+    assert seen == [2000], f"a confirmed-wedged device must use the short (~2s) forensic timeout, got {seen}"
+
+  def test_healthy_hang_keeps_default_forensic_timeout(self):
+    seen = []
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    def rm_control(obj, cmd, params, timeout=10000):
+      seen.append(timeout)
+      return no_fault
+    fake = _fake_hang_self_with_control(is_err_state=False, rm_control=rm_control, error_state=RuntimeError("some other hang"))
+    NVDevice.on_device_hang(fake)
+    assert seen == [10000], f"a not-yet-confirmed-wedged hang should keep the full forensic timeout, got {seen}"
+
+  def test_forensic_timeout_reports_one_clear_line_instead_of_propagating(self):
+    def rm_control(obj, cmd, params, timeout=10000): raise RuntimeError("Timeout waiting for RPC response for command 76")
+    orig = RuntimeError("Device fault detected. NV device is in an unrecoverable fault state.")
+    fake = _fake_hang_self_with_control(is_err_state=True, rm_control=rm_control, error_state=orig)
+    NVDevice.on_device_hang(fake)  # must not raise the RPC timeout -- it must be caught, not left to stall/propagate
+    assert "GSP-RM unresponsive (standard post-fault wedge)" in str(orig)
+
+  def test_original_exception_object_type_and_message_preserved(self):
+    def rm_control(obj, cmd, params, timeout=10000): raise RuntimeError("Timeout waiting for RPC response for command 76")
+    orig = RuntimeError("Device fault detected. NV device is in an unrecoverable fault state.")
+    fake = _fake_hang_self_with_control(is_err_state=True, rm_control=rm_control, error_state=orig)
+    NVDevice.on_device_hang(fake)
+    assert fake.error_state is orig, "must enrich the SAME exception synchronize() is about to re-raise, not a new one"
+    assert type(orig) is RuntimeError
+    assert str(orig).startswith("Device fault detected. NV device is in an unrecoverable fault state."), \
+      f"primary message must survive unchanged as a prefix, got {orig}"
+    assert str(orig) != "Device fault detected. NV device is in an unrecoverable fault state.", "context must be appended, not left off"
+
+  def test_no_original_exception_falls_back_to_a_fresh_one(self):
+    # Mirrors TestNVQuiesceOnFault's pre-existing fixture shape (no error_state at all) -- on_device_hang called
+    # standalone (not via synchronize()'s except block) must still raise, unchanged from the pre-T4.78 behavior.
+    no_fault = SimpleNamespace(mmuFault=SimpleNamespace(valid=False), smErrorStateArray=[])
+    fake = _fake_hang_self_with_control(is_err_state=False, rm_control=lambda *a, **k: no_fault)
+    with self.assertRaises(RuntimeError) as ctx: NVDevice.on_device_hang(fake)
+    assert "fresh client" in str(ctx.exception).lower(), ctx.exception
+
 if __name__ == "__main__":
   unittest.main()

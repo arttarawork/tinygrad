@@ -4,6 +4,7 @@ assert sys.platform != 'win32'
 from typing import cast
 from dataclasses import dataclass
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQProgram, HCQSignal, BumpAllocator
+from tinygrad.runtime.support.hcq import _dev_already_faulted
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, hcq_filter_visible_devices, hcq_profile
 from tinygrad.uop.ops import sint
 from tinygrad.device import Compiled, BufferSpec, TinyELF
@@ -860,25 +861,42 @@ class NVDevice(HCQCompiled[NVSignal]):
     # Prepare fault report.
     # TODO: Restore the GPU using NV83DE_CTRL_CMD_CLEAR_ALL_SM_ERROR_STATES if needed.
 
-    report = []
-    sm_errors = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES,
-      nv_gpu.NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS(hTargetChannel=self.debug_channel, numSMsToRead=100))
+    # T4.78 (T475_NV_FAULT_RCA.md S5m1): a device already known-faulted (is_err_state) has never once answered
+    # another RPC (5/5 observed) -- give these forensic RPCs a short timeout instead of burning the default 10s
+    # on each of up to two calls, and report one clear line on expiry instead of stalling.
+    rpc_timeout = 2000 if _dev_already_faulted(self) else 10000
 
-    if sm_errors.mmuFault.valid:
-      mmu = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_MMU_FAULT_INFO,
-        nv_gpu.NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS())
-      for i in range(mmu.count):
-        pfinfo = mmu.mmuFaultInfoList[i]
-        report += [f"MMU fault: 0x{pfinfo.faultAddress:X} | {NV_PFAULT_FAULT_TYPE[pfinfo.faultType]} | {NV_PFAULT_ACCESS_TYPE[pfinfo.accessType]}"]
-    else:
-      for i, e in enumerate(sm_errors.smErrorStateArray):
-        if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
+    report = []
+    try:
+      sm_errors = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES,
+        nv_gpu.NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS(hTargetChannel=self.debug_channel, numSMsToRead=100), timeout=rpc_timeout)
+
+      if sm_errors.mmuFault.valid:
+        mmu = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_MMU_FAULT_INFO,
+          nv_gpu.NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS(), timeout=rpc_timeout)
+        for i in range(mmu.count):
+          pfinfo = mmu.mmuFaultInfoList[i]
+          report += [f"MMU fault: 0x{pfinfo.faultAddress:X} | {NV_PFAULT_FAULT_TYPE[pfinfo.faultType]} | {NV_PFAULT_ACCESS_TYPE[pfinfo.accessType]}"]
+      else:
+        for i, e in enumerate(sm_errors.smErrorStateArray):
+          if e.hwwGlobalEsr or e.hwwWarpEsr:
+            report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
+    except RuntimeError:
+      report += ["GSP-RM unresponsive (standard post-fault wedge)"]
 
     # T4.37: clear bus-master before raising, same as PCIIface.sleep() -- after the RPCs above, which still need GSP
     # alive. is_nvd()-gated: NVKIface/MOCKIface have no pci_dev and never reach a live GSP fault this way.
     if self.is_nvd():
       self.iface.pci_dev.write_config_flush(pci.PCI_COMMAND, self.iface.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
-    raise RuntimeError("\n".join(report) + _fault_recovery_hint(self))
+
+    # T4.78: never replace the fault synchronize() is about to re-raise (self.error_state, set one frame up, is the
+    # SAME object) -- append forensics as context onto it instead, same type + primary message. Only synthesize a
+    # fresh RuntimeError when there's no original to enrich (on_device_hang invoked standalone, e.g. direct tests).
+    extra = "\n".join(report)
+    if (orig:=getattr(self, 'error_state', None)) is not None:
+      if extra: orig.args = (f"{orig}\n{extra}",)
+      return
+    raise RuntimeError(extra + _fault_recovery_hint(self))
 
   def _prof_init(self):
     self.profiler = self.iface.rm_alloc(self.subdevice, nv_gpu.MAXWELL_PROFILER_DEVICE,
