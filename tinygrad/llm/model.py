@@ -51,6 +51,11 @@ def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.valu
 # into a kernel count. Read via gdn_last_scan_impl[-1].
 gdn_last_scan_impl: list[int] = []
 
+# T4.76: runtime diagnostics for the WY-prefill-then-decode GPU-only garbage-token bug (see REPORT.md). 0
+# (default): zero overhead -- every call site below is `if WY_TRACE.value:`, so nothing extra is built,
+# realized, or printed. 1: generate() (below) prints one stdout line per traced step -- see _wy_trace_log.
+WY_TRACE = ContextVar("WY_TRACE", 0)
+
 def _gdn_tri_inverse(m:Tensor) -> Tensor:
   """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
   doubling instead of a length-C forward-substitution loop.
@@ -919,6 +924,35 @@ def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng
   bonus = int(rng.choice(p_probs.shape[1], p=p_probs[k_eff]))
   return draft_ids + [bonus], k_eff
 
+def _wy_trace_log(model:"Transformer", step_kind:str, argmax_out:Tensor) -> None:
+  """T4.76, WY_TRACE=1 only: one compact stdout line per traced generate() step (see there) -- per-GDN-block
+  recurrent_state/conv_state fingerprints (host-side float64 sum/nan-count/abs-max via .tolist(), the same
+  numpy-free host-pull idiom generate()'s own drain loop already uses) plus, at decode, the sampled id/top-5/
+  nan-inf/shape of the last forward() call's logits (captured into model._wy_trace_logits by forward()
+  itself -- see there). Correctness over speed throughout, per the T4.76 brief.
+
+  gdn_last_scan_impl is TRACE-only (see its own docstring above): it does not advance on a JIT REPLAY (no
+  python runs then -- engine/jit.py's _TinyJit, cnt>=2 -- see REPORT.md), so a replayed step's printed impl
+  is whatever the last TRACE (of any jit key, prefill or decode) appended, not necessarily fresh this call.
+  Still meaningful here: decode never selects WY regardless of trace/replay (T4.69b's T_pad>1 gate), so a
+  stale LOOP entry on a replayed decode step is not a false signal -- only a fresh WY entry on prefill is."""
+  def fp(t:Tensor) -> str:
+    flat = cast(list[float], t.flatten().tolist())
+    finite = [v for v in flat if v == v]  # NaN != NaN
+    return f"sum={math.fsum(finite) if finite else 0.0:.6g} nan={len(flat)-len(finite)} amax={max((abs(v) for v in finite), default=0.0):.6g}"
+
+  gdn_blocks = [(i, b) for i, b in enumerate(model.blk) if isinstance(b, GatedDeltaNetBlock)]
+  blocks_str = " ".join(f"blk{i}:state({fp(b.recurrent_state)})/conv({fp(b.conv_state)})" for i, b in gdn_blocks)
+  impl = gdn_last_scan_impl[-len(gdn_blocks):] if gdn_blocks else []
+  line = f"[WY_TRACE] step={step_kind} impl={impl} {blocks_str}"
+  if step_kind.startswith("decode") and hasattr(model, "_wy_trace_logits"):
+    logits = cast(list[float], model._wy_trace_logits.flatten().tolist())
+    top5 = sorted((v for v in logits if v == v), reverse=True)[:5]
+    line += (f" argmax={int(argmax_out.item())} top5={[round(v, 4) for v in top5]} "
+             f"logits_nan={sum(1 for v in logits if v != v)} logits_inf={sum(1 for v in logits if math.isinf(v))} "
+             f"logits_shape={tuple(model._wy_trace_logits.shape)}")
+  print(line, flush=True)
+
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     # T4.70b: FFN tensor-parallel spec, parsed from device_map's optional "tp:" segment (see parse_tp_spec)
@@ -1018,6 +1052,14 @@ class Transformer:
       return self.output(self.output_norm(x)), x[:, -1:].contiguous()  # (B,T,vocab) logits, (B,1,D) hidden
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    if WY_TRACE.value:
+      # T4.76: stash these logits into a persistent buffer via the same hasattr-gated-allocation +
+      # .uop.store()/.after() idiom this file already uses for cache_kv/recurrent_state (see GatedDeltaNetBlock
+      # ._attention below) -- so a JIT REPLAY of this graph (engine/jit.py's _TinyJit, cnt>=2: no python of
+      # forward() runs at all, see REPORT.md) still refreshes it every call, not just on the trace that first
+      # builds it. generate() reads it back (after its own .realize()) to print decode-step diagnostics.
+      if not hasattr(self, "_wy_trace_logits"): self._wy_trace_logits = Tensor.zeros_like(logits).clone()
+      logits = Tensor(logits.uop.after(self._wy_trace_logits.uop.store(logits.uop)))
     # greedy (temperature is None): plain argmax, no RNG kernels
     if temperature is None: return logits.argmax(-1, keepdim=True)
     temperature = temperature.to(logits.device)
@@ -1316,11 +1358,21 @@ class Transformer:
     # append/_cached_tokens/yield timing moves.
     pending: list[Tensor] = []
     virtual_len = len(tokens)
+    wy_decode_traces = 0  # T4.76, WY_TRACE=1 only: counts traced decode steps so far, capped at 3
     while virtual_len < self.max_context:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = cast(Tensor, self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp)).realize()
+      is_prefill_call = start_pos < prompt_len or out is None
+      out = cast(Tensor, self(t[:, sp:sp+nt] if is_prefill_call else cast(Tensor, out), sp, temp)).realize()
       start_pos += n_toks
+      if WY_TRACE.value:
+        # T4.76: the LAST prefill step is the one whose increment above finally clears the "more prompt to
+        # consume" check just below (a single-chunk prompt makes this the very first iteration); the first 3
+        # decode steps are every non-prefill call up to that cap. See _wy_trace_log for what gets printed.
+        if is_prefill_call and start_pos >= virtual_len: _wy_trace_log(self, "prefill(last)", out)
+        elif not is_prefill_call and wy_decode_traces < 3:
+          _wy_trace_log(self, f"decode#{wy_decode_traces + 1}", out)
+          wy_decode_traces += 1
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < virtual_len: continue
       # move the sampled token once, back to t's device, so the next step's input matches the JIT's prefill-captured device.
