@@ -193,3 +193,7 @@ Order: E1 → land mitigation 1 → E3 → E2 → E4; E5 only on contradiction. 
 - Only hardware can settle: the true WPR bounds (E1), the store-path culprit's identity (E3), kernel-vs-copy attribution
   (E4), and — if everything above comes back clean — the electrical/tunnel residue (E5). GSP-RM's internal wedge reason is
   out of reach from this side of the firmware and does not block any mitigation.
+
+## §8 Addendum — E1 executed (2026-08-31 close-out gap)
+
+Hypothesis B **CONFIRMED**: `NV_PFB_PRI_MMU_WPR2_ADDR_LO/HI` read 0x05f3f000/0x05ffee00 → WPR2 = [0x5f3f00000, 0x5ffee0000] = [23.812, 23.999] GiB on the 24 GiB 3090; client mm ceiling (vram−64MB) = 0x5fc000000 → **129.0 MiB overlap**, matching the predicted ~105-130 MB. Mitigation 2 applied as T4.77 (`vram_size−(256<<20)`, branch `task/T4.77-wpr-ceiling`): 256MB clears the measured 188MB WPR2 span with margin. E2 remains the corruption-mode validation. Side findings: GSP firmware is fetched from gitlab at fresh-client init (not cached — a cold-start dependency on network); WPR1 registers are absent from `nv_regs/dev_fb.py` (KeyError; WPR2 alone settles B).
