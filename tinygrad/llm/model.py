@@ -1262,7 +1262,12 @@ class Transformer:
   def warmup(self):
     # warm both the greedy and sampled jit pairs, so a request doesn't pay a mid-request capture for whichever it hits first
     for temperature in (0.0, 1.0):
-      for _ in range(2): list(zip(range(2), self.generate([0], temperature=temperature)))
+      # T4.76/T4.73 root-cause candidate: a 1-token dummy binds v_toks to exactly 1 at the PREFILL jit key's
+      # capture (is_prefill_call's `or out is None` routes the first call there), and resolve()'s degenerate-range
+      # collapse then bakes 1-token-shaped branches into the captured WY prefill graph -- every later real prefill
+      # REPLAYS that baked graph at nt>1 and floods the GDN states with NaN (hardware-observed via WY_TRACE,
+      # 2026-09-01). A 3-token dummy keeps the binding non-degenerate so the capture stays symbolic in nt.
+      for _ in range(2): list(zip(range(2), self.generate([0, 0, 0], temperature=temperature)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
