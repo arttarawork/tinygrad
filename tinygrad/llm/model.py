@@ -677,7 +677,16 @@ class GatedDeltaNetBlock(FFNBlock):
         stacked = group_outs[0].cat(*group_outs[1:], dim=2) if len(group_outs) > 1 else group_outs[0]
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
-      state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
+      # T4.73-candidate-3 (HARDWARE A/B CANDIDATE for the WY prefill->decode corruption bug -- see AUDIT.md;
+      # not confirmed, defensive): stacked gets an explicit outer .contiguous() below, on every path (G<=1
+      # and G>1 alike) -- state, the value that actually crosses into self.recurrent_state's cross-call
+      # store (read back by the NEXT jit capture: the next decode or prefill-chunk step), did not get the
+      # same treatment, relying on run_scan's bare return (G<=1) or cat()-of-contiguous-groups (G>1) plus
+      # .cast() alone to fully materialize it first. Make the two paths symmetric regardless of G. Of the
+      # three candidates here this is the one active on the exact reported config (qwen3.8-27B's 48 heads
+      # auto-split to G=2), so it's the leading suspect for the actual fix -- see AUDIT.md's ranking. A
+      # no-op on CPU; candidate for the METAL/NV A/B.
+      state_store = self.recurrent_state.uop.store(state.contiguous().cast(self.recurrent_state.dtype).uop)
       core = Tensor(stacked.contiguous().uop.after(state_store))
 
     # output; undo the padding before the output projection
