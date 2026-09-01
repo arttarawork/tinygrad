@@ -194,8 +194,11 @@ class NVDev:
     # 5           PTE_64K / PTE_4K                    20:16 / 20:12
     bits, shifts = (56, [12, 21, 29, 38, 47, 56]) if self.mmu_ver == 3 else (48, [12, 21, 29, 38, 47])
 
-    # tail vram reserved for falcon structs
-    self.mm = NVMemoryManager(self, self.vram_size - (64 << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
+    # tail vram reserved for falcon structs + GSP-RM's WPR2 region. T4.77 (E1, 2026-08-31, RTX 3090/24GB): WPR2
+    # measured at [23.812, 23.999] GiB via NV_PFB_PRI_MMU_WPR2_ADDR_LO/HI -- the old 64MB reservation left the
+    # allocator's top 129 MiB INSIDE the GSP-protected region, touched only near exhaustion (the T4.75 hypothesis-B
+    # wall-cluster faults). 256MB clears the measured 188MB WPR2 span + margin; re-measure per GPU generation.
+    self.mm = NVMemoryManager(self, self.vram_size - (256 << 20), boot_size=(2 << 20), pt_t=NVPageTableEntry, va_bits=bits, va_shifts=shifts,
       va_base=0, palloc_ranges=[(x, x) for x in [512 << 20, 2 << 20, 4 << 10]], reserve_ptable=not self.large_bar)
 
   def _alloc_boot_mem(self, size:int, data:bytes|None=None, contiguous:bool=False, sysmem:bool|None=None) -> tuple[MMIOInterface,int|None,list[int]]:
