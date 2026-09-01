@@ -707,7 +707,10 @@ class NVDevice(HCQCompiled[NVSignal]):
   # _LOCAL_SIZING (is_remote() is False for NVKIface/MOCKIface), so their behavior is provably unchanged.
   _LOCAL_SIZING  = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
                      "cmdq_size": 0x200000}
-  _REMOTE_SIZING = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
+  # T4.70d: 16MB starves under FFN-TP (per-shard dispatches 2x the kernarg burn) -- alloc_kernargs falls back to
+  # per-alloc host-sysmem maps and the TinyGPU tunnel's per-client MAP_SYSMEM_FD cap kills the client mid-load
+  # (2026-09-01, 'RPC failed: unknown error'; tunnel itself healthy -- Q8 reloaded fine). 64MB keeps TP on the slab.
+  _REMOTE_SIZING = {"kernargs_size": 64 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
                      "cmdq_size": 0x200000}
 
   # T4.18: lazily-allocated shared slab for NVCommandQueue.bind()'s hw_page on the remote transport -- see bind().
