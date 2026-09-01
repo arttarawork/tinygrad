@@ -49,8 +49,11 @@ Invocations for Artur's own later hardware runs (this task only ran the CPU one 
   # more prefill chunks, still the default (verified-stable) geometry otherwise:
   DEV=NV    PYTHONPATH=. /Users/artur/Documents/tinygrad/.venv/bin/python extra/wy_boundary_repro.py --device NV --chunks 3
   # a wider --dim needs its own --seed search first (see the tolerance/seed note above) -- don't assume 5 still works
-This task's own CPU verification:
+  # ranked mechanism #1 (REPORT.md): does pre-capturing decode against unrelated dummy data change the result?
+  DEV=NV    PYTHONPATH=. /Users/artur/Documents/tinygrad/.venv/bin/python extra/wy_boundary_repro.py --device NV --warmup
+This task's own CPU verification (both PASS):
   PYTHONPATH=. /Users/artur/Documents/tinygrad/.venv/bin/python extra/wy_boundary_repro.py
+  PYTHONPATH=. /Users/artur/Documents/tinygrad/.venv/bin/python extra/wy_boundary_repro.py --warmup
 """
 import argparse, random, sys
 from typing import Callable, cast
@@ -173,13 +176,26 @@ def run_reference(blocks:list, embd, norm, out_proj, tokens:list[int], n_decode:
   return steps
 
 def run_jit(blocks:list, embd, norm, out_proj, tokens:list[int], chunk_size:int, max_context:int,
-            n_decode:int) -> list[tuple[Tensor, Tensor]]:
+            n_decode:int, warmup:bool=False) -> list[tuple[Tensor, Tensor]]:
   """Replicates Transformer.__call__ + Transformer.generate()'s exact jit discipline (tinygrad/llm/model.py):
   the same 4-tuple jit key (is_prefill, greedy, chunk_size, spec) keyed dict of TinyJit(forward), the same
   v_start_pos/v_toks bound UOp Variables, the same `t[:, sp:sp+nt] if is_prefill_call else out` chaining of a
   decode step's input from the previous step's own (already-realized) output tensor. GDN_SCAN_IMPL=2 (WY)
   active for the whole run: the T4.69b gate (T_pad>1) keeps decode on the loop impl regardless, exactly as
-  in production -- see run_scan in model.py."""
+  in production -- see run_scan in model.py.
+
+  warmup=True additionally replicates Transformer.warmup() (model.py, called by every --serve/--warmup CLI
+  run -- cli.py) BEFORE the real comparison: a 1-token dummy sequence run through the SAME jit_cache twice.
+  REPORT.md's ranked mechanism #1 traces this to a concrete, source-confirmed fact: resolve()'s degenerate-
+  range check (uop/ops.py) makes Transformer.__call__'s is_prefill resolve False whenever the CURRENT bound
+  chunk size is exactly 1 -- true for warmup's 1-token prompt at every step -- so warmup() only ever hits the
+  decode key ((False, True, None, False)), NEVER the real (True, True, chunk_size, False) prefill key. In
+  production this means: by the time a real (>1-token) request arrives, decode's jit key is ALREADY a pure
+  replay (cnt>=2) of a graph captured from an UNRELATED dummy history, while the real prompt's OWN prefill is
+  still a fresh, never-before-traced, un-memory-planned eager call (cnt==0) -- two different TinyJit
+  lifecycles meeting for the first time exactly at the prefill->decode boundary. warmup=True reproduces that
+  same lifecycle mismatch here (state is reset to zero after, so the dummy data itself doesn't leak into the
+  real comparison -- only the CAPTURE HISTORY does)."""
   jit_cache: dict[tuple[bool, bool, int|None, bool], Callable[..., tuple[Tensor, Tensor]]] = {}
   def call(tok:Tensor, start_pos) -> tuple[Tensor, Tensor]:
     is_prefill = bool(resolve(tok.shape[1] != 1))
@@ -191,6 +207,16 @@ def run_jit(blocks:list, embd, norm, out_proj, tokens:list[int], chunk_size:int,
   v_start_pos = UOp.variable("start_pos", 0, max_context - 1)
   v_toks = UOp.variable("toks", 1, chunk_size)
   dev = blocks[0].device
+  if warmup:
+    warm_t = Tensor([0] * max_context, dtype="int32", device=dev).reshape(1, max_context)
+    with Context(GDN_SCAN_IMPL=GDN_SCAN_WY):
+      for _ in range(2):  # Transformer.warmup()'s own `for _ in range(2)` per temperature
+        a, o = call(warm_t[:, v_start_pos.bind(0):v_toks.bind(1) + v_start_pos.bind(0)], v_start_pos.bind(0))
+        Tensor.realize(a, o)
+        a, o = call(a, v_start_pos.bind(1))
+        Tensor.realize(a, o)
+    for b in blocks:  # reset state: the dummy WARMUP DATA must not leak into the real comparison below
+      for st in fingerprint_tensors(b).values(): st.assign(Tensor.zeros_like(st)).realize()
   t = Tensor(tokens + [0] * (max_context - len(tokens)), dtype="int32", device=dev).reshape(1, max_context)
   prompt_len = len(tokens)
   start_pos, virtual_len = 0, prompt_len
@@ -223,6 +249,8 @@ def main() -> int:
   p.add_argument("--seed", type=int, default=5, help="verified-stable default -- see the tolerance note below")
   p.add_argument("--rtol", type=float, default=1e-3, help="test_attention.py's own TestGatedDeltaNetBlock convention")
   p.add_argument("--atol", type=float, default=1e-3)
+  p.add_argument("--warmup", action="store_true", help="pre-capture the decode jit key against a 1-token dummy sequence "
+                  "first, replicating Transformer.warmup() -- see REPORT.md's ranked mechanism #1 and run_jit's docstring")
   args = p.parse_args()
 
   prompt_len = max(1, args.chunks) * args.chunk_size - 3
@@ -237,7 +265,8 @@ def main() -> int:
   tokens = [random.randrange(args.vocab) for _ in range(prompt_len)]
 
   ref_steps = run_reference(ref_blocks, embd, norm, out_proj, tokens, args.decode_steps)
-  jit_steps = run_jit(jit_blocks, embd, norm, out_proj, tokens, args.chunk_size, max_context, args.decode_steps)
+  jit_steps = run_jit(jit_blocks, embd, norm, out_proj, tokens, args.chunk_size, max_context, args.decode_steps,
+                       warmup=args.warmup)
   assert len(ref_steps) == len(jit_steps) == 1 + args.decode_steps
 
   for i, (ref_out, jit_out) in enumerate(zip(ref_steps, jit_steps)):
@@ -246,7 +275,7 @@ def main() -> int:
       print(f"FIRST-DIVERGENCE {divergence}")
       return 1
   print(f"PASS ({1 + args.decode_steps} steps, device={args.device}, heads={args.heads}, head_dim={args.head_dim}, "
-        f"chunk_size={args.chunk_size}, prompt_len={prompt_len})")
+        f"chunk_size={args.chunk_size}, prompt_len={prompt_len}, warmup={args.warmup})")
   return 0
 
 if __name__ == "__main__":
