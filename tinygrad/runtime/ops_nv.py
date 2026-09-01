@@ -740,7 +740,10 @@ class NVDevice(HCQCompiled[NVSignal]):
       self._kernargs_slab, self._kernargs_bump = self.allocator.alloc(4 << 20, BufferSpec(cpu_access=True)), BumpAllocator(4 << 20, wrap=False)
     slab, bump = unwrap(self._kernargs_slab), unwrap(self._kernargs_bump)
     try: return slab.offset(bump.alloc(sz, 16), sz)
-    except RuntimeError: return self.allocator._alloc(sz, BufferSpec(cpu_access=True))  # slab exhausted: fall back to a real alloc
+    except RuntimeError:
+      # T4.70d diagnosis: name the fallback (slab starvation is upstream of the tunnel map refusals under FFN-TP).
+      if getenv("TUNNEL_MAP_LOG", 0): print(f"[TUNNEL_MAP] kernargs slab exhausted -> real alloc sz={sz:#x} ({sz/2**20:.2f} MiB)", flush=True)
+      return self.allocator._alloc(sz, BufferSpec(cpu_access=True))  # slab exhausted: fall back to a real alloc
 
   def free_kernargs(self, buf:HCQBuffer) -> None:
     # Mirrors NVCommandQueue.__del__'s hw_page check: a slab-derived slice shares the slab's lifetime and
