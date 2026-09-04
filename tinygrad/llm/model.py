@@ -1390,6 +1390,25 @@ class Transformer:
     # called twice by ANY combination of VERIFY/REDO calls, both replay the same captured slot.
     if self.mtp_head is not None:
       for _ in range(2): list(zip(range(2), self.speculative_generate([0])))
+      # T4.66g: unlike the main model's own blocks above (whose warmup residue in cache_kv/recurrent_state
+      # is harmless -- a real request's own prefill legitimately rewrites position 0 onward before ever
+      # attending to it), mtp_head.block is never "prefilled": draft() only ever runs from a real request's
+      # own start_pos onward (see speculative_generate's DRAFT step), so this dummy run's own K/V at low
+      # positions (0..~3, from the nonsense prompt=[0]) is NEVER revisited/overwritten by a real request.
+      # Left in place, every draft() call for the rest of this process's life attends back to it (causal
+      # attention has no window) -- confirmed (test_spec_decode.py's TestWarmupResetsMTPCache) to measurably
+      # change a later draft() call's own logits with everything else (h/tok_ids/start_pos) held identical,
+      # isolating this from the model's other state entirely. This is exactly the "draft quality quietly
+      # degrades, but rejection is always safe so token-identity tests never catch it" shape: the main
+      # model's own state (and therefore every emitted token) is untouched, only the MTP head's own
+      # next-token guess is. Reset mtp_head.block's KV cache so it
+      # rebuilds fresh (all-zero, via _init_state's own hasattr-gated allocation, same object identity
+      # `@function(precompile=True)` doesn't pin -- see MTPHead.draft/FFNBlock.__call__'s own docstrings on
+      # why it retraces per call) on the first real request, same as if warmup had never run speculative
+      # decoding at all. freqs_cis is NOT reset: it's a pure function of config (rope_dim/max_context/
+      # rope_theta/yarn), never session data, so nothing to pollute.
+      for attr in ("cache_kv", "cache_k"):
+        if hasattr(self.mtp_head.block, attr): delattr(self.mtp_head.block, attr)
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix

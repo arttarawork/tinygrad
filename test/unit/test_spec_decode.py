@@ -549,5 +549,110 @@ class TestSpecWarmup(unittest.TestCase):
     model.warmup()
     self.assertFalse(any(key[3] for key in model.jit), f"no mtp_head means no spec=True key should exist: {list(model.jit)}")
 
+class TestPerfectDraftFullAcceptance(unittest.TestCase):
+  """T4.66g: the task this fixes started from a real-hardware regression (Qwen3.8-27B pooled, k=3): the
+  accept-length histogram went from {0:6, 2:4, 3:44} (T4.66b+c, 81% full accepts) to {0:6, 1:5, 2:59}
+  (T4.66d+e+f, 0% full accepts) -- the LAST drafted position is never accepted, even though token-identity
+  output is still correct (rejection is always safe, so no assertEqual(got, ref)-style test catches an
+  acceptance-RATE regression). This is the oracle the task's own METHOD section asks for: force the draft
+  chain to be exactly the model's own true continuation (peeked from a reference generate() run via
+  MTPHead.draft's 4-arg call site -- an instance-attribute override, the same trick
+  test_forced_perfect_matches_generate_and_full_accepts already uses on the non-GDN model). With a
+  provably-correct draft, VERIFY must accept the FULL k-token chain every iteration, or the bug is in the
+  verify/accept plumbing itself (the comparison loop, verify_chunk padding/indexing, a tok_last rebuild),
+  not in draft quality -- exactly the "pin the bug to verify/accept plumbing" split the task's SUSPECTS
+  list needed.
+
+  Bisected as instructed (git checkout tinygrad/llm/model.py at 11aac9efc/T4.66b, 2f74b7fb7/T4.66d,
+  c7ed888ba/T4.66e, and HEAD/2c444d7e1 T4.66f, re-running this exact test unchanged each time): full
+  acceptance every iteration at ALL FOUR commits, k in {1,2,3}, both PROMPTS, both _load_gdn seeds, a
+  head-group-split (G>1) GDN config, AND a real CPU:0/CPU:1 split mirroring the hardware's METAL/NV split
+  (TestSpecDeviceMap's own _load_split pattern) -- this test PASSES at every one of them, both before and
+  after this task's own fix. That rules OUT the verify/accept comparison logic (suspects 1/2: T4.66e's
+  verify_chunk/next_power2 padding, T4.66e/f's tok_last rebuilds) as the regression's cause: a wrong
+  index/pad there would corrupt the EMITTED token itself (verify_ids[m] directly becomes accepted[-1] on
+  the very iteration it goes wrong), which would break token identity with generate() immediately -- but
+  the hardware evidence says token identity holds for the whole 70-iteration run. Also rules out suspect 3
+  (T4.66d's device-local embedding copy: confirmed bit-identical to the pre-T4.66d cross-device lookup,
+  same token ids, same weights) and suspect 4 (the per-position draft_pos Variables: unchanged in every
+  commit from T4.66b's own baseline onward, so it cannot explain a regression relative to that baseline).
+
+  See T4.66g's own commit message for where the actual regression was found instead: not an indexing bug
+  in the comparison logic at all (which is why this oracle can never fail on it -- forcing the draft's own
+  OUTPUT structurally can't expose a bug that only degrades how well an UNFORCED draft predicts), but a
+  state leak in warmup() itself (TestWarmupResetsMTPCache below)."""
+
+  def test_perfect_draft_always_fully_accepts(self):
+    for k in (1, 2, 3):
+      for seed, prompt in enumerate(PROMPTS):
+        N_GEN = 16
+        lookahead = N_GEN + k + 4
+        ref = _run(_load_gdn(seed=seed), prompt, lookahead, spec=False)
+        ref_tokens = list(prompt) + ref
+
+        def fake_draft(owner, h, tok_ids, start_pos, _ref=ref_tokens):
+          pos = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
+          return _wrong_logits(_ref[pos + 1])  # "wrong" only in name -- the true next token, always
+
+        model = _load_gdn(seed=seed)
+        model.mtp_head.draft = fake_draft
+        buf = io.StringIO()
+        with Context(SPEC_STATS=1), contextlib.redirect_stdout(buf):
+          gen = model.speculative_generate(list(prompt), k=k)
+          got = [v for _, v in zip(range(N_GEN), gen)]
+          gen.close()
+        self.assertEqual(got, ref[:N_GEN], f"{k=} {seed=} {prompt=}")
+
+        stats_line = buf.getvalue()
+        hist_match = re.search(r"accept_len_hist=\{([^}]*)\}", stats_line)
+        self.assertIsNotNone(hist_match, f"{k=} {seed=} {prompt=}: SPEC_STATS never printed a histogram: {stats_line!r}")
+        hist = {}
+        for pair in hist_match.group(1).split(", ") if hist_match.group(1) else []:
+          acc_len, count = pair.split(":")
+          hist[int(acc_len)] = int(count)
+        self.assertEqual(set(hist), {k}, f"{k=} {seed=} {prompt=}: a provably-correct draft chain was still "
+                          f"not fully accepted every iteration -- accept_len_hist={hist}")
+
+class TestWarmupResetsMTPCache(unittest.TestCase):
+  """T4.66g: warmup()'s MTP-warming addition (T4.66e) calls speculative_generate([0]) (twice, see warmup's
+  own comment) to pre-capture the VERIFY/REDO jit key. Unlike the main model's own blocks (self.blk), whose
+  warmup residue in cache_kv/recurrent_state is harmless (a real request's own prefill legitimately
+  rewrites position 0 onward -- GatedDeltaNetBlock's own `initial` reset, and attention's cache simply
+  being overwritten at the positions it writes -- before ever attending to it), mtp_head.block is NEVER
+  "prefilled": draft() only ever runs from a real request's own start_pos onward (see
+  speculative_generate's DRAFT step). Left unreset, warmup's own K/V at low positions (0..~3, from the
+  nonsense prompt=[0]) is NEVER revisited/overwritten by a real request and gets attended to by every
+  draft() call for the rest of the process's life (causal attention has no window) -- this is exactly the
+  "rejection is always safe, so token-identity tests can't see it" blind spot the task's own hardware
+  evidence describes: it degrades the MTP head's own next-token guess (draft quality / acceptance rate)
+  without ever touching the main model's own state or its output."""
+
+  def test_warmup_leaves_no_cache_on_mtp_block(self):
+    model = _load_gdn(seed=0, max_context=64)
+    model.warmup()
+    for attr in ("cache_kv", "cache_k"):
+      self.assertFalse(hasattr(model.mtp_head.block, attr),
+                        f"warmup should leave mtp_head.block exactly as unused (no {attr}) as before it "
+                        "ever ran speculative decoding -- draft() rebuilds it fresh (all-zero) on first real use")
+
+  def test_stale_warmup_cache_measurably_changes_a_later_draft_call(self):
+    # isolates JUST the cache leak: same h/tok_ids/start_pos both times (a position far from warmup's own
+    # 0..~3, so it never overlaps with what gets rewritten), the only difference is whether mtp_head.block's
+    # own cache still holds warmup's nonsense-prompt K/V at those low positions or has been reset.
+    model = _load_gdn(seed=0, max_context=64)
+    model.warmup()  # the fix under test: mtp_head.block has no cache right now (see the test above)
+    dim = model.mtp_head.block.attn_norm.weight.shape[0]
+    h, tok_ids = Tensor.randn(1, 1, dim), Tensor([[3]], dtype="int32")
+    clean = model.mtp_head.draft(model, h, tok_ids, 20).numpy()
+
+    # re-pollute EXACTLY like a pre-fix warmup() would have left it (the same dummy calls, minus the reset)
+    for _ in range(2): list(zip(range(2), model.speculative_generate([0])))
+    polluted = model.mtp_head.draft(model, h, tok_ids, 20).numpy()  # same h/tok_ids/start_pos -- only the cache differs
+
+    self.assertFalse(np.allclose(clean, polluted, atol=1e-5),
+                      "mtp_head.block's cache content at low positions had no measurable effect on a "
+                      "draft() call at position 20 -- either the pollution isn't real or this stopped "
+                      "catching it")
+
 if __name__ == '__main__':
   unittest.main()
