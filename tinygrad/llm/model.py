@@ -976,9 +976,29 @@ class MTPHead:
     MLATransformerBlock already handle one end-to-end (the same way the main model's own decode step
     does), so passing one here lets mtp_head.block's @function(precompile=True) trace replay across
     drafted positions instead of retracing per position -- see speculative_generate's `v_draft_pos`
-    and SPEC_NOTES.md §4. test_mtp_load.py exercises both calling conventions directly."""
+    and SPEC_NOTES.md §4. test_mtp_load.py exercises both calling conventions directly.
+
+    T4.66d: the embedding lookup used to be `owner.token_embd(tok_ids.to(owner.token_embd.weight.device))`
+    -- SPEC_PROFILE_NOTES.md's leading candidate for DRAFT's own per-call cost, confirmed dominant on real
+    METAL+NV hardware (~280ms/call, see SPEC_FIXES_NOTES.md): tok_ids is always produced on `dev` (either
+    `tok_last`, from the main model's own output layer, or this method's own previous return -- both pinned
+    to `owner.output`'s device regardless of where mtp_head itself lives), so hopping it to
+    owner.token_embd's device and hopping the embedded vector back is two real cross-device syncs, every
+    call. A lazily-built, device-local copy of the whole embedding table (self._local_token_embd, built once
+    -- a model that never drafts never pays for it) makes tok_ids' home device and the lookup device the
+    SAME one: zero hops for this step, ever again. Considered moving mtp_head to owner.token_embd's device
+    instead (the other option this task named): doesn't work -- tok_ids' home device is pinned by
+    owner.output (unmoved, still needed by the main model's own forward), so that would only relocate this
+    same hop to the `owner.output.weight.device` line below, not remove it. See SPEC_FIXES_NOTES.md for the
+    byte-size accounting (this fork always serves a quantized GGUF, so the copy is the quantized size, not a
+    dequantized fp32 one -- `.to()` replicates whatever owner.token_embd.weight is resident as, verbatim, no
+    new precision decision here)."""
     dev = self.block.device
-    e = owner.token_embd(tok_ids.to(owner.token_embd.weight.device)).float().to(dev)
+    if not hasattr(self, "_local_token_embd"):
+      local = nn.Embedding.__new__(nn.Embedding)
+      local.weight = owner.token_embd.weight.to(dev).realize()
+      self._local_token_embd = local
+    e = self._local_token_embd(tok_ids.to(dev)).float()
     x = self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
     x = self.block(x, start_pos)
     return owner.output(self.shared_head_norm(x).to(owner.output.weight.device))
@@ -1101,17 +1121,17 @@ class Transformer:
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    # activations hop devices at block boundaries (.to is a no-op when the device matches). T4.66b: a
-    # GatedDeltaNetBlock additionally takes `spec` -- see its own __call__ -- to also capture its per-position
-    # state history (gdn_extra below); every other block type is untouched (still a bare 2-arg call).
-    gdn_extra: list[Tensor] = []
+    # activations hop devices at block boundaries (.to is a no-op when the device matches).
+    # T4.66d: no more per-GDN-block capture here (T4.66b's gdn_extra) -- speculative_generate's partial-accept
+    # fixup reverted to CHECKPOINT+REDO (measured ~10x cheaper on real METAL+NV hardware than the capture-based
+    # per-block assign this replaced -- see SPEC_FIXES_NOTES.md), which never reads gdn_extra, so every block
+    # (GDN or not) takes the same bare 2-arg call again. This also recovers the T_pad tax capture=True forced
+    # on every GDN block's scan (SPEC_PROFILE_NOTES.md SS3(c)) as a free side effect. GatedDeltaNetBlock's own
+    # `capture`/`spec` machinery (_attention, __call__) is untouched -- still there, still tested directly by
+    # test_gdn_scan_parity.py::TestGDNScanCapture -- just unreached from forward() now.
     for block in self.blk:
       xin = x.to(block.device)
-      if spec and isinstance(block, GatedDeltaNetBlock):
-        x, state_track, conv_window = cast(tuple[Tensor, Tensor, Tensor], block(xin, start_pos, spec=True))
-        gdn_extra += [state_track, conv_window]
-      else:
-        x = cast(Tensor, block(xin, start_pos))
+      x = cast(Tensor, block(xin, start_pos))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
@@ -1139,10 +1159,12 @@ class Transformer:
       # later read sees whatever the intervening replays overwrote instead of this call's own hidden state --
       # confirmed by a byte-level cache_kv diff between with/without .contiguous() on this line (SPEC_NOTES.md).
       # T4.66b: returns the FULL per-position hidden (B,T,D), not just x[:, -1:] (B,1,D) -- speculative_generate's
-      # ACCEPT step needs the hidden state at whichever position m turns out to be the accept length, not always
-      # the last one (that's the REDO forward this replaces). Callers that only ever wanted the last position
-      # (the prefill tail, and the old REDO call site this removes) slice `[:, -1:]` themselves.
-      return self.output(self.output_norm(x)), x.contiguous(), *gdn_extra  # (B,T,vocab) logits, (B,T,D) hidden, per-GDN-block captures
+      # full-accept ACCEPT step needs the hidden state at whichever position m turns out to be the accept length
+      # (m==k_eff there, so this is just the last position, but the slice-by-m expression is shared with T4.66b's
+      # since-reverted partial-accept path -- see SPEC_NOTES.md/SPEC_FIXES_NOTES.md). T4.66d's partial-accept
+      # REDO call (spec=True, same as this one) also uses this return shape; it wants only its own last position
+      # too. Callers that only ever wanted the last position (the prefill tail) slice `[:, -1:]` themselves.
+      return self.output(self.output_norm(x)), x.contiguous()  # (B,T,vocab) logits, (B,T,D) hidden
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
@@ -1501,11 +1523,16 @@ class Transformer:
     yielded at a time) -- generate() itself is untouched by this; see Transformer.__call__'s optional
     `spec=` return path.
 
-    T4.66b: a partial accept no longer pays a second ("REDO") main-model forward to rebuild GDN state and
-    h_last -- both are read directly off the SAME verify forward's own captured per-position outputs (see
-    GatedDeltaNetBlock._attention's `capture` and forward()'s spec branch). See SPEC_NOTES.md's REDO section
-    (superseded by this) for the full before/after. Draft-chain dispatch is also cheaper (distinct Variables
-    per draft position instead of one rebound k_eff times, removing a forced per-step realize -- see
+    T4.66b tried reading a partial accept's corrected GDN state directly off VERIFY's own captured per-position
+    outputs (a per-GDN-block slice + `.assign()`, no second forward) instead of paying a second ("REDO")
+    main-model forward. T4.66d REVERTS that specific piece: measured on real METAL+NV hardware, the capture-
+    based assign cost ~19.5s per partial accept (SPEC_TRACE's `state_assign_ms`) vs. ~1.8s for CHECKPOINT+REDO
+    -- a 10x regression the CPU-only dispatch-count proxy that motivated T4.66b couldn't see (same-device
+    assigns are invisible to it; see SPEC_PROFILE_NOTES.md and SPEC_FIXES_NOTES.md for the full analysis).
+    Full accept still needs no FIXUP of any kind (verify's own in-place state write is already correct) and
+    still reads h_last as `verify_h[:, m:m+1]` -- T4.66b's per-position hidden capture is free and unrelated
+    to the expensive part, so it stays. Draft-chain dispatch is also still cheaper than pre-T4.66 (distinct
+    Variables per draft position instead of one rebound k_eff times, removing a forced per-step realize -- see
     v_draft_pos below); SPEC_STATS (a ContextVar) turns on per-request accept-length instrumentation.
     """
     assert self.mtp_head is not None, "speculative_generate needs an MTP-enabled model (Transformer.from_gguf under MTP=1)"
@@ -1666,16 +1693,23 @@ class Transformer:
 
         # (b) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
         # start_pos, returning the per-position logits (what the real model actually predicts from every one of
-        # those positions), the per-position hidden state, and (T4.66b) each GDN block's own per-position state
-        # history -- see GatedDeltaNetBlock._attention's `capture` docstring. T4.66b removed the old (b)
-        # CHECKPOINT step here (a device-side clone of every GDN block's conv/recurrent state, so a partial
-        # accept could restore-then-redo): reading the correct post-partial-accept state directly off THIS
-        # call's own captures (in the ACCEPT step below) needs no snapshot to roll back to -- see SPEC_NOTES.md.
+        # those positions) and the per-position hidden state. T4.66d: CHECKPOINT is back (a device-side clone
+        # of every GDN block's conv/recurrent state -- the OLD, pre-T4.66b design) so a partial accept can
+        # restore-then-redo below -- GatedDeltaNet conv/recurrent state is a single read-modify-written
+        # accumulator, not a position-indexed cache, so once VERIFY mixes a wrong draft token into it there's no
+        # slice to discard (unlike attention KV, which needs no snapshot -- see the mask argument in
+        # SPEC_NOTES.md). T4.66b's alternative (read the corrected state directly off VERIFY's own per-position
+        # captures, no snapshot needed) measured ~10x MORE expensive on real METAL+NV hardware -- the captured
+        # state_track/conv_window this replaces is a 32x-inflated `.stack()` result (T_pad, SPEC_PROFILE_NOTES.md
+        # SS3(c)), unlike this clone's native-sized buffers -- see SPEC_FIXES_NOTES.md. Timed as part of
+        # verify_dispatch_ms below: like that phase's own buf/bind setup, this is real host CPU + dispatch-only
+        # device work (Tensor.realize() defaults to wait=False -- engine/realize.py), not a second device sync.
         if trace_on: verify_t0 = time.perf_counter()
+        gdn_snap = [(b, b.conv_state.clone(), b.recurrent_state.clone()) for b in gdn_blocks]
+        if gdn_snap: Tensor.realize(*(s for _, c, r in gdn_snap for s in (c, r)))
         buf = Tensor(chunk_ids + [0] * (chunk_size - n), dtype="int32", device=dev).reshape(1, chunk_size)
         sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n)
-        verify_result = cast(tuple[Tensor, ...], self(buf[:, :nt], sp, None, spec=True))
-        verify_logits, verify_h, gdn_extra = verify_result[0], verify_result[1], verify_result[2:]
+        verify_logits, verify_h = cast(tuple[Tensor, Tensor], self(buf[:, :nt], sp, None, spec=True))
         if trace_on: verify_dispatch_ms = (time.perf_counter() - verify_t0) * 1000
 
         # (c) ACCEPT: how many of the k_eff drafts hold up (m, 0..k_eff), and the one extra token this
@@ -1710,24 +1744,32 @@ class Transformer:
           accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
           tok_last = Tensor([[accepted[-1]]], dtype="int32", device=dev)
 
-        # T4.66b: h_last and every GDN block's state are read directly off THIS verify call's own per-position
-        # captures (verify_h, gdn_extra) at position m -- no second ("REDO") forward needed even on a partial
-        # accept. Replaces the old CHECKPOINT/restore/REDO-forward entirely -- see SPEC_NOTES.md's REDO section
-        # and GatedDeltaNetBlock._attention's `capture` docstring for what's captured and why reading it back
-        # is cheap (a slice + assign per GDN block, not a whole-model forward over m+1 tokens).
-        h_last = verify_h[:, m:m + 1].contiguous()  # same value as the old verify_h/REDO-h_last either way
         if trace_on: accept_ms = (time.perf_counter() - accept_t0) * 1000
         if trace_on: assign_t0 = time.perf_counter()
-        if m < k_eff:
-          # partial accept only: verify's forward also advanced state through the wrong tokens d_m..d_{k_eff-1}
-          # -- fix it directly from this call's own captures instead of rolling back + re-forwarding. On a
-          # full accept (m==k_eff) verify's own in-place state write is already exactly correct (every fed
-          # token was real), so there's nothing to do here -- same fast path the old code had.
-          assigns = []
-          for block, state_track, conv_window in zip(gdn_blocks, gdn_extra[0::2], gdn_extra[1::2]):
-            assigns.append(block.recurrent_state.assign(state_track[:, :, m].cast(block.recurrent_state.dtype)))
-            assigns.append(block.conv_state.assign(conv_window[:, m + 1:m + 1 + block.ssm_conv_kernel - 1].cast(block.conv_state.dtype)))
-          if assigns: Tensor.realize(*assigns)
+        if m == k_eff:
+          # full accept: every input verify saw (tok_last, d0..d_{k_eff-1}) really was correct, so its forward
+          # legitimately advanced every state through position start_pos+k_eff -- nothing to roll back, and
+          # its own last-position hidden (T4.66b's per-position capture, free and unrelated to the expensive
+          # part reverted below) IS the next h_last. Same fast path the old (pre-T4.66b) code had.
+          h_last = verify_h[:, m:m + 1].contiguous()
+        else:
+          # T4.66d: partial accept -- verify's forward also advanced GDN state through the wrong tokens
+          # d_m..d_{k_eff-1}. Roll GDN back to the CHECKPOINT above and redo exactly the m+1 confirmed-correct
+          # tokens as one small forward to rebuild the true state and get the next h_last -- this re-forward is
+          # the ~1.8s-measured cost T4.66b tried to remove; T4.66b's replacement (a per-GDN-block slice+assign
+          # off VERIFY's own captures, no re-forward) measured ~19.5s instead, ~10x worse on real METAL+NV
+          # hardware -- see SPEC_FIXES_NOTES.md. Attention KV needs no restore for the same reason it never
+          # needed a snapshot (SPEC_NOTES.md's mask argument): this redo overwrites positions
+          # [start_pos, start_pos+m+1) with the SAME values verify already wrote there (a harmless recompute),
+          # and the discarded wrong positions start_pos+m+1..start_pos+k_eff are never read before the next
+          # iteration overwrites them too. spec=True reuses VERIFY's own warmed jit key (same
+          # is_prefill/greedy/chunk_size/spec tuple), so this never pays a fresh capture.
+          if gdn_snap: Tensor.realize(*(x for b, c, r in gdn_snap for x in (b.conv_state.assign(c), b.recurrent_state.assign(r))))
+          redo_ids = chunk_ids[:m + 1]
+          buf2 = Tensor(redo_ids + [0] * (chunk_size - len(redo_ids)), dtype="int32", device=dev).reshape(1, chunk_size)
+          sp2, nt2 = v_start_pos.bind(start_pos), v_toks.bind(len(redo_ids))
+          _, redo_h = cast(tuple[Tensor, Tensor], self(buf2[:, :nt2], sp2, None, spec=True))
+          h_last = redo_h[:, -1:].contiguous()
         if trace_on: state_assign_ms = (time.perf_counter() - assign_t0) * 1000
 
         if stats_on:

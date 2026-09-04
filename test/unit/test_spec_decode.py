@@ -5,10 +5,12 @@ import numpy as np
 from tinygrad import Tensor, nn
 from tinygrad.helpers import Context
 from tinygrad.schedule import schedule_cache
+from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
   Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept,
 )
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
+from test.unit.test_llm_device_map import TEST_CONFIG
 
 # T4.64: speculative_generate must be TOKEN-IDENTICAL to generate(temperature=0.0) regardless of draft
 # quality (correctness never depends on the MTP head guessing right -- only the accept-iteration count
@@ -305,6 +307,50 @@ class TestSpecTrace(unittest.TestCase):
       # n=len(chunk_ids), the stats_on block), which should be tiny next to real tensor-op time.
       self.assertLessEqual(phases, total + 0.05, f"phases summed to more than total_ms: {line!r}")
       self.assertGreaterEqual(phases, total * 0.5, f"untimed residual ate more than half of total_ms: {line!r}")
+
+class TestMTPDraftDeviceLocalEmbed(unittest.TestCase):
+  """T4.66d: MTPHead.draft's embedding lookup used to hop tok_ids from mtp_head's device (dmap[-1], where
+  tok_ids is always produced -- see MTPHead.draft's own docstring) to token_embd's device (dmap[0]) and hop
+  the embedded vector back -- SPEC_PROFILE_NOTES.md's leading candidate for DRAFT's own per-call cost,
+  confirmed dominant (~280ms/call) on real METAL+NV hardware (SPEC_FIXES_NOTES.md). Rebuilds the same
+  two-device shape TestDeviceMapModel (test_llm_device_map.py) uses -- CPU:0/CPU:1 standing in for METAL/NV,
+  token_embd landing on CPU:0 (dmap[0]) and mtp_head on CPU:1 (dmap[-1]), the interesting (non-colocated)
+  case -- and checks the draft path's own schedule for cross-device COPY calls once the fix's lazy
+  local-embedding-table cache is warm. draft() is never jitted (SPEC_PROFILE_NOTES SS3(a)), so there's no
+  `.captured.linear` to read the way TestDeviceMapModel does -- build the schedule directly via
+  Tensor.linear_with_vars instead (schedule_linear's own "no vars" assert is a needless risk here: a plain-int
+  start_pos is documented to bake in as a literal, never a bound Variable, but linear_with_vars needs no such
+  assumption to hold)."""
+
+  def test_no_cross_device_copy_once_warm(self):
+    config = replace(TEST_CONFIG, num_blocks=2)
+    model = Transformer(config, device_map="CPU:0,CPU:1")
+    model.mtp_head = MTPHead(config, TransformerBlock)
+    last_dev = model.blk[-1].device
+    for p in nn.state.get_parameters(model.mtp_head): p.to_(last_dev)
+    Tensor.realize(*nn.state.get_parameters(model))
+
+    # the interesting case: embedding and head start on DIFFERENT devices, mirroring the real pooled map
+    # (CLAUDE.md: token_embd on dmap[0], mtp_head entirely on dmap[-1])
+    self.assertEqual(model.token_embd.weight.device, "CPU")
+    self.assertEqual(model.mtp_head.block.device, "CPU:1")
+    self.assertNotEqual(model.token_embd.weight.device, model.mtp_head.block.device)
+
+    h = Tensor.randn(1, 1, config.dim, device=last_dev)
+    tok_ids = Tensor([[3]], dtype="int32", device=last_dev)
+
+    # warm call: builds + realizes the one-time local-embedding-table copy (a real, expected COPY) plus this
+    # call's own compute -- not what's under test, just get past it.
+    model.mtp_head.draft(model, h, tok_ids, 0).realize()
+    self.assertTrue(hasattr(model.mtp_head, "_local_token_embd"), "warm call should have built the local cache")
+
+    # the SECOND call reuses the warm cache (the lazy hasattr check short-circuits, so the cache-build COPY
+    # never re-enters the graph) -- inspect its schedule (don't realize -- only the plan matters here) for
+    # cross-device copies, the same technique TestDeviceMapModel uses on a JIT-captured graph.
+    out = model.mtp_head.draft(model, h, tok_ids, 1)
+    linear, _ = out.linear_with_vars()
+    copies = [call for call in linear.src if call.src[0].op is Ops.COPY]
+    self.assertEqual(copies, [], f"draft() should perform zero cross-device copies once warm: {copies}")
 
 class TestSpecAccept(unittest.TestCase):
   """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-
