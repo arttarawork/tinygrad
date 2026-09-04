@@ -1677,8 +1677,26 @@ class Transformer:
       if start_pos + n_toks >= prompt_len:
         # T4.66b: forward(spec=True) now returns the FULL per-position hidden state (B,T,D), not just the
         # last position -- the prefill anchor only ever wanted the last one (same value as before).
+        # T4.66h: index the last REAL position with the host-known `n_toks` (positive slice), never `-1:`
+        # (negative -- needs the tensor's own reported length). This call's jit key ((True, True, chunk_size,
+        # True), keyed on chunk_size/verify_chunk, NOT on this call's own bound `nt`) is shared by every
+        # prefill-tail call of any width up to chunk_size -- e.g. warmup()'s dummy speculative_generate([0])
+        # call (a real, un-skippable side effect of warming this exact key/graph, see warmup()'s own T4.66e
+        # comment) always binds nt=1. Per _TinyJit.__call__ (engine/jit.py), only the SECOND-ever call to a
+        # key actually captures; every call from then on (capture included) returns the SAME frozen Tensor
+        # object, whose lazy shape still carries THAT capture call's own bound value -- confirmed by printing
+        # prefill_result[*].shape[1]'s UOp: after warmup (which captures this key at nt=1), a real multi-token
+        # prompt's own replay reports shape[1]'s bound CONST as 1, not its own nt. `-1:` on such a tensor
+        # silently resolves against that stale length instead of raising (unlike VERIFY's own `.pad_to(...)`-
+        # then-slice-from-0 idiom a few hundred lines down, which never needs the length at all -- the same
+        # fix shape, applied here). Reproduced without any state-cache/get_start_pos involvement at all
+        # (get_start_pos returned 0, no splice): a warm model's own real request read back WARMUP's own
+        # single-token anchor instead of its own last real position. `n_toks` is this iteration's real width
+        # (the loop only assigns tok_all/h_last on its last iteration, so it's exactly right here); the
+        # underlying buffer's DATA is always correct at every position (confirmed per-position, only the
+        # NEGATIVE INDEX's resolution was stale) -- see test_spec_decode.py's TestWarmupAnchorShift.
         prefill_result = cast(tuple[Tensor, ...], self(t[:, sp:sp + nt], sp, None, spec=True))
-        tok_all, h_last = prefill_result[0], prefill_result[1][:, -1:].contiguous()
+        tok_all, h_last = prefill_result[0], prefill_result[1][:, n_toks - 1:n_toks].contiguous()
       else:
         cast(Tensor, self(t[:, sp:sp + nt], sp, None, spec=False)).realize()
       start_pos += n_toks
@@ -1686,7 +1704,8 @@ class Transformer:
     # positions -- tokens[:-1] -- and a recurrent one's cache-hit branch requires it strictly), so the loop
     # above always runs >=1 time and both are set; the assert is only for mypy's narrowing.
     assert tok_all is not None and h_last is not None
-    anchor_logits = tok_all[:, -1:, :]  # (B,1,vocab): forward(spec=True) returns logits now, not ids (T4.65)
+    # T4.66h: n_toks (not -1:) -- see this same fix's own comment a few lines up (the prefill_result[1] slice).
+    anchor_logits = tok_all[:, n_toks - 1:n_toks, :]  # (B,1,vocab): forward(spec=True) returns logits now, not ids (T4.65)
     # the first post-prompt token: no draft/accept here, it's a plain (greedy or sampled) draw from the real
     # model's own distribution -- exactly the token generate() itself would yield first (its own
     # last-prefill-chunk sample). It's about to become chunk_ids[0]/the draft anchor below, but it's ALSO
