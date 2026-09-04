@@ -51,6 +51,19 @@ def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.valu
 # into a kernel count. Read via gdn_last_scan_impl[-1].
 gdn_last_scan_impl: list[int] = []
 
+# T4.76: runtime diagnostics for the WY-prefill-then-decode GPU-only garbage-token bug (see REPORT.md). 0
+# (default): zero overhead -- every call site below is `if WY_TRACE.value:`, so nothing extra is built,
+# realized, or printed. 1: generate() (below) prints one stdout line per traced step -- see _wy_trace_log.
+# T4.73d PHASE 1: 2: also prints one line per PREFILL CHUNK (not just the last), the granularity needed to
+# find WHICH chunk first drives a GDN block's carried state non-finite for content that only fails past
+# ~140-180 chunks (see FIXNOTES_T473C.md and the T4.73d brief) -- see _wy_chunk_trace. Still zero overhead
+# at 0/1: the per-chunk path is a separate call site, gated the same way.
+WY_TRACE = ContextVar("WY_TRACE", 0)
+# T4.73d PHASE 1: directory to dump the culprit chunk's GDN scan inputs to, WY_TRACE=2 only (needs the
+# per-chunk fingerprint to know WHEN to dump) -- "" (default): never dumps. See _wy_dump_snapshot/
+# _wy_chunk_trace for what gets captured and when.
+WY_DUMP_DIR = ContextVar("WY_DUMP_DIR", "")
+
 def _gdn_tri_inverse(m:Tensor) -> Tensor:
   """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
   doubling instead of a length-C forward-substitution loop.
@@ -165,6 +178,31 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
   out = a_bar * (q @ state.transpose(-1, -2) + qk @ u)                   # (B,H,T,V)
   final_state = a_bar[:, :, T-1, :].unsqueeze(-1) * (state + u.transpose(-1, -2) @ k)  # (B,H,V,K)
   return final_state, out.transpose(1, 2)                                # (B,T,H,V)
+
+def _wy_dump_snapshot(block:"GatedDeltaNetBlock", **named:Tensor) -> dict[str, Tensor]:
+  """T4.73d PHASE 1, WY_DUMP_DIR only: persistent per-block snapshot of THIS chunk's scan inputs (whatever
+  keyword tensors are passed in -- GatedDeltaNetBlock._attention below calls this with the incoming carried
+  state plus q/k/v/beta/alpha, right before run_scan/the head-group loop consumes them), refreshed on EVERY
+  prefill chunk call -- capture AND JIT replay alike. A plain local variable inside _attention only exists
+  during the jit key's first (capture) call; every later chunk of the same chunked-prefill run replays the
+  recorded kernel graph with NO python running at all (see _wy_trace_log's docstring on gdn_last_scan_impl
+  for the same replay gotcha), so the only way to recover an ARBITRARY later chunk's actual inputs is the
+  same persistent-buffer + .uop.store()+.after() idiom this file already uses for recurrent_state/conv_state/
+  _wy_trace_logits: each name gets a same-shape buffer (allocated once, on first use), stored into on every
+  call, and the value returned here is identical to the input (this only chains a side-effect, not a
+  transform), so the caller can swap the returned tensor in for the original transparently. _wy_chunk_trace
+  (below) reads these buffers back post-realize() when a chunk's fingerprint first goes non-finite -- at that
+  point they hold exactly THAT chunk's data, because the read happens right after that chunk's replay/capture
+  completed and before the next one starts."""
+  out: dict[str, Tensor] = {}
+  for name, t in named.items():
+    attr = f"_wy_dump_{name}"
+    tc = t.contiguous()  # AFTER's value source must be a movement/PARAM/BUFFER/CONTIGUOUS/... op (uop/spec.py) --
+                         # t itself is an arbitrary compute result (WHERE/CAST/...), so realize it standalone first
+    if not hasattr(block, attr): setattr(block, attr, Tensor.zeros_like(tc).clone())
+    buf = getattr(block, attr)
+    out[name] = Tensor(tc.uop.after(buf.uop.store(tc.cast(buf.dtype).uop)))
+  return out
 
 # T4.63: qwen3.5-family GGUFs carry a DeepSeek-style MTP ("nextn") block beyond the main num_blocks
 # (nextn_predict_layers, already excluded from num_blocks -- see from_gguf). 0 (default): today's
@@ -658,6 +696,14 @@ class GatedDeltaNetBlock(FFNBlock):
     else:
       state = initial.where(0, state.float())
 
+      if WY_DUMP_DIR.value:
+        # T4.73d PHASE 1: snapshot this chunk's full-block (pre-head-group-split) scan inputs -- see
+        # _wy_dump_snapshot's docstring for why this must be a persistent stored buffer, not just these
+        # locals, to survive a JIT replay of a LATER chunk. Captured here (whole block) rather than inside
+        # run_scan/per head-group, so a G>1 split (gdn_head_groups_for) doesn't fragment the dump.
+        snap = _wy_dump_snapshot(self, state_in=state, q=q, k=k, v=v, beta=beta, alpha=alpha)
+        state, q, k, v, beta, alpha = (snap[n] for n in ("state_in", "q", "k", "v", "beta", "alpha"))
+
       def run_scan(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
         # T4.69a: GDN_SCAN_IMPL picks the per-token loop (default/auto) or the chunkwise WY-form gdn_scan_wy
         # (device-agnostic, matmul-shaped -- see its docstring). Dispatch lives here, inside the per-group
@@ -959,6 +1005,89 @@ def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng
   bonus = int(rng.choice(p_probs.shape[1], p=p_probs[k_eff]))
   return draft_ids + [bonus], k_eff
 
+def _wy_trace_log(model:"Transformer", step_kind:str, argmax_out:Tensor) -> None:
+  """T4.76, WY_TRACE=1 only: one compact stdout line per traced generate() step (see there) -- per-GDN-block
+  recurrent_state/conv_state fingerprints (host-side float64 sum/nan-count/abs-max via .tolist(), the same
+  numpy-free host-pull idiom generate()'s own drain loop already uses) plus, at decode, the sampled id/top-5/
+  nan-inf/shape of the last forward() call's logits (captured into model._wy_trace_logits by forward()
+  itself -- see there). Correctness over speed throughout, per the T4.76 brief.
+
+  gdn_last_scan_impl is TRACE-only (see its own docstring above): it does not advance on a JIT REPLAY (no
+  python runs then -- engine/jit.py's _TinyJit, cnt>=2 -- see REPORT.md), so a replayed step's printed impl
+  is whatever the last TRACE (of any jit key, prefill or decode) appended, not necessarily fresh this call.
+  Still meaningful here: decode never selects WY regardless of trace/replay (T4.69b's T_pad>1 gate), so a
+  stale LOOP entry on a replayed decode step is not a false signal -- only a fresh WY entry on prefill is."""
+  def fp(t:Tensor) -> str:
+    flat = cast(list[float], t.flatten().tolist())
+    finite = [v for v in flat if v == v]  # NaN != NaN
+    return f"sum={math.fsum(finite) if finite else 0.0:.6g} nan={len(flat)-len(finite)} amax={max((abs(v) for v in finite), default=0.0):.6g}"
+
+  gdn_blocks = [(i, b) for i, b in enumerate(model.blk) if isinstance(b, GatedDeltaNetBlock)]
+  blocks_str = " ".join(f"blk{i}:state({fp(b.recurrent_state)})/conv({fp(b.conv_state)})" for i, b in gdn_blocks)
+  impl = gdn_last_scan_impl[-len(gdn_blocks):] if gdn_blocks else []
+  line = f"[WY_TRACE] step={step_kind} impl={impl} {blocks_str}"
+  if step_kind.startswith("decode") and hasattr(model, "_wy_trace_logits"):
+    logits = cast(list[float], model._wy_trace_logits.flatten().tolist())
+    top5 = sorted((v for v in logits if v == v), reverse=True)[:5]
+    line += (f" argmax={int(argmax_out.item())} top5={[round(v, 4) for v in top5]} "
+             f"logits_nan={sum(1 for v in logits if v != v)} logits_inf={sum(1 for v in logits if math.isinf(v))} "
+             f"logits_shape={tuple(model._wy_trace_logits.shape)}")
+  print(line, flush=True)
+
+wy_dump_done: list[bool] = []  # T4.73d PHASE 1: module-level latch -- the culprit dump fires at most once per process
+
+def _wy_chunk_fp(t:Tensor) -> tuple[int, float]:
+  """T4.73d PHASE 1: lightweight per-chunk host fingerprint -- nan count and abs-max only, no fsum (unlike
+  _wy_trace_log's fp() above): this runs once per GDN block per PREFILL CHUNK, up to ~180x more often than
+  that one traced ("last step only") fingerprint over a long chunked prefill -- see the T4.73d brief."""
+  flat = cast(list[float], t.flatten().tolist())
+  finite = [v for v in flat if v == v]  # NaN != NaN
+  return len(flat) - len(finite), max((abs(v) for v in finite), default=0.0)
+
+def _wy_chunk_trace(model:"Transformer", chunk_idx:int, chunk_start_pos:int, dump_dir:str) -> None:
+  """T4.73d PHASE 1, WY_TRACE=2 only: one stdout line per PREFILL CHUNK (generate() calls this for every
+  chunk, not just the last -- extends _wy_trace_log's WY_TRACE=1 form to the granularity the T4.73d brief
+  needs: WHICH chunk first drives a GDN block's carried state non-finite, for content that only fails past
+  ~140-180 chunks (FIXNOTES_T473C.md's single-chunk head-42 underflow is a different, already-fixed
+  mechanism -- this is diagnostic-only, for whatever cross-chunk accumulation this content triggers that
+  others don't).
+
+  When `dump_dir` is non-empty and this is the FIRST chunk whose fingerprint shows a NaN in some block's
+  recurrent_state or conv_state, also prints that block's first non-finite head (per-head nan count over
+  recurrent_state's head axis) and saves the block's scan inputs for THIS chunk -- captured every chunk
+  regardless of capture vs. JIT replay by _wy_dump_snapshot above -- plus the actual (buggy) post-chunk
+  state, to <dump_dir>/culprit_chunk<idx>_blk<i>.safetensors via nn.state.safe_save. Fires at most once per
+  process (wy_dump_done latch), so a long prefill doesn't re-dump every subsequent (still-NaN) chunk."""
+  gdn_blocks = [(i, b) for i, b in enumerate(model.blk) if isinstance(b, GatedDeltaNetBlock)]
+  parts: list[str] = []
+  culprit: tuple[int, GatedDeltaNetBlock] | None = None
+  for i, b in gdn_blocks:
+    s_nan, s_amax = _wy_chunk_fp(b.recurrent_state)
+    c_nan, c_amax = _wy_chunk_fp(b.conv_state)
+    parts.append(f"blk{i}:state(nan={s_nan} amax={s_amax:.6g})/conv(nan={c_nan} amax={c_amax:.6g})")
+    if culprit is None and (s_nan or c_nan): culprit = (i, b)
+  print(f"[WY_TRACE] chunk={chunk_idx} start_pos={chunk_start_pos} {' '.join(parts)}", flush=True)
+  if culprit is None or not dump_dir or wy_dump_done: return
+  wy_dump_done.append(True)
+  i, b = culprit
+  head_nans = [_wy_chunk_fp(b.recurrent_state[:, h])[0] for h in range(b.num_v_heads)]
+  first_head = next((h for h, n in enumerate(head_nans) if n), -1)
+  print(f"[WY_TRACE] culprit chunk={chunk_idx} blk={i} head={first_head} heads_nan={head_nans}", flush=True)
+  needed = ("state_in", "q", "k", "v", "beta", "alpha")
+  if not all(hasattr(b, f"_wy_dump_{n}") for n in needed):
+    # WY_DUMP_DIR was set (this code ran) but the culprit block never took the run_scan path this chunk
+    # (e.g. the AMD fused-kernel branch) -- nothing to dump.
+    print(f"[WY_TRACE] blk={i} has no captured scan-input snapshot -- nothing dumped", flush=True)
+    return
+  tensors = {n: getattr(b, f"_wy_dump_{n}") for n in needed}
+  tensors["recurrent_state_out"], tensors["conv_state_out"] = b.recurrent_state, b.conv_state
+  out_dir = pathlib.Path(dump_dir)
+  out_dir.mkdir(parents=True, exist_ok=True)
+  out_path = out_dir / f"culprit_chunk{chunk_idx}_blk{i}.safetensors"
+  meta = {"chunk_idx": str(chunk_idx), "start_pos": str(chunk_start_pos), "blk_idx": str(i), "culprit_head": str(first_head)}
+  nn.state.safe_save(tensors, str(out_path), metadata=meta)
+  print(f"[WY_TRACE] dumped {out_path}", flush=True)
+
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     # T4.70b: FFN tensor-parallel spec, parsed from device_map's optional "tp:" segment (see parse_tp_spec)
@@ -1058,6 +1187,14 @@ class Transformer:
       return self.output(self.output_norm(x)), x[:, -1:].contiguous()  # (B,T,vocab) logits, (B,1,D) hidden
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    if WY_TRACE.value:
+      # T4.76: stash these logits into a persistent buffer via the same hasattr-gated-allocation +
+      # .uop.store()/.after() idiom this file already uses for cache_kv/recurrent_state (see GatedDeltaNetBlock
+      # ._attention below) -- so a JIT REPLAY of this graph (engine/jit.py's _TinyJit, cnt>=2: no python of
+      # forward() runs at all, see REPORT.md) still refreshes it every call, not just on the trace that first
+      # builds it. generate() reads it back (after its own .realize()) to print decode-step diagnostics.
+      if not hasattr(self, "_wy_trace_logits"): self._wy_trace_logits = Tensor.zeros_like(logits).clone()
+      logits = Tensor(logits.uop.after(self._wy_trace_logits.uop.store(logits.uop)))
     # greedy (temperature is None): plain argmax, no RNG kernels
     if temperature is None: return logits.argmax(-1, keepdim=True)
     temperature = temperature.to(logits.device)
@@ -1356,11 +1493,30 @@ class Transformer:
     # append/_cached_tokens/yield timing moves.
     pending: list[Tensor] = []
     virtual_len = len(tokens)
+    # T4.76/T4.73d, WY_TRACE>=1 only: wy_decode_traces counts traced decode steps so far (capped at 3, both
+    # levels); wy_chunk_idx counts prefill chunks seen so far (WY_TRACE>=2 only -- 1-based in the printed line).
+    wy_decode_traces, wy_chunk_idx = 0, 0
+    wy_dump_dir = WY_DUMP_DIR.value
     while virtual_len < self.max_context:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = cast(Tensor, self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp)).realize()
+      is_prefill_call = start_pos < prompt_len or out is None
+      chunk_start_pos = start_pos  # T4.73d: this chunk's start_pos, before the increment below moves past it
+      out = cast(Tensor, self(t[:, sp:sp+nt] if is_prefill_call else cast(Tensor, out), sp, temp)).realize()
       start_pos += n_toks
+      if WY_TRACE.value and is_prefill_call:
+        # T4.76: the LAST prefill step is the one whose increment above finally clears the "more prompt to
+        # consume" check just below (a single-chunk prompt makes this the very first iteration).
+        # T4.73d PHASE 1: WY_TRACE=2 traces EVERY prefill chunk instead (see _wy_chunk_trace) -- the
+        # granularity needed to find WHICH chunk first goes non-finite, not just whether the last one is.
+        if WY_TRACE.value >= 2:
+          wy_chunk_idx += 1
+          _wy_chunk_trace(self, wy_chunk_idx, chunk_start_pos, wy_dump_dir)
+        elif start_pos >= virtual_len: _wy_trace_log(self, "prefill(last)", out)
+      elif WY_TRACE.value and wy_decode_traces < 3:
+        # the first 3 decode steps, both trace levels -- see _wy_trace_log for what gets printed.
+        _wy_trace_log(self, f"decode#{wy_decode_traces + 1}", out)
+        wy_decode_traces += 1
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < virtual_len: continue
       # move the sampled token once, back to t's device, so the next step's input matches the JIT's prefill-captured device.

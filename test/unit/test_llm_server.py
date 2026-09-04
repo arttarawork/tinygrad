@@ -1,8 +1,8 @@
-import unittest
+import contextlib, io, pathlib, re, tempfile, unittest
 import numpy as np
 from unittest.mock import patch
 from tinygrad import Tensor, UOp
-from tinygrad.nn.state import get_state_dict
+from tinygrad.nn.state import get_state_dict, safe_load
 from tinygrad.schedule import schedule_cache
 from tinygrad.helpers import Context
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig
@@ -344,6 +344,62 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
     with Context(GDN_CHUNK=4): m.warmup()
     self.assertEqual(set(m.jit.keys()), {(False, True, None, False), (False, False, None, False), (True, True, 4, False), (True, False, 4, False)})
     for key, jit in m.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
+
+CHUNK_LINE_RE = re.compile(r"^\[WY_TRACE\] chunk=(\d+) start_pos=(\d+) (blk\d+:state\(nan=\d+ amax=[^)]+\)/conv\(nan=\d+ amax=[^)]+\)\s*)+$")
+
+class TestWYTraceChunkInstrumentation(unittest.TestCase):
+  """T4.73d PHASE 1: WY_TRACE=2 must print one [WY_TRACE] chunk=... line per PREFILL CHUNK (not just the
+  last, like WY_TRACE=1 -- see model.py's _wy_chunk_trace), and WY_DUMP_DIR must save the first non-finite
+  chunk's GDN scan inputs to a loadable safetensors file. A poisoned token embedding (one vocab row set to
+  NaN) gives a deterministic, fast way to make a SPECIFIC prefill chunk's GDN state go non-finite, without
+  needing the real (numerically delicate, content x length dependent) WY bug this instrumentation exists to
+  chase -- NaN propagates through the block's linear/conv/scan math regardless of chunk content."""
+  NAN_TOKEN = 50
+
+  def setUp(self):
+    from tinygrad.llm.model import wy_dump_done
+    wy_dump_done.clear()  # module-level "dumped once already" latch -- reset so test order/xdist worker reuse can't wedge it
+
+  def _run(self, prompt:list[int], chunk:int, poison:bool, dump_dir:str = "") -> str:
+    Tensor.manual_seed(7)
+    m = Transformer(SSM_CFG)
+    if poison:
+      w = m.token_embd.weight.numpy()
+      w[self.NAN_TOKEN] = np.nan
+      Tensor.realize(m.token_embd.weight.assign(Tensor(w, dtype=m.token_embd.weight.dtype)))
+    buf = io.StringIO()
+    with Context(GDN_CHUNK=chunk, WY_TRACE=2, WY_DUMP_DIR=dump_dir), contextlib.redirect_stdout(buf):
+      list(zip(range(1), m.generate(list(prompt))))  # only need to reach the end of prefill, not decode
+    return buf.getvalue()
+
+  def test_per_chunk_lines_parse_one_per_chunk(self):
+    prompt = list(range(1, 10))  # 9 tokens at chunk=3 -> 3 prefill chunks, start_pos 0/3/6
+    lines = [ln for ln in self._run(prompt, chunk=3, poison=False).splitlines() if ln.startswith("[WY_TRACE] chunk=")]
+    self.assertEqual(len(lines), 3, lines)
+    for i, line in enumerate(lines):
+      match = CHUNK_LINE_RE.match(line)
+      self.assertIsNotNone(match, line)
+      self.assertEqual(int(match[1]), i + 1, line)  # 1-based chunk index
+      self.assertEqual(int(match[2]), i * 3, line)  # start_pos advances by the chunk width
+
+  def test_culprit_chunk_detected_and_dumped(self):
+    prompt = [1, 2, 3, 4, self.NAN_TOKEN, 6, 7, 8, 9]  # the NaN token lands in the 2nd of 3 chunks
+    with tempfile.TemporaryDirectory() as d:
+      log = self._run(prompt, chunk=3, poison=True, dump_dir=d)
+      chunk_lines = [ln for ln in log.splitlines() if ln.startswith("[WY_TRACE] chunk=")]
+      self.assertEqual(len(chunk_lines), 3, chunk_lines)
+      self.assertRegex(chunk_lines[0], r"state\(nan=0 amax=", "chunk 1 (before the NaN token) must be clean")
+      self.assertNotRegex(chunk_lines[1], r"state\(nan=0 ", "chunk 2 (contains the NaN token) must go non-finite")
+      culprit_lines = [ln for ln in log.splitlines() if ln.startswith("[WY_TRACE] culprit ")]
+      self.assertEqual(len(culprit_lines), 1, "must dump at most once, on the FIRST non-finite chunk")
+      self.assertTrue(culprit_lines[0].startswith("[WY_TRACE] culprit chunk=2 blk=0 head="), culprit_lines[0])
+      dumped = list(pathlib.Path(d).glob("culprit_chunk2_blk0.safetensors"))
+      self.assertEqual(len(dumped), 1, list(pathlib.Path(d).iterdir()))
+      tensors = safe_load(str(dumped[0]))
+      for name in ("state_in", "q", "k", "v", "beta", "alpha", "recurrent_state_out", "conv_state_out"):
+        self.assertIn(name, tensors)
+      self.assertEqual(tensors["state_in"].shape, tensors["recurrent_state_out"].shape)  # (B,H,V,K), both sides
+      self.assertTrue(np.isnan(tensors["recurrent_state_out"].numpy()).any())  # the actual (buggy) observed state
 
 def _byte_tok() -> SimpleTokenizer:
   # byte-level vocab (no merges) in the GPT-2 byte-encoder alphabet: printable ASCII maps to itself, 'Ġ' = space, 'Ċ' = newline
