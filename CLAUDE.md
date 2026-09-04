@@ -41,7 +41,9 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   Use the repo venv: `CHECK_OOB=1 DEV=CPU PYTHONPATH=. .venv/bin/python -m pytest <area> -x -q` (CI sets `CHECK_OOB=1`; serial; `-n12` only under
   `DEV=CPU` — with the METAL default `-n` spawns one real TinyGPU server per worker, T4.38; `DEV=CPU` gates never
   open NV except `test/device/test_hcq.py`, which opens `Device["NV"]` unconditionally);
-  typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .`
+  typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .` AND the CI whitespace lint
+  `.venv/bin/python -m pylint --disable=all -e W0311 -e C0303 --jobs=0 --indent-string='  ' --recursive=y .` (2-space indent — 4-space
+  scripts in `extra/` fail CI's Linters job; pylint must be installed in the venv — it wasn't until 2026-09-03)
   (from a worktree, the venv is at `/Users/artur/Documents/tinygrad/.venv` — `PYTHONPATH=.` makes
   the worktree's tinygrad win over anything installed).
 - Perf claims need before/after tok/s from the T0.3 harness on named hardware. Upstream PRs:
