@@ -654,5 +654,78 @@ class TestWarmupResetsMTPCache(unittest.TestCase):
                       "draft() call at position 20 -- either the pollution isn't real or this stopped "
                       "catching it")
 
+class TestWarmupAnchorShift(unittest.TestCase):
+  """T4.66h: T4.66g's own task flagged (but explicitly left out of scope) a DIFFERENT anomaly found while
+  isolating its MTP-cache fix: calling the FULL warmup() before a short real prompt could shift the MAIN
+  model's own first (anchor) token, even though mtp_head.block's cache leak (T4.66g's own fix, above) is
+  unrelated and per-block state (recurrent_state/conv_state/cache_kv) was bit-identical right after the real
+  prefill either way.
+
+  T4.66g's own prime suspect was get_start_pos/_cached_tokens splicing a real prompt onto warmup's dummy id
+  (0) -- DISPROVEN here: the exact "prompt starts with 0, so it splices onto warmup's own residual state"
+  collision (confirmed via direct get_start_pos() inspection: it returns a nonzero start_pos in exactly this
+  case) still matches a fresh model's own anchor, at every seed/prompt tried, before AND after this fix --
+  get_start_pos's own `tokens[:len(cached)] == cached` guard makes that reuse correct-by-construction
+  (identical in kind to snapshot_state/restore_state's own deliberate cross-session prefix reuse), not a bug.
+  Prompts that never touch id 0 at all reproduce the real bug just as reliably (see the test below), so it has
+  nothing to do with matching warmup's own dummy token.
+
+  The real mechanism: speculative_generate's own prefill-tail anchor read, `tok_all[:, -1:, :]` (and its
+  hidden-state twin, `prefill_result[1][:, -1:]`) -- a NEGATIVE index on a Tensor returned from a REPLAYED jit
+  call. Per engine/jit.py's _TinyJit.__call__ (already documented in REDO's own comment further up in
+  model.py), only a jit key's SECOND-ever call actually captures; every call from then on (capture included)
+  returns the SAME frozen Tensor object, whose lazy shape still reports THAT capture call's own bound length
+  -- confirmed by monkeypatching Transformer.__call__ to print the returned tensor's shape UOp directly: after
+  warmup (which captures this exact key at nt=1, from its own un-skippable `speculative_generate([0])` dummy
+  call -- see warmup()'s own T4.66e comment), a real 4-token prompt's first use of this SAME key (is_prefill=
+  True, keyed on chunk_size/verify_chunk, never on this call's own bound `nt`) is a replay whose reported
+  length is still frozen at 1 -- `tok_all.shape[1]`'s bound CONST reads 1, not 4. `-1:` on that reports
+  "length 1, so position 0" and silently returns warmup's OWN single-token anchor instead of the real prompt's
+  own last position; the underlying BUFFER holds fully correct per-position data throughout (confirmed
+  per-position with concrete, non-negative indices) -- only the negative index's length-dependent resolution
+  is stale. The fix mirrors VERIFY's own already-established safe idiom a few hundred lines down in the same
+  function (pad/slice using a host-known int, never a jit-returned tensor's own reported length): `n_toks`
+  (the plain Python int already tracking the width of the chunk that produced tok_all/h_last) replaces both
+  `-1:` reads.
+
+  Production exposure: tinygrad/llm/cli.py's `main()` calls `model.warmup()` unconditionally before serving
+  any request, and serves real prompts through speculative_generate() whenever MTP is enabled -- there is no
+  length-1 guard anywhere on that path, so any --mtp deployment hits this on its first real request whenever
+  that request's own final prefill chunk has more than one real token (the overwhelmingly common case for any
+  real chat prompt/template, unlike this file's own deliberately tiny/adversarial PROMPTS)."""
+
+  def test_warmup_then_speculative_generate_matches_fresh_anchor(self):
+    # neither "prompt starts with warmup's own dummy id 0" nor "prompt avoids id 0 entirely" is special --
+    # the bug (pre-fix) fires on ANY prompt whose final prefill chunk has more than 1 real token, once warmup
+    # has captured the prefill-tail key at width 1. gdn_chunk=1 is bare-CPU's own auto-selected width (T4.55);
+    # 32 is what METAL/NV auto-select (gdn_chunk_for) and what the original hardware regression ran under.
+    for gdn_chunk in (1, 32):
+      for seed, prompt in enumerate(([0, 1, 2], [1, 2, 3], [5, 9, 3, 2], [7], [0])):
+        with self.subTest(gdn_chunk=gdn_chunk, prompt=prompt):
+          with Context(GDN_CHUNK=gdn_chunk):
+            ref = _run(_load_gdn(seed=seed), prompt, 1, spec=True)
+            warm = _load_gdn(seed=seed)
+            warm.warmup()
+            got = _run(warm, prompt, 1, spec=True)
+          self.assertEqual(got, ref, f"{gdn_chunk=} {prompt=}: warmup() shifted speculative_generate's own "
+                            "anchor (first emitted) token relative to a fresh model")
+
+  def test_warmup_plain_path_alone_does_not_shift_the_anchor(self):
+    # isolates the OTHER half of warmup() (generate()'s own greedy/sampled jit pairs, which run even without
+    # mtp_head) from the spec/MTP half fixed above: this half was never broken -- generate()'s own `-1` slice
+    # (forward()'s `x[:, -1:]`) lives INSIDE the jit-captured graph itself, not a host-side read of a replayed
+    # call's reported shape, so it re-derives correctly from whatever "toks" is bound to on every replay (see
+    # this class's own docstring). Standing guard against ever reintroducing an analogous bug on this path.
+    for gdn_chunk in (1, 32):
+      for seed, prompt in enumerate(([0, 1, 2], [1, 2, 3], [5, 9, 3, 2])):
+        with self.subTest(gdn_chunk=gdn_chunk, prompt=prompt):
+          with Context(GDN_CHUNK=gdn_chunk):
+            ref = _run(_load_gdn(seed=seed), prompt, 1, spec=False)
+            warm = _load_gdn(seed=seed)
+            warm.mtp_head = None  # isolate: plain generate()-only warmup, no speculative_generate([0])
+            warm.warmup()
+            got = _run(warm, prompt, 1, spec=False)
+          self.assertEqual(got, ref, f"{gdn_chunk=} {prompt=}: plain warmup() shifted generate()'s own anchor")
+
 if __name__ == '__main__':
   unittest.main()
