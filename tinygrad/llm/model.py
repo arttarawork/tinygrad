@@ -993,15 +993,43 @@ class MTPHead:
     byte-size accounting (this fork always serves a quantized GGUF, so the copy is the quantized size, not a
     dequantized fp32 one -- `.to()` replicates whatever owner.token_embd.weight is resident as, verbatim, no
     new precision decision here)."""
+    x = self.block(self._block_in(owner, h, tok_ids), start_pos)
+    return owner.output(self.shared_head_norm(x).to(owner.output.weight.device))
+
+  def _block_in(self, owner:Transformer, h:Tensor, tok_ids:Tensor) -> Tensor:
+    """eh_proj(concat(enorm(embed(tok_ids)), hnorm(h))) on self.block's device -- (B,T,dim) f32 from h (B,T,dim) and
+    tok_ids (B,T); the shared front half of draft() (T=1) and prefill() (T symbolic). See draft()'s T4.66d note on
+    _local_token_embd."""
     dev = self.block.device
     if not hasattr(self, "_local_token_embd"):
       local = nn.Embedding.__new__(nn.Embedding)
       local.weight = owner.token_embd.weight.to(dev).realize()
       self._local_token_embd = local
     e = self._local_token_embd(tok_ids.to(dev)).float()
-    x = self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
-    x = self.block(x, start_pos)
-    return owner.output(self.shared_head_norm(x).to(owner.output.weight.device))
+    return self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
+
+  def prefill(self, owner:Transformer, h:Tensor, tok_next:list[int], start_pos:int, v_toks:UOp, v_pos:UOp) -> Tensor:
+    """T4.66l: fill `block`'s KV cache for T consecutive MTP steps at once -- what draft() does for one step, minus
+    the head. h: (1,T,dim) the main model's pre-output_norm hidden at positions p..p+T-1; tok_next: the T tokens
+    actually at positions p+1..p+T; start_pos = p+1, the cache slot of the first step (draft()'s own
+    convention: the step whose inputs are (h_t, tok_{t+1}) lives in slot t+1 -- slot 0 is never written). This is the
+    context the nextn block was trained to attend over; before T4.66l the prompt slots stayed all-zero (P zero keys
+    diluting every draft's attention -- MTP_CACHE_NOTES.md section 2/6). Returns the block's (B,T,dim) output; callers
+    realize it only for the K/V store it carries. T is symbolic (v_toks, bounded by the prefill chunk width; v_pos
+    bounds the slot) so every width 1..bound replays ONE precompiled trace -- the same reason draft() takes a
+    Variable start_pos (see there); the pad below is what gives the symbolic slice a concrete buffer to view.
+    h's shape must be concrete: callers slice a replayed key's frozen output with host-known widths (`[:, :n]`,
+    T4.66h/j) before passing it here. Both symbolic-width views are shrinks of CONTIGUOUS concrete buffers -- the
+    main prefill's own `tokens.contiguous()` pattern (Transformer.__call__): a pad folded straight into a
+    symbolic-range kernel is a gated load the range simplifier rejects (codegen/simplify.py mark_gated, `.val` on
+    the bound PARAM -- reproduced on the very first norm kernel), so h's pad is materialized by its own concrete
+    copy kernel first (one small kernel per distinct T) and the token row is built padded on the host."""
+    B, T, D = int(h.shape[0]), int(h.shape[1]), int(h.shape[2])
+    assert B == 1 and len(tok_next) == T, f"{B=} {len(tok_next)=} {T=}"
+    bound, dev = cast(int, v_toks.vmax), self.block.device
+    hs = h.to(dev).float().pad_to((B, bound, D)).contiguous()[:, :v_toks.bind(T)]
+    ts = Tensor([tok_next + [0] * (bound - T)], dtype="int32", device=dev)[:, :v_toks.bind(T)]
+    return self.block(self._block_in(owner, hs, ts), v_pos.bind(start_pos))
 
 def _softmax_np(logits:np.ndarray, temperature:float) -> np.ndarray:
   """Numerically-stable softmax(logits/temperature), float64. speculative_generate's sampled path (T4.65)
@@ -1389,7 +1417,9 @@ class Transformer:
     # VERIFY's exact jit key (see speculative_generate's own REDO comment), so once that key has been
     # called twice by ANY combination of VERIFY/REDO calls, both replay the same captured slot.
     if self.mtp_head is not None:
-      for _ in range(2): list(zip(range(2), self.speculative_generate([0])))
+      # T4.66l: a 2-token dummy prompt (not [0]) so the MTP prefill's own precompiled trace (MTPHead.prefill -- one
+      # trace for every width, shared with the accept rewrite) is warmed here too, not on the first real request.
+      for _ in range(2): list(zip(range(2), self.speculative_generate([0, 0])))
       # T4.66g: unlike the main model's own blocks above (whose warmup residue in cache_kv/recurrent_state
       # is harmless -- a real request's own prefill legitimately rewrites position 0 onward before ever
       # attending to it), mtp_head.block is never "prefilled": draft() only ever runs from a real request's
@@ -1436,9 +1466,11 @@ class Transformer:
     (always true the way serve.py calls this -- right after a generate()/speculative_generate() step yields its
     first token, i.e. prefill just completed): at least one forward pass has already run on this model, so every
     block's cache buffers exist. restore_state is the inverse; snapshot_matches tells a caller whether it's even
-    valid to call that for a given token list. mtp_head's own (attention-only) KV cache is deliberately NOT
-    included: a stale/wrong draft never affects correctness (only iteration count), the same reason
-    speculative_generate's own CHECKPOINT never protects it either -- see its comment."""
+    valid to call that for a given token list. T4.66l: mtp_head.block's own KV cache (live slice, same rule) is
+    included too when MTP is loaded -- since the MTP prefill it holds the prompt's context for the draft head, and a
+    restore without it would leave the drafts attending over whatever the last request left there (quality only,
+    never correctness -- a wrong draft costs iterations, not tokens; the one slot the restored request still cannot
+    fill is `pos` itself, step pos-1, whose hidden state is not recomputed on a cache hit)."""
     pos = len(self._cached_tokens)
     blocks: list[dict] = []
     for b in self.blk:
@@ -1446,8 +1478,12 @@ class Transformer:
       elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
       elif isinstance(b, TransformerBlock): blocks.append({"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()})
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
-    Tensor.realize(*(t for bs in blocks for t in bs.values()))
-    return {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks}
+    snap: dict = {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks}
+    # ponytail: TransformerBlock-shaped MTP block only (every nextn head this fork loads); an MLA-shaped one would need its cache_k here.
+    if self.mtp_head is not None and isinstance(self.mtp_head.block, TransformerBlock) and hasattr(self.mtp_head.block, "cache_kv"):
+      snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone()
+    Tensor.realize(*(t for bs in blocks for t in bs.values()), *([snap["mtp_cache_kv"]] if "mtp_cache_kv" in snap else []))
+    return snap
 
   def restore_state(self, snap:dict) -> None:
     """Inverse of snapshot_state: writes every cloned buffer back into this model's LIVE (preallocated) caches
@@ -1465,6 +1501,8 @@ class Transformer:
       elif isinstance(b, MLATransformerBlock): assigns.append(b.cache_k[:, :, :bs["cache_k"].shape[2], :].assign(bs["cache_k"]))
       elif isinstance(b, TransformerBlock): assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"]))
       else: raise TypeError(f"restore_state: unhandled block type {type(b).__name__}")
+    if (mk := snap.get("mtp_cache_kv")) is not None and self.mtp_head is not None:  # T4.66l -- see snapshot_state
+      assigns.append(cast(TransformerBlock, self.mtp_head.block).cache_kv[:, :, :, :mk.shape[3], :].assign(mk))
     Tensor.realize(*assigns)
     self._cached_tokens = list(snap["tokens"])
 
@@ -1664,6 +1702,9 @@ class Transformer:
     # test_draft_reuses_schedule_across_positions' own "flat after warmup" assertion still holds, just with a
     # bigger (k-entry, not 1-entry) flat plateau.
     v_draft_pos = [UOp.variable(f"draft_pos_{i}", 0, self.max_context - 1) for i in range(k)]
+    # T4.66l: the MTP block's own prefill/rewrite width and slot Variables (see MTPHead.prefill): one precompiled
+    # trace serves every prompt-chunk width 1..chunk_size and every accept rewrite 1..k (chunk_size >= k+1 above).
+    v_mtp_toks, v_mtp_pos = UOp.variable("mtp_toks", 1, chunk_size), UOp.variable("mtp_pos", 0, self.max_context - 1)
 
     # --- prefill: identical mechanics to generate() (same kind of v_start_pos/v_toks vars, same
     # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
@@ -1678,6 +1719,11 @@ class Transformer:
     while start_pos < prompt_len:
       n_toks = min(chunk_size, prompt_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
+      # T4.66l: EVERY chunk runs spec=True now (it used to be the final chunk only, the rest spec=False): the MTP
+      # prefill below needs each chunk's per-position hidden state. ponytail: every chunk thereby also pays the full
+      # per-position output projection (~2% of prefill on Qwen3.8-27B) for logits only the final chunk reads; a
+      # hidden-only spec mode (a third jit key, plus its warmup) would save it.
+      prefill_result = cast(tuple[Tensor, ...], self(t[:, sp:sp + nt], sp, None, spec=True))
       if start_pos + n_toks >= prompt_len:
         # T4.66b: forward(spec=True) now returns the FULL per-position hidden state (B,T,D), not just the
         # last position -- the prefill anchor only ever wanted the last one (same value as before).
@@ -1700,10 +1746,17 @@ class Transformer:
         # (the loop only assigns tok_all/h_last on its last iteration, so it's exactly right here); the
         # underlying buffer's DATA is always correct at every position (confirmed per-position, only the
         # NEGATIVE INDEX's resolution was stale) -- see test_spec_decode.py's TestWarmupAnchorShift.
-        prefill_result = cast(tuple[Tensor, ...], self(t[:, sp:sp + nt], sp, None, spec=True))
         tok_all, h_last = prefill_result[0], prefill_result[1][:, n_toks - 1:n_toks].contiguous()
-      else:
-        cast(Tensor, self(t[:, sp:sp + nt], sp, None, spec=False)).realize()
+      # T4.66l: MTP prefill -- fill mtp_head.block's cache for this chunk's MTP steps t = start_pos.. from (h_t,
+      # tok_{t+1}) into slots t+1 (MTPHead.prefill). The last prompt position's step needs tok_{prompt_len} -- the
+      # anchor, drawn only below -- so that one is draft()'s own first call, not ours: hence the prompt_len-1 clip.
+      # Host-known widths only (`[:, :n_mtp]`, T4.66h/j): prefill_result[1] is a replayed key's frozen output, and
+      # this is realized (dispatched, same device as that output -- from_gguf places mtp_head on the last block's
+      # device, so the queue keeps it ordered) BEFORE the next chunk's replay of the same key overwrites that buffer.
+      n_mtp = min(n_toks, prompt_len - 1 - start_pos)
+      if n_mtp > 0:
+        self.mtp_head.prefill(self, prefill_result[1][:, :n_mtp], tokens[start_pos + 1:start_pos + 1 + n_mtp], start_pos + 1,
+                              v_mtp_toks, v_mtp_pos).realize()
       start_pos += n_toks
     # get_start_pos always returns < prompt_len (a fresh/attention model can reuse at most prompt_len-1
     # positions -- tokens[:-1] -- and a recurrent one's cache-hit branch requires it strictly), so the loop
@@ -1927,6 +1980,17 @@ class Transformer:
           sp2, nt2 = v_start_pos.bind(start_pos), v_toks_verify.bind(len(redo_ids))
           _, redo_h = cast(tuple[Tensor, Tensor], self(buf2[:, :nt2], sp2, None, spec=True))
           h_last = redo_h[:, len(redo_ids) - 1:len(redo_ids)].contiguous()  # T4.66i: positive slice, same reason as the anchor (T4.66h)
+        # T4.66l: rewrite the MTP block's cache slots for the accepted positions with the TRUE per-position hidden
+        # state. The draft chain wrote slots start_pos..start_pos+k_eff-1 from (h_last, chunk_ids[i]): token-correct
+        # for i <= m, but h_last is position start_pos-1's hidden at EVERY step (see the DRAFT comment) -- so slot
+        # start_pos (step start_pos-1) is already right, while slots start_pos+1..start_pos+m (steps start_pos..
+        # start_pos+m-1) need h_{start_pos+j} = verify_h[:, j], j < m: what VERIFY holds after a full accept, and what
+        # REDO -- same jit key, hence the SAME frozen object, its replay having just rewritten positions 0..m -- holds
+        # after a partial one; paired with the tokens chunk_ids[1..m] == accepted[:m]. m == k_eff also fills the bonus
+        # token's slot start_pos+k_eff, which no draft ever wrote. Nothing to do at m == 0. Dispatch-only (counted in
+        # state_assign_ms); the device queue orders it before the next DRAFT chain's reads of the cache.
+        if m > 0:
+          self.mtp_head.prefill(self, verify_h[:, :m], chunk_ids[1:m + 1], start_pos + 1, v_mtp_toks, v_mtp_pos).realize()
         if trace_on: state_assign_ms = (time.perf_counter() - assign_t0) * 1000
 
         if stats_on:

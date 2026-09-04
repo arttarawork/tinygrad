@@ -801,5 +801,73 @@ class TestStaleReplayShape(unittest.TestCase):
     # the stale reported length, made visible: -1: on the replay is position 0, not the real last position
     self.assertGreater(float(np.abs(r_h[:, -1:].numpy() - f_h[:, 3:4].numpy()).max()), 1e-3)
 
+class TestMTPPrefill(unittest.TestCase):
+  """T4.66l: mtp_head.block's KV cache holds the prompt's MTP context (MTPHead.prefill, run chunk by chunk beside the
+  main prefill) and every accepted position's TRUE-hidden entry (the accept-time rewrite) -- the semantics the nextn
+  head was trained on: the step whose inputs are (h_t, tok_{t+1}) lives in slot t+1. Before this, the prompt slots
+  were all-zero (MTP_CACHE_NOTES.md section 6: the honest b..j baseline was 8% full chains on correct text)."""
+
+  def test_prefill_matches_chained_draft(self):
+    # the T-wide prefill must leave exactly the cache T single-step draft() calls (the pre-existing, trusted
+    # definition of one MTP step) leave for the same (h_t, tok_{t+1}) inputs at slots t+1
+    ref = _load_gdn(seed=0, max_context=64)
+    prompt = [5, 2, 3, 4, 9, 1, 7]
+    n = len(prompt)
+    a, b = _split(ref), _split(ref)
+    _, h = _spec_call(a, prompt, nt=n, bound=n)  # eager (cnt=0): concrete (1, n, D)
+    v_t, v_p = UOp.variable("mtp_toks", 1, 8), UOp.variable("mtp_pos", 0, 63)
+    a.mtp_head.prefill(a, h[:, :n - 1], prompt[1:], 1, v_t, v_p).realize()
+    v_d = UOp.variable("draft_pos_0", 0, 63)
+    for t in range(n - 1): b.mtp_head.draft(b, h[:, t:t + 1], Tensor([[prompt[t + 1]]], dtype="int32"), v_d.bind(t + 1)).realize()
+    ca, cb = (m.mtp_head.block.cache_kv[:, :, :, :n + 1, :].float().numpy() for m in (a, b))
+    np.testing.assert_allclose(ca[:, :, :, 1:n], cb[:, :, :, 1:n], rtol=1e-4, atol=1e-6)
+    self.assertEqual(float(np.abs(ca[:, :, :, 0]).max()), 0.0)  # slot 0 (step -1) is never written
+    self.assertEqual(float(np.abs(ca[:, :, :, n]).max()), 0.0)  # slot n (step n-1 needs tok_n: the anchor, draft()'s job)
+    self.assertGreater(float(np.abs(ca[:, :, :, 1:n]).max()), 0.0)
+
+  def test_generate_maintains_cache_and_snapshot_round_trips(self):
+    # after chunked prefill + draft chains with a mix of accept lengths (0..k, exercising both the full-accept and
+    # the REDO path's rewrite), every slot 1..len(tokens)-2 must match a one-shot prefill over the final token
+    # sequence on a fresh model; then snapshot_state/restore_state must carry the MTP cache too.
+    k = 3
+    ref = _load_gdn(seed=0, max_context=64)
+    prompt = [5, 2, 3, 4, 9]
+    want = _run(_split(ref), prompt, N_GEN + k + 4, spec=False)
+    ref_tokens = list(prompt) + want
+    m = _split(ref)
+    orig, calls = m.mtp_head.draft, 0
+    def fake_draft(owner, h, tok_ids, start_pos, _ref=ref_tokens):
+      nonlocal calls
+      orig(owner, h, tok_ids, start_pos).realize()  # the real draft still runs, for its K/V side effect (slot start_pos)
+      chain, step = divmod(calls, k)
+      calls += 1
+      pos = start_pos.unbind()[1]
+      # chain i accepts i mod (k+1) drafts; on out_dev, where the real draft's logits live (split model: see out_dev in model.py)
+      return _wrong_logits(_ref[pos + 1] if step < chain % (k + 1) else VOCAB - 1).to(owner.output.weight.device)
+    m.mtp_head.draft = fake_draft
+    buf = io.StringIO()
+    with Context(SPEC_STATS=1), contextlib.redirect_stdout(buf):
+      got = _run(m, prompt, N_GEN, spec=True, k=k)
+    self.assertEqual(got, want[:N_GEN])
+    hist = buf.getvalue().split("accept_len_hist=")[-1]
+    self.assertTrue(all(f"{i}:" in hist for i in range(k + 1)), buf.getvalue())
+    tokens = list(prompt) + got
+    L = len(tokens)
+    r = _split(ref)
+    _, h = _spec_call(r, tokens, nt=L - 1, bound=L - 1)
+    v_t, v_p = UOp.variable("mtp_toks", 1, L), UOp.variable("mtp_pos", 0, 63)
+    r.mtp_head.prefill(r, h[:, :L - 2], tokens[1:L - 1], 1, v_t, v_p).realize()
+    live = m.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
+    oracle = r.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
+    np.testing.assert_allclose(live[:, :, :, 1:L - 1], oracle[:, :, :, 1:L - 1], rtol=1e-3, atol=1e-4)
+    # snapshot/restore round trip carries the MTP cache (live slice [:pos])
+    snap = m.snapshot_state()
+    self.assertIn("mtp_cache_kv", snap)
+    self.assertEqual(int(snap["mtp_cache_kv"].shape[3]), snap["pos"])
+    m.mtp_head.block.cache_kv.assign(Tensor.zeros_like(m.mtp_head.block.cache_kv)).realize()
+    m.restore_state(snap)
+    back = m.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
+    np.testing.assert_array_equal(back[:, :, :, :snap["pos"]], live[:, :, :, :snap["pos"]])
+
 if __name__ == '__main__':
   unittest.main()

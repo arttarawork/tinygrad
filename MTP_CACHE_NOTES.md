@@ -111,6 +111,13 @@ its bound value, and with batch 1 the shrunk view's data offsets are `i*vocab + 
 Any read that derives a length/pad amount/negative index from the tensor's own shape is the unsafe class.
 
 ## 6. T4.66k — the acceptance gap (81% → 8% full chains) is NOT in the d..j code (CPU proof); hardware round requested
+**Resolved by R1 (2026-09-04):** 66c (`6bf1b39c1`) under today's map/env/prompt reproduced the 81% ({0:6, 1:4, 2:3, 3:42}/55)
+— on DEGENERATE output ("…marking the Copper, Coppe…", "copper, a copper, copper, copper…" from ~token 25). **The pre-66d
+"reference" acceptance numbers (T4.66b's 43-44/53 full chains, avg 3.60) came from corrupted main-model output — the
+capture-assign state path 66d reverted for cost was also wrong on the real split — and must not be cited as a baseline.**
+The honest baseline is b..j's 8% full chains on correct text, with the nextn block attending over an all-zero prompt
+context; the §2(a) MTP prefill is the fix (§7), not a regression repair.
+
 Datum: b..j on hardware (correct text): hist {0:19, 1:47, 2:17, 3:7}/90 — d0 accepted 71/90 = 79%, d1|d0 = 24/71 = 34%,
 d2|d1 = 7/24 = 29%. T4.66b on hardware (2026-09-01, TASKS.md): 43-44/53 full chains, avg 3.60 — d0 ≈ 89%, d1|d0 = 48/48,
 d2|d1 ≈ 92%. The collapse is in the CHAINED positions; d0 is roughly intact.
@@ -153,3 +160,49 @@ essay content (must be real text — 66c has no spec warmup, so no anchor bug), 
   all-zero prompt context — P zero keys each add exp(0) to every softmax denominator with a zero value behind them, so
   the attention branch is diluted by ~P/e^score: noticeable at an essay prompt, effectively gone at a 19k-token Hermes
   prompt, where the head runs on its residual path alone) and rewrite accepted positions after each accept. That lifts d0..d2 together; it is not a regression fix.
+
+## 7. T4.66l — the MTP prefill (§2(a)) as built
+Semantics (draft()'s own convention, kept): the MTP step whose inputs are (h_t, tok_{t+1}) lives in `mtp_head.block`'s
+cache slot t+1; slot 0 (step −1) is never written. `MTPHead.prefill(owner, h, tok_next, start_pos, v_toks, v_pos)` fills T
+consecutive slots [start_pos, start_pos+T) from h = the main model's pre-output_norm hidden at positions start_pos−1.. and
+tok_next = the tokens at positions start_pos.. — draft() minus the head, T-wide. `draft()` and `prefill()` share
+`_block_in` (embed → enorm/hnorm → eh_proj); test `test_prefill_matches_chained_draft` pins prefill's cache to what T
+single-step draft() calls leave (rtol 1e-4).
+
+How the prefill chunk loop feeds it: every prompt chunk now runs `spec=True` (before: the final chunk only), so each
+chunk's replay returns the per-position hidden; for chunk [s, s+n) the MTP steps are t = s..min(s+n−1, P−2) — the last
+prompt step needs tok_P, the anchor, so it stays draft()'s first call — i.e. `n_mtp = min(n, P−1−s)` steps, inputs
+`prefill_result[1][:, :n_mtp]` (host-known width, T4.66h/j) and `tokens[s+1 : s+1+n_mtp]`, slots s+1... The call is
+realized (dispatched) before the next chunk's replay of the same jit key overwrites that frozen output buffer; from_gguf
+places mtp_head on the last block's device, so the device queue keeps that order without a host sync.
+
+After each accept: the draft chain wrote slots start_pos..start_pos+k−1 from (h_last, chunk_ids[i]) — token-correct
+for i ≤ m but with the anchor's hidden at every step — so slots start_pos+1..start_pos+m are rewritten from
+`verify_h[:, :m]` (VERIFY's own per-position hidden on a full accept; REDO's — same jit key, same frozen object — on a
+partial one) and `chunk_ids[1:m+1]`. Slot start_pos was already right; m == k also fills the bonus token's slot, which
+no draft writes. One `prefill()` dispatch per accept, inside `state_assign_ms`.
+
+Symbolic width: one `mtp_toks` Variable (bound = the prefill chunk width, ≥ k+1) and one `mtp_pos` slot Variable give ONE
+precompiled block trace for every prompt-chunk width and every rewrite width (the T4.66 lesson: a plain int would retrace
+per distinct value). Gotcha found on the way: a `pad_to` folded straight into a symbolic-range kernel is a gated load the
+range simplifier rejects (`codegen/simplify.py mark_gated` → `.val` on the bound PARAM; the very first norm kernel), so h's
+pad is materialized by its own concrete copy kernel first (`.contiguous()`, one small kernel per distinct width) and the
+token row is built padded on the host — the main prefill's own `tokens.contiguous()` pattern.
+
+State cache: `snapshot_state` now includes the MTP block's live cache slice [:pos] (`mtp_cache_kv`) and `restore_state`
+writes it back — without it a cache hit would leave the draft head attending over whatever the previous request left.
+One slot per restored request stays unfilled: `pos` itself (step pos−1 needs h_{pos−1}, which a cache hit never
+recomputes) — one stale key among thousands; quality-only. Warmup's dummy prompt is [0, 0] (was [0]) so the prefill trace
+is warmed before the first real request; the post-warmup cache zeroing is unchanged.
+
+Cost (Qwen3.8-27B-class, per prompt token): one extra block forward (the MTP block: ~1/64 of the main model ≈ 1.6%) plus
+the full per-position output projection on every chunk (was final-chunk only; D×vocab×2 ≈ 1.2 GFLOP/token vs ~54 for the
+model ≈ 2%) — ~3–4% of prefill total; ponytail ceiling: a hidden-only spec mode (third jit key + its warmup) would
+return the 2%. Memory: the (1, chunk, D) f32 pad buffer per chunk (0.5 MB at chunk 32) and, per state-cache snapshot, the
+MTP block's slice (n_kv_heads × pos × head_dim × 2 × 2 B: ~78 MB at 19k tokens for an 8-head/128-dim block, ~+10% on
+top of the main snapshot). Decode: one prefill() dispatch per accept (m ≤ k rows) — microseconds of device work.
+
+Hardware validation: same invocation as before (`POOLED_MTP=1 POOLED_ENV="SPEC_STATS=1 SPEC_TRACE=1 SPEC_TOKENS=3
+NV_DISPATCH_RING=64"`, attempt-2 map, ctx 65536, Qwen3.8-27B Q8) on this branch; read the essay CONTENT (must stay the
+same correct text — the main model is untouched) and `accept_len_hist` (the draft head now sees the prompt: expect the
+chained positions to recover; the 8% full-chain b..j figure is the baseline).
