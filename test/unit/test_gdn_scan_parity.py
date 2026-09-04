@@ -25,6 +25,7 @@ from tinygrad import Tensor, nn
 from tinygrad.helpers import Context
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerConfig, GDN_SCAN_LOOP, GDN_SCAN_WY, gdn_scan_impl_for, gdn_last_scan_impl,
+  _gdn_tri_inverse, gdn_scan_wy,
 )
 
 GEOMETRIES = {
@@ -287,6 +288,83 @@ class TestGDNScanRealWeightUnderflow(unittest.TestCase):
     self.assertTrue(np.isfinite(rec_wy).all(), "T4.73c regression: WY recurrent_state went non-finite")
     np.testing.assert_allclose(out_wy, out_loop, rtol=self.RTOL2, atol=self.ATOL2, err_msg="WY vs loop output")
     np.testing.assert_allclose(rec_wy, snapshot(block_loop)[1], rtol=self.RTOL2, atol=self.ATOL2, err_msg="WY vs loop recurrent_state")
+
+class TestGDNScanHighBetaCollinearAmplification(unittest.TestCase):
+  """T4.73d regression -- see FIXNOTES_T473D.md and extra/wy_content_amplification_repro.py for the full
+  hardware diagnosis (a real WY_DUMP_AMAX capture from qwen3.8-27B blk44). Real blk44 head 25's beta values
+  for one chunk of a paragraph-repeated prompt (hardcoded below, all 32 real values) are uniformly high
+  (0.87-0.99); combined with near-collinear keys (this content's real per-chunk key cosine similarity:
+  mean~0.96, max~0.999 -- "one paragraph repeated" produces highly correlated key vectors within a chunk;
+  reconstructed here as a synthetic base-vector-plus-small-noise pattern at the real K=128 dim, not the
+  literal real k matrix, since _gdn_tri_inverse only ever sees m = beta * strictly_lower(k @ k.T), never k
+  itself), this drove the pre-T4.73d Neumann-series DOUBLING _gdn_tri_inverse to compute an inverse matrix
+  several times too large (an intermediate power transiently reaching ~1e7-1e8 before nilpotency forces
+  exact cancellation down to the true, bounded ~1.0 answer -- float32's ~7 significant digits cannot
+  represent that cancellation). This propagated into a real hardware amplification of GatedDeltaNetBlock's
+  recurrent_state (~x7 in one chunk, compounding to fp32 Inf by chunk 132 of a longer prompt).
+
+  Manually verified: reverting ONLY _gdn_tri_inverse to the retired doubling algorithm (kept inline in
+  extra/wy_content_amplification_repro.py for comparison) makes both tests below FAIL; the current
+  block-recursive-halving implementation PASSES both, matching a float64 forward-substitution reference to
+  float32 precision."""
+  # real beta, qwen3.8-27B blk44 head 25, chunk 3 of extra/t473d_payloads/p8k_x4.json's traced prefill
+  # (WY_DUMP_AMAX=5 dump, preoverflow_chunk3_blk44.safetensors) -- exact values, not rounded
+  BETA = [0.914062, 0.98291, 0.916504, 0.96582, 0.955078, 0.948242, 0.965332, 0.946289, 0.985352, 0.953613,
+          0.978027, 0.967773, 0.956055, 0.967773, 0.928223, 0.985352, 0.876953, 0.963379, 0.921875, 0.97998,
+          0.978027, 0.937012, 0.9375, 0.985352, 0.936035, 0.985352, 0.949219, 0.92334, 0.97998, 0.873535,
+          0.977051, 0.988281]
+  K_DIM = 128  # real head_k_dim==head_v_dim for the "38" geometry above
+
+  def _near_collinear_keys(self) -> np.ndarray:
+    # a base unit vector plus small per-step noise reproduces this content's ~0.96 mean pairwise cosine
+    # similarity (real, measured against the dump -- see the docstring above) without embedding the
+    # literal 32x128 real key matrix.
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal(self.K_DIM)
+    base /= np.linalg.norm(base)
+    k = np.stack([base + 0.03 * rng.standard_normal(self.K_DIM) for _ in range(len(self.BETA))])
+    return k / np.linalg.norm(k, axis=-1, keepdims=True)
+
+  def test_tri_inverse_matches_forward_substitution_reference(self):
+    k, beta, T = self._near_collinear_keys(), np.array(self.BETA), len(self.BETA)
+    strict_lower = (np.arange(T)[None, :] < np.arange(T)[:, None]).astype(np.float64)
+    m64 = beta[:, None] * ((k.astype(np.float64) @ k.astype(np.float64).T) * strict_lower)
+    self.assertGreater(np.abs(m64).max(), 0.5, "test setup sanity: m should have large (high-beta/collinear) entries")
+    # float64 forward substitution: the textbook-stable ground truth for a unit-lower-triangular solve,
+    # used only as an independent reference here -- never as the production fix (see _gdn_tri_inverse's
+    # docstring for why: it's the same O(C)-sequential-steps shape T4.69a moved away from for kernel count).
+    a = np.eye(T) + m64
+    ref = np.zeros((T, T))
+    for col in range(T):
+      b, x = np.eye(T)[:, col], np.zeros(T)
+      for row in range(T): x[row] = b[row] - a[row, :row] @ x[:row]
+      ref[:, col] = x
+    got = _gdn_tri_inverse(Tensor(m64.reshape(1, 1, T, T).astype(np.float32))).numpy().reshape(T, T)
+    np.testing.assert_allclose(got, ref, rtol=1e-3, atol=1e-3,
+      err_msg="T4.73d regression: _gdn_tri_inverse diverged from the exact forward-substitution reference "
+              "-- the doubling-era catastrophic-cancellation bug is back")
+
+  def test_full_scan_matches_loop_from_zero_state(self):
+    # the bug is visible even from a ZERO carried-in state (rhs = beta*(v - a_bar*k@state.T) collapses to
+    # beta*v, but the tri-inverse it's multiplied by is already wrong regardless of state) -- no need to
+    # fabricate a large incoming state to see gdn_scan_wy diverge from the loop here.
+    T, K = len(self.BETA), self.K_DIM
+    k_np = self._near_collinear_keys()
+    rng = np.random.default_rng(1)
+    q_np, v_np = rng.standard_normal((T, K)) * 0.1, rng.standard_normal((T, K)) * 0.3
+    beta_np, alpha_np = np.array(self.BETA), np.full(T, 0.99)  # alpha near 1: a "remembering" head, like the real one
+    q, k, v = (Tensor(a.reshape(1, 1, T, K).astype(np.float32)) for a in (q_np, k_np, v_np))
+    beta, alpha = Tensor(beta_np.reshape(1, 1, T).astype(np.float32)), Tensor(alpha_np.reshape(1, 1, T, 1).astype(np.float32))
+    final_state, _ = gdn_scan_wy(Tensor.zeros(1, 1, K, K), q, k, v, beta, alpha)
+    final_state = final_state.realize().numpy()[0, 0]
+
+    loop_state = np.zeros((K, K))
+    for t in range(T):
+      loop_state = (alpha_np[t] * (loop_state @ (np.eye(K) - beta_np[t] * np.outer(k_np[t], k_np[t])))
+                    + beta_np[t] * np.outer(v_np[t], k_np[t]))
+    np.testing.assert_allclose(final_state, loop_state, rtol=1e-2, atol=1e-2,
+      err_msg="T4.73d regression: gdn_scan_wy diverged from the sequential loop on high-beta/near-collinear "
+              "content -- the doubling-era tri-inverse amplification bug is back")
 
 if __name__ == "__main__":
   unittest.main()
