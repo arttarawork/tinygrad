@@ -2,7 +2,8 @@ import contextlib, io, re, unittest
 from dataclasses import replace
 from unittest.mock import Mock
 import numpy as np
-from tinygrad import Tensor, nn
+from typing import cast
+from tinygrad import Tensor, nn, UOp
 from tinygrad.helpers import Context, next_power2
 from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
@@ -683,10 +684,10 @@ class TestWarmupAnchorShift(unittest.TestCase):
   "length 1, so position 0" and silently returns warmup's OWN single-token anchor instead of the real prompt's
   own last position; the underlying BUFFER holds fully correct per-position data throughout (confirmed
   per-position with concrete, non-negative indices) -- only the negative index's length-dependent resolution
-  is stale. The fix mirrors VERIFY's own already-established safe idiom a few hundred lines down in the same
-  function (pad/slice using a host-known int, never a jit-returned tensor's own reported length): `n_toks`
+  is stale. The fix: slice with a host-known int, never a jit-returned tensor's own reported length -- `n_toks`
   (the plain Python int already tracking the width of the chunk that produced tok_all/h_last) replaces both
-  `-1:` reads.
+  `-1:` reads. (VERIFY's own `.pad_to(...)`-then-`[:n]` read, which this fix originally cited as the safe idiom,
+  had the same hole one layer deeper -- see TestStaleReplayShape, T4.66j.)
 
   Production exposure: tinygrad/llm/cli.py's `main()` calls `model.warmup()` unconditionally before serving
   any request, and serves real prompts through speculative_generate() whenever MTP is enabled -- there is no
@@ -727,27 +728,78 @@ class TestWarmupAnchorShift(unittest.TestCase):
             got = _run(warm, prompt, 1, spec=False)
           self.assertEqual(got, ref, f"{gdn_chunk=} {prompt=}: plain warmup() shifted generate()'s own anchor")
 
+def _split(ref:Transformer) -> Transformer:
+  """A CPU:0/CPU:1 device-map copy of `ref` (mtp_head on the last block's device), weights shared."""
+  cfg = ref.blk[0].config
+  m = Transformer(cfg, device_map="CPU:0,CPU:1")
+  m.mtp_head = MTPHead(replace(cfg, qk_norm=cfg.head_dim), TransformerBlock)
+  for p in nn.state.get_parameters(m.mtp_head): p.to_(m.blk[-1].device)
+  nn.state.load_state_dict(m, nn.state.get_state_dict(ref), verbose=False, realize=False)
+  m.realize_placement()
+  return m
+
+def _spec_call(m:Transformer, ids:list[int], nt:int, bound:int) -> tuple[Tensor, Tensor]:
+  """One direct spec=True main-model call at width `nt` under a "toks" Variable bounded by `bound` -- i.e. the
+  jit key (True, True, bound, True) speculative_generate's VERIFY/REDO use when verify_chunk == bound."""
+  v_sp, v_t = UOp.variable("start_pos", 0, m.max_context - 1), UOp.variable("toks", 1, bound)
+  t = Tensor([ids[:nt] + [0] * (bound - nt)], dtype="int32", device=m.blk[0].device)
+  return cast(tuple[Tensor, Tensor], m(t[:, :v_t.bind(nt)], v_sp.bind(0), None, spec=True))
+
 class TestWarmupSplitTokenIdentity(unittest.TestCase):
   """T4.66i: the guard that would have flagged the T4.66e..g hardware garbage -- speculative_generate AFTER a
   full warmup() (plain + spec dummies) on a real CPU:0/CPU:1 split must be token-identical to a fresh model's
-  plain generate(). NOTE: on CPU this passes before and after the T4.66h/i slice fixes (CPU resolves the
-  replayed output's negative slice correctly; the hardware stack did not) -- it guards the contract, it cannot
-  reproduce the device-specific failure."""
+  plain generate(). NOTE: whether this can fail on CPU depends on what width warmup()'s own dummy run happens
+  to capture the VERIFY/REDO key at -- here its second-ever call is VERIFY at the full k+1 (confirmed: the
+  captured "toks" bound reads 4), so the stale-length reads below never bite; TestStaleReplayShape forces a
+  width-1 capture instead."""
   def test_warmup_then_spec_on_split_matches_fresh_generate(self):
     ref = _load_gdn(seed=0, max_context=64)
-    cfg = ref.blk[0].config
-    def split():
-      m = Transformer(cfg, device_map="CPU:0,CPU:1")
-      m.mtp_head = MTPHead(replace(cfg, qk_norm=cfg.head_dim), TransformerBlock)
-      for p in nn.state.get_parameters(m.mtp_head): p.to_(m.blk[-1].device)
-      nn.state.load_state_dict(m, nn.state.get_state_dict(ref), verbose=False, realize=False)
-      m.realize_placement()
-      return m
     for prompt in ([5, 2, 3, 4], [0, 2, 3, 4]):
-      want = _run(split(), prompt, 8, spec=False)
-      m = split()
+      want = _run(_split(ref), prompt, 8, spec=False)
+      m = _split(ref)
       m.warmup()
       self.assertEqual(_run(m, prompt, 8, spec=True), want, f"{prompt=}")
+
+class TestStaleReplayShape(unittest.TestCase):
+  """T4.66j: the hardware run after T4.66h/i had the anchor right but the essay laced with id 0 ("!" in Qwen's
+  vocab) at accept boundaries, accept length capped at 2. Same mechanism as T4.66h, one reader further down: a
+  replayed jit key returns its CAPTURE call's frozen Tensors, whose symbolic "toks" length stays bound to the
+  capture width (REDO on warmup()'s first partial accept captures VERIFY's key at m+1 = 1..k), while the buffer
+  underneath is sized to the bound and holds all n real positions. VERIFY's `argmax(-1).pad_to((1, verify_chunk))
+  .tolist()[0][:n]` padded FROM that stale length, so every position >= the capture width read back as a pad
+  ZERO -- emitted as the bonus/correction token and never equal to a draft. Fixed by reading VERIFY's outputs
+  through `verify_logits[:, :n]` (a concrete-shaped shrink bounded by the host-known n; batch 1 keeps its data
+  offsets free of "toks") -- both greedy ids and the sampled path's per-position distributions.
+
+  Both tests force the condition deterministically: capture the k=3 VERIFY/REDO key (True, True, 4, True) at
+  width 1 with two direct calls (cnt=0 eager, cnt=1 capture -- engine/jit.py), then use it at width 4."""
+
+  def test_verify_after_width1_capture_matches_fresh_generate(self):
+    ref = _load_gdn(seed=0, max_context=64)
+    prompt = [5, 2, 3, 4]
+    want = _run(_split(ref), prompt, 12, spec=False)
+    self.assertNotIn(0, want)  # so a pad zero leaking into the emitted stream is visible below, not just a mismatch
+    m = _split(ref)
+    for _ in range(2): Tensor.realize(*_spec_call(m, prompt, nt=1, bound=4))
+    self.assertEqual(m.jit[(True, True, 4, True)].cnt, 2, "VERIFY/REDO key must be captured (at width 1) before the real run")
+    got = _run(m, prompt, 12, spec=True, k=3)  # pre-fix: [7, 1, 7, 1, 7, 1, 7, 0, 2, 2, 2, 2] -- id 0, then divergence
+    self.assertNotIn(0, got, f"{got=}: a pad zero reached the emitted stream")
+    self.assertEqual(got, want)
+
+  def test_replayed_outputs_read_through_host_known_width(self):
+    # the mechanism itself, for both spec=True outputs: after a width-1 capture, a width-4 replay's [:, :4] view
+    # matches a fresh (eager, correctly-shaped) call at every position; the frozen shape's negative index does not.
+    ref = _load_gdn(seed=0, max_context=64)
+    prompt = [5, 2, 3, 4]
+    m, fresh = _split(ref), _split(ref)
+    for _ in range(2): Tensor.realize(*_spec_call(m, prompt, nt=1, bound=4))
+    r_logits, r_h = _spec_call(m, prompt, nt=4, bound=4)  # replay: reported length stays at the capture's 1
+    f_logits, f_h = _spec_call(fresh, prompt, nt=4, bound=4)  # cnt=0: eager, shape bound to this call's own 4
+    np.testing.assert_allclose(r_logits[:, :4].numpy(), f_logits[:, :4].numpy(), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(r_h[:, :4].numpy(), f_h[:, :4].numpy(), rtol=1e-5, atol=1e-6)
+    self.assertEqual(r_logits[:, :4].argmax(-1).tolist(), f_logits[:, :4].argmax(-1).tolist())
+    # the stale reported length, made visible: -1: on the replay is position 0, not the real last position
+    self.assertGreater(float(np.abs(r_h[:, -1:].numpy() - f_h[:, 3:4].numpy()).max()), 1e-3)
 
 if __name__ == '__main__':
   unittest.main()

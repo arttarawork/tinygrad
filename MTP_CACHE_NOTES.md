@@ -19,9 +19,10 @@
   as realized zeros (`/tmp`-probe: after two drafts `uop.op=RESHAPE realized=True`, written positions non-zero,
   untouched positions 0). `_function.__call__` re-traces the body every call and binds the CURRENT implicit
   buffers (tinygrad/function.py:36-68), so a recreated cache is never a stale-buffer hazard at that layer.
-- What CPU cannot show: on CPU the replayed output's `-1:` resolves correctly (my shape oracle:
-  `-1:` == `pos n-1` fresh and warmed); the device stack resolved it as position 0. The positive-slice fix is
-  correct by construction on both, so CPU parity is not a reason to doubt it. **Hardware validation decides.**
+- ~~What CPU cannot show~~ CORRECTED by T4.66j (§5): CPU reproduces the stale replay shape exactly like the device;
+  my earlier shape oracle passed only because this tiny model full-accepts during warmup, so its VERIFY/REDO key
+  is captured at the full width and the stale length happens to equal the real one. Force the capture width
+  (§5) and CPU shows the whole failure, including the emitted id 0.
 
 Why 66g's delattr is still replaced (not reverted): delete-and-recreate frees a ~270 MB device buffer and
 reallocates it; a recycled allocation is not zero-filled on METAL/NV, `freqs_cis` is rebuilt, and every graph/
@@ -71,3 +72,40 @@ Serve the branch tip with MTP: `POOLED_TREE=<this worktree> POOLED_MTP=1 POOLED_
 (attempt-2 MTP map), then read the essay CONTENT (not its length): a real 192-token essay (~800 chars) with
 `SPEC_STATS` accept_len_hist showing full chains again. If the anchor is still position 0, the replay-shape
 mechanism has a second reader; if content is right but acceptance stays {2:…}, implement §2(a).
+
+## 5. T4.66j — the second reader: VERIFY's `pad_to` (hardware evidence → CPU reproduction → fix)
+Hardware after b..i (t466i @ 6ed6d20c2, METAL+NV, k=3): anchor correct ("Copper! A humble metal with a! Golden
+hue, copper has been!! A! …", 474 chars / 191 tokens) but laced with id 0 ("!") at accept boundaries;
+SPEC_STATS iters=92 emitted=191 avg_accept_len=2.08 hist={0:34, 1:18, 2:39, 3:1}; byte-identical across runs.
+
+Mechanism (same as 66h, one reader further down): `verify_logits, verify_h` are the VERIFY/REDO jit key's frozen
+capture-call Tensors. REDO on warmup()'s own first partial accept captures that key at width m+1 (1..k); the
+buffer underneath is sized to the bound (verify_chunk = 4) and holds all n real positions of every later replay,
+but the reported "toks" length stays bound to the capture width s. `argmax(-1).pad_to((1, verify_chunk))
+.tolist()[0][:n]` padded FROM s, so verify_ids[i] == 0 (pad) for every i >= s: emitted as the bonus/correction
+token (`accepted[-1] = verify_ids[m]`) and never equal to a draft, so m caps at s. The hardware histogram fits
+s = 2 (m=2 → "[d0, d1, 0]" 39 times; the single m=3 needed a drafted 0). The sampled path's
+`pad_to((1, verify_chunk, vocab))` had the identical hole (all-zero logits = uniform p past s).
+
+CPU reproduction (`TestStaleReplayShape`, CPU:0/CPU:1 split, tiny GDN model): capture the (True, True, 4, True)
+key at width 1 with two direct spec=True calls, then `speculative_generate(prompt, k=3)`:
+pre-fix `[7, 1, 7, 1, 7, 1, 7, 0, 2, 2, 2, 2]` (id 0, then divergence: the wrong token was fed to the state)
+vs fresh `generate()` `[7, 1, 7, 1, …]`. Directly on the replayed tensors: `pad_to` idiom `[10, 0, 0, 0]`,
+truth `[10, 2, 7, 7]`; `[:, :4]` view / per-position slices / the full-buffer view all `[10, 2, 7, 7]`;
+`h[:, 3:4]` == fresh, `h[:, -1:]` != fresh (the 66h mechanism, on CPU).
+
+Every host read of a spec=True jit output in speculative_generate, audited:
+| read | status |
+|---|---|
+| prefill tail `prefill_result[1][:, n_toks-1:n_toks]`, `tok_all[:, n_toks-1:n_toks]` | fixed 66h (positive, host-known) |
+| VERIFY greedy `argmax(-1).pad_to(...).tolist()[0][:n]` | **fixed 66j**: `verify_logits[:, :n].argmax(-1).tolist()` + `assert len == n` |
+| VERIFY sampled `pad_to((1, verify_chunk, vocab)).numpy()[0][:n]` | **fixed 66j**: `verify_logits[:, :n].numpy()[0]` |
+| full accept `tok_last = verify_ids_tensor[:, m:m+1]` | now a slice of the concrete (1, n) ids (was: of an argmax whose loop ran to s) |
+| full accept `verify_h[:, m:m+1]` | already safe (positive, m < bound) |
+| REDO `redo_h[:, len-1:len]` | fixed 66i |
+| DRAFT `dlogits[:, -1, :]`, `tok_last.cat(*draft_tensors)` | not jit outputs (mtp_head.draft is @function, re-traced per call; concrete (B,1,·)) |
+| generate()'s own `out` | concrete (B, vocab)/(B,1) inside the captured graph — never affected (66h's second test) |
+
+Why `[:, :n]` is safe: `_parse_view_index` clamps int slices against the Variable's **vmax** (the bound), not
+its bound value, and with batch 1 the shrunk view's data offsets are `i*vocab + v` — "toks" never enters them.
+Any read that derives a length/pad amount/negative index from the tensor's own shape is the unsafe class.

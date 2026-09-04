@@ -1691,9 +1691,10 @@ class Transformer:
         # object, whose lazy shape still carries THAT capture call's own bound value -- confirmed by printing
         # prefill_result[*].shape[1]'s UOp: after warmup (which captures this key at nt=1), a real multi-token
         # prompt's own replay reports shape[1]'s bound CONST as 1, not its own nt. `-1:` on such a tensor
-        # silently resolves against that stale length instead of raising (unlike VERIFY's own `.pad_to(...)`-
-        # then-slice-from-0 idiom a few hundred lines down, which never needs the length at all -- the same
-        # fix shape, applied here). Reproduced without any state-cache/get_start_pos involvement at all
+        # silently resolves against that stale length instead of raising (T4.66j: VERIFY's own `.pad_to(...)`
+        # read a few hundred lines down had the same hole -- it padded from the stale length, surfacing pad
+        # zeros as verify ids -- and now reads through the same host-known-width shape, `[:, :n]`).
+        # Reproduced without any state-cache/get_start_pos involvement at all
         # (get_start_pos returned 0, no splice): a warm model's own real request read back WARMUP's own
         # single-token anchor instead of its own last real position. `n_toks` is this iteration's real width
         # (the loop only assigns tok_all/h_last on its last iteration, so it's exactly right here); the
@@ -1814,15 +1815,22 @@ class Transformer:
         # temperature>0) a sampled accept/resample per spec_accept. Both branches produce `accepted`
         # (== chunk_ids[1:1+m] + [that extra token], always m+1 long) and `tok_last` (the new chain anchor).
         if trace_on: accept_t0 = time.perf_counter()
+        # T4.66j: every host read of VERIFY's outputs goes through ONE view bounded by the host-known `n`, never
+        # by the tensors' own reported length. verify_logits/verify_h are a REPLAYED jit key's frozen return
+        # objects (see the T4.66h comment on the prefill tail above): their symbolic "toks" dim stays bound to
+        # whatever width the key's CAPTURE call had -- REDO on warmup()'s own first partial accept captures it at
+        # m+1 (1..k) -- while the buffer underneath is sized to the bound (verify_chunk) and holds this call's own
+        # n real positions. The old `argmax(-1).pad_to((1, verify_chunk)).tolist()[0][:n]` idiom padded FROM that
+        # stale length, so every position >= the capture width came back as a pad ZERO: emitted as the bonus/
+        # correction token (id 0 -- Qwen's "!" -- laced through the hardware essay) and never matching a draft
+        # (the accept length capped at the capture width). Reproduced on CPU:0/CPU:1 with the key captured at
+        # width 1 (test_spec_decode.py's TestStaleReplayShape). `[:, :n]` is a concrete-shaped shrink whose data
+        # offsets never involve "toks" (batch is 1) -- the same host-known-int shape the T4.66h/i slice fixes use.
+        verify_logits_n = verify_logits[:, :n]  # (1, n, vocab), concrete shape
         if greedy:
-          # verify_logits' own shape is still the bound-but-symbolic `nt` (unlike tok_last/draft ids, which are
-          # always concrete-shaped size-1 slices) -- a symbolic-shaped tensor has no .tolist()/.numpy() (see
-          # TestCausalMask.test_symbolic_shapes in test_attention.py for the same pad-then-slice idiom): argmax
-          # it down to ids first (the same op forward() used to do internally, pre-T4.65), then pad up to the
-          # fixed verify_chunk buffer width (T4.66e: this tensor's own bound, not the prefill chunk_size),
-          # then take just the first n (live) values back on host.
-          verify_ids_tensor = verify_logits.argmax(-1)  # (1, nt) ids
-          verify_ids: list[int] = cast(list[list[int]], verify_ids_tensor.pad_to((1, verify_chunk)).tolist())[0][:n]  # [i] predicts start_pos+1+i
+          verify_ids_tensor = verify_logits_n.argmax(-1)  # (1, n) ids
+          verify_ids: list[int] = cast(list[list[int]], verify_ids_tensor.tolist())[0]  # [i] predicts start_pos+1+i
+          assert len(verify_ids) == n, f"{len(verify_ids)=} != {n=}"  # every emitted id below comes from this n-bounded read
           # verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to draft
           # d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
           # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
@@ -1832,11 +1840,11 @@ class Transformer:
           accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
           tok_last = verify_ids_tensor[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
         else:
-          # same symbolic-shape reasoning as the greedy branch (pad before pulling to host), but here we need
-          # the full per-position distributions, not just the argmax -- pad_to is a no-op on the already-fixed
-          # vocab axis, only the symbolic `nt` axis actually gets padded.
+          # same n-bounded view as the greedy branch (T4.66j -- the old `.pad_to((1, verify_chunk, vocab))` read
+          # had the identical stale-length hole: all-zero logits, i.e. a UNIFORM p, at every position past the
+          # capture width), but here we need the full per-position distributions, not just the argmax.
           vocab = int(verify_logits.shape[-1])  # never symbolic (only the T axis is) -- int() just satisfies mypy's sint=int|UOp
-          verify_np = verify_logits.pad_to((1, verify_chunk, vocab)).numpy()[0][:n]  # (n, vocab)
+          verify_np = verify_logits_n.numpy()[0]  # (n, vocab)
           p_probs = _softmax_np(verify_np, temperature)
           q_probs = np.stack(q_list) if q_list else np.empty((0, vocab))
           accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
