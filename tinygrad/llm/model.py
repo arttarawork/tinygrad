@@ -101,9 +101,21 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
     O   = Abar * (Q @ S0^T + tril(Q K^T, 0) @ U)                  -- (C,V), row i = out_i
     S_C = Abar[-1] * (S0 + U^T @ K)                                -- state leaving the chunk
   `alpha` may be a per-head scalar (last dim 1, broadcasts across V -- non-kda) or per-value-channel (last
-  dim V -- kda): nothing above assumes which, so kda needs no special-casing here (empirically verified:
-  test_attention.py's test_varied_chunk_sizes_match_decode(kda=True) runs under GDN_SCAN_IMPL=2 too; the
-  "38" geometry in test_gdn_scan_parity.py does NOT set kda, so that file's coverage is non-kda-only).
+  dim V -- kda). The tilde form above (dividing v by the cumulative Abar) is used AS-IS for kda, unchanged
+  since T4.69a -- test_attention.py's test_varied_chunk_sizes_match_decode(kda=True) still exercises it.
+
+  T4.73c: for non-kda, dividing by Abar (a product accumulated from the CHUNK START) is numerically unsafe
+  at real trained weights -- a fast-decaying head's Abar can underflow past float32's range within one
+  chunk, and multiplying back by Abar afterward does not cancel a division-by-0/overflow (see
+  FIXNOTES_T473C.md for the full real-weight diagnosis: qwen3.8-27B blk.0 head 42/48). Fixed below by an
+  EXACT reformulation (not an approximation -- the new pseudo-value w relates to the old u by w_j = Abar_j
+  * u_j pointwise) that never divides by Abar: every place decay appears is either a bounded PAIRWISE ratio
+  exp(G_i-G_j) for i>=j (in (0,1], since the cumulative log-decay G is non-increasing -- masked to exactly
+  0 for invalid (j>i) pairs by masking the exponent BEFORE exp, so it can never overflow either), or the
+  absolute exp(G_i) used strictly as a MULTIPLIER (safe to underflow to 0 -- that just means "fully
+  decayed", never a divisor). Only non-kda's scalar-per-head alpha makes this ratio foldable into a plain
+  (T,T) matrix shared across V channels; kda's per-channel Abar would need a (T,T,V) coupling/tri-solve
+  (untested cost, and kda is not established broken), so that path is untouched below.
 
   Shapes (all float32; T_pad is the WHOLE chunk -- one WY block, no further sub-chunking needed since
   GDN_CHUNK's practical ceiling (32) is already tiny for a log-depth triangular solve; padded steps are
@@ -114,7 +126,35 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
   T = q.shape[2]
   idx = Tensor.arange(T, dtype=dtypes.int32).clone(q.device)
   row, col = idx.reshape(T, 1), idx.reshape(1, T)
-  strict_lower, lower_incl = (col < row).float(), (col <= row).float()
+  strict_lower_b, lower_incl_b = col < row, col <= row
+
+  if alpha.shape[-1] == 1:  # non-kda: T4.73c safe path (see docstring addendum + FIXNOTES_T473C.md)
+    g = alpha[..., 0].float().maximum(1e-30).log()                      # (B,H,T) per-step log-decay, always finite
+    # (this floor is per-STEP, not cumulative -- only engages if a single raw step's alpha underflows to
+    # exact float32 0 on its own, which real weights here never do (observed min 5.44e-4); a defensive
+    # floor, not the fix -- the fix is never dividing by the CUMULATIVE product at all, see below)
+    G = g.cumsum(axis=2)                                                # (B,H,T) cumulative log-decay through step i
+    # NOT clamped to <=0: alpha (hence diff=G_i-G_j for the valid j<=i region) is a GATE, not guaranteed
+    # <=1 -- e.g. this file's own random-init tests draw ssm_a from randn() (can be positive, i.e. genuine
+    # per-step growth, alpha>1) -- clamping would silently cap real growth and diverge from the loop, which
+    # applies no such cap. Only the INVALID (j>i) region needs forcing to exactly 0, via the -1e30 sentinel
+    # below (masking BEFORE exp, not clamping diff), so _gdn_tri_inverse's bit-exact triangularity holds.
+    diff = G.unsqueeze(-1) - G.unsqueeze(-2)                             # (B,H,T,T) G_i-G_j, valid region only
+    ratio_incl = lower_incl_b.where(diff, -1e30).exp()                  # (B,H,T,T) exp(G_i-G_j), j<=i; else exactly 0
+    ratio_strict = strict_lower_b.where(diff, -1e30).exp()              # same, j<i only (feeds the tri-solve)
+    a_bar = G.exp().unsqueeze(-1)                                       # (B,H,T,1) Abar -- ONLY ever a multiplier below
+    kkt = (k @ k.transpose(-1, -2)) * ratio_strict                      # (B,H,T,T), decay folded in directly
+    m = beta.unsqueeze(-1) * kkt                                        # row i scaled by beta_i (Beta @ T)
+    rhs = beta.unsqueeze(-1) * (v - a_bar * (k @ state.transpose(-1, -2)))  # (B,H,T,V) -- v used RAW, no division
+    w = _gdn_tri_inverse(m) @ rhs                                       # (B,H,T,V) pseudo-values (undecayed form)
+    qk = (q @ k.transpose(-1, -2)) * ratio_incl                         # (B,H,T,T), decay folded in directly
+    out = a_bar * (q @ state.transpose(-1, -2)) + qk @ w                # (B,H,T,V) -- a_bar multiplies only the S0 term
+    tail_ratio = ratio_incl[:, :, T - 1:T, :].transpose(-1, -2)         # (B,H,T,1): exp(G_{T-1}-G_j) per row j
+    final_state = a_bar[:, :, T - 1, :].unsqueeze(-1) * state + (tail_ratio * w).transpose(-1, -2) @ k  # (B,H,V,K)
+    return final_state, out.transpose(1, 2)                            # (B,T,H,V)
+
+  # kda: unchanged since T4.69a (per-value-channel alpha; not established broken -- see docstring addendum)
+  strict_lower, lower_incl = strict_lower_b.float(), lower_incl_b.float()
   a_bar = alpha.cumprod(axis=2)                                          # (B,H,T,V|1), decay through step i
   v_tilde = v / a_bar                                                    # decay-normalized values
   kkt = (k @ k.transpose(-1, -2)) * strict_lower                         # (B,H,T,T), strictly lower

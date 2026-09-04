@@ -238,5 +238,55 @@ class TestGDNScanSingleStepGate(unittest.TestCase):
       np.testing.assert_array_equal(conv_wy, conv_loop, err_msg=f"{name=} conv_state")
       np.testing.assert_array_equal(rec_wy, rec_loop, err_msg=f"{name=} recurrent_state")
 
+class TestGDNScanRealWeightUnderflow(unittest.TestCase):
+  """T4.73c regression -- see FIXNOTES_T473C.md for the full diagnosis. At REAL trained qwen3.8-27B blk.0
+  weights, head 42 of 48 decays fast enough (learned ssm_a=-0.337646, ssm_dt.bias=14.875 -- the next-most-
+  aggressive real head's ssm_a is -0.131226, under half that magnitude) that its cumulative decay (a_bar)
+  underflows to an EXACT float32 0.0 within one 32-token chunk (observed on the real weights: a_bar[16]=
+  1.121e-44 (a denormal) -> a_bar[17]=0.0). gdn_scan_wy's pre-T4.73c formula divided v by that a_bar
+  (v_tilde = v/a_bar) -> Inf, and the causal mask -- implemented as `* strict_lower`/`* lower_incl`, i.e. a
+  plain elementwise multiply, where 0*Inf=NaN, not 0 -- spread that NaN to EVERY position of the affected
+  head and, via the shared ssm_out projection, to the entire block output. Confirmed on the real GGUF via
+  extra/wy_numerics_repro.py + extra/extract_blk0_real.py (not runnable in CI -- needs the 27GB file):
+  pre-fix, GDN_SCAN_IMPL=2 produced exactly 16384 NaNs (one full head, 786432/48 elements) in
+  recurrent_state while GDN_SCAN_IMPL=1 (the loop) stayed clean; post-fix, both are clean and agree.
+
+  This test reproduces the SAME regime with only those two hardcoded real scalars overridden (no GGUF
+  needed in CI, everything else stays make_block's usual small random init) -- they alone drive head 42's
+  per-step alpha down to ~6.6e-3 regardless of input (softplus(x+dt_bias) is dominated by dt_bias=14.875 at
+  this input scale), comfortably enough to underflow a_bar well before chunk position 32 (the real model's
+  observed low was 5.44e-4/step -- real activations push it even lower, so this hardcoded setup is a
+  gentler trigger than the real weights, not a cherry-picked worst case).
+
+  Manually verified both ways (see the T4.73c report): reverting the fix (restoring gdn_scan_wy's
+  `v_tilde = v / a_bar` non-kda form) makes this test's finiteness assertions FAIL (non-finite output and
+  recurrent_state); with the fix in place, it PASSES and WY's output/state agree with the loop within
+  RTOL2/ATOL2 below -- looser than the module's RTOL/ATOL because this file's real magnitudes (state
+  values here reach ~O(20)) reassociate float32 addition order much more visibly than the random-init
+  suite's O(1) values do (measured gap ~3e-4 relative / ~6e-3 absolute on this exact setup -- not
+  concentrated on head 42 itself, which is correctly near-zero from full decay, but on ordinary heads
+  whose larger accumulated state is more sensitive to the WY chunked reassociation vs. the sequential
+  loop's rounding order)."""
+  RTOL2, ATOL2 = 1e-2, 1e-2
+
+  def _patched_block(self) -> GatedDeltaNetBlock:
+    block = make_block(GEOMETRIES["38"])  # 48 heads -- head index 42 must exist
+    a, bias = block.ssm_a.numpy(), block.ssm_dt["bias"].numpy()
+    a[42], bias[42] = -0.337646, 14.875  # T4.73c real magnitudes, extra/blk0_real.safetensors
+    Tensor.realize(block.ssm_a.replace(Tensor(a, dtype=block.ssm_a.dtype)),
+                   block.ssm_dt["bias"].replace(Tensor(bias, dtype=block.ssm_dt["bias"].dtype)))
+    return block
+
+  def test_underflowing_real_head_stays_finite_and_matches_loop(self):
+    x = (Tensor.randn(1, 32, DIM) * 0.1).realize()  # GDN_CHUNK's practical ceiling -- the real bug's chunk width
+    block_wy, block_loop = self._patched_block(), self._patched_block()
+    with Context(GDN_SCAN_IMPL=GDN_SCAN_WY, GDN_CHUNK=32): out_wy = run_attention(block_wy, x, 0)
+    with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP, GDN_CHUNK=32): out_loop = run_attention(block_loop, x, 0)
+    _, rec_wy = snapshot(block_wy)
+    self.assertTrue(np.isfinite(out_wy).all(), "T4.73c regression: WY output went non-finite (a_bar-underflow division bug is back)")
+    self.assertTrue(np.isfinite(rec_wy).all(), "T4.73c regression: WY recurrent_state went non-finite")
+    np.testing.assert_allclose(out_wy, out_loop, rtol=self.RTOL2, atol=self.ATOL2, err_msg="WY vs loop output")
+    np.testing.assert_allclose(rec_wy, snapshot(block_loop)[1], rtol=self.RTOL2, atol=self.ATOL2, err_msg="WY vs loop recurrent_state")
+
 if __name__ == "__main__":
   unittest.main()
