@@ -1407,8 +1407,12 @@ class Transformer:
       # why it retraces per call) on the first real request, same as if warmup had never run speculative
       # decoding at all. freqs_cis is NOT reset: it's a pure function of config (rope_dim/max_context/
       # rope_theta/yarn), never session data, so nothing to pollute.
+      # T4.66i: zero it IN PLACE instead of delattr+recreate -- same object identity for every captured graph and
+      # precompiled CALL that references it, no free/realloc on the device (a recycled allocation is never
+      # zero-filled on METAL/NV), and no freqs_cis churn; the intent (no warmup K/V left for real drafts to
+      # attend to) is unchanged.
       for attr in ("cache_kv", "cache_k"):
-        if hasattr(self.mtp_head.block, attr): delattr(self.mtp_head.block, attr)
+        if hasattr(self.mtp_head.block, attr): (c:=getattr(self.mtp_head.block, attr)).assign(Tensor.zeros_like(c)).realize()
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -1914,7 +1918,7 @@ class Transformer:
           buf2 = Tensor(redo_ids + [0] * (verify_chunk - len(redo_ids)), dtype="int32", device=dev).reshape(1, verify_chunk)
           sp2, nt2 = v_start_pos.bind(start_pos), v_toks_verify.bind(len(redo_ids))
           _, redo_h = cast(tuple[Tensor, Tensor], self(buf2[:, :nt2], sp2, None, spec=True))
-          h_last = redo_h[:, -1:].contiguous()
+          h_last = redo_h[:, len(redo_ids) - 1:len(redo_ids)].contiguous()  # T4.66i: positive slice, same reason as the anchor (T4.66h)
         if trace_on: state_assign_ms = (time.perf_counter() - assign_t0) * 1000
 
         if stats_on:

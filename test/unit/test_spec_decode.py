@@ -630,10 +630,10 @@ class TestWarmupResetsMTPCache(unittest.TestCase):
   def test_warmup_leaves_no_cache_on_mtp_block(self):
     model = _load_gdn(seed=0, max_context=64)
     model.warmup()
-    for attr in ("cache_kv", "cache_k"):
-      self.assertFalse(hasattr(model.mtp_head.block, attr),
-                        f"warmup should leave mtp_head.block exactly as unused (no {attr}) as before it "
-                        "ever ran speculative decoding -- draft() rebuilds it fresh (all-zero) on first real use")
+    # T4.66i: the cache object survives (same identity for every graph that captured it) but holds no warmup K/V
+    self.assertTrue(hasattr(model.mtp_head.block, "cache_kv"))
+    self.assertEqual(float(model.mtp_head.block.cache_kv.float().abs().max().numpy()), 0.0,
+                     "warmup must leave mtp_head.block's cache all-zero: draft() must not attend to the dummy run's K/V")
 
   def test_stale_warmup_cache_measurably_changes_a_later_draft_call(self):
     # isolates JUST the cache leak: same h/tok_ids/start_pos both times (a position far from warmup's own
@@ -726,6 +726,28 @@ class TestWarmupAnchorShift(unittest.TestCase):
             warm.warmup()
             got = _run(warm, prompt, 1, spec=False)
           self.assertEqual(got, ref, f"{gdn_chunk=} {prompt=}: plain warmup() shifted generate()'s own anchor")
+
+class TestWarmupSplitTokenIdentity(unittest.TestCase):
+  """T4.66i: the guard that would have flagged the T4.66e..g hardware garbage -- speculative_generate AFTER a
+  full warmup() (plain + spec dummies) on a real CPU:0/CPU:1 split must be token-identical to a fresh model's
+  plain generate(). NOTE: on CPU this passes before and after the T4.66h/i slice fixes (CPU resolves the
+  replayed output's negative slice correctly; the hardware stack did not) -- it guards the contract, it cannot
+  reproduce the device-specific failure."""
+  def test_warmup_then_spec_on_split_matches_fresh_generate(self):
+    ref = _load_gdn(seed=0, max_context=64)
+    cfg = ref.blk[0].config
+    def split():
+      m = Transformer(cfg, device_map="CPU:0,CPU:1")
+      m.mtp_head = MTPHead(replace(cfg, qk_norm=cfg.head_dim), TransformerBlock)
+      for p in nn.state.get_parameters(m.mtp_head): p.to_(m.blk[-1].device)
+      nn.state.load_state_dict(m, nn.state.get_state_dict(ref), verbose=False, realize=False)
+      m.realize_placement()
+      return m
+    for prompt in ([5, 2, 3, 4], [0, 2, 3, 4]):
+      want = _run(split(), prompt, 8, spec=False)
+      m = split()
+      m.warmup()
+      self.assertEqual(_run(m, prompt, 8, spec=True), want, f"{prompt=}")
 
 if __name__ == '__main__':
   unittest.main()
