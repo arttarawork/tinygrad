@@ -3,7 +3,7 @@ from dataclasses import replace
 from unittest.mock import Mock
 import numpy as np
 from tinygrad import Tensor, nn
-from tinygrad.helpers import Context
+from tinygrad.helpers import Context, next_power2
 from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
@@ -420,6 +420,70 @@ class TestSpecAccept(unittest.TestCase):
       counts[accepted[0]] += 1                               # accepted[0] is the token AT the drafted position
     empirical = counts / n_trials
     np.testing.assert_allclose(empirical, p, atol=0.02)      # loose: ~7 sigma even at p's largest entry (0.40)
+
+class TestVerifyNativeWidth(unittest.TestCase):
+  """T4.66e: VERIFY (and REDO) get their own dedicated jit key + Variable (v_toks_verify, "verify_chunk" =
+  next_power2(k+1)) instead of sharing the prefill loop's wide (chunk_size, default 32) v_toks -- see
+  model.py's comments at v_toks_verify's own definition, and SPEC_VERIFY_NOTES.md for the full T_pad
+  derivation this test checks end to end (x.max_shape[1] inside GatedDeltaNetBlock._attention, which is
+  exactly the "toks" Variable's declared range once bound -- see uop/ops.py's to_max_shape/UOp.bind)."""
+
+  def test_verify_forward_gdn_scan_uses_verify_chunk_width(self):
+    k = 3
+    model = _load_gdn(seed=0, max_context=64)
+    t_pads: list[int] = []
+    orig_attention = GatedDeltaNetBlock._attention
+    def spy(self, x, start_pos, capture=False):
+      t_pads.append(x.max_shape[1])  # the exact expression _attention itself uses to compute T_pad
+      return orig_attention(self, x, start_pos, capture=capture)
+    GatedDeltaNetBlock._attention = spy
+    try:
+      # GDN_CHUNK=32 pins the prefill chunk width to the same 32 CLAUDE.md's real METAL/NV device maps
+      # auto-select (gdn_chunk_for's own default there) -- on the bare-CPU test device, gdn_chunk_for()
+      # would otherwise auto-narrow the PREFILL chunk to 1 (T4.55's non-GPU fallback), which happens to
+      # collapse chunk_size down to k+1 too and hide the very gap (32 vs verify_chunk) this test exists
+      # to check.
+      with Context(GDN_CHUNK=32):
+        gen = model.speculative_generate([1, 2, 3], k=k)
+        next(gen)  # prefill only -- its own tail chunk legitimately runs the GDN scan at chunk_size=32
+        t_pads.clear()  # only care about what happens from here: the outer loop's own VERIFY/REDO calls
+        next(gen)  # one full outer iteration: DRAFT + VERIFY (+ REDO on a partial accept), both spec=True
+    finally:
+      GatedDeltaNetBlock._attention = orig_attention
+    verify_chunk = next_power2(k + 1)
+    self.assertGreater(len(t_pads), 0, "VERIFY's forward should have run the GDN block's _attention at least once")
+    self.assertIn(verify_chunk, t_pads, f"expected a GDN scan at VERIFY_CHUNK={verify_chunk}, saw {sorted(set(t_pads))}")
+    self.assertNotIn(32, t_pads, "VERIFY/REDO must not still pad the GDN scan to the prefill chunk_size (32)")
+
+class TestSpecWarmup(unittest.TestCase):
+  """T4.66e deliverable 2: Transformer.warmup() only ever drove generate()'s own jit keys pre-T4.66e --
+  speculative_generate's spec=True keys (the prefill tail's, and VERIFY/REDO's own dedicated verify_chunk
+  one) were captured at REQUEST time instead (the T4.65 gap; recommended fix in T4.72). See warmup()'s own
+  comment for why each key needs calling TWICE (engine/jit.py _TinyJit.__call__: a key's first-ever call
+  just runs eagerly, no capture at all -- the capture that actually pays off on every later replay is the
+  SAME key's second call)."""
+
+  def test_warmup_captures_spec_keys_when_mtp_present(self):
+    model = _load_gdn(seed=0, max_context=64)
+    self.assertEqual(model.jit, {}, "nothing should be captured before warmup runs")
+    model.warmup()
+    spec_keys = [key for key in model.jit if key[3]]  # spec=True is the 4th (is_prefill, greedy, chunk_size, spec) slot
+    self.assertGreater(len(spec_keys), 0, "warmup should capture at least one spec=True jit key once mtp_head is set")
+    verify_chunk = next_power2(3 + 1)  # speculative_generate's own default k=3, matching warmup's own self.speculative_generate([0]) call
+    self.assertTrue(any(key[2] == verify_chunk for key in spec_keys),
+                    f"expected a captured spec key at chunk_size=verify_chunk={verify_chunk}, got {spec_keys}")
+    for key in spec_keys:
+      self.assertIsNotNone(model.jit[key].captured, f"jit[{key}] was called but never actually captured (still cnt<=1)")
+
+  def test_warmup_without_mtp_head_adds_no_spec_keys(self):
+    # a plain Transformer (mtp_head unset, same as _load()'s own model MINUS its Context(MTP=1) --
+    # _load() always sets mtp_head, so it can't stand in for "pre-T4.66e" here) mirrors every model built
+    # without MTP=1: warmup() must stay exactly as it was -- generate()'s own greedy+sampled keys only,
+    # never touching speculative_generate at all.
+    model = Transformer(TEST_CONFIG)
+    self.assertIsNone(model.mtp_head)
+    model.warmup()
+    self.assertFalse(any(key[3] for key in model.jit), f"no mtp_head means no spec=True key should exist: {list(model.jit)}")
 
 if __name__ == '__main__':
   unittest.main()
