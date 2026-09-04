@@ -345,36 +345,47 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
     self.assertEqual(set(m.jit.keys()), {(False, True, None, False), (False, False, None, False), (True, True, 4, False), (True, False, 4, False)})
     for key, jit in m.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
-CHUNK_LINE_RE = re.compile(r"^\[WY_TRACE\] chunk=(\d+) start_pos=(\d+) (blk\d+:state\(nan=\d+ amax=[^)]+\)/conv\(nan=\d+ amax=[^)]+\)\s*)+$")
+CHUNK_LINE_RE = re.compile(
+  r"^\[WY_TRACE\] chunk=(\d+) start_pos=(\d+) (blk\d+:state\(nan=\d+ inf=\d+ amax=[^)]+\)/conv\(nan=\d+ inf=\d+ amax=[^)]+\)\s*)+$")
 
 class TestWYTraceChunkInstrumentation(unittest.TestCase):
   """T4.73d PHASE 1: WY_TRACE=2 must print one [WY_TRACE] chunk=... line per PREFILL CHUNK (not just the
   last, like WY_TRACE=1 -- see model.py's _wy_chunk_trace), and WY_DUMP_DIR must save the first non-finite
   chunk's GDN scan inputs to a loadable safetensors file. A poisoned token embedding (one vocab row set to
-  NaN) gives a deterministic, fast way to make a SPECIFIC prefill chunk's GDN state go non-finite, without
-  needing the real (numerically delicate, content x length dependent) WY bug this instrumentation exists to
-  chase -- NaN propagates through the block's linear/conv/scan math regardless of chunk content."""
+  NaN, or to a large finite value for the pre-overflow trigger below) gives a deterministic, fast way to
+  make a SPECIFIC prefill chunk's GDN state go non-finite/large, without needing the real (numerically
+  delicate, content x length dependent) WY bug this instrumentation exists to chase -- NaN/large values
+  propagate through the block's linear/conv/scan math regardless of chunk content.
+
+  PHASE 2: real hardware found a block (blk44) that overflows straight to Inf with no NaN of its own -- only
+  a DOWNSTREAM block consuming its Inf output produced actual NaNs, and the original nan-count-only trigger
+  reported that downstream victim as "the culprit" instead. test_inf_only_block_is_the_reported_culprit
+  covers the fix (nan/inf counted separately, trigger on either); test_preoverflow_amax_trigger_fires_while_
+  still_finite covers the new WY_DUMP_AMAX trigger this real case also motivated (the non-finite trigger can
+  only ever capture a block AFTER it breaks, never the still-finite inputs a per-chunk amplification needs
+  to be measured from)."""
   NAN_TOKEN = 50
 
   def setUp(self):
-    from tinygrad.llm.model import wy_dump_done
-    wy_dump_done.clear()  # module-level "dumped once already" latch -- reset so test order/xdist worker reuse can't wedge it
+    from tinygrad.llm.model import wy_dump_amax_done, wy_dump_done
+    wy_dump_done.clear()       # module-level "dumped once already" latches -- reset so test order/xdist
+    wy_dump_amax_done.clear()  # worker reuse can't wedge either of them
 
-  def _run(self, prompt:list[int], chunk:int, poison:bool, dump_dir:str = "") -> str:
+  def _run(self, prompt:list[int], chunk:int, poison_value:float|None, dump_dir:str = "", dump_amax:float = 0.0) -> str:
     Tensor.manual_seed(7)
     m = Transformer(SSM_CFG)
-    if poison:
+    if poison_value is not None:
       w = m.token_embd.weight.numpy()
-      w[self.NAN_TOKEN] = np.nan
+      w[self.NAN_TOKEN] = poison_value
       Tensor.realize(m.token_embd.weight.assign(Tensor(w, dtype=m.token_embd.weight.dtype)))
     buf = io.StringIO()
-    with Context(GDN_CHUNK=chunk, WY_TRACE=2, WY_DUMP_DIR=dump_dir), contextlib.redirect_stdout(buf):
+    with Context(GDN_CHUNK=chunk, WY_TRACE=2, WY_DUMP_DIR=dump_dir, WY_DUMP_AMAX=dump_amax), contextlib.redirect_stdout(buf):
       list(zip(range(1), m.generate(list(prompt))))  # only need to reach the end of prefill, not decode
     return buf.getvalue()
 
   def test_per_chunk_lines_parse_one_per_chunk(self):
     prompt = list(range(1, 10))  # 9 tokens at chunk=3 -> 3 prefill chunks, start_pos 0/3/6
-    lines = [ln for ln in self._run(prompt, chunk=3, poison=False).splitlines() if ln.startswith("[WY_TRACE] chunk=")]
+    lines = [ln for ln in self._run(prompt, chunk=3, poison_value=None).splitlines() if ln.startswith("[WY_TRACE] chunk=")]
     self.assertEqual(len(lines), 3, lines)
     for i, line in enumerate(lines):
       match = CHUNK_LINE_RE.match(line)
@@ -385,11 +396,11 @@ class TestWYTraceChunkInstrumentation(unittest.TestCase):
   def test_culprit_chunk_detected_and_dumped(self):
     prompt = [1, 2, 3, 4, self.NAN_TOKEN, 6, 7, 8, 9]  # the NaN token lands in the 2nd of 3 chunks
     with tempfile.TemporaryDirectory() as d:
-      log = self._run(prompt, chunk=3, poison=True, dump_dir=d)
+      log = self._run(prompt, chunk=3, poison_value=np.nan, dump_dir=d)
       chunk_lines = [ln for ln in log.splitlines() if ln.startswith("[WY_TRACE] chunk=")]
       self.assertEqual(len(chunk_lines), 3, chunk_lines)
-      self.assertRegex(chunk_lines[0], r"state\(nan=0 amax=", "chunk 1 (before the NaN token) must be clean")
-      self.assertNotRegex(chunk_lines[1], r"state\(nan=0 ", "chunk 2 (contains the NaN token) must go non-finite")
+      self.assertRegex(chunk_lines[0], r"state\(nan=0 inf=0 amax=", "chunk 1 (before the NaN token) must be clean")
+      self.assertNotRegex(chunk_lines[1], r"state\(nan=0 inf=0 ", "chunk 2 (contains the NaN token) must go non-finite")
       culprit_lines = [ln for ln in log.splitlines() if ln.startswith("[WY_TRACE] culprit ")]
       self.assertEqual(len(culprit_lines), 1, "must dump at most once, on the FIRST non-finite chunk")
       self.assertTrue(culprit_lines[0].startswith("[WY_TRACE] culprit chunk=2 blk=0 head="), culprit_lines[0])
@@ -400,6 +411,41 @@ class TestWYTraceChunkInstrumentation(unittest.TestCase):
         self.assertIn(name, tensors)
       self.assertEqual(tensors["state_in"].shape, tensors["recurrent_state_out"].shape)  # (B,H,V,K), both sides
       self.assertTrue(np.isnan(tensors["recurrent_state_out"].numpy()).any())  # the actual (buggy) observed state
+
+  def test_inf_only_block_is_flagged_non_finite(self):
+    # T4.73d PHASE 2 regression: _wy_chunk_fp must count inf independently of nan -- a block with inf=0/
+    # nan>0 or nan=0/inf>0 must BOTH trip the "non-finite" culprit trigger (real hardware hit exactly the
+    # nan=0/inf>0 case, which the original nan-count-only check silently passed through).
+    from tinygrad.llm.model import _wy_chunk_fp
+    finite = Tensor([1.0, 2.0, -3.5])
+    nan_only = Tensor([1.0, float("nan"), 3.0])
+    inf_only = Tensor([1.0, float("inf"), 3.0])
+    self.assertEqual(_wy_chunk_fp(finite), (0, 0, 3.5))
+    self.assertEqual(_wy_chunk_fp(nan_only)[:2], (1, 0))
+    self.assertEqual(_wy_chunk_fp(inf_only)[:2], (0, 1))
+    self.assertEqual(_wy_chunk_fp(inf_only)[2], float("inf"))  # abs-max still surfaces the inf
+
+  def test_preoverflow_amax_trigger_fires_while_still_finite(self):
+    # no poisoning needed: this tiny random-init model's conv_state (raw attn_qkv projections -- ssm_a/
+    # ssm_conv1d.weight default to all-zero, which keeps recurrent_state frozen at exactly 0 here, but
+    # conv_state doesn't go through either) already has a nonzero baseline amax every chunk -- a threshold
+    # comfortably below that baseline is enough to exercise the trigger mechanism itself (fire once, on the
+    # first qualifying chunk, only while every tensor involved is still fully finite).
+    prompt = list(range(1, 10))
+    with tempfile.TemporaryDirectory() as d:
+      log = self._run(prompt, chunk=3, poison_value=None, dump_dir=d, dump_amax=1.0)
+      self.assertEqual([ln for ln in log.splitlines() if ln.startswith("[WY_TRACE] culprit ")], [],
+                        "must not fire the non-finite trigger -- this prompt never goes non-finite")
+      preoverflow_lines = [ln for ln in log.splitlines() if ln.startswith("[WY_TRACE] preoverflow ")]
+      self.assertEqual(len(preoverflow_lines), 1, "must dump at most once, on the FIRST chunk crossing the threshold")
+      match = re.match(r"^\[WY_TRACE\] preoverflow chunk=(\d+) blk=(\d+) amax=([^ ]+) threshold=1$", preoverflow_lines[0])
+      self.assertIsNotNone(match, preoverflow_lines[0])
+      self.assertGreaterEqual(float(match[3]), 1.0)
+      dumped = list(pathlib.Path(d).glob(f"preoverflow_chunk{match[1]}_blk{match[2]}.safetensors"))
+      self.assertEqual(len(dumped), 1, list(pathlib.Path(d).iterdir()))
+      tensors = safe_load(str(dumped[0]))
+      for name in ("state_in", "q", "k", "v", "beta", "alpha", "recurrent_state_out", "conv_state_out"):
+        self.assertTrue(np.isfinite(tensors[name].numpy()).all(), f"{name} must be fully finite (pre-overflow)")
 
 def _byte_tok() -> SimpleTokenizer:
   # byte-level vocab (no merges) in the GPT-2 byte-encoder alphabet: printable ASCII maps to itself, 'Ġ' = space, 'Ċ' = newline

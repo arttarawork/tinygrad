@@ -59,10 +59,18 @@ gdn_last_scan_impl: list[int] = []
 # ~140-180 chunks (see FIXNOTES_T473C.md and the T4.73d brief) -- see _wy_chunk_trace. Still zero overhead
 # at 0/1: the per-chunk path is a separate call site, gated the same way.
 WY_TRACE = ContextVar("WY_TRACE", 0)
-# T4.73d PHASE 1: directory to dump the culprit chunk's GDN scan inputs to, WY_TRACE=2 only (needs the
-# per-chunk fingerprint to know WHEN to dump) -- "" (default): never dumps. See _wy_dump_snapshot/
-# _wy_chunk_trace for what gets captured and when.
+# T4.73d PHASE 1: directory to dump chunk GDN scan inputs to, WY_TRACE=2 only (needs the per-chunk
+# fingerprint to know WHEN to dump) -- "" (default): never dumps. See _wy_dump_snapshot/_wy_chunk_trace for
+# what gets captured and when, and WY_DUMP_AMAX below for the second (pre-overflow) trigger this feeds.
 WY_DUMP_DIR = ContextVar("WY_DUMP_DIR", "")
+# T4.73d PHASE 2: a second, independent dump trigger alongside the non-finite one above -- fires on the
+# FIRST chunk where some GDN block's recurrent_state/conv_state abs-max crosses this threshold WHILE STILL
+# FULLY FINITE (e.g. 50, or whatever comfortably separates this content's real trajectory from an unrelated
+# prompt's ~0.65 baseline -- see the T4.73d brief), i.e. the last known-good snapshot before that block's
+# own eventual overflow -- needed because the non-finite trigger alone only ever captures a VICTIM block
+# that consumed an already-broken upstream input, never the still-finite state the actual per-chunk
+# amplification needs to be measured from. 0.0 (default): disabled. Needs WY_DUMP_DIR set too.
+WY_DUMP_AMAX = ContextVar("WY_DUMP_AMAX", 0.0)
 
 def _gdn_tri_inverse(m:Tensor) -> Tensor:
   """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
@@ -1034,17 +1042,46 @@ def _wy_trace_log(model:"Transformer", step_kind:str, argmax_out:Tensor) -> None
              f"logits_shape={tuple(model._wy_trace_logits.shape)}")
   print(line, flush=True)
 
-wy_dump_done: list[bool] = []  # T4.73d PHASE 1: module-level latch -- the culprit dump fires at most once per process
+wy_dump_done: list[bool] = []       # T4.73d: module latch -- the non-finite culprit dump fires at most once per process
+wy_dump_amax_done: list[bool] = []  # T4.73d PHASE 2: separate latch -- the pre-overflow amax dump fires at most once per process
 
-def _wy_chunk_fp(t:Tensor) -> tuple[int, float]:
-  """T4.73d PHASE 1: lightweight per-chunk host fingerprint -- nan count and abs-max only, no fsum (unlike
+def _wy_chunk_fp(t:Tensor) -> tuple[int, int, float]:
+  """T4.73d: lightweight per-chunk host fingerprint -- nan count, inf count, and abs-max, no fsum (unlike
   _wy_trace_log's fp() above): this runs once per GDN block per PREFILL CHUNK, up to ~180x more often than
-  that one traced ("last step only") fingerprint over a long chunked prefill -- see the T4.73d brief."""
-  flat = cast(list[float], t.flatten().tolist())
-  finite = [v for v in flat if v == v]  # NaN != NaN
-  return len(flat) - len(finite), max((abs(v) for v in finite), default=0.0)
+  that one traced ("last step only") fingerprint over a long chunked prefill -- see the T4.73d brief.
 
-def _wy_chunk_trace(model:"Transformer", chunk_idx:int, chunk_start_pos:int, dump_dir:str) -> None:
+  PHASE 2 fix: nan and inf are now counted SEPARATELY. amax already included +-inf (the `v == v` filter
+  only ever excluded NaN) so it was never wrong on its own, but _wy_chunk_trace's ORIGINAL culprit check
+  triggered on nan count alone and so missed a block that overflows straight to Inf without ever producing
+  a NaN of its own -- confirmed on real hardware: blk44 hit recurrent_state amax~1.4e38 (finite) then Inf
+  (chunk 132), and only the DOWNSTREAM block that consumed its Inf output produced actual NaNs -- that
+  downstream victim, not blk44 itself, is what the nan-only check reported as "the culprit"."""
+  flat = cast(list[float], t.flatten().tolist())
+  nan = sum(1 for v in flat if v != v)  # NaN != NaN
+  non_nan = [v for v in flat if v == v]
+  inf = sum(1 for v in non_nan if math.isinf(v))
+  return nan, inf, max((abs(v) for v in non_nan), default=0.0)  # abs-max includes +-inf, excludes only NaN
+
+def _wy_dump_block(dump_dir:str, tag:str, chunk_idx:int, i:int, b:"GatedDeltaNetBlock", extra_meta:dict[str, str]) -> None:
+  """T4.73d: shared writer for both _wy_chunk_trace dump triggers below -- saves block b's captured
+  scan-input snapshot for THIS chunk (see _wy_dump_snapshot: state_in/q/k/v/beta/alpha, refreshed every
+  chunk regardless of JIT capture vs. replay) plus its actual post-chunk recurrent_state/conv_state, to
+  <dump_dir>/<tag>_chunk<idx>_blk<i>.safetensors via nn.state.safe_save."""
+  needed = ("state_in", "q", "k", "v", "beta", "alpha")
+  if not all(hasattr(b, f"_wy_dump_{n}") for n in needed):
+    # WY_DUMP_DIR was set (this code ran) but the block never took the run_scan path this chunk (e.g. the
+    # AMD fused-kernel branch) -- nothing to dump.
+    print(f"[WY_TRACE] {tag} blk={i} has no captured scan-input snapshot -- nothing dumped", flush=True)
+    return
+  tensors = {n: getattr(b, f"_wy_dump_{n}") for n in needed}
+  tensors["recurrent_state_out"], tensors["conv_state_out"] = b.recurrent_state, b.conv_state
+  out_dir = pathlib.Path(dump_dir)
+  out_dir.mkdir(parents=True, exist_ok=True)
+  out_path = out_dir / f"{tag}_chunk{chunk_idx}_blk{i}.safetensors"
+  nn.state.safe_save(tensors, str(out_path), metadata={"chunk_idx": str(chunk_idx), "blk_idx": str(i), **extra_meta})
+  print(f"[WY_TRACE] dumped {out_path}", flush=True)
+
+def _wy_chunk_trace(model:"Transformer", chunk_idx:int, chunk_start_pos:int, dump_dir:str, dump_amax_threshold:float) -> None:
   """T4.73d PHASE 1, WY_TRACE=2 only: one stdout line per PREFILL CHUNK (generate() calls this for every
   chunk, not just the last -- extends _wy_trace_log's WY_TRACE=1 form to the granularity the T4.73d brief
   needs: WHICH chunk first drives a GDN block's carried state non-finite, for content that only fails past
@@ -1052,41 +1089,44 @@ def _wy_chunk_trace(model:"Transformer", chunk_idx:int, chunk_start_pos:int, dum
   mechanism -- this is diagnostic-only, for whatever cross-chunk accumulation this content triggers that
   others don't).
 
-  When `dump_dir` is non-empty and this is the FIRST chunk whose fingerprint shows a NaN in some block's
-  recurrent_state or conv_state, also prints that block's first non-finite head (per-head nan count over
-  recurrent_state's head axis) and saves the block's scan inputs for THIS chunk -- captured every chunk
-  regardless of capture vs. JIT replay by _wy_dump_snapshot above -- plus the actual (buggy) post-chunk
-  state, to <dump_dir>/culprit_chunk<idx>_blk<i>.safetensors via nn.state.safe_save. Fires at most once per
-  process (wy_dump_done latch), so a long prefill doesn't re-dump every subsequent (still-NaN) chunk."""
+  Two independent dump triggers, both requiring `dump_dir` and each latched to fire at most once per
+  process (so a long prefill doesn't re-dump every subsequent still-broken chunk):
+  - non-finite (wy_dump_done): the FIRST chunk where some block's recurrent_state or conv_state shows a
+    NaN OR an Inf (PHASE 2 fix -- see _wy_chunk_fp's docstring for why nan-count alone isn't enough). Also
+    prints that block's first non-finite head (nan+inf count over recurrent_state's head axis). This block
+    may be a VICTIM that merely consumed an already-broken upstream input, not the true source.
+  - pre-overflow (wy_dump_amax_done, only when `dump_amax_threshold` > 0): the FIRST chunk where some
+    block's state/conv abs-max crosses `dump_amax_threshold` WHILE STILL FULLY FINITE -- the last known-good
+    snapshot before that block's own eventual overflow, which the non-finite trigger alone can never
+    capture (by the time something is non-finite, its OWN inputs from a prior chunk are gone -- this
+    trigger exists to catch a block that is amplifying chunk-over-chunk before it actually breaks)."""
   gdn_blocks = [(i, b) for i, b in enumerate(model.blk) if isinstance(b, GatedDeltaNetBlock)]
   parts: list[str] = []
-  culprit: tuple[int, GatedDeltaNetBlock] | None = None
+  nonfinite: tuple[int, GatedDeltaNetBlock] | None = None
+  preoverflow: tuple[int, GatedDeltaNetBlock, float] | None = None
   for i, b in gdn_blocks:
-    s_nan, s_amax = _wy_chunk_fp(b.recurrent_state)
-    c_nan, c_amax = _wy_chunk_fp(b.conv_state)
-    parts.append(f"blk{i}:state(nan={s_nan} amax={s_amax:.6g})/conv(nan={c_nan} amax={c_amax:.6g})")
-    if culprit is None and (s_nan or c_nan): culprit = (i, b)
+    s_nan, s_inf, s_amax = _wy_chunk_fp(b.recurrent_state)
+    c_nan, c_inf, c_amax = _wy_chunk_fp(b.conv_state)
+    parts.append(f"blk{i}:state(nan={s_nan} inf={s_inf} amax={s_amax:.6g})/conv(nan={c_nan} inf={c_inf} amax={c_amax:.6g})")
+    if nonfinite is None and (s_nan or s_inf or c_nan or c_inf): nonfinite = (i, b)
+    still_finite = not (s_nan or s_inf or c_nan or c_inf)
+    if preoverflow is None and dump_amax_threshold > 0 and still_finite and max(s_amax, c_amax) >= dump_amax_threshold:
+      preoverflow = (i, b, max(s_amax, c_amax))
   print(f"[WY_TRACE] chunk={chunk_idx} start_pos={chunk_start_pos} {' '.join(parts)}", flush=True)
-  if culprit is None or not dump_dir or wy_dump_done: return
-  wy_dump_done.append(True)
-  i, b = culprit
-  head_nans = [_wy_chunk_fp(b.recurrent_state[:, h])[0] for h in range(b.num_v_heads)]
-  first_head = next((h for h, n in enumerate(head_nans) if n), -1)
-  print(f"[WY_TRACE] culprit chunk={chunk_idx} blk={i} head={first_head} heads_nan={head_nans}", flush=True)
-  needed = ("state_in", "q", "k", "v", "beta", "alpha")
-  if not all(hasattr(b, f"_wy_dump_{n}") for n in needed):
-    # WY_DUMP_DIR was set (this code ran) but the culprit block never took the run_scan path this chunk
-    # (e.g. the AMD fused-kernel branch) -- nothing to dump.
-    print(f"[WY_TRACE] blk={i} has no captured scan-input snapshot -- nothing dumped", flush=True)
-    return
-  tensors = {n: getattr(b, f"_wy_dump_{n}") for n in needed}
-  tensors["recurrent_state_out"], tensors["conv_state_out"] = b.recurrent_state, b.conv_state
-  out_dir = pathlib.Path(dump_dir)
-  out_dir.mkdir(parents=True, exist_ok=True)
-  out_path = out_dir / f"culprit_chunk{chunk_idx}_blk{i}.safetensors"
-  meta = {"chunk_idx": str(chunk_idx), "start_pos": str(chunk_start_pos), "blk_idx": str(i), "culprit_head": str(first_head)}
-  nn.state.safe_save(tensors, str(out_path), metadata=meta)
-  print(f"[WY_TRACE] dumped {out_path}", flush=True)
+
+  if preoverflow is not None and dump_dir and not wy_dump_amax_done:
+    wy_dump_amax_done.append(True)
+    i, b, amax_val = preoverflow
+    print(f"[WY_TRACE] preoverflow chunk={chunk_idx} blk={i} amax={amax_val:.6g} threshold={dump_amax_threshold:.6g}", flush=True)
+    _wy_dump_block(dump_dir, "preoverflow", chunk_idx, i, b, {"amax": f"{amax_val:.6g}", "threshold": f"{dump_amax_threshold:.6g}"})
+
+  if nonfinite is not None and dump_dir and not wy_dump_done:
+    wy_dump_done.append(True)
+    i, b = nonfinite
+    head_nonfinite = [sum(_wy_chunk_fp(b.recurrent_state[:, h])[:2]) for h in range(b.num_v_heads)]
+    first_head = next((h for h, n in enumerate(head_nonfinite) if n), -1)
+    print(f"[WY_TRACE] culprit chunk={chunk_idx} blk={i} head={first_head} heads_nonfinite={head_nonfinite}", flush=True)
+    _wy_dump_block(dump_dir, "culprit", chunk_idx, i, b, {"culprit_head": str(first_head)})
 
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
@@ -1496,7 +1536,7 @@ class Transformer:
     # T4.76/T4.73d, WY_TRACE>=1 only: wy_decode_traces counts traced decode steps so far (capped at 3, both
     # levels); wy_chunk_idx counts prefill chunks seen so far (WY_TRACE>=2 only -- 1-based in the printed line).
     wy_decode_traces, wy_chunk_idx = 0, 0
-    wy_dump_dir = WY_DUMP_DIR.value
+    wy_dump_dir, wy_dump_amax = WY_DUMP_DIR.value, WY_DUMP_AMAX.value
     while virtual_len < self.max_context:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
@@ -1511,7 +1551,7 @@ class Transformer:
         # granularity needed to find WHICH chunk first goes non-finite, not just whether the last one is.
         if WY_TRACE.value >= 2:
           wy_chunk_idx += 1
-          _wy_chunk_trace(self, wy_chunk_idx, chunk_start_pos, wy_dump_dir)
+          _wy_chunk_trace(self, wy_chunk_idx, chunk_start_pos, wy_dump_dir, wy_dump_amax)
         elif start_pos >= virtual_len: _wy_trace_log(self, "prefill(last)", out)
       elif WY_TRACE.value and wy_decode_traces < 3:
         # the first 3 decode steps, both trace levels -- see _wy_trace_log for what gets printed.
