@@ -109,3 +109,47 @@ Every host read of a spec=True jit output in speculative_generate, audited:
 Why `[:, :n]` is safe: `_parse_view_index` clamps int slices against the Variable's **vmax** (the bound), not
 its bound value, and with batch 1 the shrunk view's data offsets are `i*vocab + v` — "toks" never enters them.
 Any read that derives a length/pad amount/negative index from the tensor's own shape is the unsafe class.
+
+## 6. T4.66k — the acceptance gap (81% → 8% full chains) is NOT in the d..j code (CPU proof); hardware round requested
+Datum: b..j on hardware (correct text): hist {0:19, 1:47, 2:17, 3:7}/90 — d0 accepted 71/90 = 79%, d1|d0 = 24/71 = 34%,
+d2|d1 = 7/24 = 29%. T4.66b on hardware (2026-09-01, TASKS.md): 43-44/53 full chains, avg 3.60 — d0 ≈ 89%, d1|d0 = 48/48,
+d2|d1 ≈ 92%. The collapse is in the CHAINED positions; d0 is roughly intact.
+
+What the d..j diff changes on the draft path, audited against 66c (`git diff 6bf1b39c1 HEAD -- tinygrad/llm/model.py`;
+the tinygrad core is untouched between the two commits):
+- the hidden fed to draft(): still forward(spec=True)'s `x.contiguous()` = the last block's PRE-output_norm residual,
+  at position m of the verify chunk (`verify_h[:, m]` on full accept; `redo_h[:, m]` after CHECKPOINT+REDO on partial —
+  66c read `verify_h[:, m]` off 66b's capture path; same position, same quantity);
+- the draft chain: same `dtok, dpos = tok_last, start_pos`, same k distinct `draft_pos_i` Variables, same lazy merge,
+  same `tok_last` (verify_ids[m]) and `start_pos += m+1` conventions; 66d only relocates the embedding lookup
+  (device-local table, same values); 66e only narrows VERIFY/REDO's width (main-model output token-identical);
+  66g/i zero the block's cache once after warmup (66c had no spec warmup, so its first request saw a fresh
+  all-zero cache too); 66h/i/j fix host reads (anchor, h_last, verify ids) — all proven position-correct.
+
+CPU evidence (`extra/t466k_draft_equiv.py`, tiny GDN+MTP model, same seed/weights, same prompts, 66c's model.py vs
+HEAD's loaded side by side on the same core): emitted tokens EQUAL; every draft() call's (token, position) inputs
+EQUAL (21/15/15 calls over 3 prompts); draft logits identical for the first iterations and ≤ 2.2e-5 apart
+(|logits| ≈ 3e-2) once a partial accept has gone through REDO instead of 66b's capture-assign — fp noise.
+Also checked: the merged lazy draft chain gives bit-identical logits and cache contents to realizing each draft
+call (draft i+1 does see draft i's K/V — control: zeroing position P changes d1's logits by 6.8e-4), and the K/V
+lands at the right positions.
+
+Conclusion: no software mechanism in d..j for the chain collapse, on CPU. What remains is either (a) the two
+measurements were not taken under the same conditions (device map → which device runs the MTP block / its precompiled
+CALL kernels; prompt; request order → the block's cache holds a previous request's entries at [0, P)), or (b) a
+device-only effect in a d..j-touched kernel (66d's device-local embedding gather, 66e's width-4 VERIFY/REDO key) that
+CPU cannot show. Neither is decidable from here.
+
+Minimal discriminating hardware round (R1): serve the LAST GOOD tree — `6bf1b39c1` (T4.66c = 66b + SPEC_TRACE; it runs
+on the pooled map: greedy partial accepts keep `tok_last` on out_dev there, the 66f crash only arrived with 66e's host
+rebuild) — under TODAY's exact map/env/prompt (`POOLED_MTP=1 POOLED_ENV="SPEC_STATS=1 SPEC_TRACE=1 SPEC_TOKENS=3
+NV_DISPATCH_RING=64"`, attempt-2 map, ctx 65536), essay as the FIRST request after a fresh start, and read (i) the
+essay content (must be real text — 66c has no spec warmup, so no anchor bug), (ii) `accept_len_hist`.
+- ≥ ~80% full chains again ⇒ a device-only regression exists inside d..j. Then one more round on HEAD with two
+  runtime toggles I would add (`SPEC_LEGACY_EMBED=1` restores 66d's cross-device lookup; `SPEC_VERIFY_CHUNK=32`
+  restores 66e's shared width) discriminates d from e in a single serve.
+- ~8% ⇒ the 81% was a conditions artifact (or its run differed in map/prompt/order), there is no code regression,
+  and the correct next step is §2(a): prefill the MTP block over the prompt (the block currently attends over an
+  all-zero prompt context — P zero keys each add exp(0) to every softmax denominator with a zero value behind them, so
+  the attention branch is diluted by ~P/e^score: noticeable at an essay prompt, effectively gone at a 19k-token Hermes
+  prompt, where the head runs on its residual path alone) and rewrite accepted positions after each accept. That lifts d0..d2 together; it is not a regression fix.
