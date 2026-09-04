@@ -52,33 +52,49 @@ def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.valu
 gdn_last_scan_impl: list[int] = []
 
 def _gdn_tri_inverse(m:Tensor) -> Tensor:
-  """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
-  doubling instead of a length-C forward-substitution loop.
+  """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via block-recursive
+  halving: split m into 2x2 blocks [[M11,0],[M21,M22]] (M11, M22 strictly-lower-triangular on their own,
+  M21 the full below-diagonal coupling block), recurse on each half, and assemble
+    (I+m)^-1 = [[Inv11, 0], [-Inv22 @ M21 @ Inv11, Inv22]]   (Inv11 := (I+M11)^-1, Inv22 := (I+M22)^-1)
+  which is exact for any unit-lower-triangular matrix (standard block-triangular inverse identity), by
+  induction down to the C=1 base case ((I+0)^-1 = I, a scalar 1). log2(C)-deep recursion; C need not be a
+  power of 2 (odd sizes just split as evenly as possible each level -- gdn_scan_wy's T_pad is always a
+  concrete int, see the assert below, but never assumed to be a power of 2).
 
-  (First draft used block-recursive halving instead -- same O(log2 C) DEPTH, but that recursion's binary tree
-  has O(C) total nodes (1+2+4+...+C/2 calls), each contributing its own small matmuls/concats; the T4.69a
-  evidence script caught this the honest way, by measuring more/bigger lowered kernels for wy than the loop
-  at the real geometry, not by inspection. Doubling below is a straight-line loop of O(log2 C) STEPS on the
-  one full-size (C,C) matrix -- genuinely fewer, uniformly-shaped matmuls, no shrinking submatrices or cats.)
+  T4.73d: this REPLACES a Neumann-series DOUBLING implementation (P_2k = P_k + n^k@P_k, n := -m, using
+  n^C == 0 exactly to terminate in ceil(log2 C) steps on the one full-size matrix, no shrinking submatrices
+  or concats -- see FIXNOTES_T473D.md for the retired code and the full derivation) that is EXACT in
+  infinite precision but catastrophically ill-conditioned in float32 once m's entries get large (beta close
+  to 1, as trained heads with near-collinear/repeated keys within a chunk produce): repeatedly squaring
+  n (n_pow = n_pow @ n_pow) drives its magnitude up by orders of magnitude EACH doubling step (measured on
+  a real qwen3.8-27B blk44 chunk: max|n_pow| 28 -> 3.4e3 -> 1.4e6 -> 6.8e7 over 4 steps) even though the
+  running partial sum p, and the final exact answer, both stay near-unity (the huge n^k terms cancel back
+  down to ~1) -- float32's ~7 significant decimal digits are nowhere near enough to represent that
+  cancellation, producing a WRONG (too-large) inverse (measured: max|inv| ~4.2, true value ~1.0) that then
+  amplifies every downstream chunk's carried recurrent_state by a real, hardware-observed factor (~x7 that
+  chunk, compounding across chunks to fp32 overflow). Block-recursive halving never forms an intermediate
+  matrix larger than the true (bounded, since (I+m)^-1 for unit-lower-triangular m is itself well-scaled)
+  answer -- Inv11/Inv22 are themselves valid, bounded triangular inverses by induction, and Inv21 is a
+  product of bounded matrices, so there is no large-magnitude intermediate to cancel away. Verified on the
+  same real blk44 chunk (test_gdn_scan_parity.py's TestGDNScanHighBetaCollinearAmplification): matches a
+  float64 forward-substitution reference to ~1.5e-7 (float32 machine precision), vs. the old doubling
+  code's ~4.0 absolute error on a true value of ~1.0.
 
-  Let n := -m (also strictly lower triangular, hence nilpotent: n^C == 0 -- a C×C strictly-lower matrix has
-  no index path of length C respecting i>j). Then (I+m)^-1 = (I-n)^-1 = sum_{i=0}^{C-1} n^i =: P_C (finite
-  Neumann series). Doubling identity: P_2k = P_k + n^k @ P_k (sum_{i<k} n^i + n^k sum_{i<k} n^i =
-  sum_{i<k} n^i + sum_{k<=i<2k} n^i = sum_{i<2k} n^i). Starting P_1 = I, n^1 = n, and repeatedly setting
-  (P, n^k) -> (P + n^k@P, n^k@n^k) for ceil(log2(C)) steps gives P_{2^steps} with 2^steps >= C; every term
-  beyond n^{C-1} is exactly 0 (n^k[i,j] needs a length-k strictly-decreasing index chain from i to j, i.e.
-  i-j >= k, impossible once k >= C for a C-wide matrix -- and since each such entry's defining sum is then a
-  sum of exact-zero float products, this holds bit-for-bit, not just "negligibly small"), so P_{2^steps} ==
-  P_C exactly regardless of whether C is a power of 2 -- no padding or odd/even-split bookkeeping needed."""
+  This was ALREADY the very first (T4.69a) draft, dropped at the time only because it lowers to more UOps
+  (O(C) total recursive-call nodes, each its own small matmuls/concats, vs. doubling's O(log2 C) big
+  uniform matmuls) -- a real but strictly smaller concern than the correctness bug above; not established
+  broken until this task, so no defensive fallback is needed for the doubling path -- see FIXNOTES_T473D.md
+  for the full before/after kernel-count discussion if that regresses BEAM/compile time in practice."""
   c = m.shape[-1]
   assert isinstance(c, int), "gdn_scan_wy always builds m from a concrete (padded-to-T_pad) chunk size"
-  idx = Tensor.arange(c, dtype=dtypes.int32).clone(m.device)
-  eye = (idx.reshape(c, 1) == idx.reshape(1, c)).float()  # (C,C), broadcasts to m's batch shape below
-  p, n_pow = Tensor.zeros_like(m) + eye, -m
-  for _ in range((c - 1).bit_length()):  # == ceil(log2(c)) for c >= 1, computed without float log2 rounding risk
-    p = p + n_pow @ p
-    n_pow = n_pow @ n_pow
-  return p
+  if c == 1: return Tensor.ones_like(m)  # (I+0)^-1 = I -- m's diagonal (hence every 1x1 block) is exactly 0
+  lo = c // 2
+  m11, m22, m21 = m[..., :lo, :lo], m[..., lo:, lo:], m[..., lo:, :lo]
+  inv11, inv22 = _gdn_tri_inverse(m11), _gdn_tri_inverse(m22)
+  inv21 = -(inv22 @ m21 @ inv11)
+  top = inv11.cat(Tensor.zeros_like(m[..., :lo, lo:]), dim=-1)     # (..., lo, C): [Inv11 | 0]
+  bottom = inv21.cat(inv22, dim=-1)                                 # (..., C-lo, C): [Inv21 | Inv22]
+  return top.cat(bottom, dim=-2)                                    # (..., C, C)
 
 def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
   """Chunkwise WY-form gated delta rule scan: the whole (B,H,T,*) chunk in one shot via matmuls plus one
