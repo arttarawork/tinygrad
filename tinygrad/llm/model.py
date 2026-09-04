@@ -1577,6 +1577,18 @@ class Transformer:
     chunk_size = max(chunk_size, k + 1)
     gdn_blocks = [b for b in self.blk if isinstance(b, GatedDeltaNetBlock)]
     dev = self.blk[0].device
+    # T4.66f: where the DRAFT chain's own tokens live -- MTPHead.draft's return is always forced onto
+    # owner.output.weight.device (see its own last line), so draft_tensors below is ALWAYS this device,
+    # never `dev`. tok_last must match it whenever it's rebuilt from host data (the ACCEPT step below,
+    # both branches) -- full accept already gets this right for free (verify_ids_tensor lives here too,
+    # same self.output call) but the two explicit `Tensor([[accepted[-1]]], ...)` rebuilds used to hardcode
+    # `dev` instead, splitting `tok_last`/`draft_tensors` across devices with no hop between them. Harmless
+    # on any single-device config (dev==out_dev there) and on the sampled path alone (chunk_ids there is
+    # built via host .item(), never .cat()) -- but greedy's `tok_last.cat(*draft_tensors, dim=1)` a few
+    # lines below fuses them into one kernel with no copy inserted, which crashes on a real multi-device
+    # map (assert_all_same_devices) the FIRST time a partial accept (m<k_eff) is followed by another
+    # iteration -- see test_spec_decode.py's TestSpecDeviceMap for the reproduction.
+    out_dev = self.output.weight.device
 
     v_start_pos = UOp.variable("start_pos", 0, self.max_context - 1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -1786,7 +1798,9 @@ class Transformer:
           p_probs = _softmax_np(verify_np, temperature)
           q_probs = np.stack(q_list) if q_list else np.empty((0, vocab))
           accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
-          tok_last = Tensor([[accepted[-1]]], dtype="int32", device=dev)
+          # T4.66f: out_dev, not dev -- see out_dev's own comment above (this rebuild must match draft_tensors'
+          # device, the same requirement the greedy partial-accept rebuild below has).
+          tok_last = Tensor([[accepted[-1]]], dtype="int32", device=out_dev)
 
         if trace_on: accept_ms = (time.perf_counter() - accept_t0) * 1000
         if trace_on: assign_t0 = time.perf_counter()
@@ -1845,7 +1859,16 @@ class Transformer:
           # doesn't cover, because it comes from a DIFFERENT call (VERIFY) than h_last (REDO). Cheap: one
           # tiny (1,1) host->device upload, only on the partial-accept branch -- the full-accept path's own
           # `tok_last` stays exactly as lazy as before.
-          if greedy: tok_last = Tensor([[accepted[-1]]], dtype="int32", device=dev)
+          #
+          # T4.66f: device=out_dev, not dev -- see out_dev's own comment above. This rebuild used to hardcode
+          # `dev` (blk[0].device), which matches the VERIFY/REDO buffers a few lines below but NOT
+          # draft_tensors (always owner.output.weight.device, forced by MTPHead.draft's own return line) --
+          # invisible on every existing test (single-device: dev==out_dev there) but fatal on a real
+          # multi-device map, where the NEXT iteration's greedy `tok_last.cat(*draft_tensors, dim=1)` fuses a
+          # `dev` tensor with `out_dev` tensors into one kernel with no copy between them: RuntimeError: all
+          # buffers must be on the same device (schedule/__init__.py's assert_all_same_devices). Reproduced
+          # and fixed here -- see test_spec_decode.py's TestSpecDeviceMap.
+          if greedy: tok_last = Tensor([[accepted[-1]]], dtype="int32", device=out_dev)
           if gdn_snap: Tensor.realize(*(x for b, c, r in gdn_snap for x in (b.conv_state.assign(c), b.recurrent_state.assign(r))))
           redo_ids = chunk_ids[:m + 1]
           # T4.66e: verify_chunk/v_toks_verify, same as VERIFY above -- this is exactly what makes REDO

@@ -352,6 +352,70 @@ class TestMTPDraftDeviceLocalEmbed(unittest.TestCase):
     copies = [call for call in linear.src if call.src[0].op is Ops.COPY]
     self.assertEqual(copies, [], f"draft() should perform zero cross-device copies once warm: {copies}")
 
+class TestSpecDeviceMap(unittest.TestCase):
+  """T4.66f: speculative_generate on a REAL multi-device map -- blk[0] and mtp_head/output on DIFFERENT
+  devices (CPU:0/CPU:1 standing in for the real hardware's METAL/NV split, same convention
+  TestMTPDraftDeviceLocalEmbed/TestDeviceMapModel use elsewhere in this file). Every OTHER speculative-
+  decode test in this file uses _load()/_load_gdn() (device_map=None -- a single device, where the bug
+  below collapses to a no-op: `dev` and the head's device are the same string) or
+  TestMTPDraftDeviceLocalEmbed (multi-device, but calls MTPHead.draft directly once -- never
+  speculative_generate's own loop across outer iterations). Neither could have caught a tensor
+  speculative_generate itself builds landing on the wrong one of the two devices.
+
+  Bug (pre-fix): a partial accept (m < k_eff) rebuilt tok_last as `Tensor(..., device=dev)` where
+  `dev = self.blk[0].device` -- but the DRAFT chain's own tensors (draft_tensors, chained off
+  MTPHead.draft's return) are always on `owner.output.weight.device` instead (forced by draft()'s own
+  last line, `return owner.output(...)`). Those are the same string on a single device, so every test
+  above passes either way; on a real split they're not, and the NEXT outer iteration's greedy
+  `tok_last.cat(*draft_tensors, dim=1)` fuses the two into one kernel with no copy between them --
+  RuntimeError: all buffers must be on the same device (schedule/__init__.py's assert_all_same_devices).
+  Reproduced pre-fix (message: "all buffers must be on the same device: ['CPU', 'CPU:1']"), fixed by
+  building that rebuild (and the sampled-path one right above it) on `self.output.weight.device`."""
+
+  def _load_split(self, config:TransformerConfig, seed:int) -> Transformer:
+    # ref: single device, real varied weights (mirrors _load_gdn's own randomize-then-realize pattern).
+    ref = Transformer(config)
+    ref.mtp_head = MTPHead(config, TransformerBlock)
+    Tensor.manual_seed(seed)
+    for p in nn.state.get_parameters(ref): p.replace(Tensor.randn(*p.shape) * 0.1)
+    Tensor.realize(*nn.state.get_parameters(ref))
+
+    # split: same weights (via load_state_dict, which hops each tensor to ITS OWN param's already-placed
+    # device -- nn/state.py:214), but blk[0] and blk[-1]/mtp_head/output on different devices -- the
+    # from_gguf-mirroring MTP placement TestMTPDraftDeviceLocalEmbed also uses (mtp_head always lands on
+    # the LAST block's device, matching output -- see from_gguf's own MTP branch).
+    split = Transformer(config, device_map="CPU:0,CPU:1")
+    split.mtp_head = MTPHead(config, TransformerBlock)
+    for p in nn.state.get_parameters(split.mtp_head): p.to_(split.blk[-1].device)
+    nn.state.load_state_dict(split, nn.state.get_state_dict(ref), verbose=False, realize=False)
+    split.realize_placement()
+    # the whole point of this test: a REAL split, not an incidental same-device map
+    self.assertNotEqual(split.blk[0].device, split.output.weight.device)
+    self.assertEqual(split.output.weight.device, split.mtp_head.block.device)
+    return split
+
+  def test_partial_accept_then_next_iteration_matches_generate(self):
+    # a draft that's always wrong forces a partial accept (m=0 -- the exact shape SPEC_TRACE showed on
+    # real hardware) on essentially every iteration, same trick as
+    # test_forced_mismatch_still_matches_generate above (vocab_size=100 here, even less prone to a
+    # coincidental real-token match than that test's VOCAB=11). Built explicitly on
+    # owner.output.weight.device, matching the real MTPHead.draft's own contract (its last line forces
+    # this device on every return) -- a device-less Tensor(...) here would default to Device.DEFAULT,
+    # which happens to equal blk[0]'s device under DEV=CPU and would silently mask the very bug this
+    # test exists to catch.
+    config = replace(TEST_CONFIG, num_blocks=2)
+    def fake_draft(owner, h, tok_ids, start_pos):
+      wrong_id = config.vocab_size - 1
+      return Tensor([[[100.0 if i == wrong_id else -100.0 for i in range(config.vocab_size)]]],
+                    device=owner.output.weight.device)
+    for k in (1, 3):
+      for seed, prompt in enumerate(PROMPTS):
+        ref = _run(self._load_split(config, seed), prompt, N_GEN, spec=False)
+        model = self._load_split(config, seed)
+        model.mtp_head.draft = fake_draft
+        got = _run(model, prompt, N_GEN, spec=True, k=k)  # pre-fix: RuntimeError at the 2nd outer iteration
+        self.assertEqual(got, ref, f"{k=} {seed=} {prompt=}")
+
 class TestSpecAccept(unittest.TestCase):
   """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-
   sampling accept/reject/resample test T4.65 wires into speculative_generate's temperature>0 path."""
