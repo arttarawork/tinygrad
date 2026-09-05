@@ -29,10 +29,14 @@ decode step at the boundary, no special-casing needed):
 | step | reads | writes | positions touched |
 |---|---|---|---|
 | DRAFT ×k_eff | `h_last` (unchanged each call — see below), chained `tok_ids`/`start_pos` | `mtp_head.block`'s own KV cache only | `start_pos .. start_pos+k_eff-1` (mtp-block-local) |
-| CHECKPOINT | main model's GDN blocks' `conv_state`/`recurrent_state` | a device-side clone (no main-model write) | — |
-| VERIFY | `chunk_ids = [tok_last, d0..d_{k_eff-1}]` | main model: attention KV **and** GDN state, for every block | `start_pos .. start_pos+k_eff` |
+| VERIFY | `chunk_ids = [tok_last, d0..d_{k_eff-1}]` | main model: attention KV, GDN state (for every block), **and** (T4.66b) a per-position `state_track`/`conv_window` capture per GDN block, plus the full per-position hidden state | `start_pos .. start_pos+k_eff` |
 | ACCEPT | `verify_ids` vs `chunk_ids[1:]` | host-side `m` (longest matching prefix, 0..k_eff) | — |
-| REDO (only if `m<k_eff`) | GDN snapshot restore, `chunk_ids[:m+1]` | main model: attention KV (redundant) + GDN state (real fix) | `start_pos .. start_pos+m` |
+| FIXUP (only if `m<k_eff`) | this SAME VERIFY call's own `state_track`/`conv_window` captures, indexed at `m` | main model: GDN `conv_state`/`recurrent_state` for every block (a slice + `.assign()`, not a forward) | — (no re-forward, so no positions are touched a second time) |
+
+(T4.66b removed the CHECKPOINT step and the REDO forward pass this table used to have here — a
+device-side GDN-state clone every iteration, and a whole second main-model forward on every partial
+accept — replacing both with FIXUP: reading the correct post-partial-accept state directly out of
+data the VERIFY forward already computed, instead of rolling back and recomputing it. See §7.)
 
 `verify_ids[i]` (i=0..k_eff) is the greedy id predicting the position *after* `chunk_ids[i]` was fed,
 so it lines up with draft `d_i == chunk_ids[i+1]` for `i<k_eff`; `verify_ids[k_eff]` has no draft
@@ -41,13 +45,16 @@ counterpart — it's the unconditional bonus/correction token. `m` = longest pre
 tokens, spanning positions `P+2 .. P+2+m`.
 
 - **`m == k_eff` (full accept):** every fed token was real, so VERIFY's own state advance is already
-  correct through `start_pos+k_eff`. `h_last := verify_h` (VERIFY's last-position hidden, i.e. at
-  `start_pos+k_eff`), `tok_last := verify_tok[:, m:m+1]`, `start_pos += k_eff+1`. No REDO.
+  correct through `start_pos+k_eff`. `h_last := verify_h[:, m:m+1]` (VERIFY's hidden at position
+  `start_pos+k_eff`), `tok_last := verify_tok[:, m:m+1]`, `start_pos += k_eff+1`. No FIXUP (nothing to
+  fix — every GDN block's in-place state write from VERIFY's own forward is already correct).
 - **`m < k_eff` (partial accept):** VERIFY's state now also reflects the wrong `d_m..d_{k_eff-1}` —
-  see §2 for why attention KV is fine as-is but GDN state must be rolled back. REDO re-forwards
-  exactly the `m+1` confirmed-correct tokens as one chunk at the *same* `start_pos`, giving the
-  correct `h_last` (its own last position, `start_pos+m`) and, redundantly but harmlessly, rewriting
-  attention KV for those same `m+1` positions. `start_pos += m+1`.
+  see §2 for why attention KV is fine as-is but GDN state isn't. T4.66b (see §7): FIXUP reads
+  `h_last` off `verify_h[:, m:m+1]` (same slice as the full-accept case above — this is now
+  UNBRANCHED between the two) and, per GDN block, slices that SAME VERIFY call's own captured
+  `state_track[:, :, m]` / `conv_window[:, m+1:m+1+conv_kernel-1]` and `.assign()`s them directly —
+  no re-forward, no attention-KV rewrite (redundant even in the old REDO, per §2's argument).
+  `start_pos += m+1`.
 
 Both branches leave the invariant `start_pos == len(tokens)-1` intact (both grow by the same `m+1`).
 
@@ -146,13 +153,19 @@ intermediate.**
 
 ## 5. What's still left (T4.66 did not touch this)
 
-The partial-accept REDO (§1) is the acknowledged v1 cost: one extra main-model forward, purely to
-rebuild GDN state and get the correct `h_last`, on every iteration that doesn't fully accept.
-Removing it needs `forward()`'s `spec=True` path to also expose the pre-norm hidden state at *every*
-position (not just the last), so ACCEPT can slice position `m`'s hidden directly out of VERIFY's own
-output instead of re-forwarding — trading one extra forward for keeping `k_eff+1` hidden states alive
-instead of 1 per VERIFY call. (This section used to also list binding `MTPHead.draft`'s `start_pos` to
-a Variable as a T4.66 candidate — that's done now, see §4; the REDO cost above is the only thing left.)
+**(T4.66b, done — see §7)** The partial-accept REDO was the acknowledged v1 cost: one extra
+main-model forward, purely to rebuild GDN state and get the correct `h_last`, on every iteration that
+doesn't fully accept. This section used to sketch the fix as "expose the pre-norm hidden state at
+every position" — that turned out to be only HALF of it (see §7): `h_last` alone doesn't need a
+second forward to fix, but the GDN blocks' `conv_state`/`recurrent_state` do, since they're not
+position-indexed (§2) — REDO existed for THEM, not for `h_last`. §7 covers both. (This section used to
+also list binding `MTPHead.draft`'s `start_pos` to a Variable as a T4.66 candidate — done, see §4.)
+
+What's left after T4.66b: the draft chain's `k` steps are still `k` separate python-level calls into
+`mtp_head.block` (T4.66b removed the forced per-step `.realize()` — see §7 — but not the per-call
+`_function(precompile=True)` graph-(re)construction overhead itself, which a single `TinyJit`-wrapped,
+fixed-`k`, internally-unrolled draft-chain function could remove — sketched, not built, in §7's own
+"not done" note).
 
 ## 6. T4.65 — logits-returning `forward(spec=True)`, sampled acceptance, serve wiring
 
@@ -230,3 +243,124 @@ gates). The splice/`_cached_tokens` path (`splice_ids`, `self.server.last`) is u
 both generators mutate the same `tokens`/`self._cached_tokens` the same way (`speculative_generate` already
 mirrored `generate()`'s bookkeeping exactly since T4.64), so which one produced a given turn's tokens is
 invisible to it.
+
+## 7. T4.66b — REDO-free partial accept, cheaper draft dispatch, SPEC_STATS
+
+**Goal**: T4.66 fixed the draft chain's schedule-cache growth; §5's leftover was the partial-accept REDO — a
+second, full main-model forward (attention + MoE + every GDN block) over the `m+1` confirmed tokens, paid on
+every iteration that doesn't fully accept, purely to get the correct `h_last` and GDN state back. This section
+removes it, cheapens the draft chain's dispatch count, and adds opt-in instrumentation to pick `k`.
+
+**1. REDO removal — the state-exposure question.** The REDO existed for two things bundled into one forward:
+`h_last` (the main model's pre-`output_norm` hidden at position `start_pos+m`) and each GDN block's
+`conv_state`/`recurrent_state` as they'd be after only `m+1` tokens. These have very different answers:
+
+- `h_last` needs no second forward at all: `forward()`'s `spec=True` path already computes the FULL
+  per-position hidden `x` (every position, not just the last) before slicing — T4.65's own comment already
+  noted "applying output_norm+output to every position ... is strictly more work, never less" but the codebase
+  still only ever kept the LAST position's slice (`x[:, -1:]`). T4.66b keeps the whole thing (`x.contiguous()`,
+  same `.contiguous()` reasoning as always — see §3) and lets `speculative_generate` slice `[:, m:m+1]` once
+  `m` is known, host-side, after ACCEPT. Full accept and partial accept now share ONE `h_last` expression —
+  `verify_h[:, m:m+1]` — where before they were two branches (`verify_h` vs a REDO's own output).
+- GDN state is the genuinely hard part, and the actual crux of this task: `conv_state`/`recurrent_state` are
+  O(1) accumulators, not position-indexed (§2), so there's no *slice* of them to take at position `m` the way
+  there is for hidden/logits/KV — UNLESS the block's own scan is made to expose every intermediate state it
+  passes through on the way to the final one. Investigated both scan implementations
+  (`GatedDeltaNetBlock._attention`'s `GDN_SCAN_LOOP` else-branch and `gdn_scan_wy`'s chunked WY form):
+  - **LOOP (the standing default — `GDN_SCAN_IMPL` auto-resolves to it, see T4.69a)**: the per-token python
+    loop already computes `state` at every step `t` on its way to the final one — it just used to overwrite the
+    python variable each iteration and let the intermediate values fall out of scope. Retaining them (one more
+    `.stack()`, the same way `outs` already gets stacked) is genuinely free: same ops, same schedule, no new
+    kernel shapes. `conv_state`'s equivalent-at-prefix-`p` value was ALREADY being computed as a byproduct too —
+    the existing `conv_state_store` line's `conv_window[:, T:T+conv_kernel-1]` slice generalizes to
+    `conv_window[:, p:p+conv_kernel-1]` for ANY prefix length `p`, since `conv_window` already holds every
+    position's conv-projected row before the store ever happens. So for the actual serving path, the answer to
+    "can the scan cheaply expose per-position state" is **yes, for free**.
+  - **WY (`gdn_scan_wy`, off by default, not the serving path)**: NOT free. It only ever forms the chunk's
+    LAST state via one `(V,K)` matmul (`u.transpose(-1,-2) @ k`, see the function's own `final_state` line) —
+    exposing every prefix would need a cumsum-shaped computation of comparable cost to the one WY already
+    replaced the loop with (i.e. real extra work, not retention of something already computed). Not
+    implemented: `capture=True` forces the LOOP path regardless of `GDN_SCAN_IMPL`/device (see
+    `GatedDeltaNetBlock._attention`'s own docstring) — correct on any build, and per T4.69b's own note (WY has
+    "nothing to amortize" and measures pathologically slow at `T_pad==1`), forcing the loop for VERIFY's tiny
+    `k_eff+1`-token chunk specifically is perf-neutral-or-better even on a WY-enabled build. Same reasoning
+    excludes the AMD fused kernel (`gated_delta_prefill`, RDNA3-only, descoped for this fork — CLAUDE.md): one
+    opaque hardware-loop kernel, nothing to retain from either.
+
+**Plumbing this out costs threading, not compute.** `_attention` gains `capture:bool=False`
+(`GatedDeltaNetBlock`-only — the base `FFNBlock`/`TransformerBlock`/`MLATransformerBlock` never see it),
+returning `(out, state_track, conv_window)` instead of bare `out` when `True` — `state_track` is
+`(B,H,T_pad,V,K)`, `state_track[:,:,t]` is this block's `recurrent_state` as it would be after only the first
+`t+1` real rows (validated directly, at every `t`, in `test_gdn_scan_parity.py::TestGDNScanCapture`).
+`GatedDeltaNetBlock` gets its own `__call__` override: `spec=False` (every decode/prefill call, i.e. the
+entire non-speculative universe) delegates to `super().__call__` unchanged — byte-identical cost, nothing new
+ever built; `spec=True` (VERIFY only) builds the capturing variant. `forward()`'s block loop special-cases
+`isinstance(block, GatedDeltaNetBlock)` when `spec=True` to call it this way and collect `(state_track,
+conv_window)` per GDN block; its `spec=True` return grows from `(logits, hidden)` to `(logits, hidden,
+*per_gdn_block_captures)` — a flat tuple, kept per-block (not stacked into one tensor) specifically so blocks
+living on DIFFERENT devices (this model's whole reason for existing — see CLAUDE.md's pooled-server device
+map) never get an implicit cross-device copy just to be captured. **Why a side-channel instance attribute
+wouldn't have worked**: `GatedDeltaNetBlock.__call__`'s `_run` closure is `@function(precompile=True)`-wrapped,
+and (like the outer `TinyJit(self.forward)`, per §3's lesson) only what a jitted/precompiled closure actually
+*returns* survives being read after another call to the same closure — an attribute stashed on `self` inside
+`_attention` and read back later, outside that same call, has no guarantee of reflecting THIS call's data by
+then. Every new value here is threaded through an actual return statement for exactly this reason.
+
+**ACCEPT's FIXUP step, replacing CHECKPOINT+REDO**: no snapshot to take beforehand (nothing to roll back to —
+see §1's table) and, on partial accept, a plain slice + `.assign()` per GDN block reading directly off THIS
+verify call's own `gdn_extra`, not a second forward. Full accept needs no FIXUP at all (VERIFY's own in-place
+write is already correct) — same fast path the old code had, just without a CHECKPOINT to have avoided
+un-doing.
+
+**2. Draft-chain dispatch.** The `k_eff` sequential `mtp_head.draft` calls each used to end in a forced
+`.realize()` (T4.66): `v_draft_pos` was ONE Variable, rebound to a different concrete value every step, and a
+single merged schedule can't carry two bound values for the same name (`"bind mismatch on draft_pos, i !=
+i+1"`) — so each step had to be individually dispatched before the next `.bind()` of that name even existed.
+T4.66b uses `k` DISTINCT Variables (`draft_pos_0..k-1`) instead of rebinding one — no name is ever bound twice
+within one schedule, so the realize is gone and all `k_eff` steps merge into ONE schedule, dispatched by
+`chunk_ids`' own batched `.tolist()` (same mechanic VERIFY/FIXUP already relied on). Cost: `k` (not 1)
+warmed-once schedule-cache/`to_program_cache` entries for the draft chain instead of 1 — still bounded (`k`
+defaults to 3), same "one entry-set per NAME" property T4.66 established, just `k` of them; verified this
+doesn't regress by re-running `test_draft_reuses_schedule_across_positions` unchanged (still asserts zero
+growth after warmup, just a larger flat plateau).
+
+**Not done — a real jit capture for the whole chain.** The `.realize()` removal above cuts DISPATCH count
+(`k_eff` async dispatches → 1), but each draft step is still a separate PYTHON-level call into
+`mtp_head.block.__call__`'s `_function(precompile=True)` closure, which re-executes its python body (UOp
+construction, `get_state_dict`, `graph_rewrite`) every single call — `_function` never caches across calls the
+way `TinyJit` does. A `TinyJit`-wrapped, fixed-`k`, internally-unrolled draft-chain method (`for i in
+range(k): ...` built ONCE into one captured graph, keyed on the constant `k` — analogous to how
+`GatedDeltaNetBlock._attention`'s own per-token loop is already one python-unrolled chain inside ONE trace, and
+structurally the same nesting `Transformer.__call__`'s `TinyJit(self.forward)` already does around many
+`_function`-wrapped block calls) would remove that too — internal per-step positions would be `start_pos + i`
+(constant-offset arithmetic on the chain's ONE bound Variable, not `k` separate binds, so no naming scheme
+needed there either). Not implemented here: real, but it's a new capture mechanism to get right (especially
+threading the greedy chain's per-step argmax feedback through one unrolled trace) rather than a
+small, well-isolated change like the two items above, and `k_eff<k` (the max_context-boundary degrade, see
+§1) would still need the existing per-step loop as a fallback. Left as a design, not attempted, per this
+task's own priority order (item 1 > item 2 > item 3) and STOP condition for lower-priority items.
+
+**3. SPEC_STATS.** A `ContextVar` (default `0`, module-level next to `MTP`/`GDN_CHUNK` etc.) — `0`: zero
+overhead, not even a dict write, just one cheap `if` per outer iteration. `1`: `speculative_generate`
+accumulates an accept-length histogram (`m -> iteration count`) and drafts-per-emitted-token, printed once via
+a `try/finally` wrapping the main loop — fires whether the loop exhausts `max_context` or the generator is
+closed/abandoned early (a request ending in `serve.py`, or a test calling `gen.close()` — both raise
+`GeneratorExit` at the current `yield`, which the `finally` catches on its way out). This is the knob for
+picking `k` on real hardware: a low average accept length for a given `k` means the draft head isn't good
+enough to justify it (wasted DRAFT compute genuinely spent on tokens that get rejected); the histogram's shape
+(e.g. mass concentrated at `m=0` vs spread toward `m=k`) shows which direction to move `k` in, and
+drafts-per-token relates directly to the wall-clock trade this whole feature is making.
+
+**Correctness.** Every existing token-identity/state-integrity test (T4.64/T4.65's greedy and sampled paths)
+passes unchanged against the REDO-free path — none of them previously exercised a REAL `GatedDeltaNetBlock`
+at all (`test_spec_decode.py`'s base synthetic model is `full_attention_interval=1`, i.e. zero GDN blocks, so
+the old CHECKPOINT/REDO code ran as an always-empty no-op list there — the REAL correctness surface this task
+touches was previously untested). New: `test_gdn_scan_parity.py::TestGDNScanCapture` checks `capture=True`'s
+`state_track`/`conv_window` against sequential per-token ground truth at EVERY position (not just the final
+one), plus that capturing changes no output/final-state, plus that it forces the loop under an explicit WY
+context. `test_spec_decode.py` adds a `_load_gdn` model (a real `GatedDeltaNetBlock` + plain attention block,
+built directly a la `test_gdn_scan_parity.py::make_block`, no GGUF needed) and
+`test_forced_partial_accept_matches_generate_gdn`: a `fake_draft` engineered to be right about the first
+drafted position of every chain and wrong about every later one, forcing a genuine mid-chain partial accept
+(`0 < m < k_eff`) deterministically every iteration (confirmed via SPEC_STATS, not just inferred) — greedy
+output still matches `generate()` exactly.

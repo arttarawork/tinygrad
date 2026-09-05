@@ -239,6 +239,80 @@ class TestGDNScanSingleStepGate(unittest.TestCase):
       np.testing.assert_array_equal(conv_wy, conv_loop, err_msg=f"{name=} conv_state")
       np.testing.assert_array_equal(rec_wy, rec_loop, err_msg=f"{name=} recurrent_state")
 
+class TestGDNScanCapture(unittest.TestCase):
+  """T4.66b: GatedDeltaNetBlock._attention(capture=True) additionally returns (state_track, conv_window) --
+  see _attention's own docstring. speculative_generate's REDO-free reconstruction (test_spec_decode.py's
+  forced-partial-accept test) reads these at an arbitrary position m, so this file -- which already isolates
+  the scan from generate()/speculative_generate()'s own JIT machinery -- is the right place to pin down that
+  EVERY position's captured state is correct, not just the final one a plain parity test would cover."""
+
+  def test_state_track_matches_per_prefix_sequential_state(self):
+    for name in GEOMETRIES:
+      ssm = GEOMETRIES[name]
+      block = make_block(ssm)
+      x = (Tensor.randn(1, SMALL_TOKENS, DIM) * 0.1).realize()
+      x_norm = block.attn_norm(x)
+      block._init_state(x_norm)
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP):
+        _, state_track, conv_window = block._attention(x_norm, 0, capture=True)
+      state_track_np, conv_window_np = state_track.numpy(), conv_window.numpy()
+
+      # ground truth: a FRESH block fed one token at a time, snapshotted after each -- exactly the state
+      # speculative_generate's ACCEPT step needs for "only the first t+1 tokens were really fed", any t.
+      ref_block = make_block(ssm)
+      for t in range(SMALL_TOKENS):
+        run_attention(ref_block, x[:, t:t + 1], t)
+        ref_conv, ref_rec = snapshot(ref_block)
+        np.testing.assert_allclose(state_track_np[:, :, t], ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{name=} t={t} recurrent_state")
+        p = t + 1
+        np.testing.assert_allclose(conv_window_np[:, p:p + block.ssm_conv_kernel - 1], ref_conv, rtol=RTOL, atol=ATOL,
+                                    err_msg=f"{name=} t={t} conv_state")
+
+  def test_capture_does_not_change_output_or_final_state(self):
+    # capture=True must be a pure addition (two extra return values) -- the actual attention OUTPUT and the
+    # final conv/recurrent state it leaves behind must be bit-identical to a capture=False call from an
+    # identically-seeded fresh block (same reasoning as TestGDNScanSingleStepGate's loop-vs-WY equality check).
+    for name in GEOMETRIES:
+      ssm = GEOMETRIES[name]
+      x = (Tensor.randn(1, SMALL_TOKENS, DIM) * 0.1).realize()
+      block_a, block_b = make_block(ssm), make_block(ssm)
+      out_a = run_attention(block_a, x, 0)
+      x_norm = block_b.attn_norm(x)
+      block_b._init_state(x_norm)
+      out_b, _, _ = block_b._attention(x_norm, 0, capture=True)
+      np.testing.assert_array_equal(out_a, out_b.realize().numpy(), err_msg=f"{name=} output")
+      conv_a, rec_a = snapshot(block_a)
+      conv_b, rec_b = snapshot(block_b)
+      np.testing.assert_array_equal(conv_a, conv_b, err_msg=f"{name=} conv_state")
+      np.testing.assert_array_equal(rec_a, rec_b, err_msg=f"{name=} recurrent_state")
+
+  def test_capture_forces_loop_even_under_wy(self):
+    # _attention's own docstring: capture=True always takes the per-token loop, even when GDN_SCAN_IMPL
+    # requests WY -- gdn_scan_wy has no cheap per-position state to hand back (see the docstring's reasoning),
+    # so silently honoring WY here would either crash (assert state_track is not None) or (if that assert were
+    # ever weakened) silently hand speculative_generate a None it can't reconstruct state from. Checked via
+    # gdn_last_scan_impl the same way TestGDNScanSingleStepGate does, plus a correctness check against the
+    # same per-prefix ground truth as the test above (a smaller slice of it -- just position 0 and the last).
+    for name in GEOMETRIES:
+      ssm = GEOMETRIES[name]
+      block = make_block(ssm)
+      x = (Tensor.randn(1, SMALL_TOKENS, DIM) * 0.1).realize()
+      x_norm = block.attn_norm(x)
+      block._init_state(x_norm)
+      gdn_last_scan_impl.clear()
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_WY):
+        _, state_track, conv_window = block._attention(x_norm, 0, capture=True)
+        Tensor.realize(state_track, conv_window)  # force the dispatch now, still inside the WY context
+      self.assertTrue(gdn_last_scan_impl, "run_scan recorded no dispatch")
+      self.assertEqual(set(gdn_last_scan_impl), {GDN_SCAN_LOOP}, f"{name=}: capture=True must never dispatch to WY")
+
+      ref_block = make_block(ssm)
+      run_attention(ref_block, x[:, :1], 0)
+      ref_conv0, ref_rec0 = snapshot(ref_block)
+      np.testing.assert_allclose(state_track.numpy()[:, :, 0], ref_rec0, rtol=RTOL, atol=ATOL, err_msg=f"{name=} t=0 recurrent_state")
+      np.testing.assert_allclose(conv_window.numpy()[:, 1:1 + block.ssm_conv_kernel - 1], ref_conv0, rtol=RTOL, atol=ATOL,
+                                  err_msg=f"{name=} t=0 conv_state")
+
 class TestGDNScanRealWeightUnderflow(unittest.TestCase):
   """T4.73c regression -- see FIXNOTES_T473C.md for the full diagnosis. At REAL trained qwen3.8-27B blk.0
   weights, head 42 of 48 decays fast enough (learned ssm_a=-0.337646, ssm_dt.bias=14.875 -- the next-most-
