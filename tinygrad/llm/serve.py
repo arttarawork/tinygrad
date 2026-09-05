@@ -42,6 +42,20 @@ def normalize_messages(messages:list[dict]) -> None:
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
 
+def lmstudio_models_payload(model_name:str, max_context:int) -> dict:
+  # T4.80: LM Studio's native GET /api/v1/models shape -- Hermes's /reasoning command only offers effort
+  # levels for a model whose provider answers this probe with a non-empty capabilities.reasoning.allowed_options.
+  return {"models": [{"key":model_name, "id":model_name, "object":"model", "type":"llm", "max_context_length":max_context,
+                      "capabilities": {"reasoning": {"allowed_options": ["none", "minimal", "low", "medium", "high", "xhigh"]}},
+                      "loaded_instances": [{"id":model_name, "config": {"context_length":max_context}}]}]}
+
+def template_kwargs(body:dict) -> dict:
+  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level
+  # reasoning_effort (LM Studio's /reasoning knob) overrides enable_thinking when present -- see T4.80.
+  kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
+  if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
+  return kwargs
+
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
@@ -93,6 +107,8 @@ class Handler(HTTPRequestHandler):
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
+    elif self.path == "/api/v1/models":
+      self.send_data(json.dumps(lmstudio_models_payload(self.server.model_name, self.server.model.max_context)).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
                 reasoning:bool=False, record:tuple[str, list[int], int]|None=None):
@@ -174,14 +190,14 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # render and tokenize
       normalize_messages(body["messages"])
-      # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does
-      kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
+      kwargs = template_kwargs(body)
       def render(messages:list[dict], add_generation_prompt:bool) -> str:
         return self.server.template.render(messages=messages, tools=body.get("tools"), add_generation_prompt=add_generation_prompt, **kwargs)
       rendered = render(body["messages"], True)
       ids: list[int] = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
         or self.server.tok.encode(rendered)
-      stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  ")
+      think = f"think:{'on' if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  " if "enable_thinking" in kwargs else ""
+      stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  {think}")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
         return self.send_data(json.dumps({"error":{"message":f"prompt has {len(ids)} tokens, but the model context is "
@@ -209,6 +225,8 @@ class Handler(HTTPRequestHandler):
         if tool_calls: message["tool_calls"] = tool_calls
         self.send_data(json.dumps({**c, "object":"chat.completion",
           "choices":[{"index":0, "message":message, "finish_reason":finish_reason}]}).encode())
+    elif self.path == "/api/v1/models/load":  # T4.80: LM Studio's load probe -- a no-op, the model is always loaded
+      self.send_data(json.dumps({"status":"loaded", "model":self.server.model_name, "context_length":self.server.model.max_context}).encode())
     else:
       # a clean 404, not an exception: local tooling probes other servers' APIs on this port (Ollama's /api/show and
       # friends), and raising here tears down the connection and spams a traceback per probe
