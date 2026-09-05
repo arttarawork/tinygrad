@@ -409,7 +409,7 @@ class FFNBlock:
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
-  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor) -> Tensor: raise NotImplementedError
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor: raise NotImplementedError
 
   def _rope_freqs(self, rope:int|UOp|Tensor, T:int|UOp) -> Tensor:
     # T5.3: `rope` is either this chunk's first ROPE position (an int/Variable: a slice of the table -- every text request, and decode
@@ -459,7 +459,8 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
-  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
+    if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
@@ -545,7 +546,8 @@ class MLATransformerBlock(FFNBlock):
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
     self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
+    if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)

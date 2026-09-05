@@ -1,7 +1,7 @@
 # T5.4 (VISION_DESIGN.md section 2.1/2.4): server/CLI vision wiring -- pure-function unit tests plus a couple of
 # HTTP-level 400/capability checks in the T4.80 TestLMStudioShim style (test/unit/test_llm_server.py). No real
 # model/encoder: stubs only.
-import base64, unittest
+import base64, importlib.util, unittest
 from types import SimpleNamespace
 from tinygrad.llm.image import hash_ids, image_hash
 from tinygrad.llm.serve import (ImageError, IMAGE_PLACEHOLDER, LLMServer, expand_image_pads, extract_images,
@@ -76,6 +76,7 @@ class TestExtractImages(unittest.TestCase):
     with self.assertRaises(ImageError):
       extract_images(messages)
 
+@unittest.skipUnless(importlib.util.find_spec("PIL"), "needs Pillow (the CI unit lane has none)")
 class TestLoadImage(unittest.TestCase):
   def test_garbage_bytes_is_image_error_not_a_raw_pil_exception(self):
     with self.assertRaises(ImageError):
