@@ -193,11 +193,11 @@ class TestGDNScanChunkParity(unittest.TestCase):
         np.testing.assert_allclose(conv, ref_conv, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} continuation conv_state")
         np.testing.assert_allclose(rec, ref_rec, rtol=RTOL, atol=ATOL, err_msg=f"{impl=} {name=} continuation recurrent_state")
 
-  def test_auto_resolves_to_loop(self):
-    # T4.69a: GDN_SCAN_IMPL=0 (auto, the default) must resolve to GDN_SCAN_LOOP -- flipping the default to
-    # WY is a later, measured decision (see extra/gdn_wy_evidence.py), so today's graph stays byte-identical
-    # for anyone not explicitly opting in. Explicit 1/2 must resolve to themselves.
-    with Context(GDN_SCAN_IMPL=0): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_LOOP)
+  def test_auto_resolves_to_wy(self):
+    # T4.69c: GDN_SCAN_IMPL=0 (auto, the default) now resolves to GDN_SCAN_WY -- the measured flip T4.69a deferred
+    # (27 vs 22-23 tok/s prefill on qwen3.8-27B once T4.73c/d made WY greedy-identical to the loop on real weights).
+    # Decode still takes the loop via run_scan's T_pad>1 gate. Explicit 1/2 must resolve to themselves.
+    with Context(GDN_SCAN_IMPL=0): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_WY)
     with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_LOOP)
     with Context(GDN_SCAN_IMPL=GDN_SCAN_WY): self.assertEqual(gdn_scan_impl_for(), GDN_SCAN_WY)
 

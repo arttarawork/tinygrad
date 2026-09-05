@@ -50,7 +50,11 @@ def gdn_head_groups_for(num_v_heads:int) -> int:
 # GDN_HEAD_GROUPS-sliced call composes with it for free (each group independently dispatches).
 GDN_SCAN_IMPL = ContextVar("GDN_SCAN_IMPL", 0)
 GDN_SCAN_LOOP, GDN_SCAN_WY = 1, 2
-def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.value > 0 else GDN_SCAN_LOOP
+# T4.69c (2026-09-04): auto (0) now selects the chunkwise WY form for chunked prefill -- decode/T_pad==1 still takes the
+# loop via run_scan's T4.69b gate. Flipped only after T4.73c (a_bar underflow) + T4.73d (tri-inverse cancellation) made WY
+# greedy-identical to the loop on real weights end-to-end on hardware; measured 27 tok/s vs 22-23 at 5.9k on qwen3.8-27B.
+# GDN_SCAN_IMPL=1 restores the loop everywhere.
+def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.value > 0 else GDN_SCAN_WY
 # T4.69b: test-introspection only, never read inside the model itself -- run_scan (below) appends the impl it
 # actually dispatched to (post single-step gate), so a test can assert WY vs LOOP was chosen without reaching
 # into a kernel count. Read via gdn_last_scan_impl[-1].

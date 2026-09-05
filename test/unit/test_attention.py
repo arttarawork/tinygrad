@@ -287,6 +287,15 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     fresh = self._run_attention(self._make_block(config), x[:, :2], 0)
     np.testing.assert_allclose(restarted, fresh, rtol=1e-3, atol=1e-3)
 
+def _assert_state_match(a, b, err_msg=""):
+  """Head-group parity on the recurrent state. Under the per-token loop the G=1 and G>1 graphs do the same arithmetic in the same
+  order, so the state is bit-identical. Under the WY chunkwise scan (the default since T4.69c) the grouped and ungrouped graphs fuse
+  differently on METAL (CI's macOS lane, measured 2026-09-05: max |d| 1.5e-8 on values ~0.1, max rel 3.1e-7 -- the fp32 rounding
+  floor; outputs still bit-identical), so compare the state with a tolerance just above that floor."""
+  from tinygrad.llm.model import gdn_scan_impl_for, GDN_SCAN_WY
+  if gdn_scan_impl_for() == GDN_SCAN_WY: np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-7, err_msg=err_msg)
+  else: np.testing.assert_array_equal(a, b, err_msg=err_msg)
+
 class TestGatedDeltaNetHeadGroups(unittest.TestCase):
   """T4.62: GDN_HEAD_GROUPS splits the else-branch's unrolled per-t scan into G sequential head groups so the
   lowered kernel's UOp count doesn't scale with num_v_heads on wide-head geometries (qwen3.8-27B, H=48 blows
@@ -336,13 +345,13 @@ class TestGatedDeltaNetHeadGroups(unittest.TestCase):
     x = self._tensor_linspace(-0.5, 0.5, (1, chunk, config.dim))
     out1, outN = self._attend(block1, x, 0, 1), self._attend(blockN, x, 0, groups)
     np.testing.assert_array_equal(outN, out1, err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill output")
-    np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
+    _assert_state_match(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
                                   err_msg=f"{num_v_heads=} {chunk=} {groups=} prefill state")
     # start_pos>0 continuation: state carried from the prefill above must keep matching exactly
     x2 = self._tensor_linspace(0.3, -0.3, (1, chunk, config.dim))
     out1b, outNb = self._attend(block1, x2, chunk, 1), self._attend(blockN, x2, chunk, groups)
     np.testing.assert_array_equal(outNb, out1b, err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation output")
-    np.testing.assert_array_equal(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
+    _assert_state_match(blockN.recurrent_state.numpy(), block1.recurrent_state.numpy(),
                                   err_msg=f"{num_v_heads=} {chunk=} {groups=} continuation state")
 
   def test_auto_picks_g1_at_32_heads_g2_at_48(self):
