@@ -6,7 +6,7 @@ from tinygrad.nn.state import get_state_dict
 from tinygrad.schedule import schedule_cache
 from tinygrad.helpers import Context
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig
-from tinygrad.llm.serve import StreamRouter, splice_ids
+from tinygrad.llm.serve import StreamRouter, splice_ids, lmstudio_models_payload, template_kwargs, LLMServer
 from tinygrad.llm.cli import SimpleTokenizer, FallbackTemplate
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
@@ -396,6 +396,61 @@ class TestSpliceIds(unittest.TestCase):
 
   def test_no_assistant_turn_falls_back(self):
     self.assertIsNone(self._splice(self.hist + [{"role":"user","content":"more"}]))
+
+class TestLMStudioShim(unittest.TestCase):
+  # T4.80: LM Studio's native probe endpoints (Hermes's /reasoning command) + reasoning_effort -> enable_thinking
+
+  def test_template_kwargs_no_overrides(self):
+    self.assertEqual(template_kwargs({}), {"preserve_thinking": True})
+
+  def test_template_kwargs_honors_chat_template_kwargs(self):
+    self.assertEqual(template_kwargs({"chat_template_kwargs": {"enable_thinking": False}}),
+                     {"preserve_thinking": True, "enable_thinking": False})
+
+  def test_reasoning_effort_none_overrides_chat_template_kwargs(self):
+    body = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": True}}
+    self.assertEqual(template_kwargs(body)["enable_thinking"], False)
+
+  def test_reasoning_effort_overrides_to_thinking_on(self):
+    self.assertEqual(template_kwargs({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}})["enable_thinking"], True)
+    self.assertEqual(template_kwargs({"reasoning_effort": "medium"})["enable_thinking"], True)
+
+  def test_reasoning_effort_case_and_whitespace_insensitive(self):
+    self.assertEqual(template_kwargs({"reasoning_effort": "NONE "})["enable_thinking"], False)
+
+  def test_lmstudio_models_payload_shape(self):
+    self.assertEqual(lmstudio_models_payload("tiny", 32)["models"], [{
+      "key": "tiny", "id": "tiny", "object": "model", "type": "llm", "max_context_length": 32,
+      "capabilities": {"reasoning": {"allowed_options": ["none", "minimal", "low", "medium", "high", "xhigh"]}},
+      "loaded_instances": [{"id": "tiny", "config": {"context_length": 32}}],
+    }])
+
+  def test_lmstudio_and_openai_probe_endpoints_over_http(self):
+    import threading, time, json, types, urllib.request, urllib.error
+    server = LLMServer(("127.0.0.1", 0), model=types.SimpleNamespace(max_context=32), model_name="tiny", tok=None, template=None)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    try:
+      with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/models", timeout=5) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.read()), lmstudio_models_payload("tiny", 32))
+      load_req = urllib.request.Request(f"http://127.0.0.1:{port}/api/v1/models/load", data=b"{}",
+                                        headers={"Content-Type": "application/json"})
+      with urllib.request.urlopen(load_req, timeout=5) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.read()), {"status": "loaded", "model": "tiny", "context_length": 32})
+      with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as resp:
+        self.assertEqual(json.loads(resp.read()), {"object": "list", "data": [{"id": "tiny", "object": "model"}]})
+      nope_req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/nope", data=b"{}",
+                                        headers={"Content-Type": "application/json"})
+      with self.assertRaises(urllib.error.HTTPError) as cm:
+        urllib.request.urlopen(nope_req, timeout=5)
+      self.assertEqual(cm.exception.code, 404)
+    finally:
+      server.shutdown()
+      server.server_close()
 
 if __name__ == '__main__':
   unittest.main()
