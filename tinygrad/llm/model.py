@@ -10,7 +10,8 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
-from tinygrad.helpers import ContextVar
+from tinygrad.helpers import ContextVar, DEBUG
+import traceback
 
 # T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 0 = auto: 32 on the GPU
 # backends it was measured on -- METAL (qwen3.5:0.8b: 77 -> 168 tok/s no-BEAM, 99 -> 346 BEAM'd) and NV (the METAL+NV pooled
@@ -1086,7 +1087,10 @@ class Transformer:
     # their pre-T5.3 keys and graphs untouched.
     chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
     vision = (True,) if rope_start is not None or vis_e is not None else ()  # text keys stay the pre-T5.3 4-tuples
-    return self.jit.setdefault((is_prefill, temperature is None, chunk_size, spec) + vision, TinyJit(self.forward))(
+    key = (is_prefill, temperature is None, chunk_size, spec) + vision
+    if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
+      print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}")
+    return self.jit.setdefault(key, TinyJit(self.forward))(
       tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos)
 
   def realize_placement(self):
