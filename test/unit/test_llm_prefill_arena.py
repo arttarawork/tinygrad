@@ -55,6 +55,22 @@ class TestPrefillArena(unittest.TestCase):
     slot = cfg.n_heads * 32 * (cfg.max_context + 32) * 4
     self.assertLess(max(arenas[0]), 2.3 * slot, f"prefill arena {max(arenas[0])/1e6:.2f} MB vs slot {slot/1e6:.2f} MB")
 
+  def test_planned_size_is_block_aligned_and_reusable(self):
+    # the sizing must (a) keep every offset block_size-aligned (LLVM kernel args are declared `align 32`; x86 aligned vector
+    # loads fault otherwise) and (b) let a freed block satisfy an equal request across the whole size range
+    from tinygrad.schedule.memory import planned_size
+    from tinygrad.runtime.support.memory import TLSFAllocator
+    for n in list(range(0, 70000, 7)) + [2105344, 402718720, 1 << 30]:
+      self.assertEqual(planned_size(n) % 256, 0, n)
+      self.assertGreaterEqual(planned_size(n), n)
+    for n in (300, 4096, 8200, 2105344, 402718720):
+      sz, t = planned_size(n), TLSFAllocator(planned_size(n) * 6, block_size=256, lv2_cnt=32)
+      a, b = t.alloc(sz), t.alloc(sz)
+      t.free(a)
+      c = t.alloc(sz)
+      self.assertEqual(c, a, f"n={n}: a freed equal-sized block must be reused")
+      self.assertEqual((a | b | c) % 256, 0)
+
   def test_planner_does_not_change_numerics(self):
     # the planner only decides WHERE intermediates live: outputs must equal the unplanned run bit for bit
     def ids(no_planner:int) -> list[int]:
