@@ -83,7 +83,8 @@ class VisionEncoder:  # Qwen3_5MoeVisionModel (+ its Qwen3_5MoeVisionPatchMerger
     # T5.5: the weights' actual device -- `device=None` (tests; CI's METAL default lane) or a gguf_load that ignored the request
     # must never leave the host-built index/rope tensors on a different device than the weights (round 8/CI: 'expected index and
     # self on the same device').
-    return self.position_embd.device if hasattr(self, 'position_embd') else (self._device or Device.DEFAULT)
+    if hasattr(self, 'position_embd'): return self.position_embd.device
+    return self._device if self._device is not None else Device.DEFAULT
 
   @staticmethod
   def from_mmproj(path:str|pathlib.Path, device:str|None=None) -> VisionEncoder:
