@@ -10,7 +10,7 @@ from __future__ import annotations
 import math, pathlib
 from dataclasses import dataclass
 import numpy as np
-from tinygrad import Tensor, nn
+from tinygrad import Device, Tensor, nn
 from tinygrad.llm.gguf import gguf_load
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ def _rotate_half(x:Tensor) -> Tensor:
 
 class VisionEncoder:  # Qwen3_5MoeVisionModel (+ its Qwen3_5MoeVisionPatchMerger)
   def __init__(self, c:VisionConfig, device:str|None=None):
-    self.c, self.device = c, device
+    self.c, self._device = c, device
     self.patch_embd = nn.Linear(c.patch_vec, c.hidden)          # Qwen3_5MoeVisionPatchEmbed: the Conv3d(k=s=[T,p,p]) as a Linear
     self.position_embd = Tensor.zeros(c.n_pos, c.hidden)        # nn.Embedding(num_position_embeddings)
     self.blk = [VisionBlock(c) for _ in range(c.depth)]
@@ -77,6 +77,13 @@ class VisionEncoder:  # Qwen3_5MoeVisionModel (+ its Qwen3_5MoeVisionPatchMerger
     merged = c.hidden * c.merge * c.merge
     self.mm0, self.mm2 = nn.Linear(merged, merged), nn.Linear(merged, c.out)  # merger.linear_fc1 / linear_fc2
     self.inv_freq = 1.0 / (10000.0 ** (np.arange(0, c.head_dim // 2, 2, dtype=np.float32) / (c.head_dim // 2)))  # VisionRotaryEmbedding(head_dim//2)
+
+  @property
+  def device(self) -> str|tuple[str, ...]:
+    # T5.5: the weights' actual device -- `device=None` (tests; CI's METAL default lane) or a gguf_load that ignored the request
+    # must never leave the host-built index/rope tensors on a different device than the weights (round 8/CI: 'expected index and
+    # self on the same device').
+    return self.position_embd.device if hasattr(self, 'position_embd') else (self._device or Device.DEFAULT)
 
   @staticmethod
   def from_mmproj(path:str|pathlib.Path, device:str|None=None) -> VisionEncoder:
