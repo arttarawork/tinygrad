@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time, signal
+import sys, argparse, codecs, itertools, typing, re, unicodedata, json, time, signal, os
 from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
@@ -7,6 +7,7 @@ from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, 
 from tinygrad.llm.model import Transformer
 if TYPE_CHECKING:
   import jinja2
+  from tinygrad.llm.vision import VisionEncoder
 
 # T1.8b: opt-in tuned decode-attention kernel (default off). See tinygrad/llm/attn_kernel.py for what it
 # does and its hard limiter (falls back to the default SDPA path once the JIT promotes the KV-cache slice
@@ -154,6 +155,7 @@ def main():
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
   parser.add_argument("--device-map", default=None, help='Per-block device placement: "0-15:CPU:0,16-31:CPU:1" or "CPU:0,CPU:1" (even split); '
                        'optional "experts:<device>" segment routes MoE routed-expert weights to a separate device')
+  parser.add_argument("--mmproj", default=None, help="vision projector GGUF (mmproj-*.gguf) next to the model; enables image_url content parts")
   parser.add_argument("--serve", nargs='?', type=int, const=8000, metavar="PORT", help="Run OpenAI compatible API (optional port, default 8000)")
   parser.add_argument("--mtp", action="store_true", help="Route chat completions through MTP speculative decoding "
                        "(needs MTP=1 at load time so the model actually has an mtp_head; k is the SPEC_TOKENS env var, default 3)")
@@ -171,6 +173,15 @@ def main():
   file_sizes = [y.nbytes() for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"using model \"{model_name}\" with {sum(file_sizes):,} bytes and {sum(x.numel() for x in nn.state.get_parameters(model)):,} params, "
         f"max context {args.max_context} on {nn.state.get_parameters(model)[0].device}")
+
+  # T5.4: --mmproj loads the model's own vision encoder (VISION_DESIGN.md section 2.4). VISION_DEVICE overrides where it runs;
+  # default is blk[0]'s device, so on the standing serving map the injected embeddings need no cross-device hop.
+  enc: VisionEncoder|None = None
+  if args.mmproj:
+    from tinygrad.llm.vision import VisionEncoder
+    vision_device = os.environ.get("VISION_DEVICE") or model.blk[0].device
+    assert isinstance(vision_device, str), f"--mmproj needs a single device string, got {vision_device!r} from blk[0] -- set VISION_DEVICE"
+    enc = VisionEncoder.from_mmproj(args.mmproj, vision_device)
 
   # get tokenizer
   tok = SimpleTokenizer.from_gguf_kv(kv)
@@ -191,7 +202,7 @@ def main():
 
   # warmup the JIT
   if args.warmup or args.serve:
-    with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
+    with Context(DEBUG=max(DEBUG.value, 1)): model.warmup(vision=args.mmproj is not None)
 
   # start server
   if args.serve:
@@ -199,7 +210,7 @@ def main():
     # python's default disposition would skip it
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     LLMServer(('', args.serve), model, model_name, tok, template, mtp=args.mtp,
-              state_cache_mb=STATE_CACHE_MB if args.state_cache else 0).serve_forever()
+              state_cache_mb=STATE_CACHE_MB if args.state_cache else 0, vision=enc).serve_forever()
 
   # do benchmark
   if args.benchmark is not None:

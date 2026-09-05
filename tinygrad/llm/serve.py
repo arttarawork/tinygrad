@@ -1,12 +1,16 @@
 from __future__ import annotations
-import collections, json, pathlib, re, time, typing, uuid
+import collections, json, os, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
+from tinygrad import Tensor
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
-from tinygrad.llm.model import snapshot_matches, snapshot_nbytes
+from tinygrad.llm.image import DEFAULT_MAX_PIXELS, hash_ids, image_hash, n_visual_tokens, preprocess
+from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
+  import numpy as np
   from tinygrad.llm.cli import SimpleTokenizer
   from tinygrad.llm.model import Transformer
+  from tinygrad.llm.vision import VisionEncoder
 
 # T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag.
 SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
@@ -42,11 +46,100 @@ def normalize_messages(messages:list[dict]) -> None:
         try: tc["function"]["arguments"] = json.loads(args)
         except json.JSONDecodeError: pass
 
-def lmstudio_models_payload(model_name:str, max_context:int) -> dict:
+# T5.4 (VISION_DESIGN.md section 2.1/2.4): OpenAI image_url content parts. See cli.py's --mmproj flag for how a VisionEncoder gets
+# attached to LLMServer, and Handler.do_POST below for how these helpers fit into the request path.
+IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"  # literal text -- the chat template sees plain text; the resulting
+                                                                     # image_pad ids get expanded post-tokenize by expand_image_pads
+IMAGE_URL_TIMEOUT_S = 10
+IMAGE_URL_MAX_BYTES = 20 * 1024 * 1024
+
+class ImageError(Exception):
+  """A client-facing image request error: Handler.do_POST catches this and answers 400 with .code as the OpenAI-style error code
+  (e.g. "vision_unavailable"; "invalid_image" is the default)."""
+  def __init__(self, message:str, code:str = "invalid_image"):
+    super().__init__(message)
+    self.code = code
+
+def image_error_response(message:str, code:str) -> dict:
+  return {"error": {"message": message, "type": "invalid_request_error", "code": code}}
+
+def _fetch_image_url(url:str) -> bytes:
+  """data:<mime>;base64,<payload> -> base64-decode; http(s) -> fetch with a timeout and a size cap; anything else is a client error."""
+  if url.startswith("data:"):
+    header, sep, payload = url.partition(",")
+    if not sep or "base64" not in header: raise ImageError(f"unsupported data url (need base64): {url[:50]!r}")
+    import base64
+    try: return base64.b64decode(payload)
+    except Exception as e: raise ImageError(f"bad base64 image data: {e}") from e
+  if url.startswith(("http://", "https://")):
+    import urllib.request
+    try:
+      with urllib.request.urlopen(url, timeout=IMAGE_URL_TIMEOUT_S) as resp: data = resp.read(IMAGE_URL_MAX_BYTES + 1)
+    except Exception as e: raise ImageError(f"could not fetch image url {url[:80]!r}: {e}") from e
+    if len(data) > IMAGE_URL_MAX_BYTES: raise ImageError(f"image at {url[:80]!r} exceeds {IMAGE_URL_MAX_BYTES} bytes")
+    return data
+  raise ImageError(f"unsupported image url scheme: {url[:50]!r}")
+
+def extract_images(messages:list[dict]) -> list[bytes]:
+  """Flattens every message's list-form `content` (OpenAI content parts) to a plain string IN PLACE: a `text` part contributes its
+  text, an `image_url` part (a {"url": ...} dict or a bare url string) contributes IMAGE_PLACEHOLDER at that position and its bytes
+  are fetched and appended to the returned list, in prompt order (VISION_DESIGN.md section 2.1). A non-list `content` (the common,
+  text-only case) is untouched -- text-only requests keep behaving byte-identically. Raises ImageError (-> 400) on an unsupported
+  content-part type or image url scheme."""
+  images: list[bytes] = []
+  for m in messages:
+    content = m.get("content")
+    if not isinstance(content, list): continue
+    parts: list[str] = []
+    for c in content:
+      if c.get("type") == "text": parts.append(c.get("text", ""))
+      elif c.get("type") == "image_url":
+        url = c["image_url"]["url"] if isinstance(c["image_url"], dict) else c["image_url"]
+        images.append(_fetch_image_url(url))
+        parts.append(IMAGE_PLACEHOLDER)
+      else: raise ImageError(f"unsupported content part type: {c.get('type')!r}")
+    m["content"] = "".join(parts)
+  return images
+
+def load_image(data:bytes, max_pixels:int) -> tuple[np.ndarray, tuple[int, int, int]]:
+  """image.py's preprocess(), with a bad image (corrupt bytes -> PIL OSError, extreme aspect ratio -> ValueError) turned into an
+  ImageError (-> 400 invalid_image) instead of propagating into an unhandled 500."""
+  try: return preprocess(data, max_pixels=max_pixels)
+  except (ValueError, OSError) as e: raise ImageError(f"invalid image: {e}") from e
+
+def expand_image_pads(ids:list[int], pad_id:int, images:list[tuple[bytes, int, tuple[int, int, int]]],
+                      vocab_size:int) -> tuple[list[int], list[tuple[int, int, tuple[int, int, int]]]]:
+  """Expands each `pad_id` occurrence in `ids` into a run of n ids, one occurrence per (digest, n, grid) in `images`, in order
+  (VISION_DESIGN.md section 2.1): the first min(8, n) ids are hash_ids(digest, vocab_size) -- so two prompts differing only in image
+  content differ in token ids too, which is what get_start_pos and the T4.67 state cache key their reuse decision on -- the rest of
+  the run stays pad_id (the model never embeds these ids as text; T5.3's VisionInput.spans is how it knows to replace them). Returns
+  the expanded ids and each image's (offset, n, grid) span into them, in id order. Raises ImageError if the pad-occurrence count in
+  `ids` doesn't match len(images)."""
+  out: list[int] = []
+  spans: list[tuple[int, int, tuple[int, int, int]]] = []
+  it = iter(images)
+  for tid in ids:
+    if tid != pad_id:
+      out.append(tid)
+      continue
+    img = next(it, None)
+    if img is None: raise ImageError("more image placeholders in the prompt than images")
+    digest, n, grid = img
+    k = min(8, n)
+    spans.append((len(out), n, grid))
+    out += hash_ids(digest, vocab_size)[:k] + [pad_id] * (n - k)
+  if next(it, None) is not None: raise ImageError("fewer image placeholders in the prompt than images")
+  return out, spans
+
+def lmstudio_models_payload(model_name:str, max_context:int, vision:bool = False) -> dict:
   # T4.80: LM Studio's native GET /api/v1/models shape -- Hermes's /reasoning command only offers effort
   # levels for a model whose provider answers this probe with a non-empty capabilities.reasoning.allowed_options.
+  # T5.4: capabilities.vision=True (only set when True -- omitted, not False, otherwise) lets Hermes's vision auxiliary
+  # task route to this server; see cli.py's --mmproj.
+  capabilities: dict[str, typing.Any] = {"reasoning": {"allowed_options": ["none", "minimal", "low", "medium", "high", "xhigh"]}}
+  if vision: capabilities["vision"] = True
   return {"models": [{"key":model_name, "id":model_name, "object":"model", "type":"llm", "max_context_length":max_context,
-                      "capabilities": {"reasoning": {"allowed_options": ["none", "minimal", "low", "medium", "high", "xhigh"]}},
+                      "capabilities": capabilities,
                       "loaded_instances": [{"id":model_name, "config": {"context_length":max_context}}]}]}
 
 def template_kwargs(body:dict) -> dict:
@@ -108,10 +201,11 @@ class Handler(HTTPRequestHandler):
   def do_GET(self):
     if self.path == "/v1/models": self.send_data(json.dumps({"object":"list","data":[{"id":self.server.model_name,"object":"model"}]}).encode())
     elif self.path == "/api/v1/models":
-      self.send_data(json.dumps(lmstudio_models_payload(self.server.model_name, self.server.model.max_context)).encode())
+      payload = lmstudio_models_payload(self.server.model_name, self.server.model.max_context, self.server.vision is not None)
+      self.send_data(json.dumps(payload).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False, record:tuple[str, list[int], int]|None=None):
+                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -122,7 +216,9 @@ class Handler(HTTPRequestHandler):
     if cache_start_pos == 0 and self.server.state_cache_mb > 0 and (snap := self.server.find_snapshot(ids)) is not None:
       model.restore_state(snap)
       cache_start_pos = model.get_start_pos(ids)
-    stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}  {colored('--', 'BLACK')}  ")
+    # T5.4: " img:{images}/{visual tokens}" after the in: field, only when this request actually carries images.
+    img_field = f" img:{len(vision.spans)}/{sum(n for _, n, _ in vision.spans)}" if vision is not None and vision.spans else ""
+    stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}{img_field}  {colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     def chunk(d:dict): return {"choices": [{"index":0, "delta":d, "finish_reason":None}], **tmpl}
     out: list[int] = []
@@ -140,9 +236,10 @@ class Handler(HTTPRequestHandler):
     # has an mtp_head (Transformer.from_gguf under MTP=1) -- absent either condition, this is model.generate,
     # byte-identical to before --mtp existed. speculative_generate(temperature=temperature) already picks
     # its own greedy (temperature<=0) vs sampled (>0) path internally, so no extra branching is needed here.
-    use_spec = self.server.mtp and model.mtp_head is not None
+    # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
+    use_spec = self.server.mtp and model.mtp_head is not None and vision is None
     gen = model.speculative_generate(ids, k=self.server.spec_k, temperature=temperature) if use_spec \
-      else model.generate(ids, temperature=temperature)
+      else model.generate(ids, temperature=temperature, vision=vision)
     try:
       yield chunk({"role":"assistant", "content":""})
       for next_id in gen:
@@ -190,12 +287,42 @@ class Handler(HTTPRequestHandler):
     if self.path == "/v1/chat/completions":
       # render and tokenize
       normalize_messages(body["messages"])
+      # T5.4 (VISION_DESIGN.md section 2.1/2.4): image_url content parts. extract_images flattens body["messages"] content lists to
+      # plain text IN PLACE -- a no-op for the common text-only body, which is untouched from here on -- collecting raw image bytes.
+      loaded: list[tuple[bytes, np.ndarray, tuple[int, int, int]]] = []
+      try:
+        images = extract_images(body["messages"])
+        if images and (self.server.vision is None or self.server.image_pad_id is None):
+          raise ImageError("start the server with --mmproj", code="vision_unavailable")
+        for data in images:
+          patches, grid = load_image(data, self.server.vision_max_pixels)
+          loaded.append((image_hash(data), patches, grid))
+      except ImageError as e:
+        return self.send_data(json.dumps(image_error_response(str(e), e.code)).encode(), status_code=400)
       kwargs = template_kwargs(body)
       def render(messages:list[dict], add_generation_prompt:bool) -> str:
         return self.server.template.render(messages=messages, tools=body.get("tools"), add_generation_prompt=add_generation_prompt, **kwargs)
       rendered = render(body["messages"], True)
-      ids: list[int] = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
-        or self.server.tok.encode(rendered)
+      ids: list[int]
+      vision_input: VisionInput|None = None
+      record: tuple[str, list[int], int]|None = None
+      if loaded:
+        # image prompts skip splice_ids (the splice cache stays text-only -- expanded ids already carry the image identity for the
+        # T4.67 state cache) and pass no record= either; run_model forces the plain generate() path when vision is set.
+        enc, pad_id = self.server.vision, self.server.image_pad_id
+        assert enc is not None and pad_id is not None  # guaranteed by the vision_unavailable check above
+        vocab_size = int(self.server.model.token_embd.weight.shape[0])
+        try:
+          ids, spans = expand_image_pads(self.server.tok.encode(rendered), pad_id,
+                                         [(digest, n_visual_tokens(grid), grid) for digest, _, grid in loaded], vocab_size)
+        except ImageError as e:
+          return self.send_data(json.dumps(image_error_response(str(e), e.code)).encode(), status_code=400)
+        embed_list = [enc(Tensor(patches, device=enc.device), grid) for _, patches, grid in loaded]
+        vision_input = VisionInput(spans, Tensor.cat(*embed_list, dim=0).realize())
+      else:
+        ids = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
+          or self.server.tok.encode(rendered)
+        record = (rendered, ids, len(body["messages"]))
       think = f"think:{'on' if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  " if "enable_thinking" in kwargs else ""
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  {think}")
       if len(ids) >= self.server.model.max_context:
@@ -208,7 +335,7 @@ class Handler(HTTPRequestHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"), record=(rendered, ids, len(body["messages"])))
+                              reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
@@ -235,7 +362,7 @@ class Handler(HTTPRequestHandler):
 
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
-               mtp:bool=False, spec_k:int=SPEC_TOKENS, state_cache_mb:int=0):
+               mtp:bool=False, spec_k:int=SPEC_TOKENS, state_cache_mb:int=0, vision:VisionEncoder|None=None):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
     self.mtp, self.spec_k = mtp, spec_k  # T4.65: --mtp/SPEC_TOKENS -- see Handler.run_model's use_spec
     self.last: tuple[str, list[int], int, list[int]]|None = None  # (rendered prompt, ids, message count, generated ids) of the last completed request
@@ -245,6 +372,16 @@ class LLMServer(TCPServerWithReuse):
     # pre-T4.67 -- see Handler.run_model); pass state_cache_mb=STATE_CACHE_MB (or cli.py's --state-cache) to enable.
     self.state_cache_mb = state_cache_mb
     self.snapshots: collections.OrderedDict[tuple[int, ...], dict] = collections.OrderedDict()  # insertion/touch order == LRU order
+    # T5.4: --mmproj wiring (VISION_DESIGN.md section 2.4) -- vision is None unless cli.py's --mmproj loaded a VisionEncoder.
+    # image_pad_id is resolved ONCE here, not per-request: None (no --mmproj, or "<|image_pad|>" isn't a single token in this
+    # tokenizer) makes every image_url request 400 vision_unavailable in do_POST, same as vision being None does.
+    self.vision = vision
+    self.vision_max_pixels = int(os.environ.get("VISION_MAX_PIXELS") or DEFAULT_MAX_PIXELS)
+    try: pad_ids = tok.encode("<|image_pad|>") if tok is not None else []
+    except Exception: pad_ids = []
+    # a tok stub whose .encode isn't configured for real ids (test/null/*'s bare Mock()) degrades to vision off, not a crash --
+    # same outcome as a real tokenizer where "<|image_pad|>" isn't exactly one id.
+    self.image_pad_id = pad_ids[0] if isinstance(pad_ids, list) and len(pad_ids) == 1 else None
     super().__init__(server_address, Handler)
 
   def find_snapshot(self, ids:list[int]) -> dict|None:
