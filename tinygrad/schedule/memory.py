@@ -17,6 +17,15 @@ def _can_plan(b:UOp, held_bufs:set[UOp]) -> bool:
 
 LaneKey = tuple[str, int]
 
+def planned_size(n:int, block_size:int=256, lv2_cnt:int=32) -> int:
+  """The size a planned buffer is allocated with. TLSFAllocator.alloc rounds a request up to its next bucket boundary before
+  searching, so a freed block of EXACTLY the requested size sits one bucket below the search start and is never reused. Sizing
+  every buffer to that bucket up front lets equal-sized buffers with disjoint lifetimes share one slot (the attention score
+  pipeline -- qk / exp / normalized weights, each (B,H,T,Tk_max) fp32 -- then plans as 2 slots, not 3). Never below a
+  block_size multiple: all offsets stay block_size-aligned (the LLVM renderer declares kernel pointers `align 32`)."""
+  n = max(block_size, n)
+  return round_up(n, max(block_size, 1 << (n.bit_length() - lv2_cnt.bit_length())))
+
 def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
   if NO_MEMORY_PLANNER: return linear
   if held_bufs is None: held_bufs = set()
@@ -39,12 +48,7 @@ def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
 
   # suballocation: build sorted open/close events, then alloc/free in order
   block_size, lv2_cnt = 256, 32
-  # size every buffer to the TLSF bucket the allocator would round its request up to anyway (alloc() rounds the request up to
-  # the next bucket boundary before searching, so a freed block of EXACTLY the requested size sits one bucket below the search
-  # start and is never reused). With bucket-aligned sizes, equal-sized buffers with disjoint lifetimes share one slot: the
-  # attention score pipeline (qk / exp / normalized weights, each (B,H,T,Tk_max) fp32) then plans as 2 slots, not 3.
-  def tlsf_size(n:int) -> int: return round_up(n:=max(block_size, n), 1 << (n.bit_length() - lv2_cnt.bit_length()))
-  nbytes = {b: tlsf_size(b.max_numel() * b.dtype.itemsize) for b in first_appearance}
+  nbytes = {b: planned_size(b.max_numel() * b.dtype.itemsize, block_size, lv2_cnt) for b in first_appearance}
   events = sorted([(first_appearance[b], True, b) for b in first_appearance] +
                   [(last_appearance[b] + 1 + buf_hold.get(b, 0), False, b) for b in first_appearance], key=lambda x: (x[0], x[1]))
   total_memory = sum(nbytes.values()) * 2
