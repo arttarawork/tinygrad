@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
-from tinygrad.helpers import ContextVar, DEBUG
+from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
 import traceback
 
 # T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 0 = auto: 32 on the GPU
@@ -1091,7 +1091,8 @@ class Transformer:
     vision = (True,) if rope_start is not None or vis_e is not None else ()  # text keys stay the pre-T5.3 4-tuples
     key = (is_prefill, temperature is None, chunk_size, spec) + vision
     if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
-      print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}")
+      mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
+      print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
     return self.jit.setdefault(key, TinyJit(self.forward))(
       tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos)
 
