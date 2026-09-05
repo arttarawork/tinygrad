@@ -19,6 +19,10 @@ from tinygrad.helpers import ContextVar
 # 64 falls off a cliff even on METAL (28 tok/s). Set GDN_CHUNK explicitly to override either way.
 # T4.68: 64 is explicit-only (never auto-selected above); CPU scan-parity now covers both geometries (test_gdn_scan_parity.py).
 GDN_CHUNK = ContextVar("GDN_CHUNK", 0)
+# T5.5: prefill chunk width for IMAGE prompts. The image-prompt jit family is a second capture whose planned arena is the attention
+# score pipeline (2 x (B,H,T,Tk_max) fp32 after T5.6) -- it scales with the chunk width, and on the pooled qwen3.6-35B @192k every
+# extra prefill family costs ~0.78 GB of the 3090's headroom at width 32. 16 halves that for the few hundred visual tokens of a request.
+VISION_CHUNK = ContextVar("VISION_CHUNK", 16)
 def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   if GDN_CHUNK.value > 0: return GDN_CHUNK.value
   dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
@@ -1273,8 +1277,9 @@ class Transformer:
       # T5.3: the image-prompt family too (chunked prefill with the side inputs, then decode with rope_start) -- a 2-chunk dummy prompt
       # carrying one 4-token span (grid (1, 4, 4) merges to 2x2), so the first real image request replays instead of capturing
       dummy = VisionInput([(1, 4, (1, 4, 4))], Tensor.zeros(4, self.token_embd.weight.shape[1]))
-      for temperature in (0.0, 1.0):
-        for _ in range(2): list(zip(range(2), self.generate([0] * 38, temperature=temperature, vision=dummy)))
+      # T5.5: greedy only -- image requests are always decoded greedily (serve.py forces it), so the sampled vision pair is never hit;
+      # each extra prefill family costs ~0.78 GB on the 3090 (see VISION_CHUNK), and the standing map has room for exactly one.
+      for _ in range(2): list(zip(range(2), self.generate([0] * 38, temperature=0.0, vision=dummy)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -1351,6 +1356,7 @@ class Transformer:
     # prefill at decode speed -- 46 tok/s on the pooled qwen3.6-35B). GDN_CHUNK caps the chunk width for those devices instead.
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
       chunk_size = min(chunk_size, gdn_chunk_for(self.token_embd.weight.device))
+    if vision is not None: chunk_size = min(chunk_size, VISION_CHUNK.value)  # T5.5: see VISION_CHUNK
     drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)

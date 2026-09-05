@@ -239,7 +239,8 @@ class Handler(HTTPRequestHandler):
     # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
     use_spec = self.server.mtp and model.mtp_head is not None and vision is None
     gen = model.speculative_generate(ids, k=self.server.spec_k, temperature=temperature) if use_spec \
-      else model.generate(ids, temperature=temperature, vision=vision)
+      else model.generate(ids, temperature=0.0 if vision is not None else temperature, vision=vision)  # T5.5: image requests are greedy --
+      # only the greedy vision jit family is warmed (each extra prefill family costs ~0.78 GB on the 3090, see model.VISION_CHUNK)
     try:
       yield chunk({"role":"assistant", "content":""})
       for next_id in gen:
