@@ -498,6 +498,9 @@ class APLRemotePCIDevice(RemotePCIDevice):
     super().__init__(devpref, "usb4", sock=sock)
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    # T4.70d diagnosis: the tunnel refuses SOME sysmem maps under FFN-TP with an opaque 'unknown error' -- name
+    # every request so the failing size/flags are in the log (one line per map; load-time maps are few).
+    if getenv("TUNNEL_MAP_LOG", 0): print(f"[TUNNEL_MAP] MAP_SYSMEM_FD size={size:#x} ({size/2**20:.2f} MiB) contiguous={contiguous}", flush=True)
     mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
     memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt='B')
 

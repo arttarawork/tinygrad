@@ -39,7 +39,11 @@ def graph_split_rewrite(linear:UOp, max_batch_size:int=0) -> UOp:
     if len(current_batch) <= 1 and not getenv("GRAPH_ONE_KERNEL"): new_src.extend(current_batch)
     else:
       new_src.append(create_graph_call(current_batch))
-      max_batch_size *= 2
+      # T4.70d: the unbounded doubling grows late batches into graph-wide kernargs pools that exceed both the
+      # kernarg slab and the TinyGPU tunnel's per-map size cap on dispatch-heavy graphs (FFN-TP: 2 identical
+      # loads died in HCQGraph.__init__'s pool alloc). JIT_BATCH_CAP=N (default 0 = today's unbounded behavior)
+      # bounds the growth so each HCQGraph's pool stays mappable over the tunnel.
+      max_batch_size = min(max_batch_size * 2, cap) if (cap:=getenv("JIT_BATCH_CAP", 0)) else max_batch_size * 2
       if DEBUG >= 2: print(f"JIT GRAPHing batch with {len(current_batch)} kernels")
     current_batch, current_batch_devs = [], []
 

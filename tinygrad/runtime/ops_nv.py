@@ -707,7 +707,10 @@ class NVDevice(HCQCompiled[NVSignal]):
   # _LOCAL_SIZING (is_remote() is False for NVKIface/MOCKIface), so their behavior is provably unchanged.
   _LOCAL_SIZING  = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
                      "cmdq_size": 0x200000}
-  _REMOTE_SIZING = {"kernargs_size": 16 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
+  # T4.70d: remote kernargs_size feeds alloc_kernargs's never-freed slab (it used to hardcode 4MB and ignore
+  # this knob entirely -- the actual starvation driver under FFN-TP). Measured TP demand ~12MB; 64MB = one
+  # tunnel mapping with generous headroom vs TinyGPU's ~87-per-client map-count budget.
+  _REMOTE_SIZING = {"kernargs_size": 64 << 20, "sigalloc_size": 0x1000, "gpfifo_area_size": 0x300000, "gpfifo_entries": 0x10000,
                      "cmdq_size": 0x200000}
 
   # T4.18: lazily-allocated shared slab for NVCommandQueue.bind()'s hw_page on the remote transport -- see bind().
@@ -734,10 +737,17 @@ class NVDevice(HCQCompiled[NVSignal]):
     sz = max(size, 1)
     if not self.is_remote(): return self.allocator._alloc(sz, BufferSpec(cpu_access=True))
     if self._kernargs_slab is None:
-      self._kernargs_slab, self._kernargs_bump = self.allocator.alloc(4 << 20, BufferSpec(cpu_access=True)), BumpAllocator(4 << 20, wrap=False)
+      # T4.70d: was a hardcoded 4MB -- under FFN-TP the graph-pool demand is ~12MB total, so the slab wrapped
+      # into ~84 per-alloc tunnel maps and hit TinyGPU's per-client map-count budget (~87 observed) with an
+      # opaque 'RPC failed'. Read the sizing knob (remote: 64MB) so the whole demand stays on ONE mapping.
+      ksz = self.sizing["kernargs_size"]
+      self._kernargs_slab, self._kernargs_bump = self.allocator.alloc(ksz, BufferSpec(cpu_access=True)), BumpAllocator(ksz, wrap=False)
     slab, bump = unwrap(self._kernargs_slab), unwrap(self._kernargs_bump)
     try: return slab.offset(bump.alloc(sz, 16), sz)
-    except RuntimeError: return self.allocator._alloc(sz, BufferSpec(cpu_access=True))  # slab exhausted: fall back to a real alloc
+    except RuntimeError:
+      # T4.70d diagnosis: name the fallback (slab starvation is upstream of the tunnel map refusals under FFN-TP).
+      if getenv("TUNNEL_MAP_LOG", 0): print(f"[TUNNEL_MAP] kernargs slab exhausted -> real alloc sz={sz:#x} ({sz/2**20:.2f} MiB)", flush=True)
+      return self.allocator._alloc(sz, BufferSpec(cpu_access=True))  # slab exhausted: fall back to a real alloc
 
   def free_kernargs(self, buf:HCQBuffer) -> None:
     # Mirrors NVCommandQueue.__del__'s hw_page check: a slab-derived slice shares the slab's lifetime and
