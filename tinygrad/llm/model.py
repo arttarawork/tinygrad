@@ -10,7 +10,8 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
-from tinygrad.helpers import ContextVar, next_power2
+from tinygrad.helpers import ContextVar, next_power2, DEBUG, GlobalCounters
+import traceback
 
 # T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 0 = auto: 32 on the GPU
 # backends it was measured on -- METAL (qwen3.5:0.8b: 77 -> 168 tok/s no-BEAM, 99 -> 346 BEAM'd) and NV (the METAL+NV pooled
@@ -19,6 +20,10 @@ from tinygrad.helpers import ContextVar, next_power2
 # 64 falls off a cliff even on METAL (28 tok/s). Set GDN_CHUNK explicitly to override either way.
 # T4.68: 64 is explicit-only (never auto-selected above); CPU scan-parity now covers both geometries (test_gdn_scan_parity.py).
 GDN_CHUNK = ContextVar("GDN_CHUNK", 0)
+# T5.5: prefill chunk width for IMAGE prompts. The image-prompt jit family is a second capture whose planned arena is the attention
+# score pipeline (2 x (B,H,T,Tk_max) fp32 after T5.6) -- it scales with the chunk width, and on the pooled qwen3.6-35B @192k every
+# extra prefill family costs ~0.78 GB of the 3090's headroom at width 32. 16 halves that for the few hundred visual tokens of a request.
+VISION_CHUNK = ContextVar("VISION_CHUNK", 16)
 def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   if GDN_CHUNK.value > 0: return GDN_CHUNK.value
   dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
@@ -52,33 +57,49 @@ def gdn_scan_impl_for() -> int: return GDN_SCAN_IMPL.value if GDN_SCAN_IMPL.valu
 gdn_last_scan_impl: list[int] = []
 
 def _gdn_tri_inverse(m:Tensor) -> Tensor:
-  """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via Neumann-series
-  doubling instead of a length-C forward-substitution loop.
+  """(I+m)^-1 for a strictly-lower-triangular (..., C, C) m (zero diagonal and above), via block-recursive
+  halving: split m into 2x2 blocks [[M11,0],[M21,M22]] (M11, M22 strictly-lower-triangular on their own,
+  M21 the full below-diagonal coupling block), recurse on each half, and assemble
+    (I+m)^-1 = [[Inv11, 0], [-Inv22 @ M21 @ Inv11, Inv22]]   (Inv11 := (I+M11)^-1, Inv22 := (I+M22)^-1)
+  which is exact for any unit-lower-triangular matrix (standard block-triangular inverse identity), by
+  induction down to the C=1 base case ((I+0)^-1 = I, a scalar 1). log2(C)-deep recursion; C need not be a
+  power of 2 (odd sizes just split as evenly as possible each level -- gdn_scan_wy's T_pad is always a
+  concrete int, see the assert below, but never assumed to be a power of 2).
 
-  (First draft used block-recursive halving instead -- same O(log2 C) DEPTH, but that recursion's binary tree
-  has O(C) total nodes (1+2+4+...+C/2 calls), each contributing its own small matmuls/concats; the T4.69a
-  evidence script caught this the honest way, by measuring more/bigger lowered kernels for wy than the loop
-  at the real geometry, not by inspection. Doubling below is a straight-line loop of O(log2 C) STEPS on the
-  one full-size (C,C) matrix -- genuinely fewer, uniformly-shaped matmuls, no shrinking submatrices or cats.)
+  T4.73d: this REPLACES a Neumann-series DOUBLING implementation (P_2k = P_k + n^k@P_k, n := -m, using
+  n^C == 0 exactly to terminate in ceil(log2 C) steps on the one full-size matrix, no shrinking submatrices
+  or concats -- see FIXNOTES_T473D.md for the retired code and the full derivation) that is EXACT in
+  infinite precision but catastrophically ill-conditioned in float32 once m's entries get large (beta close
+  to 1, as trained heads with near-collinear/repeated keys within a chunk produce): repeatedly squaring
+  n (n_pow = n_pow @ n_pow) drives its magnitude up by orders of magnitude EACH doubling step (measured on
+  a real qwen3.8-27B blk44 chunk: max|n_pow| 28 -> 3.4e3 -> 1.4e6 -> 6.8e7 over 4 steps) even though the
+  running partial sum p, and the final exact answer, both stay near-unity (the huge n^k terms cancel back
+  down to ~1) -- float32's ~7 significant decimal digits are nowhere near enough to represent that
+  cancellation, producing a WRONG (too-large) inverse (measured: max|inv| ~4.2, true value ~1.0) that then
+  amplifies every downstream chunk's carried recurrent_state by a real, hardware-observed factor (~x7 that
+  chunk, compounding across chunks to fp32 overflow). Block-recursive halving never forms an intermediate
+  matrix larger than the true (bounded, since (I+m)^-1 for unit-lower-triangular m is itself well-scaled)
+  answer -- Inv11/Inv22 are themselves valid, bounded triangular inverses by induction, and Inv21 is a
+  product of bounded matrices, so there is no large-magnitude intermediate to cancel away. Verified on the
+  same real blk44 chunk (test_gdn_scan_parity.py's TestGDNScanHighBetaCollinearAmplification): matches a
+  float64 forward-substitution reference to ~1.5e-7 (float32 machine precision), vs. the old doubling
+  code's ~4.0 absolute error on a true value of ~1.0.
 
-  Let n := -m (also strictly lower triangular, hence nilpotent: n^C == 0 -- a C×C strictly-lower matrix has
-  no index path of length C respecting i>j). Then (I+m)^-1 = (I-n)^-1 = sum_{i=0}^{C-1} n^i =: P_C (finite
-  Neumann series). Doubling identity: P_2k = P_k + n^k @ P_k (sum_{i<k} n^i + n^k sum_{i<k} n^i =
-  sum_{i<k} n^i + sum_{k<=i<2k} n^i = sum_{i<2k} n^i). Starting P_1 = I, n^1 = n, and repeatedly setting
-  (P, n^k) -> (P + n^k@P, n^k@n^k) for ceil(log2(C)) steps gives P_{2^steps} with 2^steps >= C; every term
-  beyond n^{C-1} is exactly 0 (n^k[i,j] needs a length-k strictly-decreasing index chain from i to j, i.e.
-  i-j >= k, impossible once k >= C for a C-wide matrix -- and since each such entry's defining sum is then a
-  sum of exact-zero float products, this holds bit-for-bit, not just "negligibly small"), so P_{2^steps} ==
-  P_C exactly regardless of whether C is a power of 2 -- no padding or odd/even-split bookkeeping needed."""
+  This was ALREADY the very first (T4.69a) draft, dropped at the time only because it lowers to more UOps
+  (O(C) total recursive-call nodes, each its own small matmuls/concats, vs. doubling's O(log2 C) big
+  uniform matmuls) -- a real but strictly smaller concern than the correctness bug above; not established
+  broken until this task, so no defensive fallback is needed for the doubling path -- see FIXNOTES_T473D.md
+  for the full before/after kernel-count discussion if that regresses BEAM/compile time in practice."""
   c = m.shape[-1]
   assert isinstance(c, int), "gdn_scan_wy always builds m from a concrete (padded-to-T_pad) chunk size"
-  idx = Tensor.arange(c, dtype=dtypes.int32).clone(m.device)
-  eye = (idx.reshape(c, 1) == idx.reshape(1, c)).float()  # (C,C), broadcasts to m's batch shape below
-  p, n_pow = Tensor.zeros_like(m) + eye, -m
-  for _ in range((c - 1).bit_length()):  # == ceil(log2(c)) for c >= 1, computed without float log2 rounding risk
-    p = p + n_pow @ p
-    n_pow = n_pow @ n_pow
-  return p
+  if c == 1: return Tensor.ones_like(m)  # (I+0)^-1 = I -- m's diagonal (hence every 1x1 block) is exactly 0
+  lo = c // 2
+  m11, m22, m21 = m[..., :lo, :lo], m[..., lo:, lo:], m[..., lo:, :lo]
+  inv11, inv22 = _gdn_tri_inverse(m11), _gdn_tri_inverse(m22)
+  inv21 = -(inv22 @ m21 @ inv11)
+  top = inv11.cat(Tensor.zeros_like(m[..., :lo, lo:]), dim=-1)     # (..., lo, C): [Inv11 | 0]
+  bottom = inv21.cat(inv22, dim=-1)                                 # (..., C-lo, C): [Inv21 | Inv22]
+  return top.cat(bottom, dim=-2)                                    # (..., C, C)
 
 def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor) -> tuple[Tensor, Tensor]:
   """Chunkwise WY-form gated delta rule scan: the whole (B,H,T,*) chunk in one shot via matmuls plus one
@@ -101,9 +122,21 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
     O   = Abar * (Q @ S0^T + tril(Q K^T, 0) @ U)                  -- (C,V), row i = out_i
     S_C = Abar[-1] * (S0 + U^T @ K)                                -- state leaving the chunk
   `alpha` may be a per-head scalar (last dim 1, broadcasts across V -- non-kda) or per-value-channel (last
-  dim V -- kda): nothing above assumes which, so kda needs no special-casing here (empirically verified:
-  test_attention.py's test_varied_chunk_sizes_match_decode(kda=True) runs under GDN_SCAN_IMPL=2 too; the
-  "38" geometry in test_gdn_scan_parity.py does NOT set kda, so that file's coverage is non-kda-only).
+  dim V -- kda). The tilde form above (dividing v by the cumulative Abar) is used AS-IS for kda, unchanged
+  since T4.69a -- test_attention.py's test_varied_chunk_sizes_match_decode(kda=True) still exercises it.
+
+  T4.73c: for non-kda, dividing by Abar (a product accumulated from the CHUNK START) is numerically unsafe
+  at real trained weights -- a fast-decaying head's Abar can underflow past float32's range within one
+  chunk, and multiplying back by Abar afterward does not cancel a division-by-0/overflow (see
+  FIXNOTES_T473C.md for the full real-weight diagnosis: qwen3.8-27B blk.0 head 42/48). Fixed below by an
+  EXACT reformulation (not an approximation -- the new pseudo-value w relates to the old u by w_j = Abar_j
+  * u_j pointwise) that never divides by Abar: every place decay appears is either a bounded PAIRWISE ratio
+  exp(G_i-G_j) for i>=j (in (0,1], since the cumulative log-decay G is non-increasing -- masked to exactly
+  0 for invalid (j>i) pairs by masking the exponent BEFORE exp, so it can never overflow either), or the
+  absolute exp(G_i) used strictly as a MULTIPLIER (safe to underflow to 0 -- that just means "fully
+  decayed", never a divisor). Only non-kda's scalar-per-head alpha makes this ratio foldable into a plain
+  (T,T) matrix shared across V channels; kda's per-channel Abar would need a (T,T,V) coupling/tri-solve
+  (untested cost, and kda is not established broken), so that path is untouched below.
 
   Shapes (all float32; T_pad is the WHOLE chunk -- one WY block, no further sub-chunking needed since
   GDN_CHUNK's practical ceiling (32) is already tiny for a log-depth triangular solve; padded steps are
@@ -114,7 +147,35 @@ def gdn_scan_wy(state:Tensor, q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:T
   T = q.shape[2]
   idx = Tensor.arange(T, dtype=dtypes.int32).clone(q.device)
   row, col = idx.reshape(T, 1), idx.reshape(1, T)
-  strict_lower, lower_incl = (col < row).float(), (col <= row).float()
+  strict_lower_b, lower_incl_b = col < row, col <= row
+
+  if alpha.shape[-1] == 1:  # non-kda: T4.73c safe path (see docstring addendum + FIXNOTES_T473C.md)
+    g = alpha[..., 0].float().maximum(1e-30).log()                      # (B,H,T) per-step log-decay, always finite
+    # (this floor is per-STEP, not cumulative -- only engages if a single raw step's alpha underflows to
+    # exact float32 0 on its own, which real weights here never do (observed min 5.44e-4); a defensive
+    # floor, not the fix -- the fix is never dividing by the CUMULATIVE product at all, see below)
+    G = g.cumsum(axis=2)                                                # (B,H,T) cumulative log-decay through step i
+    # NOT clamped to <=0: alpha (hence diff=G_i-G_j for the valid j<=i region) is a GATE, not guaranteed
+    # <=1 -- e.g. this file's own random-init tests draw ssm_a from randn() (can be positive, i.e. genuine
+    # per-step growth, alpha>1) -- clamping would silently cap real growth and diverge from the loop, which
+    # applies no such cap. Only the INVALID (j>i) region needs forcing to exactly 0, via the -1e30 sentinel
+    # below (masking BEFORE exp, not clamping diff), so _gdn_tri_inverse's bit-exact triangularity holds.
+    diff = G.unsqueeze(-1) - G.unsqueeze(-2)                             # (B,H,T,T) G_i-G_j, valid region only
+    ratio_incl = lower_incl_b.where(diff, -1e30).exp()                  # (B,H,T,T) exp(G_i-G_j), j<=i; else exactly 0
+    ratio_strict = strict_lower_b.where(diff, -1e30).exp()              # same, j<i only (feeds the tri-solve)
+    a_bar = G.exp().unsqueeze(-1)                                       # (B,H,T,1) Abar -- ONLY ever a multiplier below
+    kkt = (k @ k.transpose(-1, -2)) * ratio_strict                      # (B,H,T,T), decay folded in directly
+    m = beta.unsqueeze(-1) * kkt                                        # row i scaled by beta_i (Beta @ T)
+    rhs = beta.unsqueeze(-1) * (v - a_bar * (k @ state.transpose(-1, -2)))  # (B,H,T,V) -- v used RAW, no division
+    w = _gdn_tri_inverse(m) @ rhs                                       # (B,H,T,V) pseudo-values (undecayed form)
+    qk = (q @ k.transpose(-1, -2)) * ratio_incl                         # (B,H,T,T), decay folded in directly
+    out = a_bar * (q @ state.transpose(-1, -2)) + qk @ w                # (B,H,T,V) -- a_bar multiplies only the S0 term
+    tail_ratio = ratio_incl[:, :, T - 1:T, :].transpose(-1, -2)         # (B,H,T,1): exp(G_{T-1}-G_j) per row j
+    final_state = a_bar[:, :, T - 1, :].unsqueeze(-1) * state + (tail_ratio * w).transpose(-1, -2) @ k  # (B,H,V,K)
+    return final_state, out.transpose(1, 2)                            # (B,T,H,V)
+
+  # kda: unchanged since T4.69a (per-value-channel alpha; not established broken -- see docstring addendum)
+  strict_lower, lower_incl = strict_lower_b.float(), lower_incl_b.float()
   a_bar = alpha.cumprod(axis=2)                                          # (B,H,T,V|1), decay through step i
   v_tilde = v / a_bar                                                    # decay-normalized values
   kkt = (k @ k.transpose(-1, -2)) * strict_lower                         # (B,H,T,T), strictly lower
@@ -197,10 +258,10 @@ class ExpertGating(enum.IntEnum):
   SOFTMAX_WEIGHT = 3  # softmax over the top-k selected logits
   SQRT_SOFTPLUS = 4
 
-@functools.cache
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|None=None, yarn_factor: float = 1.0,
-                          yarn_orig_ctx: int = 0, yarn_beta_fast: float = 32.0, yarn_beta_slow: float = 1.0,
-                          yarn_attn_factor: float|None = None) -> Tensor:
+def rope_inv_freq(dim: int, theta: float = 10000.0, yarn_factor: float = 1.0, yarn_orig_ctx: int = 0, yarn_beta_fast: float = 32.0,
+                  yarn_beta_slow: float = 1.0, yarn_attn_factor: float|None = None) -> tuple[Tensor, float]:
+  """(inv_freq (dim//2,), attn_scale): the per-frequency-pair rotation rates precompute_freqs_cis's table is built from, split out (T5.3)
+  so the image-prompt path (mrope_freqs_cis) rotates with exactly the same numbers."""
   inv_freq = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
   attn_scale = 1.0
   if yarn_factor > 1.0:
@@ -214,8 +275,28 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|
     extrap_factor = 1.0 - ((Tensor.arange(dim // 2) - low) / (high - low)).clamp(0, 1)
     inv_freq = inv_freq / yarn_factor * (1 - extrap_factor) + inv_freq * extrap_factor
     attn_scale = yarn_attn_factor if yarn_attn_factor is not None else (0.1 * math.log(yarn_factor) + 1.0 if yarn_factor > 1 else 1.0)
+  return inv_freq, attn_scale
+
+@functools.cache
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, device:str|tuple[str, ...]|None=None, yarn_factor: float = 1.0,
+                          yarn_orig_ctx: int = 0, yarn_beta_fast: float = 32.0, yarn_beta_slow: float = 1.0,
+                          yarn_attn_factor: float|None = None) -> Tensor:
+  inv_freq, attn_scale = rope_inv_freq(dim, theta, yarn_factor, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow, yarn_attn_factor)
   freqs = Tensor.arange(end).unsqueeze(dim=1) * inv_freq.unsqueeze(dim=0)
   return (freqs.cos() * attn_scale).cat(freqs.sin() * attn_scale, dim=-1).clone(device)
+
+def mrope_freqs_cis(pos3:Tensor, config:TransformerConfig) -> Tensor:
+  """T5.3: interleaved M-RoPE rows (T, rope_dim) = cos|sin for per-token (t, h, w) positions `pos3` (1, T, 3) int32 -- Qwen3.5/3.6's
+  `mrope_interleaved` with section [11, 11, 10] over the 32 pairs of rope_dim 64: frequency pair i rotates by the position of axis i % 3
+  (t, h, w). A text token carries (p, p, p) and gets exactly precompute_freqs_cis's row p (same int32 -> float32 product, same cos/sin).
+  Computed from the positions, not gathered from the max_context table: nothing to prove in-bounds, no (T, 3, max_context) one-hot."""
+  inv_freq, attn_scale = rope_inv_freq(config.rope_dim, config.rope_theta, config.yarn_factor, config.yarn_orig_ctx, config.yarn_beta_fast,
+                                       config.yarn_beta_slow, config.yarn_attn_factor)
+  n = config.rope_dim // 2
+  ang = pos3[0].float().unsqueeze(-1) * inv_freq.reshape(1, 1, n)                                            # (T, 3, n): every axis
+  axis = (Tensor.arange(n) % 3).reshape(1, 1, n) == Tensor.arange(3).reshape(1, 3, 1)  # constants, device-free like pairwise_topk's
+  ang = axis.where(ang, 0.0).sum(axis=1)                                                                       # (T, n): pair i <- axis i%3
+  return (ang.cos() * attn_scale).cat(ang.sin() * attn_scale, dim=-1)
 
 @functools.cache
 def positions(n:int, device:str|None=None) -> Tensor: return Tensor.arange(n, dtype=dtypes.int32).clone(device).realize()
@@ -322,6 +403,7 @@ class TransformerConfig:
   tp: tuple[tuple[str, float], ...] = ()
 
 class FFNBlock:
+  freqs_cis: Tensor  # set by the attention/MLA subclasses' _init_state (GDN blocks never touch it)
   def __init__(self, config:TransformerConfig):
     self.config = config
 
@@ -435,16 +517,24 @@ class FFNBlock:
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor: raise NotImplementedError
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor: raise NotImplementedError
 
-  def __call__(self, x: Tensor, start_pos: int|UOp):
+  def _rope_freqs(self, rope:int|UOp|Tensor, T:int|UOp) -> Tensor:
+    # T5.3: `rope` is either this chunk's first ROPE position (an int/Variable: a slice of the table -- every text request, and decode
+    # steps after images via generate()'s rope_start Variable) or a (1, T, 3) int32 tensor of per-token (t, h, w) positions (the
+    # image-prompt chunks). start_pos keeps indexing the KV cache; only the rotation angle moves.
+    if isinstance(rope, Tensor): return mrope_freqs_cis(rope, self.config)
+    return self.freqs_cis[rope:rope+T]
+
+  def __call__(self, x: Tensor, start_pos: int|UOp, rope:int|UOp|Tensor|None=None):
     self._init_state(x)
+    if rope is None: rope = start_pos  # text: rope position == cache position (the pre-T5.3 graph, same UOp in both slots)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
+    def _run(x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor):
+      h =     x + self._attention(self.attn_norm(x), start_pos, rope)
       return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
-    return _run(x, start_pos)
+    return _run(x, start_pos, rope)
 
 # --- attention-override hook (T1.8) -----------------------------------------------------------
 # Pluggable seam for a fused/tuned attention kernel to replace the standard (multi-kernel) SDPA
@@ -477,7 +567,8 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
+    if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
@@ -490,8 +581,9 @@ class TransformerBlock(FFNBlock):
     v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+    freqs_cis = self._rope_freqs(rope, T)
+    q = apply_rope(q[..., :self.config.rope_dim], freqs_cis).cat(q[..., self.config.rope_dim:], dim=-1)
+    k = apply_rope(k[..., :self.config.rope_dim], freqs_cis).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     # cast to the cache's dtype at write (a no-op when KV_F32=1); cast back up to the activation dtype at
@@ -562,19 +654,20 @@ class MLATransformerBlock(FFNBlock):
     self.attn_v_b = {"weight": Tensor.zeros(config.n_heads, config.v_head_dim, config.kv_lora_rank)}
     self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
+    if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
     q = q_proj.reshape(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2)
     q_nope, q_rope = q[..., :q_nope_head_dim], q[..., q_nope_head_dim:]
-    if not self.config.ssm or not self.config.ssm.kda: q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
+    if not self.config.ssm or not self.config.ssm.kda: q_rope = apply_rope(q_rope, self._rope_freqs(rope, T))
     q = (q_nope @ self.attn_k_b["weight"].transpose(-1, -2)).cat(q_rope, dim=-1)
 
     kv_a = self.attn_kv_a_mqa(x)
     c_kv = self.attn_kv_a_norm(kv_a[..., :self.config.kv_lora_rank])
     k_rope = kv_a[..., self.config.kv_lora_rank:].reshape(B, T, 1, self.config.rope_dim).transpose(1, 2)
-    if not self.config.ssm or not self.config.ssm.kda: k_rope = apply_rope(k_rope, self.freqs_cis[start_pos:start_pos+T])
+    if not self.config.ssm or not self.config.ssm.kda: k_rope = apply_rope(k_rope, self._rope_freqs(rope, T))
 
     k_store = c_kv.reshape(B, 1, T, self.config.kv_lora_rank).cat(k_rope.reshape(B, 1, T, self.config.rope_dim), dim=-1)
     # cast to the cache's dtype at write, back up to x's dtype at read -- see TransformerBlock._attention
@@ -618,7 +711,8 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
-  def _attention(self, x:Tensor, start_pos:int|UOp, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
+    # rope: unused, GDN has no positions (T5.3); kept so FFNBlock.__call__ can pass it positionally to every block type.
     """capture=False (every caller except speculative_generate's VERIFY -- see GatedDeltaNetBlock.__call__)
     is byte-identical to pre-T4.66b behavior: the retention branches below never run, nothing extra is ever
     materialized. capture=True additionally returns (state_track, conv_window), which speculative_generate
@@ -762,7 +856,9 @@ class GatedDeltaNetBlock(FFNBlock):
     assert state_track is not None, "capture=True always takes the per-token-loop branch above (never the AMD-fused or WY path)"
     return out, state_track.contiguous(), conv_window.contiguous()
 
-  def __call__(self, x:Tensor, start_pos:int|UOp, spec:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:
+  def __call__(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, spec:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:
+    # rope (T5.3): passed positionally by Transformer.forward to every block; GDN has no positions, so it is ignored here -- it must
+    # still be a named parameter, or forward()'s third argument would land in `spec`.
     # T4.66b: spec=False (every caller except speculative_generate's VERIFY forward -- see there) is exactly
     # FFNBlock.__call__, unchanged -- same _run closure, same single-Tensor return, zero extra tensors ever
     # built. spec=True additionally threads this block's captured per-position GDN state history (see
@@ -1140,16 +1236,18 @@ class Transformer:
                                        + ([d for d, _ in tp] if tp is not None else []))
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
-    # we specialize the JIT for prefill/rollout, sampled/greedy, and spec (T4.64); prefill also keys on
+    # T5.3: rope-position deficit at the end of _cached_tokens -- sum over the images in it of (visual tokens - rope span), 0 for text
+    self._rope_delta: int = 0
+    # we specialize the JIT for prefill/rollout, sampled/greedy, spec (T4.64) and vision (T5.3); prefill also keys on
     # chunk_size (T4.12) -- created lazily in __call__ since chunk_size isn't known until generate() picks one
-    self.jit: dict[tuple[bool, bool, int|None, bool], Callable[..., Tensor|tuple[Tensor, ...]]] = {}
+    self.jit: dict[tuple, Callable[..., Tensor|tuple[Tensor, ...]]] = {}
 
-  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, ...]:
+  def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
+              vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
     # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    # activations hop devices at block boundaries (.to is a no-op when the device matches).
     # T4.66d: no more per-GDN-block capture here (T4.66b's gdn_extra) -- speculative_generate's partial-accept
     # fixup reverted to CHECKPOINT+REDO (measured ~10x cheaper on real METAL+NV hardware than the capture-based
     # per-block assign this replaced -- see SPEC_FIXES_NOTES.md), which never reads gdn_extra, so every block
@@ -1157,9 +1255,18 @@ class Transformer:
     # on every GDN block's scan (SPEC_PROFILE_NOTES.md SS3(c)) as a free side effect. GatedDeltaNetBlock's own
     # `capture`/`spec` machinery (_attention, __call__) is untouched -- still there, still tested directly by
     # test_gdn_scan_parity.py::TestGDNScanCapture -- just unreached from forward() now.
-    for block in self.blk:
-      xin = x.to(block.device)
-      x = cast(Tensor, block(xin, start_pos))
+    # T5.3: rope_start (a bound Variable from generate()) is the rope position of tokens[0] when it differs from the cache position
+    # (decode after images); None keeps the pre-T5.3 graph exactly. vis_e/vis_m/vis_pos make this an image-prompt chunk: (1, chunk, D)
+    # visual embeddings replace the token embeddings where the (1, chunk) mask is set, and the (1, chunk, 3) int32 (t, h, w) rope
+    # positions ride to the attention blocks (GDN blocks ignore them). All three are chunk-max sized; T slices them like tokens.
+    rope: int|UOp|Tensor = start_pos if rope_start is None else rope_start
+    if vis_e is not None:
+      assert vis_m is not None and vis_pos is not None, "image-prompt chunk needs vis_e, vis_m and vis_pos together"
+      T = tokens.shape[1]
+      x = vis_m[:, :T].to(x.device).unsqueeze(-1).where(vis_e[:, :T].to(x.device).float(), x)
+      rope = vis_pos[:, :T]
+    # activations hop devices at block boundaries (.to is a no-op when the device matches)
+    for block in self.blk: x = cast(Tensor, block(x.to(block.device), start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
@@ -1201,7 +1308,8 @@ class Transformer:
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False) -> Tensor|tuple[Tensor, ...]:
+  def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
+               vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
     is_prefill = bool(resolve(tokens.shape[1] != 1))
     # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
     # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
@@ -1210,9 +1318,17 @@ class Transformer:
     # independent), so only the prefill variants need the extra key; None keeps the rollout jit singular.
     # T4.64: `spec` also joins the key -- it picks a python branch inside forward() that changes the traced
     # graph (and its return arity), so a spec=True call must never replay a spec=False capture or vice versa.
+    # T5.3: `vision` joins the key too -- an image request's prompt chunks carry three extra input tensors and its decode steps a second
+    # bound Variable (rope_start), so its captures can never replay a text capture or vice versa; text requests pass neither and keep
+    # their pre-T5.3 keys and graphs untouched.
     chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
-    return self.jit.setdefault((is_prefill, temperature is None, chunk_size, spec), TinyJit(self.forward))(
-      tokens.contiguous(), start_pos, temperature, spec)
+    vision = (True,) if rope_start is not None or vis_e is not None else ()  # text keys stay the pre-T5.3 4-tuples
+    key = (is_prefill, temperature is None, chunk_size, spec) + vision
+    if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
+      mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
+      print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
+    return self.jit.setdefault(key, TinyJit(self.forward))(
+      tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos)
 
   def realize_placement(self):
     """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --
@@ -1394,7 +1510,7 @@ class Transformer:
       model.realize_placement()
     return model, kv
 
-  def warmup(self):
+  def warmup(self, vision:bool=False):
     # warm both the greedy and sampled jit pairs, so a request doesn't pay a mid-request capture for whichever it hits first
     for temperature in (0.0, 1.0):
       for _ in range(2): list(zip(range(2), self.generate([0], temperature=temperature)))
@@ -1443,6 +1559,13 @@ class Transformer:
       # attend to) is unchanged.
       for attr in ("cache_kv", "cache_k"):
         if hasattr(self.mtp_head.block, attr): (c:=getattr(self.mtp_head.block, attr)).assign(Tensor.zeros_like(c)).realize()
+    if vision:
+      # T5.3: the image-prompt family too (chunked prefill with the side inputs, then decode with rope_start) -- a 2-chunk dummy prompt
+      # carrying one 4-token span (grid (1, 4, 4) merges to 2x2), so the first real image request replays instead of capturing
+      dummy = VisionInput([(1, 4, (1, 4, 4))], Tensor.zeros(4, self.token_embd.weight.shape[1]))
+      # T5.5: greedy only -- image requests are always decoded greedily (serve.py forces it), so the sampled vision pair is never hit;
+      # each extra prefill family costs ~0.78 GB on the 3090 (see VISION_CHUNK), and the standing map has room for exactly one.
+      for _ in range(2): list(zip(range(2), self.generate([0] * 38, temperature=0.0, vision=dummy)))
 
   def get_start_pos(self, tokens:list[int]) -> int:
     # recurrent state can't be partially reused after divergence: reuse it only when tokens extend the cached prefix
@@ -1478,7 +1601,7 @@ class Transformer:
       elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
       elif isinstance(b, TransformerBlock): blocks.append({"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()})
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
-    snap: dict = {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks}
+    snap: dict = {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks, "rope_delta": self._rope_delta}
     # ponytail: TransformerBlock-shaped MTP block only (every nextn head this fork loads); an MLA-shaped one would need its cache_k here.
     if self.mtp_head is not None and isinstance(self.mtp_head.block, TransformerBlock) and hasattr(self.mtp_head.block, "cache_kv"):
       snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone()
@@ -1505,9 +1628,11 @@ class Transformer:
       assigns.append(cast(TransformerBlock, self.mtp_head.block).cache_kv[:, :, :, :mk.shape[3], :].assign(mk))
     Tensor.realize(*assigns)
     self._cached_tokens = list(snap["tokens"])
+    self._rope_delta = snap.get("rope_delta", 0)  # T5.3 (pre-T5.3 snapshots: text only, 0)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1):
-    """drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1, vision:VisionInput|None=None):
+    """vision (T5.3): the prompt's images -- see VisionInput. None (every pre-T5.3 caller) is the byte-identical text path.
+    drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
     syncing every sampled token. drain_every=1 (default) is byte-identical to the pre-T2.5 behavior -- every
     generate()-caller and test that assumes one .item()/next() per decode step keeps working unchanged. Pass
     drain_every=2..4 from a real serving loop to amortize the sync (streaming still yields one token at a time,
@@ -1525,6 +1650,7 @@ class Transformer:
     # prefill at decode speed -- 46 tok/s on the pooled qwen3.6-35B). GDN_CHUNK caps the chunk width for those devices instead.
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
       chunk_size = min(chunk_size, gdn_chunk_for(self.token_embd.weight.device))
+    if vision is not None: chunk_size = min(chunk_size, VISION_CHUNK.value)  # T5.5: see VISION_CHUNK
     drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
@@ -1536,6 +1662,19 @@ class Transformer:
     # recompute start_pos from what's currently valid in the caches
     start_pos = self.get_start_pos(tokens)
     out, prompt_len = None, len(tokens)
+    # T5.3: image prompts (and text prompts extending a cached image prefix) get a host-side plan: per-position (t,h,w) rope ids + image
+    # mask + encoder rows for the chunks still to prefill, and the rope deficit the decode steps run at. Text-only stays plan-less.
+    if vision is not None:
+      for off, n, _ in vision.spans:  # never resume inside an image span: re-prefill it whole (its rows ride with its chunks)
+        if off < start_pos < off + n: start_pos = off
+    if start_pos == 0: self._rope_delta = 0
+    elif self._rope_delta and start_pos != len(self._cached_tokens):
+      start_pos = 0  # ponytail: partial-prefix reuse (attention-only models) behind images -- the stored deficit is the full prefix's; re-prefill
+    plan = _VisionPlan(vision, prompt_len, start_pos, self._rope_delta, chunk_size, int(self.token_embd.weight.shape[1]), t.device) \
+      if vision is not None or self._rope_delta else None
+    if plan is not None:
+      v_rope_start = UOp.variable("rope_start", 0, self.max_context-1)
+      self._rope_delta = plan.delta
     # T2.5: a sampled token already chains device-side -- `out` feeds the next step's input directly (below),
     # no host round-trip needed for the compute itself. .item() was only ever needed for host bookkeeping/
     # streaming (tokens list, _cached_tokens, yield). So launch up to `drain_every` decode steps back-to-back
@@ -1549,7 +1688,12 @@ class Transformer:
     while virtual_len < self.max_context:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = cast(Tensor, self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp)).realize()
+      inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
+      if plan is None: out = cast(Tensor, self(inp, sp, temp)).realize()
+      elif start_pos < prompt_len:
+        e, m, p3 = plan.chunk(start_pos, n_toks)
+        out = cast(Tensor, self(inp, sp, temp, vis_e=e, vis_m=m, vis_pos=p3)).realize()
+      else: out = cast(Tensor, self(inp, sp, temp, rope_start=v_rope_start.bind(start_pos - plan.delta))).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < virtual_len: continue
@@ -1714,6 +1858,9 @@ class Transformer:
     prompt_len = len(tokens)
     t = Tensor(tokens + [0] * (self.max_context - prompt_len), dtype="int32", device=dev).reshape(1, self.max_context)
     start_pos = self.get_start_pos(tokens)
+    # T5.3: this path has no rope_start/vision plumbing -- a cached prefix that contains images would decode at the wrong rope positions
+    if start_pos > 0 and self._rope_delta: start_pos = 0
+    if start_pos == 0: self._rope_delta = 0
     tok_all: Tensor|None = None
     h_last: Tensor|None = None
     while start_pos < prompt_len:
@@ -2022,6 +2169,60 @@ class Transformer:
         print(f"[SPEC_STATS] iters={stats_iters} emitted={stats_emitted} drafted={stats_drafted} "
               f"avg_accept_len={stats_emitted/stats_iters:.2f} drafts_per_token={stats_drafted/stats_emitted:.2f} "
               f"accept_len_hist={{{hist_str}}}")
+
+@dataclass(frozen=True)
+class VisionInput:
+  """T5.3: the visual side of one prompt. spans: per image in id order, (offset of its run in the id list, visual token count n,
+  (t, gh, gw) PATCH grid) with n == (gh//2)*(gw//2) (t must be 1 -- video is out of scope); embeds: the encoder's (sum of n, D) rows in
+  the same order (T5.2). The ids at a span's positions are placeholders the model never embeds (T5.4 puts hash-derived ids there so the
+  sequence stays cache-keyable); vision_start/vision_end are ordinary text tokens outside the span."""
+  spans: list[tuple[int, int, tuple[int, int, int]]]
+  embeds: Tensor
+
+def vision_positions(spans:list[tuple[int, int, tuple[int, int, int]]], prompt_len:int, start_pos:int,
+                     delta:int) -> tuple[np.ndarray, np.ndarray, int]:
+  """HF get_rope_index for ids[start_pos:prompt_len]: (pos3 (n, 3) int32 (t, h, w) rope ids, mask (n,) bool = visual positions, the rope
+  deficit at prompt_len). Text tokens count up from start_pos - delta; an image span at rope position p takes (p, p+hi, p+wi) over its
+  merged gh//2 x gw//2 grid row-major, and the text after it resumes at p + max(gh, gw)//2 -- so each image adds n - max(gh, gw)//2 to
+  the deficit. Spans fully inside the reused prefix are `delta`'s business (skipped); a boundary inside a span is a caller bug."""
+  import numpy as np
+  n = prompt_len - start_pos
+  pos3, mask = np.zeros((n, 3), np.int32), np.zeros(n, bool)
+  p, i = start_pos - delta, start_pos  # rope position of ids[i]
+  for off, cnt, (gt, gh, gw) in sorted(spans):
+    if off + cnt <= start_pos: continue
+    assert off >= start_pos, f"vision_positions: reuse boundary {start_pos} inside the image span at {off}+{cnt}"
+    assert gt == 1 and cnt == (gh // 2) * (gw // 2), f"vision_positions: span {(off, cnt, (gt, gh, gw))} is not one image of (gh//2)*(gw//2) tokens"
+    pos3[i-start_pos:off-start_pos] = np.arange(p, p + off - i)[:, None]  # the text run before the span
+    p, i = p + off - i, off
+    hi, wi = np.meshgrid(np.arange(gh // 2), np.arange(gw // 2), indexing="ij")
+    pos3[i-start_pos:i-start_pos+cnt] = p + np.stack([np.zeros_like(hi), hi, wi], -1).reshape(cnt, 3)
+    mask[i-start_pos:i-start_pos+cnt] = True
+    p, i = p + max(gh, gw) // 2, i + cnt
+  pos3[i-start_pos:] = np.arange(p, p + prompt_len - i)[:, None]  # the trailing text
+  return pos3, mask, prompt_len - (p + prompt_len - i)
+
+class _VisionPlan:
+  """T5.3, generate()'s per-request image bookkeeping: vision_positions over the chunks still to prefill, the encoder rows on the host,
+  and chunk() -- the three chunk-max-sized side inputs (vis_e, vis_m, vis_pos: see Transformer.forward) for the chunk at [sp, sp+n)."""
+  def __init__(self, vision:VisionInput|None, prompt_len:int, start_pos:int, delta:int, chunk:int, dim:int, device:str|tuple[str, ...]|None):
+    import numpy as np
+    self.spans = sorted(vision.spans) if vision is not None else []
+    self.start, self.width, self.dim, self.device = start_pos, chunk, dim, device
+    self.pos3, self.mask, self.delta = vision_positions(self.spans, prompt_len, start_pos, delta)
+    self.rows = vision.embeds.numpy().astype(np.float32) if vision is not None else None
+    if self.rows is not None: assert self.rows.shape == (sum(c for _, c, _ in self.spans), dim), f"embeds {self.rows.shape} vs spans/dim"
+  def chunk(self, sp:int, n:int) -> tuple[Tensor, Tensor, Tensor]:
+    import numpy as np
+    e, m, p3 = np.zeros((1, self.width, self.dim), np.float32), np.zeros((1, self.width), bool), np.zeros((1, self.width, 3), np.int32)
+    lo = sp - self.start
+    m[0, :n], p3[0, :n] = self.mask[lo:lo+n], self.pos3[lo:lo+n]
+    base = 0
+    for off, cnt, _ in self.spans:
+      a, b = max(off, sp), min(off + cnt, sp + n)  # the span's overlap with this chunk
+      if a < b: e[0, a-sp:b-sp] = cast(np.ndarray, self.rows)[base + a - off:base + b - off]
+      base += cnt
+    return Tensor(e, device=self.device), Tensor(m, device=self.device), Tensor(p3, device=self.device)
 
 def snapshot_nbytes(snap:dict) -> int:
   """Total device-buffer bytes a Transformer.snapshot_state() dict holds: recursively sums every Tensor's

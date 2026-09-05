@@ -138,7 +138,12 @@ class TestNVRemoteSizingSkeleton(unittest.TestCase):
     remote_sizing = NVDevice._REMOTE_SIZING if NVDevice.is_remote(remote_dev) else NVDevice._LOCAL_SIZING
     assert local_sizing is NVDevice._LOCAL_SIZING and local_sizing is not NVDevice._REMOTE_SIZING
     assert remote_sizing is NVDevice._REMOTE_SIZING and remote_sizing is not NVDevice._LOCAL_SIZING
-    assert NVDevice._LOCAL_SIZING == NVDevice._REMOTE_SIZING, "values must be identical pre-dock -- a no-op skeleton, not a tuned one"
+    # T4.70d: the skeleton is no longer a no-op -- remote kernargs_size is tuned (16MB starved under FFN-TP's
+    # dispatch burst; the per-alloc fallback then hit the TinyGPU tunnel's per-client map cap -- see ops_nv.py).
+    # Everything else must stay identical; assert the exact intended divergence, nothing more.
+    assert NVDevice._REMOTE_SIZING["kernargs_size"] == 64 << 20 and NVDevice._LOCAL_SIZING["kernargs_size"] == 16 << 20
+    assert {k: v for k, v in NVDevice._LOCAL_SIZING.items() if k != "kernargs_size"} == \
+           {k: v for k, v in NVDevice._REMOTE_SIZING.items() if k != "kernargs_size"}, "only kernargs_size may diverge"
     assert NVDevice._LOCAL_SIZING is not NVDevice._REMOTE_SIZING, "but distinct objects, so tuning later is a values-only edit"
 
 class TestNVBindRemoteBatching(unittest.TestCase):
@@ -212,7 +217,8 @@ class TestNVKernargsPoolSlab(unittest.TestCase):
       page.offset = lambda off, osz, page=page: SimpleNamespace(size=osz, base=page)
       return page
     fake_dev = SimpleNamespace(allocator=SimpleNamespace(alloc=fake_alloc, _alloc=fake_alloc, _free=lambda *a, **k: None),
-                               is_remote=lambda: is_remote, _kernargs_slab=None, _kernargs_bump=None)
+                               is_remote=lambda: is_remote, _kernargs_slab=None, _kernargs_bump=None,
+                               sizing=NVDevice._REMOTE_SIZING if is_remote else NVDevice._LOCAL_SIZING)  # T4.70d: slab size now reads the knob
     bufs = [NVDevice.alloc_kernargs(fake_dev, size) for _ in range(n)]
     for b in bufs: NVDevice.free_kernargs(fake_dev, b)
     return len(allocs)
