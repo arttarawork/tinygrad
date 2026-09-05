@@ -1,4 +1,4 @@
-import unittest, importlib.util, pathlib
+import os, unittest, importlib.util, pathlib
 import numpy as np
 from tinygrad import Tensor
 from tinygrad.llm.vision import VisionConfig, VisionEncoder, merge_window_rowcol, bilinear_taps
@@ -95,3 +95,15 @@ class TestVisionEncoderParity(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+MMPROJ = "/Users/artur/models/qwen3.6-35b-a3b-q8/mmproj-BF16.gguf"
+@unittest.skipUnless(os.path.exists(MMPROJ), "needs the real mmproj file")
+class TestVisionEncoderPlacement(unittest.TestCase):
+  def test_from_mmproj_places_weights_on_the_requested_device(self):
+    # T5.5: on the pooled server the encoder must live on blk[0]'s device (METAL), not the process default (DEV=NV) --
+    # gguf_load's device_map does not place these tensors. CPU:1 stands in for "a device that is not the default".
+    from tinygrad.llm.vision import VisionEncoder
+    from tinygrad.nn.state import get_state_dict
+    enc = VisionEncoder.from_mmproj(MMPROJ, "CPU:1")
+    devs = {t.device for t in get_state_dict(enc).values() if isinstance(t, Tensor)}
+    self.assertEqual(devs, {"CPU:1"}, devs)

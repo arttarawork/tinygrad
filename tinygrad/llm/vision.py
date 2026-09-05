@@ -87,7 +87,9 @@ class VisionEncoder:  # Qwen3_5MoeVisionModel (+ its Qwen3_5MoeVisionPatchMerger
                      out=kv["clip.vision.projection_dim"], n_pos=int(w["v.position_embd.weight"].shape[0]),
                      eps=float(kv.get("clip.vision.attention.layer_norm_epsilon", 1e-6)))
     enc = VisionEncoder(c, device)
-    def f(n:str) -> Tensor: return w[n].float().realize()  # bf16 weights / f32 biases+norms -> float32 on `device`
+    # T5.5: gguf_load's device_map is the LLM's per-block map; for this file it leaves tensors on the process default device
+    # (DEV=NV on the pooled server -- the encoder silently lived on the 3090), so move each one explicitly.
+    def f(n:str) -> Tensor: return (w[n].to(device) if device is not None else w[n]).float().realize()  # bf16/f32 -> float32 on `device`
     # llama.cpp stores the Conv3d kernel [T,p,p] as one 2-D slice per temporal step: weight (t=0) and weight.1 (t=1); re-stack on the
     # temporal axis and flatten in the patch vector's (channel, temporal, y, x) order
     slices = [f("v.patch_embd.weight")] + [f(f"v.patch_embd.weight.{t}") for t in range(1, c.temporal)]
