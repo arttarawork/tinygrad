@@ -19,6 +19,11 @@ from tinygrad.helpers import ContextVar
 # 64 falls off a cliff even on METAL (28 tok/s). Set GDN_CHUNK explicitly to override either way.
 # T4.68: 64 is explicit-only (never auto-selected above); CPU scan-parity now covers both geometries (test_gdn_scan_parity.py).
 GDN_CHUNK = ContextVar("GDN_CHUNK", 0)
+# T5.5: prefill chunk width for IMAGE prompts only. The image-prompt jit family is a second capture with its own planned scratch
+# (~1.3 GB at width 32 on the pooled qwen3.6-35B, the same as the text family's); on the 3090 that second set landed on top of a
+# 22.9 GB footprint and hit the T4.77 ceiling (MemoryError: 1.13 GB on NV). Scratch scales with the width, so vision prompts prefill
+# 8 wide -- ~4x less scratch, ~4x more chunks for the few hundred visual tokens of a request. Text prompts are untouched.
+VISION_CHUNK = ContextVar("VISION_CHUNK", 8)
 def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   if GDN_CHUNK.value > 0: return GDN_CHUNK.value
   dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
@@ -1351,6 +1356,7 @@ class Transformer:
     # prefill at decode speed -- 46 tok/s on the pooled qwen3.6-35B). GDN_CHUNK caps the chunk width for those devices instead.
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
       chunk_size = min(chunk_size, gdn_chunk_for(self.token_embd.weight.device))
+    if vision is not None: chunk_size = min(chunk_size, VISION_CHUNK.value)  # T5.5: see VISION_CHUNK
     drain_every = max(1, drain_every)
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
