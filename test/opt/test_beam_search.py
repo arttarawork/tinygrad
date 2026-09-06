@@ -356,7 +356,7 @@ class TestBeamCacheOnly(unittest.TestCase):
   def test_uncached_kernel_gets_hand_coded_opts_without_launching(self):
     s, rawbufs, var_vals = _build_seed()
     def boom(*a, **k): raise AssertionError("BEAM_CACHE_ONLY must not compile or launch a candidate")
-    with patch.object(search_mod, "_try_compile", boom), Context(BEAM_CACHE_ONLY=1):
+    with patch.object(search_mod, "_try_compile", boom), Context(BEAM_CACHE_ONLY=1), patch.dict(os.environ, {"BEAM_CACHE_ONLY_DEVS": "NULL"}):
       got = search_mod.beam_search(s, rawbufs, var_vals, 2, disable_cache=True)
     self.assertEqual(got.applied_opts, hand_coded_optimizations(s.copy()).applied_opts)
 
