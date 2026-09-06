@@ -464,6 +464,13 @@ class TestStateCacheOOM(unittest.TestCase):
                     state_cache_mb=mb)
     self.addCleanup(srv.server_close)
     return srv
+  def test_one_shot_image_requests_are_not_cached(self):
+    srv = self._server(1024)
+    srv.store_snapshot([1, 2, 3], True)   # T5.7c: an image request never lands in the cache
+    self.assertEqual(len(srv.snapshots), 0)
+    srv.store_snapshot([1, 2, 3])
+    self.assertEqual(len(srv.snapshots), 1)
+
   def test_memoryerror_is_swallowed_and_cache_cleared(self):
     srv = self._server(1)
     srv.snapshots[(1, 2)] = {"t": Tensor.zeros(4)}
