@@ -454,3 +454,34 @@ class TestLMStudioShim(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+class TestStateCacheOOM(unittest.TestCase):
+  """T5.7: a failed snapshot must never abort the request; oversized sequences are skipped; eviction happens before allocation."""
+  def _server(self, mb):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import LLMServer
+    srv = LLMServer(("127.0.0.1", 0), model=SimpleNamespace(max_context=64, snapshot_state=lambda: {}), model_name="tiny", tok=None, template=None,
+                    state_cache_mb=mb)
+    self.addCleanup(srv.server_close)
+    return srv
+  def test_memoryerror_is_swallowed_and_cache_cleared(self):
+    srv = self._server(1)
+    srv.snapshots[(1, 2)] = {"t": Tensor.zeros(4)}
+    def boom(): raise MemoryError("Allocation of 77.06 MB failed on NV")
+    srv.model.snapshot_state = boom
+    srv.store_snapshot([1, 2, 3, 4])   # must not raise
+    self.assertEqual(len(srv.snapshots), 0)
+  def test_oversized_sequence_is_skipped(self):
+    srv = self._server(1)   # 1 MB cap
+    srv.snapshots[tuple(range(8))] = {"t": Tensor.zeros(256 * 1024)}   # 1 MB for 8 tokens = 128 KB/token
+    calls = []
+    srv.model.snapshot_state = lambda: calls.append(1) or {"t": Tensor.zeros(1)}
+    srv.store_snapshot(list(range(64)))   # ~8 MB predicted > cap -> skipped without allocating
+    self.assertEqual(calls, [])
+    self.assertIn(tuple(range(8)), srv.snapshots)
+  def test_evicts_before_allocating(self):
+    srv = self._server(1)
+    srv.snapshots[tuple(range(8))] = {"t": Tensor.zeros(192 * 1024)}   # 768 KB for 8 tokens
+    srv.model.snapshot_state = lambda: {"t": Tensor.zeros(192 * 1024)}
+    srv.store_snapshot(list(range(8, 16)))   # predicted 768 KB; 768 + 768 > 1 MB -> the old one is evicted first
+    self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])
