@@ -1082,5 +1082,42 @@ class TestNVEagerDrainForensics(unittest.TestCase):
       q._submit_to_gpfifo(dev, gpfifo)
     assert sync_calls == [1], f"NV_EAGER_DRAIN=1 must synchronize exactly once per submission, got {sync_calls}"
 
+# T6.3 (T4.54): NVDevice._ensure_has_local_memory after a FAILED SLM realloc. _realloc (hcq.py) frees the old buffer, and on MemoryError
+# returns a fresh buffer of the OLD size with ok=False; the per-TPC window programmed by the setup that follows must then describe the
+# old size too -- the requested (larger) one over the smaller buffer is exactly the off-the-end stack window that faulted the 3090 on
+# every deep BEAM candidate of the pooled 27B at 128k (2026-09-06). Pure-Python: a fake self + a recording NVComputeQueue.
+class TestSLMReallocFailure(unittest.TestCase):
+  GEOM = dict(max_warps_per_sm=48, num_sm_per_tpc=2, num_tpc_per_gpc=6, num_gpcs=7)  # GA102
+  def _dev(self, ok:bool):
+    d = SimpleNamespace(slm_per_thread=0x240, timeline_signal=None, timeline_value=1, next_timeline=lambda: 2, synchronize=lambda: None, **self.GEOM)
+    d._slm_bytes_per_tpc = lambda: NVDevice._slm_bytes_per_tpc(d)
+    d.shader_local_mem = SimpleNamespace(va_addr=0x1000, size=d._slm_bytes_per_tpc() * 42)
+    d._realloc = lambda oldbuf, new_size, options=None, force=False: (SimpleNamespace(va_addr=0x2000, size=new_size if ok else oldbuf.size), ok)
+    return d
+  def _run(self, ok:bool, required:int):
+    calls = []
+    class Q:
+      def wait(self, *a): return self
+      def setup(self, **kw):
+        calls.append(kw)
+        return self
+      def signal(self, *a): return self
+      def submit(self, dev): return self
+    with patch("tinygrad.runtime.ops_nv.NVComputeQueue", Q):
+      d = self._dev(ok)
+      NVDevice._ensure_has_local_memory(d, required)
+    return d, calls[-1]
+  def test_failed_realloc_keeps_the_window_inside_the_buffer(self):
+    d, setup = self._run(ok=False, required=4096)
+    self.assertEqual(d.slm_per_thread, 0x240)                                             # restored
+    self.assertEqual(setup["local_mem"], 0x2000)                                          # the replacement buffer
+    self.assertLessEqual(setup["local_mem_tpc_bytes"] * 42, d.shader_local_mem.size)     # 42 TPC windows fit the buffer it has
+    self.assertEqual(setup["local_mem_tpc_bytes"], NVDevice._slm_bytes_per_tpc(d))
+  def test_successful_realloc_programs_the_new_window(self):
+    d, setup = self._run(ok=True, required=4096)
+    self.assertEqual(d.slm_per_thread, 4096)
+    self.assertEqual(setup["local_mem_tpc_bytes"], NVDevice._slm_bytes_per_tpc(d))
+    self.assertLessEqual(setup["local_mem_tpc_bytes"] * 42, d.shader_local_mem.size)
+
 if __name__ == "__main__":
   unittest.main()
