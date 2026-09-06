@@ -864,15 +864,27 @@ class NVDevice(HCQCompiled[NVSignal]):
 
     self.synchronize()
 
+  def _slm_bytes_per_tpc(self) -> int:
+    return round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
+
   def _ensure_has_local_memory(self, required):
     if self.slm_per_thread >= required: return
 
+    # T6.3 (T4.54): _realloc frees the current SLM buffer before allocating the new one -- drain the queue first so no in-flight
+    # kernel still owns a stack in it.
+    self.synchronize()
     self.slm_per_thread, old_slm_per_thread = round_up(required, 32), self.slm_per_thread
-    bytes_per_tpc = round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
+    bytes_per_tpc = self._slm_bytes_per_tpc()
     self.shader_local_mem, ok = self._realloc(self.shader_local_mem, round_up(bytes_per_tpc*self.num_tpc_per_gpc*self.num_gpcs, 0x20000))
 
-    # Realloc failed, restore the old value.
-    if not ok: self.slm_per_thread = old_slm_per_thread
+    # Realloc failed (OOM): _realloc handed back a buffer of the OLD size, so restore the old per-thread value AND describe the old
+    # per-TPC window below. Programming the requested (larger) window over the smaller buffer made every later stack access on the
+    # higher TPCs run off the end -- an MMU fault on the next kernel that spills, i.e. the 'memory-starved BEAM search ends in a
+    # device fault' of T4.47 and the 7 deterministic candidate faults of 2026-09-06 (deep UNROLL/UPCAST candidates spill; the
+    # pooled 27B at 128k leaves ~3 GB free on the 3090 and a 3-8 KB stack asks for 0.4-1 GB of SLM at once).
+    if not ok:
+      self.slm_per_thread = old_slm_per_thread
+      bytes_per_tpc = self._slm_bytes_per_tpc()
 
     cast(NVComputeQueue, NVComputeQueue().wait(self.timeline_signal, self.timeline_value - 1)) \
                                          .setup(local_mem=self.shader_local_mem.va_addr, local_mem_tpc_bytes=bytes_per_tpc) \
