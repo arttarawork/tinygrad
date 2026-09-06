@@ -1,4 +1,4 @@
-import math, time, traceback, signal
+import math, pathlib, time, traceback, signal
 from collections import Counter
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
@@ -6,12 +6,12 @@ from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, colored, time_to_str
 from tinygrad.helpers import IGNORE_BEAM_CACHE, ContextVar
-BEAM_CACHE_ONLY = ContextVar("BEAM_CACHE_ONLY", 0)
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt.postrange import Scheduler
+BEAM_CACHE_ONLY = ContextVar("BEAM_CACHE_ONLY", 0)  # T6.3: cached BEAM winners only; uncached kernels take the hand-coded opts
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(8)]
 actions += [Opt(op=OptOps.UNROLL, axis=axis, arg=amt) for amt in [0,4,7] for axis in range(5)]
@@ -44,7 +44,12 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
   # in the AST id + shape + applied_opts; this print fires right before the candidate's actual GPU launch,
   # so the last LAUNCH lines before a fault-abort name the launches that immediately preceded it (the true
   # faulting candidate may be one of these, not just the one the abort exception names -- see T4.47_RCA.md).
-  if BEAM_LAUNCH_LOG: print(f"LAUNCH {time.time():.3f} {name}", flush=True)
+  if BEAM_LAUNCH_LOG:
+    print(f"LAUNCH {time.time():.3f} {name}", flush=True)
+    if BEAM_LAUNCH_LOG >= 2:  # T6.3/T4.54: also keep the candidate's source, named by launch time, so a fault's last launches can be read
+      d = pathlib.Path(getenv("BEAM_LAUNCH_DIR", "/tmp/beam_launch"))
+      d.mkdir(parents=True, exist_ok=True)
+      (d / f"{time.time():.3f}.txt").write_text(f"// {name}\n{prg.arg.src}")
   timeout = int(early_stop * 1e3) if dev_timeout and early_stop is not None and early_stop < math.inf else None
   factor = 1
   if allow_test_size and max_global_size is not None:
