@@ -2239,6 +2239,24 @@ def snapshot_nbytes(snap:dict) -> int:
     return 0
   return walk(snap)
 
+def snapshot_nbytes_for(snap:dict, n_tokens:int) -> int:
+  """Predict the bytes a snapshot of an n_tokens-long sequence would take, from an existing snapshot: KV-cache slices
+  (`cache_kv`/`cache_k`, one row per token) scale with the length; GDN conv/recurrent states (and everything else) are
+  fixed-size accumulators and count once. A plain nbytes*n/len(tokens) extrapolation charges the fixed states per token
+  and predicts ~29 GB for a 39k-token session (T5.7b) -- then serve.py skips snapshots that would fit."""
+  pos = max(int(snap.get("pos", len(snap.get("tokens", [])))), 1)
+  per_token, fixed = 0.0, 0
+  for blk in snap.get("blocks", []):
+    for k, v in blk.items():
+      if not isinstance(v, Tensor): continue
+      nb = math.prod(int(d) for d in v.shape) * v.dtype.itemsize
+      if k in ("cache_kv", "cache_k"): per_token += nb / pos
+      else: fixed += nb
+  # MTP cache slice (T4.66l) and any other per-token entries at the top level
+  for k, v in snap.items():
+    if k != "blocks" and isinstance(v, Tensor): per_token += math.prod(int(d) for d in v.shape) * v.dtype.itemsize / pos
+  return int(fixed + per_token * n_tokens)
+
 def snapshot_matches(snap:dict, tokens:list[int]) -> bool:
   """True iff snap's cached tokens are a strict, exact prefix of `tokens` -- the same recurrent exact-prefix
   rule get_start_pos enforces (see there): only then is Transformer.restore_state(snap) safe to apply before

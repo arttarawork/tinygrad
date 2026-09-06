@@ -454,3 +454,44 @@ class TestLMStudioShim(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+class TestStateCacheOOM(unittest.TestCase):
+  """T5.7: a failed snapshot must never abort the request; oversized sequences are skipped; eviction happens before allocation."""
+  def _server(self, mb):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import LLMServer
+    srv = LLMServer(("127.0.0.1", 0), model=SimpleNamespace(max_context=64, snapshot_state=lambda: {}), model_name="tiny", tok=None, template=None,
+                    state_cache_mb=mb)
+    self.addCleanup(srv.server_close)
+    return srv
+  def test_memoryerror_is_swallowed_and_cache_cleared(self):
+    srv = self._server(1)
+    srv.snapshots[(1, 2)] = {"t": Tensor.zeros(4)}
+    def boom(): raise MemoryError("Allocation of 77.06 MB failed on NV")
+    srv.model.snapshot_state = boom
+    srv.store_snapshot([1, 2, 3, 4])   # must not raise
+    self.assertEqual(len(srv.snapshots), 0)
+  def test_size_estimate_separates_fixed_state_from_per_token_kv(self):
+    # T5.7b: a 4-token snapshot with 1 MB of GDN state and 4 KB/token of KV must predict ~1 MB + n*4 KB, not (1 MB+16 KB)*n/4
+    from tinygrad.llm.model import snapshot_nbytes_for
+    snap = {"tokens": [1, 2, 3, 4], "pos": 4, "blocks": [{"recurrent_state": Tensor.zeros(256 * 1024)},              # 1 MB fixed (fp32)
+                                                          {"cache_kv": Tensor.zeros(2, 1, 1, 4, 512)}]}                 # 4 KB/token (fp32)
+    self.assertEqual(snapshot_nbytes_for(snap, 4), 1024 * 1024 + 4 * 4096)
+    self.assertEqual(snapshot_nbytes_for(snap, 4000), 1024 * 1024 + 4000 * 4096)
+    self.assertLess(snapshot_nbytes_for(snap, 4000), 20 * 1024 * 1024)   # the naive extrapolation would say ~1 GB
+  def test_oversized_sequence_is_skipped(self):
+    srv = self._server(1)   # 1 MB cap
+    # 1 MB of KV for 8 tokens = 128 KB/token
+    srv.snapshots[tuple(range(8))] = {"pos": 8, "tokens": list(range(8)), "blocks": [{"cache_kv": Tensor.zeros(256 * 1024)}]}
+    calls = []
+    srv.model.snapshot_state = lambda: calls.append(1) or {"t": Tensor.zeros(1)}
+    srv.store_snapshot(list(range(64)))   # ~8 MB predicted > cap -> skipped without allocating
+    self.assertEqual(calls, [])
+    self.assertIn(tuple(range(8)), srv.snapshots)
+  def test_evicts_before_allocating(self):
+    srv = self._server(1)
+    # 768 KB of KV for 8 tokens
+    srv.snapshots[tuple(range(8))] = {"pos": 8, "tokens": list(range(8)), "blocks": [{"cache_kv": Tensor.zeros(192 * 1024)}]}
+    srv.model.snapshot_state = lambda: {"t": Tensor.zeros(192 * 1024)}
+    srv.store_snapshot(list(range(8, 16)))   # predicted 768 KB; 768 + 768 > 1 MB -> the old one is evicted first
+    self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])

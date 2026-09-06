@@ -272,14 +272,17 @@ class TestGDNScanCapture(unittest.TestCase):
     # capture=True must be a pure addition (two extra return values) -- the actual attention OUTPUT and the
     # final conv/recurrent state it leaves behind must be bit-identical to a capture=False call from an
     # identically-seeded fresh block (same reasoning as TestGDNScanSingleStepGate's loop-vs-WY equality check).
+    # T4.69c made WY the default scan; capture=True always takes the loop, so compare against the LOOP arm explicitly
+    # (loop vs WY are greedy-identical, not bit-identical -- test_capture_forces_loop_even_under_wy covers that interplay).
     for name in GEOMETRIES:
       ssm = GEOMETRIES[name]
       x = (Tensor.randn(1, SMALL_TOKENS, DIM) * 0.1).realize()
       block_a, block_b = make_block(ssm), make_block(ssm)
-      out_a = run_attention(block_a, x, 0)
-      x_norm = block_b.attn_norm(x)
-      block_b._init_state(x_norm)
-      out_b, _, _ = block_b._attention(x_norm, 0, capture=True)
+      with Context(GDN_SCAN_IMPL=GDN_SCAN_LOOP):
+        out_a = run_attention(block_a, x, 0)
+        x_norm = block_b.attn_norm(x)
+        block_b._init_state(x_norm)
+        out_b, _, _ = block_b._attention(x_norm, 0, capture=True)
       np.testing.assert_array_equal(out_a, out_b.realize().numpy(), err_msg=f"{name=} output")
       conv_a, rec_a = snapshot(block_a)
       conv_b, rec_b = snapshot(block_b)
