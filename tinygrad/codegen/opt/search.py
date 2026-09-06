@@ -11,7 +11,9 @@ from tinygrad.engine.realize import time_call
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt.postrange import Scheduler
+from tinygrad.dtype import dtypes, _to_np_dtype
 BEAM_CACHE_ONLY = ContextVar("BEAM_CACHE_ONLY", 0)  # T6.3: cached BEAM winners only; uncached kernels take the hand-coded opts
+BEAM_VERIFY = ContextVar("BEAM_VERIFY", 1)  # T6.4: verify the winner's result against the hand-coded baseline before trusting it
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(8)]
 actions += [Opt(op=OptOps.UNROLL, axis=axis, arg=amt) for amt in [0,4,7] for axis in range(5)]
@@ -162,6 +164,34 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
 
 BEAM_DEBUG = getenv("BEAM_DEBUG")
 BEAM_LAUNCH_LOG = getenv("BEAM_LAUNCH_LOG", 0)  # T4.53: gate for _time_program's per-candidate LAUNCH log
+
+def _verify_winner(base:Scheduler, win:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int]) -> bool:
+  # T6.4 (real incident 2026-09-06): BEAM picks a winner by TIMING alone and never checks its RESULT -- a wrong
+  # winner (a bad opt combo the timing happened not to punish) can silently ship broken output (a METAL
+  # vision-encoder kernel produced garbage embeddings until the cached winner was deleted by hand). Compile
+  # base(line) and win(ner) the same way _try_compile does, run each for real on identical deterministic inputs,
+  # and compare every buffer they touch.
+  import numpy as np
+  def to_prg(cand:Scheduler) -> UOp:
+    ast, dev = cand.copy().get_optimized_ast(name_override="test"), cand.ren.target.device
+    return to_program(ast.substitute({p: p.replace(arg=replace(p.arg, device=dev)) for p in ast.toposort() if p.op is Ops.PARAM}), cand.ren)
+  def run(cand:Scheduler) -> list:
+    prg = to_prg(cand)
+    rng = np.random.default_rng(0)
+    for b in rawbufs:
+      npd = _to_np_dtype(b.dtype)
+      # ponytail: bfloat16/fp8 have no exact numpy dtype (itemsize doesn't match) -- raises below, so verification
+      # is skipped (winner kept unverified) for kernels touching them. upgrade: vectorized bit-truncate/-extend
+      # for bfloat16 if that ever matters in practice.
+      if npd is None or np.dtype(npd).itemsize != b.dtype.itemsize: raise RuntimeError(f"beam-verify: no numpy dtype for {b.dtype}")
+      vals:np.ndarray = np.zeros(b.size, npd) if dtypes.is_int(b.dtype) or dtypes.is_bool(b.dtype) else rng.random(b.size).astype(npd)
+      b.copy_from(Buffer("PYTHON", b.size, b.dtype, opaque=memoryview(bytearray(vals.tobytes()))))
+    _time_program(prg, var_vals, rawbufs, allow_test_size=False, cnt=1)
+    return [b.numpy() for b in rawbufs]
+  base_out, win_out = run(base), run(win)
+  half = any(b.dtype is dtypes.float16 for b in rawbufs)
+  return all(np.allclose(a, w, rtol=1e-2 if half else 1e-4, atol=1e-5, equal_nan=True) for a, w in zip(base_out, win_out))
+
 def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:int, allow_test_size=True, disable_cache=IGNORE_BEAM_CACHE.value):
   key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.target.device, "suffix": s.ren.suffix}
   if not disable_cache and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
@@ -283,6 +313,25 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
           raise RuntimeError(f"BEAM: device fault detected while timing the hand-coded fallback for {s.colored_shape()}. Original error: {e}") from e
         if BEAM_DEBUG: print(f"BEAM fallback timing failed (result stays uncached): {e}")
     beam[0] = (hc, hc_tm)
+  # T6.4: the winner picked purely on timing above may simply be WRONG (see _verify_winner above). Verify it
+  # against the hand-coded baseline on deterministic inputs before it's ever cached or returned.
+  if BEAM_VERIFY and beam[0][0].applied_opts != s.applied_opts:
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    baseline = hand_coded_optimizations(s.copy())
+    try: verified = _verify_winner(baseline, beam[0][0], rawbufs, var_vals)
+    except Exception as e:
+      verified = None  # inconclusive (compile error, unsupported dtype, ...) -- old behavior: keep the winner
+      if BEAM_DEBUG: print(f"BEAM_VERIFY: could not verify the winner for {s.colored_shape()} ({type(e).__name__}: {e}) -- keeping it unverified")
+    if verified is False:
+      print(colored(f"WARNING: BEAM winner for {s.ast.key.hex()[:12]} {s.colored_shape()} mismatches the hand-coded baseline "
+                     f"on deterministic inputs (winner applied_opts={beam[0][0].applied_opts}) -- falling back to the baseline", "red"))
+      base_tm = math.inf
+      try:
+        if (proc:=_try_compile((0, baseline), uops_max=0, timeout=False)[1]) is not None:
+          base_tm = min(_time_program(proc[0], var_vals, rawbufs, allow_test_size=allow_test_size,
+                                       clear_l2=hasattr(dev, 'invalidate_caches'), dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1)))
+      except Exception: pass  # keep base_tm=inf: T4.39 below then correctly skips caching this run's finding
+      beam[0] = (baseline, base_tm)
   # T4.39: an inf best time means the search never produced an empirically-validated winner -- either the
   # total-failure fallback above (whose score is still the untouched seed's inf) or a candidate whose only
   # timing attempt hit _time_program's AssertionError path (search.py:50). Don't persist that: a later run

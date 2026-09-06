@@ -360,5 +360,51 @@ class TestBeamCacheOnly(unittest.TestCase):
       got = search_mod.beam_search(s, rawbufs, var_vals, 2, disable_cache=True)
     self.assertEqual(got.applied_opts, hand_coded_optimizations(s.copy()).applied_opts)
 
+# T6.4 (real incident 2026-09-06): a wrong BEAM winner (a bad opt combo the timing happened not to punish) shipped
+# broken output on METAL until the cached winner was deleted by hand. NULL can't run real kernels (no copyout --
+# see NullAllocator), so unlike _build_seed's search-diagnostics tests above, these build a real, executable
+# Scheduler on the CPU device (schedule_linear + args_from_ast, same pattern as test/backend/test_linearizer.py).
+def _cpu_seed(fn):
+  dev = Device["CPU"]
+  with Context(ALLOW_DEVICE_USAGE=1):
+    ast = fn().schedule_linear().src[-1].src[0]
+  s = Scheduler(ast, dev.renderer)
+  rawbufs, var_vals = args_from_ast(ast, "CPU")
+  for b in rawbufs: b.ensure_allocated()
+  return s, rawbufs, var_vals
+
+class TestBeamVerify(unittest.TestCase):
+  def test_verify_winner_matches_identical_computation(self):
+    # same computation (x+1), two different (both legal) opt paths -- must verify as equal
+    s, rawbufs, var_vals = _cpu_seed(lambda: Tensor.rand(16, 16, device="CPU") + 1)
+    base = hand_coded_optimizations(s.copy())
+    win = s.copy()
+    win.apply_opt(Opt(OptOps.UPCAST, axis=0, arg=4))
+    self.assertNotEqual(base.applied_opts, win.applied_opts)  # actually exercising two different opt paths
+    with Context(ALLOW_DEVICE_USAGE=1):
+      self.assertTrue(search_mod._verify_winner(base, win, rawbufs, var_vals))
+
+  def test_verify_winner_rejects_different_computation(self):
+    # cleanest way to get a deliberately-wrong "winner" (T6.4 task notes): a different AST (x*2 instead of x+1)
+    # of the same shapes/buffers, fed straight into the helper -- no need to trick beam_search's own search loop
+    base, rawbufs, var_vals = _cpu_seed(lambda: Tensor.rand(16, 16, device="CPU") + 1)
+    wrong, _, _ = _cpu_seed(lambda: Tensor.rand(16, 16, device="CPU") * 2)
+    with Context(ALLOW_DEVICE_USAGE=1):
+      self.assertFalse(search_mod._verify_winner(base, wrong, rawbufs, var_vals))
+
+  def test_verification_exception_keeps_the_winner(self):
+    # a broken verifier (compile error, unsupported dtype, ...) must not crash the search or discard a good
+    # winner -- pin the search to one fixed, real, non-trivially-optimized candidate (so the outcome doesn't
+    # depend on which candidate real timing happens to prefer) and make _verify_winner itself raise.
+    s, rawbufs, var_vals = _cpu_seed(lambda: Tensor.rand(16, 16, device="CPU") + 1)
+    fixed = s.copy()
+    fixed.apply_opt(Opt(OptOps.UPCAST, axis=0, arg=4))
+    def one_candidate(si, include_0=False, max_up=None): return {0: fixed}
+    with mock.patch.object(search_mod, "get_kernel_actions", one_candidate), \
+         mock.patch.object(search_mod, "_verify_winner", side_effect=RuntimeError("boom")):
+      with Context(ALLOW_DEVICE_USAGE=1, PARALLEL=0, CACHELEVEL=0):
+        result = search_mod.beam_search(s, rawbufs, var_vals, 1, disable_cache=True)
+    self.assertEqual(result.applied_opts, fixed.applied_opts)
+
 if __name__ == "__main__":
   unittest.main()
