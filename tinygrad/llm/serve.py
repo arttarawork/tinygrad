@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from tinygrad import Tensor
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.llm.image import DEFAULT_MAX_PIXELS, hash_ids, image_hash, n_visual_tokens, preprocess
-from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes
+from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes, snapshot_nbytes_for
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
   import numpy as np
@@ -408,8 +408,8 @@ class LLMServer(TCPServerWithReuse):
     # existing snapshot's bytes-per-token and skip sequences that could never fit the cap; (2) evict BEFORE allocating so the
     # old and new snapshots never coexist; (3) an allocation failure drops the cache and the request continues uncached.
     if self.snapshots:
-      k0, s0 = next(iter(self.snapshots.items()))
-      if (est := snapshot_nbytes(s0) * len(ids) // max(len(k0), 1)) > cap:
+      s0 = next(iter(self.snapshots.values()))
+      if (est := snapshot_nbytes_for(s0, len(ids))) > cap:
         stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (~{est>>20} MB > cap)', 'yellow')}  {colored('--', 'BLACK')}  ")
         return
       total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
