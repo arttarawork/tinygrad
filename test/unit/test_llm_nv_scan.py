@@ -21,7 +21,7 @@ def reference(q, k, v, beta, alpha, state):
     previous, av = st.copy(), alpha[:, :, t, :, None]
     delta = (v[:, :, t] - (previous*k[:, :, t, None]).sum(-1)*alpha[:, :, t]) * beta[:, :, t, None]
     st = previous*av + delta[..., None]*k[:, :, t, None, :]
-    out[:, :, t] = (previous*q[:, :, t, None]).sum(-1)*alpha[:, :, t] + delta*(q[:, :, t]*k[:, :, t]).sum(-1)
+    out[:, :, t] = (previous*q[:, :, t, None]).sum(-1)*alpha[:, :, t] + delta*(q[:, :, t]*k[:, :, t]).sum(-1)[..., None]  # (1,H,1): broadcast over dv
   return out, st
 
 def random_inputs(heads, key_dim, value_dim, tokens=CHUNK, seed=0):
