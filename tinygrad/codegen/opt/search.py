@@ -129,11 +129,13 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
     # SEARCH SPACE only; hand-applied opts stay legal everywhere. Renderer root cause = T4.54.
     if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" \
        and AxisType.GROUP_REDUCE in s.axis_types: continue
-    # T6.3: a GROUP on NV in a kernel with a SYMBOLIC axis faulted the 3090 3/3 (the pooled qwen3.8-27B's 128k decode scores
-    # kernel `24 toks (start_pos+toks) 256`: every depth-4 expansion of GROUP(0,16) LOCAL(0,8) UNROLL(0,4) launched right before
-    # the fault; CHECK_OOB's z3 pass cannot see vectorized indices, so it did not reject it). Search-space only, like T4.53.
-    if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" \
-       and any(not isinstance(d, int) for d in s.full_shape): continue
+    # T6.3: GROUP on NV faulted the 3090 4/4 while BEAM-warming the pooled qwen3.8-27B's 128k decode family -- first the symbolic
+    # scores kernel `24 toks (start_pos+toks) 256`, then (symbolic kernels excluded) the plain `24 32 128 128` kernel; every
+    # launch before each fault carried GROUP(0,16) (BEAM_LAUNCH_LOG). CHECK_OOB's z3 pass cannot see vectorized indices, so it
+    # never rejects them. Until the renderer root cause (T4.54) is fixed, keep GROUP/GROUPTOP out of the NV SEARCH SPACE
+    # entirely (BEAM_NV_GROUP=1 re-enables for experiments); cached winners and hand-applied opts are untouched, like T4.53.
+    if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" and not getenv("BEAM_NV_GROUP", 0):
+      continue
     if a.axis is not None and a.op is not OptOps.TC:
       try: ax = s.real_axis(a.op, a.axis)
       except KernelOptError: continue
