@@ -26,7 +26,9 @@ def reference(q, k, v, beta, alpha, state):
 
 def random_inputs(heads, key_dim, value_dim, tokens=CHUNK, seed=0):
   rng = np.random.default_rng(seed)
-  q, k = (rng.normal(size=(1, heads, tokens, key_dim)).astype(np.float32) for _ in range(2))
+  # l2-normalized like the model's q/k before the scan: with |k| = 1 the delta rule is contractive and the fp32 state stays
+  # bounded; raw normals blow the state up to ~1e13 over 32 steps and fp32 accumulation-order noise then breaks rtol=1e-4.
+  q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (rng.normal(size=(1, heads, tokens, key_dim)).astype(np.float32) for _ in range(2)))
   v, beta = rng.normal(size=(1, heads, tokens, value_dim)).astype(np.float32), rng.uniform(size=(1, heads, tokens)).astype(np.float32)
   alpha = rng.uniform(0.8, 1, size=(1, heads, tokens, value_dim)).astype(np.float32)
   return q, k, v, beta, alpha, rng.normal(size=(1, heads, value_dim, key_dim)).astype(np.float32)
