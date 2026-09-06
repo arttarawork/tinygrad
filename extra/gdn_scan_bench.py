@@ -20,8 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tinygrad import Tensor, nn  # noqa: E402
-from tinygrad.helpers import GlobalCounters  # noqa: E402
-from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig  # noqa: E402
+from tinygrad.helpers import GlobalCounters, Context  # noqa: E402
+from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig, GDN_SCAN_LOOP, GDN_SCAN_WY  # noqa: E402
+from tinygrad.llm.kernels.nv import nv_custom_kernels_supported  # noqa: E402
 
 # same real head geometry as test/unit/test_gdn_scan_parity.py -- GatedDeltaNetBlock.__init__ derives
 # head_k_dim=ssm.state_size, num_k_heads=ssm.group_count, num_v_heads=ssm.time_step_rank,
@@ -54,6 +55,9 @@ def main():
   p.add_argument("--tokens", type=int, default=None, help="total tokens to scan through (default: 256, or 8 with --smoke)")
   p.add_argument("--dim", type=int, default=None, help="residual width fed to the block's linears (default: 64, or 8 with --smoke)")
   p.add_argument("--smoke", action="store_true", help="tiny sizes, to prove the script executes -- does not change --geometry's head shape")
+  p.add_argument("--impl", choices=["auto", "loop", "wy", "nv_fused"], default="auto", help="scan: auto = the model's default (the fused "
+                 "kernel when the device gate is open, else WY); loop/wy force GDN_SCAN_IMPL with the fused path off; nv_fused = the T6.2 CUDA "
+                 "kernel (needs --device NV, sm_70+, GDN_NV_FUSED=1 -- asserts otherwise)")
   args = p.parse_args()
 
   chunk = args.chunk or (2 if args.smoke else 32)
@@ -61,23 +65,28 @@ def main():
   dim = args.dim or (8 if args.smoke else 64)
   assert chunk > 0 and tokens > 0, f"--chunk {chunk} and --tokens {tokens} must both be > 0"
 
+  if args.impl == "nv_fused":
+    assert nv_custom_kernels_supported(args.device), f"--impl nv_fused: gate closed for device={args.device} (needs NV sm_70+, GDN_NV_FUSED=1)"
+  ctx = {"loop": dict(GDN_SCAN_IMPL=GDN_SCAN_LOOP, GDN_NV_FUSED=0), "wy": dict(GDN_SCAN_IMPL=GDN_SCAN_WY, GDN_NV_FUSED=0)}.get(args.impl, {})
   block = make_block(args.geometry, dim, max_context=tokens, device=args.device)
   x = (Tensor.randn(1, tokens, dim, device=args.device) * 0.1).realize()
-  print(f"geometry={args.geometry} device={args.device} dim={dim} tokens={tokens} chunk={chunk} "
+  print(f"geometry={args.geometry} device={args.device} impl={args.impl} fused_gate={nv_custom_kernels_supported(args.device)} "
+        f"dim={dim} tokens={tokens} chunk={chunk} "
         f"num_v_heads={block.num_v_heads} num_k_heads={block.num_k_heads} "
         f"head_k_dim={block.head_k_dim} head_v_dim={block.head_v_dim}")
 
-  pos = 0
-  while pos < tokens:
-    size = min(chunk, tokens - pos)
-    x_norm = block.attn_norm(x[:, pos:pos + size])
-    block._init_state(x_norm)
-    GlobalCounters.reset()
-    st = time.perf_counter()
-    block._attention(x_norm, pos).realize()
-    dt = time.perf_counter() - st
-    print(f"chunk[{pos}:{pos + size}] {size / dt:.2f} tok/s {GlobalCounters.global_mem / dt / 1e9:.2f} GB/s")
-    pos += size
+  with Context(**ctx):
+    pos = 0
+    while pos < tokens:
+      size = min(chunk, tokens - pos)
+      x_norm = block.attn_norm(x[:, pos:pos + size])
+      block._init_state(x_norm)
+      GlobalCounters.reset()
+      st = time.perf_counter()
+      block._attention(x_norm, pos).realize()
+      dt = time.perf_counter() - st
+      print(f"chunk[{pos}:{pos + size}] {size / dt:.2f} tok/s {GlobalCounters.global_mem / dt / 1e9:.2f} GB/s")
+      pos += size
 
 if __name__ == "__main__":
   main()
