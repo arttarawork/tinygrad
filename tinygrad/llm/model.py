@@ -8,6 +8,7 @@ if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays nump
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, next_power2, DEBUG, GlobalCounters
@@ -837,9 +838,11 @@ class GatedDeltaNetBlock(FFNBlock):
     state_track: Tensor|None = None
     # T4.66b: `capture` also excludes the fused path -- it has no per-position state to expose (see the
     # docstring above), so capturing forces the plain loop below regardless of device.
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device) and not capture:
-      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
+    fused = gated_delta_prefill if amd_custom_kernels_supported(x.device) else \
+            nv_gated_delta_prefill if nv_custom_kernels_supported(x.device) else None
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and fused is not None and not capture:
+      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3 / NV sm_70+, T6.2)
+      core = fused(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
       state = initial.where(0, state.float())
 
