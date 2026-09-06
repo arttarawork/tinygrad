@@ -248,7 +248,7 @@ class Handler(HTTPRequestHandler):
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
-          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids)
+          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
         if tok.is_end(next_id): break
         out.append(next_id)
         for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
@@ -393,10 +393,14 @@ class LLMServer(TCPServerWithReuse):
     self.snapshots.move_to_end(best_key)
     return self.snapshots[best_key]
 
-  def store_snapshot(self, ids:list[int]) -> None:
+  def store_snapshot(self, ids:list[int], one_shot:bool=False) -> None:
     """Snapshot self.model's current state -- assumed to have just finished prefilling exactly `ids` (see
     Handler.run_model) -- under key tuple(ids), LRU-evicting the oldest entries to stay under state_cache_mb
     (always keeping at least the just-stored entry, even if it alone exceeds the cap)."""
+    # T5.7c (2026-09-06): image requests are one-shot auxiliary calls (screenshot analysis) that are never continued, yet each
+    # snapshot carries the ~150 MB fixed DeltaNet state; five of them ate the 3090's headroom, the 46k-token session snapshot
+    # then OOM'd and the whole cache was dropped -> a 41-minute re-prefill. Don't cache them.
+    if one_shot: return
     key = tuple(ids)
     if key in self.snapshots:
       self.snapshots.move_to_end(key)
