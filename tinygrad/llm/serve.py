@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from tinygrad import Tensor
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.llm.image import DEFAULT_MAX_PIXELS, hash_ids, image_hash, n_visual_tokens, preprocess
-from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes
+from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes, snapshot_nbytes_for
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 if TYPE_CHECKING:
   import numpy as np
@@ -401,8 +401,25 @@ class LLMServer(TCPServerWithReuse):
     if key in self.snapshots:
       self.snapshots.move_to_end(key)
       return
-    self.snapshots[key] = self.model.snapshot_state()
     cap = self.state_cache_mb * 1024 * 1024
-    total = sum(snapshot_nbytes(s) for s in self.snapshots.values())
+    # T5.7: a snapshot is allocated on the model's devices and the 3090 has only a few hundred MB of headroom once the vision
+    # jit families are up. 2026-09-05: a 39k-token Telegram session's ~0.8 GB snapshot OOM'd on NV *before the first token was
+    # streamed*, Hermes saw an empty response and re-ran the 4-minute prefill four times. So: (1) predict the size from an
+    # existing snapshot's bytes-per-token and skip sequences that could never fit the cap; (2) evict BEFORE allocating so the
+    # old and new snapshots never coexist; (3) an allocation failure drops the cache and the request continues uncached.
+    if self.snapshots:
+      s0 = next(iter(self.snapshots.values()))
+      if (est := snapshot_nbytes_for(s0, len(ids))) > cap:
+        stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (~{est>>20} MB > cap)', 'yellow')}  {colored('--', 'BLACK')}  ")
+        return
+      total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
+      while total + est > cap and self.snapshots: total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])
+    try: snap = self.model.snapshot_state()
+    except MemoryError as e:
+      self.snapshots.clear()
+      stderr_log(f"{colored(f'state cache: snapshot dropped ({str(e)[:50]}), cache cleared', 'yellow')}  {colored('--', 'BLACK')}  ")
+      return
+    self.snapshots[key] = snap
+    total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
     while total > cap and len(self.snapshots) > 1:
       total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])

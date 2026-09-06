@@ -8,6 +8,7 @@ if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays nump
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, next_power2, DEBUG, GlobalCounters
@@ -255,6 +256,20 @@ def kv_cache_dtype() -> DType:
   the dominant decode-memory cost). KV_F32=1 reverts to dtypes.default_float, e.g. to isolate an accuracy
   regression. Does NOT apply to GatedDeltaNetBlock's recurrent state -- see its _init_state for why."""
   return dtypes.default_float if getenv("KV_F32", 0) else dtypes.float16
+
+# T6.1: KV_INT8=1 -- int8 KV cache for TransformerBlock's *standard* attention path only (byte-identical to
+# today when unset). Out of scope: MLATransformerBlock.cache_k (a single already-compressed latent cache --
+# a different quantization problem) and GatedDeltaNetBlock's conv_state/recurrent_state (small O(1)
+# accumulators, not the thing that scales with max_context). Independent of KV_F32 -- that flag keeps
+# governing cache_k/conv_state as before; it's meaningless for cache_kv once this is on (int8 either way).
+# Per-(position, kv-head) symmetric absmax scales, kv_int8_block(head_dim)-wide blocks along head_dim
+# (llama.cpp's q8_0 KV granularity), one scale per block for K and one for V -- see TransformerBlock's
+# _init_state (allocation) and _attention (the quantize-on-write/dequantize-on-read idiom).
+def kv_int8_block(head_dim:int) -> int:
+  """Quantization block width along head_dim: 32 (every real model config in this fork has head_dim a
+  multiple of 32) when it divides evenly, else the whole head_dim as a single block -- keeps tiny test
+  configs (e.g. head_dim=8) exact and reshape-safe without a stricter assert no real model would ever hit."""
+  return 32 if head_dim % 32 == 0 else head_dim
 
 class ExpertGating(enum.IntEnum):
   SOFTMAX = 1
@@ -592,15 +607,36 @@ class TransformerBlock(FFNBlock):
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     # cast to the cache's dtype at write (a no-op when KV_F32=1); cast back up to the activation dtype at
     # read, so attention compute always runs at x's precision regardless of what the cache stores
-    assigned_kv = Tensor(self.cache_kv.uop.after(
-      self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)))
-    # on RDNA3, hybrid models use custom flash attention kernels directly on the (compressed) KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
-      attn = flash_attention(q, assigned_kv, start_pos+T)
-      attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-      return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-    k = assigned_kv[0, :, :, 0:start_pos+T, :].cast(x.dtype)
-    v = assigned_kv[1, :, :, 0:start_pos+T, :].cast(x.dtype)
+    if self.cache_kv.dtype == dtypes.int8:
+      # T6.1 KV_INT8: symmetric absmax int8 quant, `blk`-wide blocks along head_dim (see kv_int8_block).
+      # Two independent buffers (cache_kv, cache_kv_scale), each with its own .uop.after(store) so the JIT
+      # sees both writes ordered before their own reads -- same dependency idiom as the plain-cast path
+      # below, just doubled since there are now two buffers instead of one. AMD's fused flash-attention
+      # kernel (below, in the else branch) expects a real-valued cache and is never reached here -- KV_INT8
+      # always takes the dequant+attention_impl path, a correct (if not fused-kernel-accelerated) fallback
+      # on the already-descoped AMD/hybrid combo (CLAUDE.md: AMD is not a target).
+      blk = kv_int8_block(self.config.head_dim)
+      blocks = Tensor.stack(k, v).reshape(2, B, self.config.n_kv_heads, T, self.config.head_dim // blk, blk)
+      scale = (blocks.abs().max(axis=-1, keepdim=True) / 127.0).maximum(1e-8)           # (2,B,KvH,T,Hd//blk,1)
+      quant = (blocks / scale).round().clip(-127, 127).cast(dtypes.int8).reshape(2, B, self.config.n_kv_heads, T, self.config.head_dim)
+      assigned_kv = Tensor(self.cache_kv.uop.after(
+        self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(quant.uop)))
+      assigned_scale = Tensor(self.cache_kv_scale.uop.after(
+        self.cache_kv_scale[:, :, :, start_pos:start_pos+T, :].uop.store(scale.squeeze(-1).cast(self.cache_kv_scale.dtype).uop)))
+      def _dequant(idx:int) -> Tensor:
+        qv, sv = assigned_kv[idx, :, :, 0:start_pos+T, :], assigned_scale[idx, :, :, 0:start_pos+T, :]
+        return (qv.cast(x.dtype).reshape(*qv.shape[:-1], qv.shape[-1] // blk, blk) * sv.cast(x.dtype).unsqueeze(-1)).reshape(qv.shape)
+      k, v = _dequant(0), _dequant(1)
+    else:
+      assigned_kv = Tensor(self.cache_kv.uop.after(
+        self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)))
+      # on RDNA3, hybrid models use custom flash attention kernels directly on the (compressed) KV cache
+      if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+        attn = flash_attention(q, assigned_kv, start_pos+T)
+        attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+        return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+      k = assigned_kv[0, :, :, 0:start_pos+T, :].cast(x.dtype)
+      v = assigned_kv[1, :, :, 0:start_pos+T, :].cast(x.dtype)
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -635,9 +671,18 @@ class TransformerBlock(FFNBlock):
     # __call__ runs _init_state before the @function(precompile=True) trace, inside which nothing may touch a device
     self._positions(x)
     if not hasattr(self, "cache_kv"):
+      int8 = bool(getenv("KV_INT8", 0))
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
       self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=kv_cache_dtype(), device=x.device)
+                                   dtype=dtypes.int8 if int8 else kv_cache_dtype(), device=x.device)
+      if int8:
+        # T6.1 KV_INT8: one absmax scale per kv_int8_block(head_dim)-wide chunk of head_dim, same leading
+        # shape as cache_kv. Zeroed like cache_kv itself: a position never written is never read either (see
+        # _attention's 0:start_pos+T reads), so leftover-zero scale there is inert (0 dequants to 0 regardless
+        # of scale) -- same reasoning as cache_kv's own zero-fill above.
+        self.cache_kv_scale = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context,
+                                           self.config.head_dim // kv_int8_block(self.config.head_dim),
+                                           dtype=dtypes.float16, device=x.device)
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta, device=x.device,
         yarn_factor=self.config.yarn_factor, yarn_orig_ctx=self.config.yarn_orig_ctx, yarn_beta_fast=self.config.yarn_beta_fast,
         yarn_beta_slow=self.config.yarn_beta_slow, yarn_attn_factor=self.config.yarn_attn_factor)
@@ -793,9 +838,11 @@ class GatedDeltaNetBlock(FFNBlock):
     state_track: Tensor|None = None
     # T4.66b: `capture` also excludes the fused path -- it has no per-position state to expose (see the
     # docstring above), so capturing forces the plain loop below regardless of device.
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device) and not capture:
-      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
-      core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
+    fused = gated_delta_prefill if amd_custom_kernels_supported(x.device) else \
+            nv_gated_delta_prefill if nv_custom_kernels_supported(x.device) else None
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and fused is not None and not capture:
+      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3 / NV sm_70+, T6.2)
+      core = fused(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
       state = initial.where(0, state.float())
 
@@ -1603,13 +1650,18 @@ class Transformer:
     for b in self.blk:
       if isinstance(b, GatedDeltaNetBlock): blocks.append({"conv_state": b.conv_state.clone(), "recurrent_state": b.recurrent_state.clone()})
       elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
-      elif isinstance(b, TransformerBlock): blocks.append({"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()})
+      elif isinstance(b, TransformerBlock):
+        bs: dict = {"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()}
+        if hasattr(b, "cache_kv_scale"): bs["cache_kv_scale"] = b.cache_kv_scale[:, :, :, :pos, :].clone()  # T6.1 KV_INT8
+        blocks.append(bs)
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
     snap: dict = {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks, "rope_delta": self._rope_delta}
     # ponytail: TransformerBlock-shaped MTP block only (every nextn head this fork loads); an MLA-shaped one would need its cache_k here.
     if self.mtp_head is not None and isinstance(self.mtp_head.block, TransformerBlock) and hasattr(self.mtp_head.block, "cache_kv"):
       snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone()
-    Tensor.realize(*(t for bs in blocks for t in bs.values()), *([snap["mtp_cache_kv"]] if "mtp_cache_kv" in snap else []))
+      if hasattr(self.mtp_head.block, "cache_kv_scale"):  # T6.1 KV_INT8
+        snap["mtp_cache_kv_scale"] = self.mtp_head.block.cache_kv_scale[:, :, :, :pos, :].clone()
+    Tensor.realize(*(t for bs in blocks for t in bs.values()), *(snap[key] for key in ("mtp_cache_kv", "mtp_cache_kv_scale") if key in snap))
     return snap
 
   def restore_state(self, snap:dict) -> None:
@@ -1626,10 +1678,16 @@ class Transformer:
     for b, bs in zip(self.blk, snap["blocks"]):
       if isinstance(b, GatedDeltaNetBlock): assigns += [b.conv_state.assign(bs["conv_state"]), b.recurrent_state.assign(bs["recurrent_state"])]
       elif isinstance(b, MLATransformerBlock): assigns.append(b.cache_k[:, :, :bs["cache_k"].shape[2], :].assign(bs["cache_k"]))
-      elif isinstance(b, TransformerBlock): assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"]))
+      elif isinstance(b, TransformerBlock):
+        assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"]))
+        if (bscale := bs.get("cache_kv_scale")) is not None:  # T6.1 KV_INT8
+          assigns.append(b.cache_kv_scale[:, :, :, :bscale.shape[3], :].assign(bscale))
       else: raise TypeError(f"restore_state: unhandled block type {type(b).__name__}")
     if (mk := snap.get("mtp_cache_kv")) is not None and self.mtp_head is not None:  # T4.66l -- see snapshot_state
-      assigns.append(cast(TransformerBlock, self.mtp_head.block).cache_kv[:, :, :, :mk.shape[3], :].assign(mk))
+      mtp_block = cast(TransformerBlock, self.mtp_head.block)
+      assigns.append(mtp_block.cache_kv[:, :, :, :mk.shape[3], :].assign(mk))
+      if (mks := snap.get("mtp_cache_kv_scale")) is not None:  # T6.1 KV_INT8
+        assigns.append(mtp_block.cache_kv_scale[:, :, :, :mks.shape[3], :].assign(mks))
     Tensor.realize(*assigns)
     self._cached_tokens = list(snap["tokens"])
     self._rope_delta = snap.get("rope_delta", 0)  # T5.3 (pre-T5.3 snapshots: text only, 0)
@@ -2238,6 +2296,24 @@ def snapshot_nbytes(snap:dict) -> int:
     if isinstance(x, (list, tuple)): return sum(walk(v) for v in x)
     return 0
   return walk(snap)
+
+def snapshot_nbytes_for(snap:dict, n_tokens:int) -> int:
+  """Predict the bytes a snapshot of an n_tokens-long sequence would take, from an existing snapshot: KV-cache slices
+  (`cache_kv`/`cache_k`, one row per token) scale with the length; GDN conv/recurrent states (and everything else) are
+  fixed-size accumulators and count once. A plain nbytes*n/len(tokens) extrapolation charges the fixed states per token
+  and predicts ~29 GB for a 39k-token session (T5.7b) -- then serve.py skips snapshots that would fit."""
+  pos = max(int(snap.get("pos", len(snap.get("tokens", [])))), 1)
+  per_token, fixed = 0.0, 0
+  for blk in snap.get("blocks", []):
+    for k, v in blk.items():
+      if not isinstance(v, Tensor): continue
+      nb = math.prod(int(d) for d in v.shape) * v.dtype.itemsize
+      if k in ("cache_kv", "cache_k"): per_token += nb / pos
+      else: fixed += nb
+  # MTP cache slice (T4.66l) and any other per-token entries at the top level
+  for k, v in snap.items():
+    if k != "blocks" and isinstance(v, Tensor): per_token += math.prod(int(d) for d in v.shape) * v.dtype.itemsize / pos
+  return int(fixed + per_token * n_tokens)
 
 def snapshot_matches(snap:dict, tokens:list[int]) -> bool:
   """True iff snap's cached tokens are a strict, exact prefix of `tokens` -- the same recurrent exact-prefix
