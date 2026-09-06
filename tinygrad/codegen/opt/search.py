@@ -5,7 +5,8 @@ from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, colored, time_to_str
-from tinygrad.helpers import IGNORE_BEAM_CACHE
+from tinygrad.helpers import IGNORE_BEAM_CACHE, ContextVar
+BEAM_CACHE_ONLY = ContextVar("BEAM_CACHE_ONLY", 0)
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
@@ -162,6 +163,11 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     ret = s.copy()
     for o in val[len(s.applied_opts):]: ret.apply_opt(o)
     return ret
+  # T6.3: BEAM_CACHE_ONLY=1 -- cached winners only; an uncached kernel gets the hand-coded opts instead of a search (no candidate
+  # is ever launched). For NV silicon where fresh searches fault the device (5/5 on the pooled qwen3.8-27B at 128k, T4.54 open).
+  if BEAM_CACHE_ONLY:
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    return hand_coded_optimizations(s) if not any(u.op is Ops.STAGE for u in s.ast.backward_slice) else s
 
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
