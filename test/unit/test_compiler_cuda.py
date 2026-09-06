@@ -291,5 +291,33 @@ class TestCompileServerWrite(unittest.TestCase):
     self.assertEqual(proc.written, expected_wire)
     self.assertEqual(proc.write_calls, 1)
 
+class InterruptedCompiler(FakeCompiler):
+  """the exchange dies mid-read with something that is NOT a CompileError (BEAM's SIGALRM BeamCompileTimeout)"""
+  def compile_server(self, src:str, proc) -> bytes: raise RuntimeError("BeamCompileTimeout")
+
+class TestInterruptedExchange(unittest.TestCase):
+  def setUp(self):
+    csc._server_cache.clear()
+    FakeCompiler.spawn_count = 0
+
+  def test_interrupted_exchange_evicts_the_server(self):
+    # T6.3: an interrupted request/response leaves the reply in the pipe; a reused server pairs every later request with the
+    # previous reply, which compile_cached stores under the wrong source (the poisoned-cubin device faults of 2026-09-06).
+    c = InterruptedCompiler()
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
+    proc = c.compiler_process
+    with self.assertRaises(RuntimeError): csc._compile_with_retry(c, "src", "cmd", "sm_86", True)
+    self.assertTrue(proc.killed and proc.waited)                                            # reaped, not reused
+    self.assertIsNot(csc._get_server(c, "cmd", "sm_86", True), proc)                        # the next call gets a fresh server
+    self.assertEqual(FakeCompiler.spawn_count, 2)
+
+  def test_genuine_compile_error_keeps_the_server(self):
+    c = AlwaysBadCompiler()
+    c.compiler_process = csc._get_server(c, "cmd", "sm_86", True)
+    proc = c.compiler_process
+    with self.assertRaises(CompileError): csc._compile_with_retry(c, "src", "cmd", "sm_86", True)
+    self.assertIs(csc._get_server(c, "cmd", "sm_86", True), proc)                           # a fully-formed reply: still in sync
+    self.assertEqual(FakeCompiler.spawn_count, 1)
+
 if __name__ == "__main__":
   unittest.main()

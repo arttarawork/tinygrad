@@ -1,16 +1,17 @@
-import math, time, traceback, signal
+import math, pathlib, time, traceback, signal
 from collections import Counter
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
 from tinygrad.uop.render import pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, colored, time_to_str
-from tinygrad.helpers import IGNORE_BEAM_CACHE
+from tinygrad.helpers import IGNORE_BEAM_CACHE, ContextVar
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.engine.realize import time_call
 from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt.postrange import Scheduler
+BEAM_CACHE_ONLY = ContextVar("BEAM_CACHE_ONLY", 0)  # T6.3: cached BEAM winners only; uncached kernels take the hand-coded opts
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(8)]
 actions += [Opt(op=OptOps.UNROLL, axis=axis, arg=amt) for amt in [0,4,7] for axis in range(5)]
@@ -43,7 +44,12 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
   # in the AST id + shape + applied_opts; this print fires right before the candidate's actual GPU launch,
   # so the last LAUNCH lines before a fault-abort name the launches that immediately preceded it (the true
   # faulting candidate may be one of these, not just the one the abort exception names -- see T4.47_RCA.md).
-  if BEAM_LAUNCH_LOG: print(f"LAUNCH {time.time():.3f} {name}", flush=True)
+  if BEAM_LAUNCH_LOG:
+    print(f"LAUNCH {time.time():.3f} {name}", flush=True)
+    if BEAM_LAUNCH_LOG >= 2:  # T6.3/T4.54: also keep the candidate's source, named by launch time, so a fault's last launches can be read
+      d = pathlib.Path(getenv("BEAM_LAUNCH_DIR", "/tmp/beam_launch"))
+      d.mkdir(parents=True, exist_ok=True)
+      (d / f"{time.time():.3f}.txt").write_text(f"// {name}\n" + next((u.arg for u in prg.src if u.op is Ops.SOURCE), "// no SOURCE uop"))
   timeout = int(early_stop * 1e3) if dev_timeout and early_stop is not None and early_stop < math.inf else None
   factor = 1
   if allow_test_size and max_global_size is not None:
@@ -129,6 +135,13 @@ def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dic
     # SEARCH SPACE only; hand-applied opts stay legal everywhere. Renderer root cause = T4.54.
     if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" \
        and AxisType.GROUP_REDUCE in s.axis_types: continue
+    # T6.3: GROUP on NV faulted the 3090 4/4 while BEAM-warming the pooled qwen3.8-27B's 128k decode family -- first the symbolic
+    # scores kernel `24 toks (start_pos+toks) 256`, then (symbolic kernels excluded) the plain `24 32 128 128` kernel; every
+    # launch before each fault carried GROUP(0,16) (BEAM_LAUNCH_LOG). CHECK_OOB's z3 pass cannot see vectorized indices, so it
+    # never rejects them. Until the renderer root cause (T4.54) is fixed, keep GROUP/GROUPTOP out of the NV SEARCH SPACE
+    # entirely (BEAM_NV_GROUP=1 re-enables for experiments); cached winners and hand-applied opts are untouched, like T4.53.
+    if a.op in {OptOps.GROUP, OptOps.GROUPTOP} and s.ren is not None and s.ren.target.device == "NV" and not getenv("BEAM_NV_GROUP", 0):
+      continue
     if a.axis is not None and a.op is not OptOps.TC:
       try: ax = s.real_axis(a.op, a.axis)
       except KernelOptError: continue
@@ -155,6 +168,12 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     ret = s.copy()
     for o in val[len(s.applied_opts):]: ret.apply_opt(o)
     return ret
+  # T6.3: BEAM_CACHE_ONLY=1 -- cached winners only; an uncached kernel gets the hand-coded opts instead of a search (no candidate
+  # is ever launched). For NV silicon where fresh searches fault the device (5/5 on the pooled qwen3.8-27B at 128k, T4.54 open).
+  # BEAM_CACHE_ONLY_DEVS (default "NV") limits it to those devices; "" applies it everywhere (METAL searches are safe, keep them).
+  if BEAM_CACHE_ONLY and s.ren.target.device in (getenv("BEAM_CACHE_ONLY_DEVS", "NV").split(",") + [""]):  # "" = every device
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    return hand_coded_optimizations(s) if not any(u.op is Ops.STAGE for u in s.ast.backward_slice) else s
 
   beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
   seen_libs = set()
