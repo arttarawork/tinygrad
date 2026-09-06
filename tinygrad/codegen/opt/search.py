@@ -49,7 +49,7 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
     if BEAM_LAUNCH_LOG >= 2:  # T6.3/T4.54: also keep the candidate's source, named by launch time, so a fault's last launches can be read
       d = pathlib.Path(getenv("BEAM_LAUNCH_DIR", "/tmp/beam_launch"))
       d.mkdir(parents=True, exist_ok=True)
-      (d / f"{time.time():.3f}.txt").write_text(f"// {name}\n{prg.arg.src}")
+      (d / f"{time.time():.3f}.txt").write_text(f"// {name}\n" + next((u.arg for u in prg.src if u.op is Ops.SOURCE), "// no SOURCE uop"))
   timeout = int(early_stop * 1e3) if dev_timeout and early_stop is not None and early_stop < math.inf else None
   factor = 1
   if allow_test_size and max_global_size is not None:
