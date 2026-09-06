@@ -170,7 +170,8 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:i
     return ret
   # T6.3: BEAM_CACHE_ONLY=1 -- cached winners only; an uncached kernel gets the hand-coded opts instead of a search (no candidate
   # is ever launched). For NV silicon where fresh searches fault the device (5/5 on the pooled qwen3.8-27B at 128k, T4.54 open).
-  if BEAM_CACHE_ONLY:
+  # BEAM_CACHE_ONLY_DEVS (default "NV") limits it to those devices; "" applies it everywhere (METAL searches are safe, keep them).
+  if BEAM_CACHE_ONLY and s.ren.target.device in (getenv("BEAM_CACHE_ONLY_DEVS", "NV").split(",") + [""]):  # "" = every device
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     return hand_coded_optimizations(s) if not any(u.op is Ops.STAGE for u in s.ast.backward_slice) else s
 
