@@ -78,11 +78,13 @@ class TestNVFusedScanParity(unittest.TestCase):
     for pos, start in ((0, np.zeros_like(initial)), (CHUNK, initial)):  # start_pos == 0 must ignore the resident state
       with self.subTest(start_pos=pos):
         expected_out, expected_state = reference(q, k, v, beta, alpha, start)
-        state = Tensor(initial).contiguous().realize()
         start_pos = Tensor(UOp.variable("start_pos", 0, 4096).bind(pos))
-        # realize with the bound tensor: the kernel reads the Variable, and standalone nothing else puts its BIND in the schedule
-        # (in the model the state/conv chain carries it); the model's own call site never trips this
-        out = gated_delta_prefill(Tensor(q), Tensor(k), Tensor(v), Tensor(beta), Tensor(alpha), state, start_pos).realize(start_pos)
+        # the kernel reads the Variable by name; its BIND has to be in the same schedule. The model carries it through the
+        # state's AFTER chain (the conv-state store uses start_pos), so mirror that: the realized state buffer, ordered after an
+        # unrealized kernel that contains the bound variable.
+        state = Tensor(initial).contiguous().realize()
+        state = Tensor(state.uop.after((start_pos * 0).float().contiguous().uop))
+        out = gated_delta_prefill(Tensor(q), Tensor(k), Tensor(v), Tensor(beta), Tensor(alpha), state, start_pos).realize()
         np.testing.assert_allclose(out.numpy(), expected_out, rtol=1e-4, atol=1e-4)
         np.testing.assert_allclose(state.numpy(), expected_state, rtol=1e-4, atol=1e-4)
 
