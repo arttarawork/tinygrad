@@ -1,5 +1,5 @@
 from __future__ import annotations
-import collections, json, os, pathlib, re, socketserver, threading, time, typing, uuid
+import collections, json, os, pathlib, re, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad import Tensor
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
@@ -304,16 +304,6 @@ class Handler(HTTPRequestHandler):
       if slog is not None: slog.close()
 
   def do_POST(self):
-    # T4.84: the model is single-flight, but the server is threaded (LLMServer) so metadata GETs and the LM Studio load probe
-    # answer while a completion is streaming -- Hermes probes /api/v1/models with a 5 s timeout at every /model switch and
-    # session start, and a probe that hits a busy server made it fall back to a 65k window. Only completions take the lock.
-    lock = self.server.lock if self.path == "/v1/chat/completions" else None
-    if lock is not None: lock.acquire()
-    try: self._do_POST()
-    finally:
-      if lock is not None: lock.release()
-
-  def _do_POST(self):
     request_st = time.perf_counter()
     stderr_log(f"{self.path}  {colored('--', 'BLACK')}  ")
     raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -395,12 +385,10 @@ class Handler(HTTPRequestHandler):
       self.send_data(json.dumps({"error": {"message": f"unknown path {self.path}", "type": "invalid_request_error"}}).encode(),
                      status_code=404)
 
-class LLMServer(socketserver.ThreadingMixIn, TCPServerWithReuse):
-  daemon_threads = True  # T4.84: a worker mid-generation never blocks the SIGTERM exit (the GSP unload runs at exit as before)
+class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
                mtp:bool=False, spec_k:int=SPEC_TOKENS, state_cache_mb:int=0, vision:VisionEncoder|None=None):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
-    self.lock = threading.Lock()  # T4.84: serializes /v1/chat/completions (see Handler.do_POST)
     self.mtp, self.spec_k = mtp, spec_k  # T4.65: --mtp/SPEC_TOKENS -- see Handler.run_model's use_spec
     self.last: tuple[str, list[int], int, list[int]]|None = None  # (rendered prompt, ids, message count, generated ids) of the last completed request
     # T4.67: cross-session state cache -- self.last above only ever remembers ONE (the most recent) sequence;
