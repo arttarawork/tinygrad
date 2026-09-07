@@ -425,6 +425,34 @@ class TestLMStudioShim(unittest.TestCase):
       "loaded_instances": [{"id": "tiny", "config": {"context_length": 32}}],
     }])
 
+  def test_metadata_answers_while_a_completion_holds_the_lock(self):
+    # T4.84: Hermes probes /api/v1/models (5 s timeout) while a turn may be streaming; GETs must not queue behind it.
+    import threading, time, json, types, urllib.request
+    from tinygrad.llm.serve import Handler
+    server = LLMServer(("127.0.0.1", 0), model=types.SimpleNamespace(max_context=32), model_name="tiny", tok=None, template=None)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    self.addCleanup(server.server_close)
+    self.addCleanup(server.shutdown)
+    entered = []
+    with patch.object(Handler, "_do_POST", lambda self: (entered.append(time.perf_counter()), self.send_data(b"{}"))):
+      server.lock.acquire()   # an in-flight completion
+      try:
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/models", timeout=5) as resp:
+          self.assertEqual(json.loads(resp.read())["models"][0]["max_context_length"], 32)
+        self.assertLess(time.perf_counter() - t0, 2.0)
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=b"{}", headers={"Content-Type": "application/json"})
+        poster = threading.Thread(target=lambda: urllib.request.urlopen(req, timeout=10).read(), daemon=True)
+        poster.start()
+        time.sleep(0.5)
+        self.assertEqual(entered, [])   # the completion waits for the lock
+        released = time.perf_counter()
+      finally: server.lock.release()
+      poster.join(5)
+      self.assertEqual(len(entered), 1)
+      self.assertGreaterEqual(entered[0], released)
+
   def test_lmstudio_and_openai_probe_endpoints_over_http(self):
     import threading, time, json, types, urllib.request, urllib.error
     server = LLMServer(("127.0.0.1", 0), model=types.SimpleNamespace(max_context=32), model_name="tiny", tok=None, template=None)
