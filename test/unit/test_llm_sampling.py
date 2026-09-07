@@ -42,3 +42,15 @@ class TestGreedySampling(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestMinPSampling(unittest.TestCase):
+  """T4.85: min-p drops the tail below min_p x top probability; the top token always survives; min_p=0 leaves the tail reachable."""
+  def test_tail_never_sampled_with_min_p(self):
+    from tinygrad.llm.model import sample_logits
+    logits = Tensor([[6.0, 5.9, -4.0, -4.0]]).expand(64, 4).contiguous()   # two near-ties on top, two tokens ~1e-4 of the top
+    ids = sample_logits(logits, Tensor([1.0]), min_p=0.5).numpy().ravel().tolist()
+    self.assertTrue(set(ids) <= {0, 1}, ids)
+    self.assertEqual(sample_logits(logits, Tensor([1.0]), min_p=1.0).numpy().ravel().tolist(), [0]*64)   # only the top survives
+    ids0 = sample_logits(Tensor([[0.0, 0.0, 0.0, 0.0]]).expand(256, 4).contiguous(), Tensor([1.0]), min_p=0.0).numpy().ravel().tolist()
+    self.assertEqual(set(ids0), {0, 1, 2, 3})   # uniform logits, no cut: every token reachable
