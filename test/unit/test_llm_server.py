@@ -455,6 +455,22 @@ class TestLMStudioShim(unittest.TestCase):
 if __name__ == '__main__':
   unittest.main()
 
+class TestStreamLog(unittest.TestCase):
+  """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
+  def test_fields_and_rotation(self):
+    import os, tempfile
+    from tinygrad.llm.serve import StreamLog
+    with tempfile.TemporaryDirectory() as d:
+      p = os.path.join(d, "s.log")
+      with open(p, "w") as f: f.write("x" * 9_000_000)   # oversized leftover -> rotated away first
+      log = StreamLog(p, "tiny in:0+3")
+      for field, text in (("reasoning_content", "let me "), ("reasoning_content", "think"), ("content", "42")): log.write(field, text)
+      log.close()
+      self.assertTrue(os.path.exists(p + ".1"))
+      body = open(p).read()
+      self.assertIn("tiny in:0+3 =====", body)
+      self.assertIn("--- reasoning_content ---\nlet me think\n--- content ---\n42", body)
+
 class TestStateCacheOOM(unittest.TestCase):
   """T5.7: a failed snapshot must never abort the request; oversized sequences are skipped; eviction happens before allocation."""
   def _server(self, mb):

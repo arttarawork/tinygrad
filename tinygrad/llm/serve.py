@@ -149,6 +149,23 @@ def template_kwargs(body:dict) -> dict:
   if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
   return kwargs
 
+class StreamLog:
+  """T4.83: STREAM_LOG=<path> appends every request's streamed text as it is generated (reasoning and content, flushed per
+  token) so `tail -f` or the LAN viewer page (~/.hermes/stream-viewer) shows the thinking LIVE -- Hermes itself only shows
+  reasoning once the turn completes. One rotation at 8 MB keeps the file small."""
+  def __init__(self, path:str, header:str):
+    if os.path.exists(path) and os.path.getsize(path) > 8_000_000: os.replace(path, path + ".1")
+    self.f, self.field = open(path, "a", encoding="utf-8"), ""
+    self.f.write(f"\n\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {header} =====\n")
+    self.f.flush()
+  def write(self, field:str, text:str) -> None:
+    if field != self.field:
+      self.f.write(f"\n--- {field} ---\n")
+      self.field = field
+    self.f.write(text)
+    self.f.flush()
+  def close(self) -> None: self.f.close()
+
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
@@ -226,6 +243,7 @@ class Handler(HTTPRequestHandler):
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
     router = StreamRouter(reasoning)
+    slog = StreamLog(p, f"{model_name} in:{cache_start_pos}+{len(ids)-cache_start_pos}{img_field}") if (p := os.environ.get("STREAM_LOG")) else None
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -251,11 +269,15 @@ class Handler(HTTPRequestHandler):
           if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
         if tok.is_end(next_id): break
         out.append(next_id)
-        for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
+        for field, delta in router.route(dec(next_id)):
+          if slog is not None: slog.write(field, delta)
+          yield chunk({field:delta})
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
-      for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
+      for field, delta in router.route(dec(), final=True):
+        if slog is not None: slog.write(field, delta)
+        yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
         if (parsed := parse_tool_call(m.group(1))) is None:
@@ -278,6 +300,8 @@ class Handler(HTTPRequestHandler):
     except GeneratorExit:
       if not completed: log_stats(interrupted=True)
       raise
+    finally:
+      if slog is not None: slog.close()
 
   def do_POST(self):
     request_st = time.perf_counter()
