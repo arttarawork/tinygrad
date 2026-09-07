@@ -149,6 +149,13 @@ def template_kwargs(body:dict) -> dict:
   if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
   return kwargs
 
+# T4.85: Hermes (and most agent clients) send no `temperature`; an absent value used to mean 0 = greedy decoding, and Qwen's
+# thinking mode under greedy decoding degenerates into endless repetition (2026-09-07: 12k chars of reasoning, three sentences
+# repeated 11x). DEFAULT_TEMPERATURE (env, default 0 = byte-identical to before) is what an omitted temperature means; the
+# standing recipe sets 0.6 (Qwen's thinking-mode recommendation). An explicit temperature in the request always wins.
+DEFAULT_TEMPERATURE = getenv("DEFAULT_TEMPERATURE", 0.0)
+def request_temperature(body:dict) -> float: return float(body.get("temperature", DEFAULT_TEMPERATURE))
+
 class StreamLog:
   """T4.83: STREAM_LOG=<path> appends every request's streamed text as it is generated (reasoning and content, flushed per
   token) so `tail -f` or the LAN viewer page (~/.hermes/stream-viewer) shows the thinking LIVE -- Hermes itself only shows
@@ -359,7 +366,7 @@ class Handler(HTTPRequestHandler):
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=request_temperature(body),
                               reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input)
       if body.get("stream"): self.stream_json(chunks)
       else:

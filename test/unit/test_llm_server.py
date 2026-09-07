@@ -455,6 +455,16 @@ class TestLMStudioShim(unittest.TestCase):
 if __name__ == '__main__':
   unittest.main()
 
+class TestDefaultTemperature(unittest.TestCase):
+  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins."""
+  def test_omitted_uses_default_explicit_wins(self):
+    import tinygrad.llm.serve as srv
+    self.assertEqual(srv.request_temperature({}), 0.0)
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6):
+      self.assertEqual(srv.request_temperature({}), 0.6)
+      self.assertEqual(srv.request_temperature({"temperature": 0}), 0.0)
+      self.assertEqual(srv.request_temperature({"temperature": 1.1}), 1.1)
+
 class TestStreamLog(unittest.TestCase):
   """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
   def test_fields_and_rotation(self):
