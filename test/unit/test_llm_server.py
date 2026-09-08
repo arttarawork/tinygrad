@@ -502,6 +502,49 @@ class TestThinkingBudget(unittest.TestCase):
       efforts = ("minimal", "low", "medium", "high", "xhigh")
       self.assertEqual([srv.thinking_budget({"reasoning_effort": e}) for e in efforts], [512, 1024, 4096, 16384, 0])
 
+class TestReasoningLoopBreaker(unittest.TestCase):
+  """T4.89: a sentence cycle inside the think block gets a decisive nudge; after LOOP_NUDGES nudges the block is closed."""
+  def test_cycle_is_nudged_then_closed(self):
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.serve import Handler
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self):
+        return lambda i=None: "" if i is None else chr(i)
+    cycle = "Actually, the simplest is: keep two files, zip them. A single self-contained file is more portable. "
+    close = [ord(c) for c in srv.THINK_CLOSE]
+    calls = []
+    def generate(ids, temperature=0.0, vision=None):
+      calls.append(list(ids))
+      if ids[-len(close):] == close:            # the think block was closed for us: answer
+        for c in "42": yield ord(c)
+        yield 0
+      else:                                     # otherwise keep circling (the server nudges us out of it)
+        while True:
+          for c in cycle: yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=Tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    with patch.object(srv, "LOOP_REPEATS", 3), patch.object(srv, "LOOP_NUDGES", 2):
+      out = list(h.run_model([ord("q")], "m", reasoning=True))
+    reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in out if c["choices"])
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 4)                                        # initial + 2 nudges + the close
+    self.assertEqual(reasoning.count(srv.LOOP_NUDGE.strip()), 2)
+    self.assertIn("Considering the limited time", reasoning)
+    self.assertLess(reasoning.count("keep two files"), 3 * 3 + 3)         # each round was cut at the third repeat
+    self.assertEqual(content.strip(), "42")
+
+  def test_detector_ignores_short_and_resets(self):
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    self.assertIsNone(d.feed("ok. ok. ok. ok. "))                            # <6 words never counts
+    for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))
+    self.assertEqual(d.feed("the same long  sentence said AGAIN and again.\n"), "the same long sentence said again and again.")
+    for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))   # counts reset after a hit
+
 class TestStreamLog(unittest.TestCase):
   """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
   def test_fields_and_rotation(self):
