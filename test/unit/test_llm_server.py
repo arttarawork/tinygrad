@@ -545,6 +545,63 @@ class TestReasoningLoopBreaker(unittest.TestCase):
     self.assertEqual(d.feed("the same long  sentence said AGAIN and again.\n"), "the same long sentence said again and again.")
     for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))   # counts reset after a hit
 
+class TestKeepAlive(unittest.TestCase):
+  """T4.90: empty-delta heartbeats while the generator is silent; a hung-up client stops generation."""
+  def _handler(self, wfile):
+    from tinygrad.llm.serve import Handler
+    h = Handler.__new__(Handler)
+    h.wfile, h.send_response, h.send_header, h.end_headers = wfile, lambda *a: None, lambda *a: None, lambda: None
+    return h
+
+  def test_heartbeats_fill_the_silence(self):
+    import io, json, time
+    import tinygrad.llm.serve as srv
+    tmpl = {"id":"x", "object":"chat.completion.chunk", "created":1, "model":"m"}
+    def gen():
+      yield {"choices":[{"index":0, "delta":{"role":"assistant", "content":""}, "finish_reason":None}], **tmpl}
+      time.sleep(0.45)                                                      # the "prefill"
+      yield {"choices":[{"index":0, "delta":{"content":"hi"}, "finish_reason":None}], **tmpl}
+    w = io.BytesIO()
+    with patch.object(srv, "KEEPALIVE_SEC", 0.1): self._handler(w).stream_json(gen())
+    lines = [json.loads(l[6:]) for l in w.getvalue().decode().split("\n\n") if l.startswith("data: ") and l != "data: [DONE]"]
+    beats = [l for l in lines if l["choices"][0]["delta"] == {}]
+    self.assertGreaterEqual(len(beats), 2)
+    self.assertEqual(beats[0]["model"], "m")                                 # heartbeats carry the reply's template keys
+    self.assertEqual([l["choices"][0]["delta"].get("content") for l in lines if l["choices"][0]["delta"]], ["", "hi"])
+    self.assertTrue(w.getvalue().endswith(b"data: [DONE]\n\n"))
+
+  def test_hung_up_client_stops_generation(self):
+    import io, time
+    import tinygrad.llm.serve as srv
+    class Gone(io.BytesIO):
+      def __init__(self):
+        super().__init__()
+        self.n = 0
+      def write(self, b):
+        self.n += 1
+        if self.n > 1: raise BrokenPipeError()                              # the client left after the first chunk
+        return super().write(b)
+    closed, produced = [], []
+    def gen():
+      try:
+        yield {"choices":[{"index":0, "delta":{"role":"assistant", "content":""}, "finish_reason":None}], "model":"m"}
+        time.sleep(0.4)                                                      # silence: the heartbeat hits the dead socket
+        for i in range(50):
+          produced.append(i)
+          yield {"choices":[{"index":0, "delta":{"content":"x"}, "finish_reason":None}], "model":"m"}
+      finally: closed.append(True)
+    with patch.object(srv, "KEEPALIVE_SEC", 0.1): self._handler(Gone()).stream_json(gen())
+    self.assertEqual(closed, [True])
+    self.assertLessEqual(len(produced), 1)                                   # noticed before the first real token, at most one slipped
+
+  def test_disabled_falls_back_to_plain_stream(self):
+    import io
+    import tinygrad.llm.serve as srv
+    w = io.BytesIO()
+    def gen(): yield {"choices":[{"index":0, "delta":{"content":"a"}, "finish_reason":None}], "model":"m"}
+    with patch.object(srv, "KEEPALIVE_SEC", 0): self._handler(w).stream_json(gen())
+    self.assertEqual(w.getvalue().count(b"data: "), 2)                        # the chunk + [DONE], no heartbeats
+
 class TestStreamLog(unittest.TestCase):
   """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
   def test_fields_and_rotation(self):
