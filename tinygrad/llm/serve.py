@@ -156,6 +156,17 @@ def template_kwargs(body:dict) -> dict:
 DEFAULT_TEMPERATURE = getenv("DEFAULT_TEMPERATURE", 0.0)
 def request_temperature(body:dict) -> float: return float(body.get("temperature", DEFAULT_TEMPERATURE))
 
+# T4.88: thinking budget. Qwen's thinking mode overthinks (2026-09-07: 45k reasoning tokens, 4 h, for one turn); Qwen's own
+# recipe is to cap the think block and force it closed with a short "answer now" sentence, then let the model continue from
+# its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; low/minimal get a
+# quarter/eighth, high 4x, xhigh unlimited. The plain generate() path only (MTP's speculative loop is not spliced).
+THINK_BUDGET = getenv("THINK_BUDGET", 0)
+THINK_CLOSE = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+def thinking_budget(body:dict) -> int:
+  if not THINK_BUDGET: return 0
+  e = str(body.get("reasoning_effort", "medium")).strip().lower()
+  return {"minimal": THINK_BUDGET // 8, "low": THINK_BUDGET // 4, "high": THINK_BUDGET * 4, "xhigh": 0}.get(e, THINK_BUDGET)
+
 class StreamLog:
   """T4.83: STREAM_LOG=<path> appends every request's streamed text as it is generated (reasoning and content, flushed per
   token) so `tail -f` or the LAN viewer page (~/.hermes/stream-viewer) shows the thinking LIVE -- Hermes itself only shows
@@ -229,7 +240,7 @@ class Handler(HTTPRequestHandler):
       self.send_data(json.dumps(payload).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None):
+                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -268,7 +279,8 @@ class Handler(HTTPRequestHandler):
       # only the greedy vision jit family is warmed (each extra prefill family costs ~0.78 GB on the 3090, see model.VISION_CHUNK)
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in gen:
+      it = iter(gen)
+      while (next_id := next(it, None)) is not None:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
@@ -282,6 +294,18 @@ class Handler(HTTPRequestHandler):
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
+        if think_budget and not use_spec and router.mode == "reasoning" and len(out) >= think_budget:
+          # T4.88: budget hit -- feed the closing sentence as if the model wrote it, then keep generating from the same
+          # cache (ids+out is the live prefix, so only THINK_CLOSE's few tokens prefill). Once per request.
+          stderr_log(f"{colored(f'think budget {think_budget} hit -- closing the think block', 'yellow')}  {colored('--', 'BLACK')}  ")
+          gen.close()
+          for t in tok.encode(THINK_CLOSE):
+            out.append(t)
+            for field, delta in router.route(dec(t)):
+              if slog is not None: slog.write(field, delta)
+              yield chunk({field:delta})
+          gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision)
+          it, think_budget = iter(gen), 0
       for field, delta in router.route(dec(), final=True):
         if slog is not None: slog.write(field, delta)
         yield chunk({field:delta})
@@ -367,7 +391,8 @@ class Handler(HTTPRequestHandler):
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=request_temperature(body),
-                              reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input)
+                              reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input,
+                              think_budget=thinking_budget(body))
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
