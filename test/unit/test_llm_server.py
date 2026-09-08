@@ -465,6 +465,43 @@ class TestDefaultTemperature(unittest.TestCase):
       self.assertEqual(srv.request_temperature({"temperature": 0}), 0.0)
       self.assertEqual(srv.request_temperature({"temperature": 1.1}), 1.1)
 
+class TestThinkingBudget(unittest.TestCase):
+  """T4.88: past the budget the server closes the think block itself and continues the same request from the cached prefix."""
+  def test_budget_closes_think_block_and_continues(self):
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.serve import Handler
+    # a char-level tokenizer: id == ord(ch); 0 ends the stream
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self):
+        return lambda i=None: "" if i is None else chr(i)
+    calls = []
+    def generate(ids, temperature=0.0, vision=None):
+      calls.append(list(ids))
+      if len(calls) == 1:                       # the model thinks forever
+        for c in "think " * 100: yield ord(c)
+      else:                                     # after the forced close it answers
+        for c in "42": yield ord(c)
+        yield 0
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=Tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    ids = [ord(c) for c in "q"]
+    out = list(h.run_model(ids, "m", reasoning=True, think_budget=12))
+    reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in out if c["choices"])
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 2)
+    self.assertTrue(calls[1][-len(srv.THINK_CLOSE):] == [ord(c) for c in srv.THINK_CLOSE])   # the second generate continues from ids+out+close
+    self.assertIn("Considering the limited time", reasoning)
+    self.assertLess(len(reasoning), 12 + len(srv.THINK_CLOSE) + 8)                          # the runaway think was cut at the budget
+    self.assertEqual(content.strip(), "42")
+    self.assertEqual(srv.thinking_budget({"reasoning_effort": "low"}), 0)                    # THINK_BUDGET is 0 in tests: unlimited
+    with patch.object(srv, "THINK_BUDGET", 4096):
+      efforts = ("minimal", "low", "medium", "high", "xhigh")
+      self.assertEqual([srv.thinking_budget({"reasoning_effort": e}) for e in efforts], [512, 1024, 4096, 16384, 0])
+
 class TestStreamLog(unittest.TestCase):
   """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
   def test_fields_and_rotation(self):
