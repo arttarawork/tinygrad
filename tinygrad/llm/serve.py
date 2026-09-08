@@ -1,11 +1,11 @@
 from __future__ import annotations
-import collections, json, os, pathlib, re, time, typing, uuid
+import collections, json, os, pathlib, re, threading, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad import Tensor
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.llm.image import DEFAULT_MAX_PIXELS, hash_ids, image_hash, n_visual_tokens, preprocess
 from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes, snapshot_nbytes_for
-from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
+from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler, filter_keys
 if TYPE_CHECKING:
   import numpy as np
   from tinygrad.llm.cli import SimpleTokenizer
@@ -251,7 +251,53 @@ def splice_ids(last:tuple[str, list[int], int, list[int]], rendered:str, message
   if not ends or (idx := max(turn.rfind(e) for e in ends)) < 0: return None
   return prev_ids + gen + tok.encode(turn[idx:] + rendered[len(upto):])
 
+# T4.90: heartbeat period (s) for streamed replies; 0 disables. The 2026-09-08 session loss started with Hermes's stream
+# watchdog dropping a request during a 2 h prefill silence and the server not noticing the hang-up until its first token.
+KEEPALIVE_SEC = getenv("KEEPALIVE_SEC", 30)
+
 class Handler(HTTPRequestHandler):
+  def stream_json(self, source):
+    """viz's stream_json plus a heartbeat: while the generator is silent (prefill, a buffered tool call) a helper thread
+    writes an empty-delta chunk every KEEPALIVE_SEC, so clients' stale-stream watchdogs stay quiet and a hung-up client
+    is noticed within ~KEEPALIVE_SEC instead of at the first real token (generation then stops). The generator itself
+    stays on this thread -- METAL objects must (T4.84); the helper only touches the socket."""
+    if not KEEPALIVE_SEC: return super().stream_json(source)
+    lock, st = threading.Lock(), typing.cast(dict[str, typing.Any], {"last": time.monotonic(), "done": False, "gone": False, "tmpl": None})
+    def write(d:dict):
+      self.wfile.write(f"data: {json.dumps(filter_keys(d))}\n\n".encode("utf-8"))
+      self.wfile.flush()
+      st["last"] = time.monotonic()
+    def beat():
+      while not st["done"]:
+        time.sleep(min(1.0, KEEPALIVE_SEC))
+        if st["done"] or st["tmpl"] is None or time.monotonic() - st["last"] < KEEPALIVE_SEC: continue
+        with lock:
+          if st["done"]: break
+          try: write({**st["tmpl"], "choices": [{"index":0, "delta":{}, "finish_reason":None}]})
+          except OSError:
+            st["gone"] = True
+            break
+    t = threading.Thread(target=beat, daemon=True)
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      t.start()
+      for r in source:
+        if st["gone"]: break
+        with lock: write(r)
+        if st["tmpl"] is None: st["tmpl"] = {k:v for k, v in r.items() if k != "choices"}
+      if not st["gone"]:
+        with lock:
+          self.wfile.write("data: [DONE]\n\n".encode("utf-8"))
+          self.wfile.flush()
+    except (BrokenPipeError, ConnectionResetError): pass
+    finally:
+      st["done"] = True
+      source.close()
+      if t.is_alive(): t.join(timeout=2)
+
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
