@@ -167,6 +167,27 @@ def thinking_budget(body:dict) -> int:
   e = str(body.get("reasoning_effort", "medium")).strip().lower()
   return {"minimal": THINK_BUDGET // 8, "low": THINK_BUDGET // 4, "high": THINK_BUDGET * 4, "xhigh": 0}.get(e, THINK_BUDGET)
 
+# T4.89: reasoning loop breaker. The 2026-09-07 captures show Qwen's "anxious" thinking is literal sentence cycles (one 44k-char
+# think block said "actually, the simplest is: keep two files, zip them." 11 times, oscillating with the other option), not long
+# productive thinking. When a sentence of >=6 words recurs LOOP_REPEATS times inside the think block the server injects a decisive
+# sentence in the model's own voice and continues; after LOOP_NUDGES nudges it closes the think block (THINK_CLOSE). LOOP_REPEATS=0 disables.
+LOOP_REPEATS, LOOP_NUDGES = getenv("LOOP_REPEATS", 3), getenv("LOOP_NUDGES", 3)
+LOOP_NUDGE = ("\n\nI notice I've been going back and forth over the same point. It's settled: I'll go with the approach I already have, "
+              "stop re-checking it, and move on to the next step.\n\n")
+class LoopDetector:
+  """Counts normalized reasoning sentences (>=6 words) as they stream; feed() returns the sentence that just hit `repeats`, then resets."""
+  def __init__(self, repeats:int): self.repeats, self.buf, self.counts = repeats, "", collections.Counter[str]()
+  def feed(self, delta:str) -> str|None:
+    self.buf += delta
+    while (m := re.search(r"[.!?]\s|\n", self.buf)) is not None:
+      sent, self.buf = " ".join(self.buf[:m.end()].lower().split()), self.buf[m.end():]
+      if len(sent.split()) < 6: continue
+      self.counts[sent] += 1
+      if self.counts[sent] >= self.repeats:
+        self.buf, self.counts = "", collections.Counter()
+        return sent
+    return None
+
 class StreamLog:
   """T4.83: STREAM_LOG=<path> appends every request's streamed text as it is generated (reasoning and content, flushed per
   token) so `tail -f` or the LAN viewer page (~/.hermes/stream-viewer) shows the thinking LIVE -- Hermes itself only shows
@@ -280,6 +301,19 @@ class Handler(HTTPRequestHandler):
     try:
       yield chunk({"role":"assistant", "content":""})
       it = iter(gen)
+      def inject(text:str):
+        # T4.88/T4.89: feed `text` as if the model wrote it, then continue the same request from ids+out (the live cached
+        # prefix -- only `text`'s few tokens prefill).
+        nonlocal gen, it
+        gen.close()
+        for t in tok.encode(text):
+          out.append(t)
+          for field, delta in router.route(dec(t)):
+            if slog is not None: slog.write(field, delta)
+            yield chunk({field:delta})
+        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision)
+        it = iter(gen)
+      loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS and not use_spec else None), 0
       while (next_id := next(it, None)) is not None:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
@@ -288,24 +322,24 @@ class Handler(HTTPRequestHandler):
           if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
         if tok.is_end(next_id): break
         out.append(next_id)
+        hit = None
         for field, delta in router.route(dec(next_id)):
           if slog is not None: slog.write(field, delta)
           yield chunk({field:delta})
+          if loops is not None and field == "reasoning_content": hit = loops.feed(delta) or hit
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
-        if think_budget and not use_spec and router.mode == "reasoning" and len(out) >= think_budget:
-          # T4.88: budget hit -- feed the closing sentence as if the model wrote it, then keep generating from the same
-          # cache (ids+out is the live prefix, so only THINK_CLOSE's few tokens prefill). Once per request.
+        if hit is not None and router.mode == "reasoning":
+          nudges += 1
+          msg = f"reasoning loop x{LOOP_REPEATS} ({hit[:48]!r}) -- nudge {nudges}/{LOOP_NUDGES}"
+          stderr_log(f"{colored(msg, 'yellow')}  {colored('--', 'BLACK')}  ")
+          yield from inject(LOOP_NUDGE if nudges <= LOOP_NUDGES else THINK_CLOSE)
+        elif think_budget and not use_spec and router.mode == "reasoning" and len(out) >= think_budget:
+          # T4.88: budget hit -- close the think block with Qwen's own "answer now" sentence. Once per request.
           stderr_log(f"{colored(f'think budget {think_budget} hit -- closing the think block', 'yellow')}  {colored('--', 'BLACK')}  ")
-          gen.close()
-          for t in tok.encode(THINK_CLOSE):
-            out.append(t)
-            for field, delta in router.route(dec(t)):
-              if slog is not None: slog.write(field, delta)
-              yield chunk({field:delta})
-          gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision)
-          it, think_budget = iter(gen), 0
+          yield from inject(THINK_CLOSE)
+          think_budget = 0
       for field, delta in router.route(dec(), final=True):
         if slog is not None: slog.write(field, delta)
         yield chunk({field:delta})
