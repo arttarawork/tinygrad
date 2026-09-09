@@ -141,6 +141,26 @@ class TestTransformerGenerate(unittest.TestCase):
     router = StreamRouter(reasoning=True)
     self.assertEqual(list(router.route("reasoning</think>answer")),
                      [("reasoning_content", "reasoning"), ("content", "answer")])
+    # T4.97: </think> before <tool_call> still routes through content mode first, byte-identical to before change A
+    router = StreamRouter(reasoning=True)
+    out = list(router.route('reasoning</think>ok <tool_call>{"name":"f"}</tool_call>', final=True))
+    self.assertEqual(out, [("reasoning_content", "reasoning"), ("content", "ok ")])
+    self.assertEqual((router.mode, router.buf), ("tool", '<tool_call>{"name":"f"}</tool_call>'))
+
+  def test_tool_call_inside_think_block_ends_reasoning(self):
+    # T4.97: a well-formed tool call emitted INSIDE the think block, with no </think> at all, must still end up
+    # routed for the final tool-call parse, not swallowed as reasoning_content (2026-09-08 production incident).
+    import re
+    from tinygrad.llm.serve import parse_tool_call
+    router = StreamRouter(reasoning=True)
+    chunks = ["let me call the tool. ", "<tool_c", 'all>{"name":"f","arguments":{}}</tool_call>']  # mid-tag split
+    out = [d for c in chunks for d in router.route(c)]
+    out += list(router.route("", final=True))
+    self.assertEqual(out, [("reasoning_content", "let me call the tool. ")])  # never leaked as reasoning_content
+    self.assertEqual(router.mode, "tool")
+    self.assertTrue(router.buf.startswith("<tool_call>"))
+    calls = [parse_tool_call(m.group(1)) for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL)]
+    self.assertEqual(calls, [("f", {})])
 
   def test_kv_cache_reuse(self):
     """Test that generate reuses the KV cache when tokens extend the cached prefix."""
@@ -544,6 +564,25 @@ class TestReasoningLoopBreaker(unittest.TestCase):
     for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))
     self.assertEqual(d.feed("the same long  sentence said AGAIN and again.\n"), "the same long sentence said again and again.")
     for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))   # counts reset after a hit
+
+  def test_detector_ignores_code_ish_sentences(self):
+    # T4.97: repeated code/formula lines (2026-09-08: an iterated code edit, an arithmetic checklist) are legitimate
+    # repetition, not an anxious loop -- a line carrying '=', ';', '{', '}', a backtick, or '</' never counts.
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    code = "let offtick = i*t16 + t16 - 1;\n"                                # >=6 words, has '=' and ';'
+    for _ in range(4): self.assertIsNone(d.feed(code))                      # never fires, however many times repeated
+    prose = "Actually, the simplest is: keep two files, zip them.\n"        # a real loop sentence -- no skip chars
+    for _ in range(2): self.assertIsNone(d.feed(prose))
+    self.assertEqual(d.feed(prose), "actually, the simplest is: keep two files, zip them.")   # still fires at LOOP_REPEATS
+
+  def test_detector_mixed_stream_fires_on_prose_not_code(self):
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    code = "let offtick = i*t16 + t16 - 1;\n"
+    prose = "Actually, the simplest is: keep two files, zip them.\n"
+    hits = [d.feed(code + prose) for _ in range(3)]                          # code line never counts, prose does
+    self.assertEqual(hits, [None, None, "actually, the simplest is: keep two files, zip them."])
 
 class TestKeepAlive(unittest.TestCase):
   """T4.90: empty-delta heartbeats while the generator is silent; a hung-up client stops generation."""

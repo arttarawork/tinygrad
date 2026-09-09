@@ -181,7 +181,9 @@ class LoopDetector:
     self.buf += delta
     while (m := re.search(r"[.!?]\s|\n", self.buf)) is not None:
       sent, self.buf = " ".join(self.buf[:m.end()].lower().split()), self.buf[m.end():]
-      if len(sent.split()) < 6: continue
+      # T4.97: skip code-ish sentences (assignment/statement/markup chars) -- legitimate repetition (iterating on a
+      # code line, an arithmetic checklist), not an anxious loop; prose sentences never carry these characters.
+      if len(sent.split()) < 6 or any(c in sent for c in "=;{}`") or "</" in sent: continue
       self.counts[sent] += 1
       if self.counts[sent] >= self.repeats:
         self.buf, self.counts = "", collections.Counter()
@@ -218,16 +220,31 @@ class StreamRouter:
     hold = max((i for i in range(1, min(len(self.buf), len(tag))+1) if tag.startswith(self.buf[-i:])), default=0) if not final else 0
     emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
     return emit, False
+  def split2(self, tag_a:str, tag_b:str, final:bool) -> tuple[str, str|None]:
+    # like split(), but for two candidate tags: whichever fully appears first wins (None if neither yet); the holdback
+    # at the end covers a partial suffix match of EITHER tag, so a chunk ending mid-tag is never emitted early.
+    ia, ib = self.buf.find(tag_a), self.buf.find(tag_b)
+    tag = tag_a if ia != -1 and (ib == -1 or ia < ib) else tag_b if ib != -1 else None
+    if tag is not None:
+      before, self.buf = self.buf.split(tag, 1)
+      return before, tag
+    hold = max((i for t in (tag_a, tag_b) for i in range(1, min(len(self.buf), len(t))+1) if t.startswith(self.buf[-i:])),
+              default=0) if not final else 0
+    emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
+    return emit, None
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
     if self.mode == "undecided":  # decide whether the output starts with a think block
       if not final and len(self.buf) < len("<think>") and "<think>".startswith(self.buf): return
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
     if self.mode == "reasoning":
-      emit, done = self.split("</think>", final)
+      # T4.97: a <tool_call> emitted before </think> (the model never closes the block) still ends reasoning mode here --
+      # same tool-mode handoff as the content-mode case below, so the final parse in run_model still finds the call.
+      emit, tag = self.split2("</think>", "<tool_call>", final)
       if emit: yield "reasoning_content", emit
-      if not done: return
-      self.mode = "content"
+      if tag is None: return
+      if tag == "<tool_call>": self.mode, self.buf = "tool", "<tool_call>" + self.buf
+      else: self.mode = "content"
     if self.mode == "tool": return
     emit, found = self.split("<tool_call>", final)
     if emit: yield "content", emit
