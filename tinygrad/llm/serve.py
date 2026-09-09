@@ -311,13 +311,18 @@ class Handler(HTTPRequestHandler):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
+    # T4.96: true iff the live cache did NOT extend (cold, or about to resume from a snapshot below) -- only a
+    # boundary request stores a snapshot after prefill (below): a tool-loop step's snapshot would just evict it.
+    boundary = cache_start_pos == 0
     # T4.67: (a) the splice/live-cache path above found nothing to reuse -- before falling back to a fully cold
     # prefill (c), try the cross-session state cache (b): the longest snapshot whose ids exactly prefix this
     # request's. Skipped entirely when the cache is off (state_cache_mb<=0), so snapshot_state/restore_state are
     # then never called -- byte-identical to pre-T4.67 behavior.
-    if cache_start_pos == 0 and self.server.state_cache_mb > 0 and (snap := self.server.find_snapshot(ids)) is not None:
+    if boundary and self.server.state_cache_mb > 0 and (snap := self.server.find_snapshot(ids)) is not None:
       model.restore_state(snap)
       cache_start_pos = model.get_start_pos(ids)
+      del snap  # T4.96: this generator frame outlives the yield below -- an undeleted ref here kept the snapshot's
+                # device buffers allocated through store_snapshot's own allocation later in this request (OOM)
     # T5.4: " img:{images}/{visual tokens}" after the in: field, only when this request actually carries images.
     img_field = f" img:{len(vision.spans)}/{sum(n for _, n, _ in vision.spans)}" if vision is not None and vision.spans else ""
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}{img_field}  {colored('--', 'BLACK')}  ")
@@ -371,7 +376,8 @@ class Handler(HTTPRequestHandler):
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
-          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
+          # T4.96: only if `boundary` (this request didn't extend the live cache) -- else it's a tool-loop step.
+          if boundary and self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
         if tok.is_end(next_id): break
         out.append(next_id)
         hit = None
@@ -554,8 +560,9 @@ class LLMServer(TCPServerWithReuse):
     # existing snapshot's bytes-per-token and skip sequences that could never fit the cap; (2) evict BEFORE allocating so the
     # old and new snapshots never coexist; (3) an allocation failure drops the cache and the request continues uncached.
     if self.snapshots:
-      s0 = next(iter(self.snapshots.values()))
-      if (est := snapshot_nbytes_for(s0, len(ids))) > cap:
+      # T4.96: don't bind the oldest snapshot to a name -- an unreleased reference survived the evict loop and
+      # the allocation below, so the freed cap was never actually free (every store OOM'd past one full snapshot).
+      if (est := snapshot_nbytes_for(next(iter(self.snapshots.values())), len(ids))) > cap:
         stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (~{est>>20} MB > cap)', 'yellow')}  {colored('--', 'BLACK')}  ")
         return
       total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
