@@ -142,11 +142,27 @@ def lmstudio_models_payload(model_name:str, max_context:int, vision:bool = False
                       "capabilities": capabilities,
                       "loaded_instances": [{"id":model_name, "config": {"context_length":max_context}}]}]}
 
+# T4.91: EFFORT_LEVELS maps a client's reasoning_effort (LM Studio vocabulary; max/ultra are informal xhigh aliases) to the
+# value the Qwen3.8 template itself accepts (low/medium/xhigh only -- it raises otherwise) and to a THINK_BUDGET multiplier;
+# high and xhigh both render as the template's "xhigh" but keep different budgets (4x vs unlimited). Shared by template_kwargs
+# and thinking_budget below so the two cannot drift.
+EFFORT_LEVELS: dict[str, tuple[str, float]] = {
+  "minimal": ("low", 0.125), "low": ("low", 0.25), "medium": ("medium", 1.0),
+  "high": ("xhigh", 4.0), "xhigh": ("xhigh", 0.0), "max": ("xhigh", 0.0), "ultra": ("xhigh", 0.0),
+}
+
 def template_kwargs(body:dict) -> dict:
-  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level
-  # reasoning_effort (LM Studio's /reasoning knob) overrides enable_thinking when present -- see T4.80.
+  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level reasoning_effort
+  # (LM Studio's /reasoning knob) overrides enable_thinking when present and, only while thinking stays on, is mapped through
+  # EFFORT_LEVELS to the template's own reasoning_effort value (an explicit chat_template_kwargs.reasoning_effort still wins;
+  # passing the variable to a template that ignores it is harmless -- jinja just never reads it). NOTE: the level's instruction
+  # text sits at the very front of the rendered prompt, so changing it mid-conversation breaks splice_ids's prefix match and the
+  # next turn re-prefills from scratch -- expected. See T4.80/T4.91.
   kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
-  if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
+  if isinstance(effort := body.get("reasoning_effort"), str):
+    e = effort.strip().lower()
+    kwargs["enable_thinking"] = e not in ("none", "off")
+    if kwargs["enable_thinking"]: kwargs.setdefault("reasoning_effort", EFFORT_LEVELS.get(e, ("medium", 1.0))[0])
   return kwargs
 
 # T4.85: Hermes (and most agent clients) send no `temperature`; an absent value used to mean 0 = greedy decoding, and Qwen's
@@ -158,14 +174,14 @@ def request_temperature(body:dict) -> float: return float(body.get("temperature"
 
 # T4.88: thinking budget. Qwen's thinking mode overthinks (2026-09-07: 45k reasoning tokens, 4 h, for one turn); Qwen's own
 # recipe is to cap the think block and force it closed with a short "answer now" sentence, then let the model continue from
-# its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; low/minimal get a
-# quarter/eighth, high 4x, xhigh unlimited. The plain generate() path only (MTP's speculative loop is not spliced).
+# its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; EFFORT_LEVELS (T4.91)
+# scales it per level. The plain generate() path only (MTP's speculative loop is not spliced).
 THINK_BUDGET = getenv("THINK_BUDGET", 0)
 THINK_CLOSE = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
 def thinking_budget(body:dict) -> int:
   if not THINK_BUDGET: return 0
-  e = str(body.get("reasoning_effort", "medium")).strip().lower()
-  return {"minimal": THINK_BUDGET // 8, "low": THINK_BUDGET // 4, "high": THINK_BUDGET * 4, "xhigh": 0}.get(e, THINK_BUDGET)
+  factor = EFFORT_LEVELS.get(str(body.get("reasoning_effort", "medium")).strip().lower(), ("medium", 1.0))[1]
+  return int(THINK_BUDGET * factor)
 
 # T4.89: reasoning loop breaker. The 2026-09-07 captures show Qwen's "anxious" thinking is literal sentence cycles (one 44k-char
 # think block said "actually, the simplest is: keep two files, zip them." 11 times, oscillating with the other option), not long
@@ -459,7 +475,8 @@ class Handler(HTTPRequestHandler):
         ids = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
           or self.server.tok.encode(rendered)
         record = (rendered, ids, len(body["messages"]))
-      think = f"think:{'on' if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  " if "enable_thinking" in kwargs else ""
+      think = (f"think:{kwargs.get('reasoning_effort', 'xhigh') if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  "
+               if "enable_thinking" in kwargs else "")
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  {think}")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")

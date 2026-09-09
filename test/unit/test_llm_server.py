@@ -418,6 +418,26 @@ class TestLMStudioShim(unittest.TestCase):
   def test_reasoning_effort_case_and_whitespace_insensitive(self):
     self.assertEqual(template_kwargs({"reasoning_effort": "NONE "})["enable_thinking"], False)
 
+  def test_template_kwargs_effort_levels(self):
+    # T4.91: minimal/low/medium/high/xhigh/max all map onto the Qwen3.8 template's low/medium/xhigh vocabulary; an
+    # unrecognized string falls back to medium (the template raises on anything it doesn't recognize, so an unmapped
+    # value must never reach it), and an absent reasoning_effort is a no-op (covered by test_template_kwargs_no_overrides).
+    cases = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "garbage": "medium"}
+    for effort, level in cases.items():
+      with self.subTest(effort=effort):
+        self.assertEqual(template_kwargs({"reasoning_effort": effort}),
+                          {"preserve_thinking": True, "enable_thinking": True, "reasoning_effort": level})
+
+  def test_template_kwargs_none_and_off_disable_thinking(self):
+    # thinking off means no reasoning_effort key at all -- the template never reads it then (T4.91).
+    self.assertEqual(template_kwargs({"reasoning_effort": "none"}), {"preserve_thinking": True, "enable_thinking": False})
+    self.assertEqual(template_kwargs({"reasoning_effort": "off"}), {"preserve_thinking": True, "enable_thinking": False})
+
+  def test_template_kwargs_explicit_reasoning_effort_wins(self):
+    # a client's own chat_template_kwargs.reasoning_effort beats the one we derive from the top-level effort (T4.91).
+    body = {"reasoning_effort": "high", "chat_template_kwargs": {"reasoning_effort": "medium"}}
+    self.assertEqual(template_kwargs(body), {"preserve_thinking": True, "enable_thinking": True, "reasoning_effort": "medium"})
+
   def test_lmstudio_models_payload_shape(self):
     self.assertEqual(lmstudio_models_payload("tiny", 32)["models"], [{
       "key": "tiny", "id": "tiny", "object": "model", "type": "llm", "max_context_length": 32,
@@ -451,6 +471,90 @@ class TestLMStudioShim(unittest.TestCase):
     finally:
       server.shutdown()
       server.server_close()
+
+class TestReasoningEffortStandInTemplate(unittest.TestCase):
+  """T4.91: render through a small jinja2 template that mirrors the Qwen3.8 template's reasoning_effort CONTRACT (accepts
+  low/medium/xhigh, raises otherwise, injects distinguishable text per level) -- independent of that template's actual
+  prose, which TestReasoningEffortRealTemplate below checks directly against the GGUF (where, unlike here, 'medium'
+  turns out to inject no text at all)."""
+  TEMPLATE = (
+    "{%- if enable_thinking is defined and enable_thinking is false -%}\n"
+    "[thinking off]\n"
+    "{%- else -%}\n"
+    "{%- set e = reasoning_effort|default('xhigh') -%}\n"
+    "{%- if e == 'high' -%}{%- set e = 'xhigh' -%}{%- endif -%}\n"
+    "{%- if e not in ('low', 'medium', 'xhigh') -%}\n"
+    "{{ raise_exception('Unexpected reasoning effort ' ~ e) }}\n"
+    "{%- endif -%}\n"
+    "[effort:{{ e }}]\n"
+    "{%- endif -%}"
+  )
+
+  @classmethod
+  def setUpClass(cls):
+    import jinja2
+    env = jinja2.Environment()
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    cls.template = env.from_string(cls.TEMPLATE)
+
+  def _render(self, reasoning_effort):
+    return self.template.render(**template_kwargs({"reasoning_effort": reasoning_effort}))
+
+  def test_low_medium_high_render_distinct_text(self):
+    self.assertIn("[effort:low]", self._render("low"))
+    self.assertIn("[effort:medium]", self._render("medium"))
+    self.assertIn("[effort:xhigh]", self._render("high"))  # Hermes "high" -> template "xhigh"
+
+  def test_none_disables_thinking_with_no_effort_text(self):
+    out = self._render("none")
+    self.assertIn("[thinking off]", out)
+    self.assertNotIn("[effort:", out)
+
+  def test_garbage_effort_never_reaches_the_template(self):
+    self._render("garbage")  # our own mapping already sanitized it to "medium" -- must not raise
+
+import os
+GGUF_PATH = "/Users/artur/models/qwen3.8-27b-q8/Qwen3.8-27B-Q8_0.gguf"
+
+@unittest.skipUnless(os.path.exists(GGUF_PATH), "qwen3.8-27b GGUF not present on this machine")
+class TestReasoningEffortRealTemplate(unittest.TestCase):
+  """T4.91: render the model's OWN chat template (text loaded from the GGUF header, no weights -- see gguf_load) with our
+  derived kwargs. Verified against the template source first: it accepts reasoning_effort in {low, medium, xhigh}
+  (raises otherwise; 'high' is its own internal alias for xhigh) but only 'xhigh' and 'low' actually inject an
+  instruction sentence into the system prompt -- 'medium' is silently accepted and adds no text."""
+
+  @classmethod
+  def setUpClass(cls):
+    import pathlib, json, jinja2
+    from tinygrad.llm.gguf import gguf_load
+    kv, _ = gguf_load(pathlib.Path(GGUF_PATH))
+    env = jinja2.Environment()
+    env.filters['tojson'] = lambda obj, **kw: json.dumps(obj, **kw)
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    env.globals['strftime_now'] = lambda fmt: ""
+    env.globals['bos_token'], env.globals['eos_token'] = "", ""
+    cls.template = env.from_string(kv['tokenizer.chat_template'])
+
+  def _render(self, reasoning_effort):
+    kwargs = template_kwargs({"reasoning_effort": reasoning_effort})
+    return self.template.render(messages=[{"role": "user", "content": "hi"}], tools=None, add_generation_prompt=True, **kwargs)
+
+  def test_low_injects_low_instruction(self):
+    self.assertIn("Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+                  "conclusion without unnecessary elaboration.", self._render("low"))
+
+  def test_high_injects_xhigh_instruction(self):
+    self.assertIn("Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+                  "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity "
+                  "in the final answer.", self._render("high"))
+
+  def test_medium_injects_nothing(self):
+    self.assertNotIn("Reasoning effort is set to", self._render("medium"))
+
+  def test_thinking_off_renders_closed_think_block(self):
+    out = self._render("none")
+    self.assertNotIn("Reasoning effort is set to", out)
+    self.assertTrue(out.rstrip().endswith("<think>\n\n</think>"))
 
 if __name__ == '__main__':
   unittest.main()
