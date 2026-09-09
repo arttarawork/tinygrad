@@ -880,7 +880,7 @@ class TestSpliceCacheCopy(unittest.TestCase):
   def test_prompt_list_untouched_and_last_is_pure(self):
     from types import SimpleNamespace
     from tinygrad.llm.serve import Handler
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       for c in "42\0":                      # two real tokens then EOS (id 0)
         ids.append(ord(c))
         model._cached_tokens = ids[:-1]
@@ -919,7 +919,7 @@ class TestSpliceCacheCopy(unittest.TestCase):
     import tinygrad.llm.serve as srv
     from tinygrad.llm.serve import Handler
     calls = []
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       calls.append(list(ids))
       if len(calls) == 1:                   # the model thinks forever, mutating its `ids` arg like the real generate()
         for c in "think " * 100:
@@ -951,7 +951,7 @@ class TestBoundarySnapshot(unittest.TestCase):
   def test_boundary_flag_follows_the_live_cache(self):
     from types import SimpleNamespace
     from tinygrad.llm.serve import Handler
-    def generate(ids, temperature=0.0, vision=None): yield 0   # ends immediately -- one store opportunity per request
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0): yield 0   # ends immediately -- one store opportunity per request
     calls = []
     model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
     server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=1, vision=None, last=None,
@@ -995,7 +995,7 @@ class TestBoundarySnapshot(unittest.TestCase):
       def get_start_pos(self, ids):
         return len(self.cached) if self.cached and len(self.cached) < len(ids) and ids[:len(self.cached)] == self.cached else 0
       def restore_state(self, snap): self.cached = list(snap["tokens"])
-      def generate(self, ids, temperature=0.0, vision=None):
+      def generate(self, ids, temperature=0.0, vision=None, presence_penalty=0.0):
         self.cached = list(ids)
         for t in self.script:
           yield t
