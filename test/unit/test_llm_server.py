@@ -665,3 +665,79 @@ class TestStateCacheOOM(unittest.TestCase):
     srv.model.snapshot_state = lambda: {"t": Tensor.zeros(192 * 1024)}
     srv.store_snapshot(list(range(8, 16)))   # predicted 768 KB; 768 + 768 > 1 MB -> the old one is evicted first
     self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])
+
+class TestSpliceCacheCopy(unittest.TestCase):
+  """T4.95: Transformer.generate()/speculative_generate() append every token they yield straight into the `ids` list
+  they're given (real behavior -- see model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). run_model must pass
+  a COPY, or that mutation leaks into do_POST's record (server.last, read by splice_ids as the next turn's prev_ids)
+  and into inject()'s `ids + out` resume prompt, doubling this turn's own output. The fakes below mutate their `ids`
+  argument like the real ones do -- the other fakes in this file don't, which is why they never caught this."""
+  def _tok(self):
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self):
+        return lambda i=None: "" if i is None else chr(i)
+    return Tok()
+
+  def test_prompt_list_untouched_and_last_is_pure(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    def generate(ids, temperature=0.0, vision=None):
+      for c in "42\0":                      # two real tokens then EOS (id 0)
+        ids.append(ord(c))
+        model._cached_tokens = ids[:-1]
+        yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    h.server = server
+    ids = [ord("q")]
+    record = ("<rendered>", ids, 1)          # do_POST builds record from the SAME `ids` object it passes to run_model
+    list(h.run_model(ids, "m", record=record))
+    self.assertEqual(ids, [ord("q")])                       # the caller's prompt list is untouched by generate()
+    self.assertEqual(server.last[1], [ord("q")])             # prev_ids for the next splice_ids call is the pure prompt
+    self.assertEqual(server.last[3], [ord("4"), ord("2")])   # generated ids, tracked separately (out) -- EOS excluded
+
+  def test_speculative_path_prompt_also_untouched(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    def speculative_generate(ids, k=3, temperature=0.0):
+      for c in "42\0":
+        ids.append(ord(c))
+        model._cached_tokens = ids[:-1]
+        yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, speculative_generate=speculative_generate, mtp_head=object(), max_context=4096)
+    h = Handler.__new__(Handler)
+    server = SimpleNamespace(model=model, tok=self._tok(), mtp=True, spec_k=3, state_cache_mb=0, vision=None, last=None)
+    h.server = server
+    ids = [ord("q")]
+    record = ("<rendered>", ids, 1)
+    list(h.run_model(ids, "m", record=record))
+    self.assertEqual(ids, [ord("q")])
+    self.assertEqual(server.last[1], [ord("q")])
+
+  def test_inject_resumes_without_duplicating_prior_output(self):
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.serve import Handler
+    calls = []
+    def generate(ids, temperature=0.0, vision=None):
+      calls.append(list(ids))
+      if len(calls) == 1:                   # the model thinks forever, mutating its `ids` arg like the real generate()
+        for c in "think " * 100:
+          ids.append(ord(c))
+          model._cached_tokens = ids[:-1]
+          yield ord(c)
+      else:                                 # after the forced close it answers
+        for c in "42\0":
+          ids.append(ord(c))
+          model._cached_tokens = ids[:-1]
+          yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    list(h.run_model([ord("q")], "m", reasoning=True, think_budget=12))
+    self.assertEqual(len(calls), 2)
+    # the resumed prompt is prompt + (everything generated before the budget hit) + THINK_CLOSE, each token once
+    self.assertEqual(calls[1], [ord("q")] + [ord(c) for c in "think think "] + [ord(c) for c in srv.THINK_CLOSE])

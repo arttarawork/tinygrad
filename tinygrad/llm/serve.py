@@ -341,8 +341,14 @@ class Handler(HTTPRequestHandler):
     # its own greedy (temperature<=0) vs sampled (>0) path internally, so no extra branching is needed here.
     # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
     use_spec = self.server.mtp and model.mtp_head is not None and vision is None
-    gen = model.speculative_generate(ids, k=self.server.spec_k, temperature=temperature) if use_spec \
-      else model.generate(ids, temperature=0.0 if vision is not None else temperature, vision=vision)  # T5.5: image requests are greedy --
+    # T4.95: list(ids), not ids -- generate()/speculative_generate() append every token they yield straight into
+    # the list they're given (model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). `ids` here is the SAME
+    # object as do_POST's `record`/self.server.last and inject()'s `ids + out` below, so an uncopied `ids` would
+    # let this turn's own output leak into next turn's splice_ids prev_ids (doubling it) and into inject()'s
+    # resumed prompt (doubling everything generated before the nudge/budget hit). A copy keeps `ids` the pure
+    # prompt for the rest of this function; cli.py's generate() callers still rely on the mutation and are untouched.
+    gen = model.speculative_generate(list(ids), k=self.server.spec_k, temperature=temperature) if use_spec \
+      else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision)  # T5.5: image requests are greedy --
       # only the greedy vision jit family is warmed (each extra prefill family costs ~0.78 GB on the 3090, see model.VISION_CHUNK)
     try:
       yield chunk({"role":"assistant", "content":""})
