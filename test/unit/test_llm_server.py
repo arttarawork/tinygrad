@@ -131,7 +131,7 @@ class TestTransformerGenerate(unittest.TestCase):
   def test_recurrent_divergent_prompt_restarts(self):
     model, calls = Transformer(TEST_CONFIG), []
     model.has_recurrent_block, model._cached_tokens = True, [1, 2, 9]
-    def mock_call(self, tokens, start_pos, temperature):
+    def mock_call(self, tokens, start_pos, temperature, **kwargs):
       calls.append(start_pos)
       return Tensor([[42]])
     with patch.object(Transformer, '__call__', mock_call): next(model.generate([1, 2, 10, 11]))
@@ -456,14 +456,48 @@ if __name__ == '__main__':
   unittest.main()
 
 class TestDefaultTemperature(unittest.TestCase):
-  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins."""
+  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins.
+  T4.92: a THINKING request gets DEFAULT_TEMPERATURE_THINK instead (falling back to DEFAULT_TEMPERATURE when unset)."""
   def test_omitted_uses_default_explicit_wins(self):
     import tinygrad.llm.serve as srv
-    self.assertEqual(srv.request_temperature({}), 0.0)
+    self.assertEqual(srv.request_temperature({}, False), 0.0)
     with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6):
-      self.assertEqual(srv.request_temperature({}), 0.6)
-      self.assertEqual(srv.request_temperature({"temperature": 0}), 0.0)
-      self.assertEqual(srv.request_temperature({"temperature": 1.1}), 1.1)
+      self.assertEqual(srv.request_temperature({}, False), 0.6)
+      self.assertEqual(srv.request_temperature({"temperature": 0}, False), 0.0)
+      self.assertEqual(srv.request_temperature({"temperature": 1.1}, False), 1.1)
+
+  def test_thinking_falls_back_to_default_temperature_unset(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6), patch.object(srv, "DEFAULT_TEMPERATURE_THINK", srv.DEFAULT_TEMPERATURE):
+      self.assertEqual(srv.request_temperature({}, True), 0.6)   # DEFAULT_TEMPERATURE_THINK unset -> mirrors DEFAULT_TEMPERATURE
+
+  def test_thinking_uses_its_own_default_and_explicit_wins(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.7), patch.object(srv, "DEFAULT_TEMPERATURE_THINK", 1.0):
+      self.assertEqual(srv.request_temperature({}, True), 1.0)     # thinking gets its own default, independent of DEFAULT_TEMPERATURE
+      self.assertEqual(srv.request_temperature({}, False), 0.7)    # non-thinking untouched
+      self.assertEqual(srv.request_temperature({"temperature": 0.3}, True), 0.3)  # explicit wins in either mode
+
+class TestPresencePenalty(unittest.TestCase):
+  """T4.92: PRESENCE_PENALTY applies to non-thinking requests only unless the request sends its own presence_penalty
+  (which always wins, in either mode -- 0 explicitly disables it, distinct from omitting the field)."""
+  def test_default_is_zero_non_thinking(self):
+    import tinygrad.llm.serve as srv
+    self.assertEqual(srv.request_presence_penalty({}, False), 0.0)
+    self.assertEqual(srv.request_presence_penalty({}, True), 0.0)
+
+  def test_env_applies_to_non_thinking_only(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "PRESENCE_PENALTY", 1.5):
+      self.assertEqual(srv.request_presence_penalty({}, False), 1.5)
+      self.assertEqual(srv.request_presence_penalty({}, True), 0.0)   # thinking never gets the env default
+
+  def test_explicit_request_value_always_wins(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "PRESENCE_PENALTY", 1.5):
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 0.3}, False), 0.3)
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 2.0}, True), 2.0)
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 0}, False), 0.0)  # explicit 0 disables it
 
 class TestThinkingBudget(unittest.TestCase):
   """T4.88: past the budget the server closes the think block itself and continues the same request from the cached prefix."""
@@ -478,7 +512,7 @@ class TestThinkingBudget(unittest.TestCase):
       def stream_decoder(self):
         return lambda i=None: "" if i is None else chr(i)
     calls = []
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       calls.append(list(ids))
       if len(calls) == 1:                       # the model thinks forever
         for c in "think " * 100: yield ord(c)
@@ -516,7 +550,7 @@ class TestReasoningLoopBreaker(unittest.TestCase):
     cycle = "Actually, the simplest is: keep two files, zip them. A single self-contained file is more portable. "
     close = [ord(c) for c in srv.THINK_CLOSE]
     calls = []
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       calls.append(list(ids))
       if ids[-len(close):] == close:            # the think block was closed for us: answer
         for c in "42": yield ord(c)
