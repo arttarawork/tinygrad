@@ -665,3 +665,91 @@ class TestStateCacheOOM(unittest.TestCase):
     srv.model.snapshot_state = lambda: {"t": Tensor.zeros(192 * 1024)}
     srv.store_snapshot(list(range(8, 16)))   # predicted 768 KB; 768 + 768 > 1 MB -> the old one is evicted first
     self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])
+
+  def test_reference_to_oldest_snapshot_is_released_before_reallocating(self):
+    # T4.96: the oldest snapshot used to stay referenced (bound to a local name) through the evict loop and the
+    # snapshot_state() call right after it, so evicting it from self.snapshots never actually freed its device
+    # buffers. A snapshot_state that raises MemoryError while any snapshot it previously handed out is still
+    # referenced (checked via weakref, after a gc.collect()) reproduces exactly that failure mode.
+    import gc, weakref
+    class Snap(dict): pass  # a plain dict doesn't support weakref
+    srv = self._server(1)   # 1 MB cap -- fits exactly one 768 KB snapshot
+    refs: list[weakref.ref] = []
+    def snapshot_state():
+      gc.collect()
+      if any(r() is not None for r in refs): raise MemoryError("Allocation of 768.00 KB failed on NV")
+      snap = Snap(blocks=[{"recurrent_state": Tensor.zeros(192 * 1024)}])   # 768 KB, fixed cost (T5.7b)
+      refs.append(weakref.ref(snap))
+      return snap
+    srv.model.snapshot_state = snapshot_state
+    srv.store_snapshot(list(range(8)))
+    srv.store_snapshot(list(range(16)))   # 768 KB + 768 KB > 1 MB cap -> evicts the first; it must not still be referenced
+    self.assertEqual(list(srv.snapshots.keys()), [tuple(range(16))])
+
+class TestBoundarySnapshot(unittest.TestCase):
+  """T4.96: only a request that did NOT extend the live cache (cold, or resumed from a snapshot) stores one --
+  a tool-loop step that merely extended it must not evict the snapshot that bridges the next real boundary."""
+  def _tok(self):
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self): return lambda i=None: "" if i is None else chr(i)
+    return Tok()
+
+  def test_boundary_only_requests_store_a_snapshot(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    def generate(ids, temperature=0.0, vision=None): yield 0   # ends immediately -- one store opportunity per request
+    calls = []
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=1, vision=None, last=None,
+                              find_snapshot=lambda ids: None, store_snapshot=lambda *a: calls.append(a))
+    h = Handler.__new__(Handler)
+    h.server = server
+    list(h.run_model([1, 2, 3], "m"))                  # cold (get_start_pos always 0) -- a boundary request
+    self.assertEqual(len(calls), 1)
+    model.get_start_pos = lambda ids: 1                 # extends the live cache -- not a boundary
+    calls.clear()
+    list(h.run_model([1, 2, 3], "m"))
+    self.assertEqual(calls, [])                          # a tool-loop-style continuation must not store
+
+  def test_reference_to_restored_snapshot_is_released_before_next_store(self):
+    # T4.96: run_model's own `snap := find_snapshot(ids)` walrus is a generator-frame local -- generator frames
+    # don't drop locals across yields, so it used to live for the whole request. A snapshot restored early in a
+    # request was then still referenced when that same request's store_snapshot tried to evict and replace it.
+    import gc, weakref
+    from tinygrad.llm.serve import Handler
+    class Snap(dict): pass
+    class FakeModel:
+      mtp_head, max_context = None, 4096
+      def __init__(self): self.cached, self.script = [], []
+      def get_start_pos(self, ids):
+        return len(self.cached) if self.cached and len(self.cached) < len(ids) and ids[:len(self.cached)] == self.cached else 0
+      def restore_state(self, snap): self.cached = list(snap["tokens"])
+      def generate(self, ids, temperature=0.0, vision=None):
+        self.cached = list(ids)
+        for t in self.script:
+          yield t
+          self.cached.append(t)
+        yield 0
+    model = FakeModel()
+    refs: list[weakref.ref] = []
+    def snapshot_state():
+      gc.collect()
+      if any(r() is not None for r in refs): raise MemoryError("Allocation of 768.00 KB failed on NV")
+      snap = Snap(tokens=list(model.cached), blocks=[{"recurrent_state": Tensor.zeros(192 * 1024)}])
+      refs.append(weakref.ref(snap))
+      return snap
+    model.snapshot_state = snapshot_state
+    srv = LLMServer(("127.0.0.1", 0), model=model, model_name="tiny", tok=self._tok(), template=None, state_cache_mb=1)
+    self.addCleanup(srv.server_close)
+    h = Handler.__new__(Handler)
+    h.server = srv
+
+    model.script = [9, 8]                       # request 1 "thinks" for two tokens -- the live cache ends past [1,2,3]
+    list(h.run_model([1, 2, 3], "m"))            # cold prefill -- snapshot A stored at the [1,2,3] boundary
+    self.assertEqual(list(srv.snapshots.keys()), [(1, 2, 3)])
+
+    model.script = []                            # request 2 (e.g. reasoning stripped from the rendered prompt):
+    list(h.run_model([1, 2, 3, 7], "m"))         # extends A, not the (diverged) live cache -- resumes from A, stores B
+    self.assertEqual(list(srv.snapshots.keys()), [(1, 2, 3, 7)])   # A was released before B's allocation
