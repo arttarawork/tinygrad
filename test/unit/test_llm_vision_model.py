@@ -48,7 +48,9 @@ class TestTextPathUnchanged(unittest.TestCase):
       return Tensor([[42]])
     with patch.object(Transformer, "__call__", mock_call):
       list(zip(range(3), fresh().generate(list(PROMPT))))
-    self.assertTrue(all(k == {} for k in seen), seen)
+    # T4.92: presence_penalty is always explicit (like temperature) and inert (None) when unused -- vis_e/vis_m/vis_pos/
+    # rope_start are the ones that must never leak into a plain text call.
+    self.assertTrue(all(k == {"presence_penalty": None} for k in seen), seen)
 
 class TestVisionPositions(unittest.TestCase):
   def test_one_image(self):
