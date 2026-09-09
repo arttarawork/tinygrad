@@ -1,5 +1,7 @@
 # TASKS.md — agent handoff for the Ampere-over-Thunderbolt effort
 
+> **Next arc (drafted 2026-09-09, not started):** T4.91 `reasoning_effort` passthrough (every think:on request has run at the template default xhigh) → T4.92 model-card sampler defaults + presence penalty → T4.93 the 27B on the 3090 ALONE at 4-bit (measure first) → T4.94 MTP on that build. Entries at the end of the T4 section.
+
 Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md` — read both first).
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
 (AOOSTAR AG02) was in the mail — **Phase 0 tasks need no NVIDIA hardware at all.**
