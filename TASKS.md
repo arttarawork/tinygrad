@@ -1,6 +1,6 @@
 # TASKS.md — agent handoff for the Ampere-over-Thunderbolt effort
 
-> **Next arc (drafted 2026-09-09, not started):** T4.91 `reasoning_effort` passthrough (every think:on request has run at the template default xhigh) → T4.92 model-card sampler defaults + presence penalty → T4.93 the 27B on the 3090 ALONE at 4-bit (measure first) → T4.94 MTP on that build. Entries at the end of the T4 section.
+> **Next arc (drafted 2026-09-09, not started):** T4.91 `reasoning_effort` passthrough (every think:on request has run at the template default xhigh) → T4.92 model-card sampler defaults + presence penalty → T4.93 the 27B on the 3090 ALONE at 4-bit (measure first) → T4.94 MTP on that build. Entries at the end of the T4 section. **Bugs found 2026-09-09 reading the live session: T4.95 splice duplication, T4.96 dead state cache, T4.97 nudge echo — one-liners, not applied.**
 
 Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md` — read both first).
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
@@ -364,6 +364,46 @@ can be built and proven before the dock ships.
   was k=4), keep the T4.73 WY-numerics caveat in view. *Done when:* a tok/s row with acceptance rates. STOP if outputs diverge from
   non-speculative greedy — speculation must be lossless.
 
+- **T4.95 📋 — Splice cache duplicates the previous assistant turn (`generate()` appends into the request's `ids`)** `[MAC]` deps: —
+  Found 2026-09-09 reading the live 27B session. `Transformer.generate` appends every generated token into the caller's list
+  (`tokens.append`, model.py ~1791) and serve.py passes the request's `ids` itself, so after a reply `ids` = prompt + generated + EOS;
+  `record` holds that mutated list and the next turn's `splice_ids` builds `prev_ids + gen + rest` → the previous turn sits TWICE in the
+  model's context ([prompt][G][<|im_end|>][G][tool result…]) with a stray end-of-turn token between the copies. Every tool step silently
+  prefills the previous output again (log: +new = out_prev + 1 + tool result — 09-08 18:57→19:27: +2781 = 1882+1+898, +2340 = 1090+1+1249,
+  +2029 = 1764+1+264, +1922 = 1061+1+860, +481 = 159+1+321), the context inflates by the sum of the turn's outputs (~25.5k of the 87.6k
+  prompt at 22:07; ~38k tokens ≈ 49 min of hidden prefill over the 10-hour turn), and the T4.88/T4.89 inject path duplicates the reasoning
+  before the first nudge inside the same request (9,092 tokens at 14:13, 2,532 at 22:59 — the next request's `in:` exceeded prompt+out by
+  exactly those). In the tree since T4.56 (2026-08-27), so the 35B era had it too. The unit tests fake `generate` without the append.
+  Fix: pass a copy — `model.generate(list(ids), …)` at run_model's two generate calls (inject already builds a fresh list); or copy inside
+  generate() if the CLI chat loop does not rely on the mutation. Regression test: a real `Transformer(TEST_CONFIG)` through the handler
+  twice; assert `len(ids)` unchanged after run_model and no repeated block in the second request's ids. *Done when:* two consecutive
+  tool-turn log lines show +new ≈ tool result only. STOP if cli.py depends on the appended list — then copy in serve.py only.
+- **T4.96 📋 — State cache never resumes a Hermes thinking session: boundary snapshots lost to two lingering references + tool-turn eviction** `[MAC+dock]` deps: —
+  Evidence 09-08/09: every user message in a thinking session re-prefilled from zero (22:07 in:0+46344 = 47 min, 22:59 in:0+47419 = 47 min,
+  00:26 in:0+48440 = 48 min, 14:13 in:0+59761 = 62 min). Qwen's template strips reasoning from every assistant turn before the latest user
+  message, so the prompt diverges from the extend-only live cache at the turn's first think block; only a snapshot taken at the previous
+  user boundary can bridge it, and that snapshot never survives: (1) `store_snapshot` keeps `s0` (the oldest snapshot dict) alive across
+  its evict loop and run_model keeps `snap` (the restored one) alive for the whole request, so the evicted snapshot's NV buffers are still
+  allocated when the new clone is made → "Allocation of ~100 MB failed on NV. Used: 22.4 GB, cache cleared" on every second request above
+  ~45k tokens (perfect alternation, log lines 83921-83925; LRUAllocator already does free_cache+retry, so the memory is genuinely held);
+  (2) under the 2 GB cap only one ≥30k-token snapshot fits, so the first tool-turn snapshot evicts the boundary one anyway; (3) above ~58k
+  tokens the cap skips every snapshot. Net: zero snapshot hits this session while 1.7-2.1 GB of NV sat in a dead snapshot. Fix: `del s0`
+  / `del snap` (two one-liners), then snapshot only requests that did not extend the live cache (cache_start_pos == 0 = a boundary) and
+  pin that one — tool-turn snapshots only help retries. Expected: a user message costs the answer + tool results + new message (~1-2 min)
+  instead of ~50 min, for sessions ≤ ~58k. Beyond: host-memory snapshots (the Mac sits at 38% free with 4 GB in the compressor — measure
+  first) or keep sessions under 60k. *Done when:* a Telegram thinking turn's first request logs in:<boundary>, not in:0. STOP if NV
+  headroom at 50k is below one snapshot after the fix — then the cap must drop to ~1.5 GB.
+- **T4.97 📋 — Loop breaker follow-ups: the nudge becomes the loop; tool calls inside the think block** `[MAC]` deps: —
+  09-08 22:59 (in:0+47419): the first nudge fired on the model re-quoting the user ("is it possible to reference them to get a better");
+  the model then echoed the nudge sentence verbatim 3× → nudge 2 → 3× → nudge 3 → 3× → close: 12 copies, zero progress, then a fine
+  answer after THINK_CLOSE. 09-08 21:52 (in:81874+4664): after the nudge the model emitted `<tool_call>` INSIDE the think block (never
+  `</think>`); the router kept it as reasoning_content, Hermes saw an empty response and appended its synthetic user nudge → user boundary
+  → 47-min re-prefill. 09-08 14:13: the nudge on a code line (`let offtick = …`) changed nothing; the block ran on to 16,937 tokens.
+  Levers: (a) `LOOP_NUDGES=0` (config only): the first repeated sentence closes the think block with Qwen's own sentence — in all three
+  cases the immediate close would have been better; (b) router: `<tool_call>` inside reasoning mode ends the think block (promote to tool
+  mode); (c) skip code-ish sentences (containing `=` `;` `(`) in the detector. *Done when:* a week of log lines with no "nudge n/3" chains
+  and no empty-response nudges from Hermes. STOP if (a) truncates answers on the 09-08 capture prompts — then keep LOOP_NUDGES=1.
+
 ## Phase 1 — dock arrives (`DOCK`)
 
 - **TD.1 ✅ — TinyGPU first light** (done 2026-08-24, see status log): install script, DEXT approval, `DEV=NV` test_tiny; audit
@@ -423,3 +463,4 @@ flowchart LR
 - **2026-09-07 T4.89 reasoning loop breaker (integration/t6, on top of T4.88 858439c30):** Artur: "I'm fine with long thinking context, mainly looking to see if we can avoid the anxious thinking loops". Stream captures: the loops are literal sentence cycles (44k-char block: "keep two files, zip them." 11× oscillating with "a single self-contained file is more portable." 11×; 111k block: 106 sentences 2-4×; healthy 12k block 1%). `LoopDetector` counts normalized ≥6-word sentences; at `LOOP_REPEATS`=3 the server injects a decisive sentence in the model's voice via the shared `inject()` (T4.88 mechanism), after `LOOP_NUDGES`=3 closes the think block. Budget raised to a safety net: plist `THINK_BUDGET=16384` (medium 16k, high 64k, xhigh unlimited) + `LOOP_REPEATS=3`. Tests: 49 pass in test_llm_server.py. Not built: presence penalty (Qwen's documented 0-2 lever; penalizes every reused token incl. code identifiers — try only if the breaker is not enough).
 - **2026-09-08 T4.87 root cause + the 106k lesson (docs only):** the Squelch build (Telegram session 20260908_001400) grew to 106k tokens; a Hermes compaction attempt (its own 120 s no-output watchdog, `compression.context_timeout_seconds`, fired during our 210 s prefill silence) evicted the only ≤2 GB snapshot and replaced the live cache → a 106k re-prefill from 0 (2 h 05 at 14 tok/s) → Hermes's 2 h stream-stale watchdog dropped it at the 7200 s mark → retry → in:0 AGAIN: `get_start_pos` for recurrent models reuses the live cache only when the new ids EXTEND `_cached_tokens` exactly, and the cache held prompt+1 generated token, so a retry with any different continuation can never reuse it; only a prompt-boundary snapshot bridges that, and at 106k it is ~3.5 GB (34 KB/token) > the 2 GB cap and > free NV (22.45/24 GB). Session auto-reset by Hermes at 09:55; server restarted 10:07 to drop the orphaned prefill (the server only notices a hang-up at its first write). Levers, in order: Hermes `compression.context_timeout_seconds: 1800` + `context_total_ceiling_seconds: 7200` (config-only, immediate); server keep-alive chunks during prefill (quiets both Hermes watchdogs AND detects hang-ups early — T4.90 candidate); keep sessions under ~60k tokens so boundary snapshots fit the cap. Squelch itself works (headless-verified: load, play, MIDI, MP3) and is served read-only at :9121.
 - **2026-09-08 T4.90 stream heartbeat (integration/t6):** Artur: "Feel free to apply the fixes". (1) Hermes config: `compression.context_timeout_seconds: 1800` + `context_total_ceiling_seconds: 7200` (top-level `compression:` block; read fresh per attempt, no gateway restart; backup `config.yaml.bak-20260908-1015-compaction-watchdog`). (2) `Handler.stream_json` override: a helper thread writes an empty-delta chunk (with the reply's template keys) every `KEEPALIVE_SEC` (default 30, 0 = off) while the generator is silent; Hermes stamps liveness for ANY accepted chunk (`_accept_chat_chunk` → `last_chunk_time`), so its 2 h stream watchdog stays quiet through any prefill; a failed heartbeat write marks the client gone and the generator is closed at its next yield (no more orphan generations; the in-progress prefill still runs to its end). Generator stays on the request thread (T4.84). 52 pass in test_llm_server.py. Deploy: idle-gated restart (last request complete + 15 min quiet) so a running Hermes turn is not cut.
+- **2026-09-09 session read (docs only) — four learnings from the 27B Telegram session 20260908_095553 (163 msgs, 83 API calls, 74k output tokens):** the 14:13 turn took 10.2 h for five bug fixes: one 16,937-token think block (~2 h of decode; the 16384 medium budget did not fire, so that chat runs at high/xhigh — the override lives only in the gateway's memory; T4.91 is the lever), three full re-prefills of 46-48k tokens (~2.3 h; T4.96), ~38k tokens of hidden duplicate prefill (~49 min; T4.95), and one compaction that now completes (8 min, 102→97 messages, 100.5k→25.4k real tokens — the T4.90 watchdog change validated) plus its 25-min re-prefill. Speeds at 50-98k context with thinking: prefill 12-14 tok/s incremental, 17 tok/s for a 47k cold prefill, decode 2-3 tok/s; the heartbeat held (no stream drops since the 09-08 restart). Loop breaker fired 3× (T4.97). Hermes's empty-response recovery is a synthetic user message, which strips the turn's reasoning → a full re-prefill (22:07). No code changed; T4.95-T4.97 drafted with one-line fixes.
