@@ -170,7 +170,24 @@ def template_kwargs(body:dict) -> dict:
 # repeated 11x). DEFAULT_TEMPERATURE (env, default 0 = byte-identical to before) is what an omitted temperature means; the
 # standing recipe sets 0.6 (Qwen's thinking-mode recommendation). An explicit temperature in the request always wins.
 DEFAULT_TEMPERATURE = getenv("DEFAULT_TEMPERATURE", 0.0)
-def request_temperature(body:dict) -> float: return float(body.get("temperature", DEFAULT_TEMPERATURE))
+# T4.92: Qwen's model card recommends DIFFERENT samplers per mode (thinking: temperature 1.0/top-p 0.95; non-thinking:
+# temperature 0.7/top-p 0.8) -- one DEFAULT_TEMPERATURE for both modes was always a compromise. DEFAULT_TEMPERATURE_THINK
+# (env, default: falls back to DEFAULT_TEMPERATURE -- so a server that never sets it keeps today's single-default
+# behavior, byte-identical) is what an omitted temperature means for a THINKING request only; a non-thinking request keeps
+# meaning DEFAULT_TEMPERATURE, same as before T4.92. An explicit request temperature always wins, in either mode.
+DEFAULT_TEMPERATURE_THINK = getenv("DEFAULT_TEMPERATURE_THINK", DEFAULT_TEMPERATURE)
+def request_temperature(body:dict, thinking:bool) -> float:
+  return float(body.get("temperature", DEFAULT_TEMPERATURE_THINK if thinking else DEFAULT_TEMPERATURE))
+
+# T4.92: Qwen's model card also recommends presence_penalty=1.5 in non-thinking mode ("to reduce endless repetitions"; thinking
+# mode wants 0 -- penalizing reused reasoning vocabulary mid-thought would fight the model's own working-through-it style).
+# PRESENCE_PENALTY (env, default 0 = byte-identical to before this existed -- see model.py's Transformer.generate) is what a
+# non-thinking request gets when it sends no presence_penalty of its own; a thinking request never gets the env default. A
+# request's own `presence_penalty` always wins in EITHER mode (0 explicitly disables it, same as omitting it in non-thinking).
+PRESENCE_PENALTY = getenv("PRESENCE_PENALTY", 0.0)
+def request_presence_penalty(body:dict, thinking:bool) -> float:
+  if "presence_penalty" in body: return float(body["presence_penalty"])
+  return 0.0 if thinking else PRESENCE_PENALTY
 
 # T4.88: thinking budget. Qwen's thinking mode overthinks (2026-09-07: 45k reasoning tokens, 4 h, for one turn); Qwen's own
 # recipe is to cap the think block and force it closed with a short "answer now" sentence, then let the model continue from
@@ -340,7 +357,8 @@ class Handler(HTTPRequestHandler):
       self.send_data(json.dumps(payload).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0):
+                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0,
+                presence_penalty:float=0.0):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -378,6 +396,9 @@ class Handler(HTTPRequestHandler):
     # byte-identical to before --mtp existed. speculative_generate(temperature=temperature) already picks
     # its own greedy (temperature<=0) vs sampled (>0) path internally, so no extra branching is needed here.
     # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
+    # T4.92: presence_penalty is plumbed to the plain generate() path only -- speculative_generate's accept/resample math
+    # (Leviathan et al., see model.py's spec_accept) has its own correctness proof that a logit bias would need to thread
+    # through carefully, out of scope here, so a --mtp request never applies one (T4.92's own task note).
     use_spec = self.server.mtp and model.mtp_head is not None and vision is None
     # T4.95: list(ids), not ids -- generate()/speculative_generate() append every token they yield straight into
     # the list they're given (model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). `ids` here is the SAME
@@ -386,8 +407,9 @@ class Handler(HTTPRequestHandler):
     # resumed prompt (doubling everything generated before the nudge/budget hit). A copy keeps `ids` the pure
     # prompt for the rest of this function; cli.py's generate() callers still rely on the mutation and are untouched.
     gen = model.speculative_generate(list(ids), k=self.server.spec_k, temperature=temperature) if use_spec \
-      else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision)  # T5.5: image requests are greedy --
-      # only the greedy vision jit family is warmed (each extra prefill family costs ~0.78 GB on the 3090, see model.VISION_CHUNK)
+      else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
+      # T5.5: image requests are greedy -- only the greedy vision jit family is warmed (each extra prefill family costs
+      # ~0.78 GB on the 3090, see model.VISION_CHUNK)
     try:
       yield chunk({"role":"assistant", "content":""})
       it = iter(gen)
@@ -401,7 +423,9 @@ class Handler(HTTPRequestHandler):
           for field, delta in router.route(dec(t)):
             if slog is not None: slog.write(field, delta)
             yield chunk({field:delta})
-        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision)
+        # T4.92: presence_penalty carries over -- generate() resets its own mask per call, so without this an active
+        # penalty would silently vanish for the rest of the response after a loop-breaker/think-budget injection.
+        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
         it = iter(gen)
       loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS and not use_spec else None), 0
       while (next_id := next(it, None)) is not None:
@@ -515,10 +539,11 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      thinking = rendered.rstrip().endswith("<think>")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=request_temperature(body),
-                              reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input,
-                              think_budget=thinking_budget(body))
+                              max_tokens=max_tokens, temperature=request_temperature(body, thinking),
+                              reasoning=thinking, record=record, vision=vision_input, think_budget=thinking_budget(body),
+                              presence_penalty=request_presence_penalty(body, thinking))
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"

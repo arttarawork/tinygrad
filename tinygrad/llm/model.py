@@ -1307,7 +1307,8 @@ class Transformer:
     self.jit: dict[tuple, Callable[..., Tensor|tuple[Tensor, ...]]] = {}
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
-              vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
+              vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
+              presence_penalty:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
     # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
@@ -1366,12 +1367,19 @@ class Transformer:
       return self.output(self.output_norm(x)), x.contiguous()  # (B,T,vocab) logits, (B,T,D) hidden
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    # T4.92: presence penalty -- self.penalty_mask is a (1,vocab) 0/1 buffer, reset in place at the start of generate() and
+    # updated in its eager decode loop (never inside this jit'd graph -- see generate()'s own comment); a plain READ here is
+    # exactly like reading cache_kv, no AFTER-chaining needed. presence_penalty is a Tensor (not a python float), same reason
+    # temperature is: its MAGNITUDE can then vary across replays of this same captured graph -- only "is it None" (part of
+    # __call__'s jit key) may ever change which graph gets captured. None (every pre-T4.92 caller) skips this entirely.
+    if presence_penalty is not None: logits = logits - self.penalty_mask.to(logits.device) * presence_penalty.to(logits.device)
     # greedy (temperature is None): plain argmax, no RNG kernels
     if temperature is None: return logits.argmax(-1, keepdim=True)
     return sample_logits(logits, temperature.to(logits.device), MIN_P)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
-               vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
+               vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
+               presence_penalty:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
     is_prefill = bool(resolve(tokens.shape[1] != 1))
     # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
     # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
@@ -1383,14 +1391,18 @@ class Transformer:
     # T5.3: `vision` joins the key too -- an image request's prompt chunks carry three extra input tensors and its decode steps a second
     # bound Variable (rope_start), so its captures can never replay a text capture or vice versa; text requests pass neither and keep
     # their pre-T5.3 keys and graphs untouched.
+    # T4.92: `presence_penalty` (is not None) joins vision in one (vision_on, penalty_on) pair, appended only when at least one is
+    # active -- plain text/no-penalty keys stay the pre-T5.3 4-tuples. The two flags must stay POSITIONAL together, never each its
+    # own independently-omitted single-True marker: omitting either on its own collapses "vision only" and "penalty only" onto the
+    # identical (...,True) key, so a penalty-only decode step would replay a vision capture (wrong inputs) or vice versa.
     chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
-    vision = (True,) if rope_start is not None or vis_e is not None else ()  # text keys stay the pre-T5.3 4-tuples
-    key = (is_prefill, temperature is None, chunk_size, spec) + vision
+    vision_on, penalty_on = rope_start is not None or vis_e is not None, presence_penalty is not None
+    key = (is_prefill, temperature is None, chunk_size, spec) + ((vision_on, penalty_on) if vision_on or penalty_on else ())
     if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
       mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
       print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
     return self.jit.setdefault(key, TinyJit(self.forward))(
-      tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos)
+      tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos, presence_penalty)
 
   def realize_placement(self):
     """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --
@@ -1703,13 +1715,18 @@ class Transformer:
     self._cached_tokens = list(snap["tokens"])
     self._rope_delta = snap.get("rope_delta", 0)  # T5.3 (pre-T5.3 snapshots: text only, 0)
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1, vision:VisionInput|None=None):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1, vision:VisionInput|None=None,
+               presence_penalty:float=0.0):
     """vision (T5.3): the prompt's images -- see VisionInput. None (every pre-T5.3 caller) is the byte-identical text path.
     drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
     syncing every sampled token. drain_every=1 (default) is byte-identical to the pre-T2.5 behavior -- every
     generate()-caller and test that assumes one .item()/next() per decode step keeps working unchanged. Pass
     drain_every=2..4 from a real serving loop to amortize the sync (streaming still yields one token at a time,
-    just in bursts -- see the NOTE below the drain block for EOS handling)."""
+    just in bursts -- see the NOTE below the drain block for EOS handling).
+    presence_penalty (T4.92, OpenAI-style, binary presence not frequency): <=0 (the default) is byte-identical to before this
+    existed -- no buffer allocated, no extra op anywhere. >0 subtracts `presence_penalty` from the logit of every token id
+    already emitted BY THIS generate() CALL (never the prompt, never a previous call -- see self.penalty_mask's reset below
+    and forward()'s own comment for the read side) before the greedy/sampled decision, every step."""
     # T4.6: a prompt that already fills (or overflows) max_context has zero room to generate into. Without this,
     # `while virtual_len < self.max_context` below never runs and this silently yields nothing (len==max_context),
     # or the `t = Tensor(...).reshape(1, self.max_context)` a few lines down throws an opaque shape-mismatch
@@ -1730,6 +1747,16 @@ class Transformer:
     # TODO: use UOp.variable for temperature once float variables are supported
     # create helper tensors on the block devices that consume them, so device_map'd models don't replay a cross-device copy every step
     temp = Tensor([temperature], device=self.blk[-1].device) if temperature > 0 else None
+    # T4.92: penalty_mask must be reset IN PLACE, never reassigned -- a jit family already captured with presence_penalty active
+    # baked in a read of THIS buffer object; reassigning self.penalty_mask here would silently detach every future replay of
+    # that graph from the reset (same reasoning as T4.66i's in-place MTP cache-reset, see its comment). hasattr guards the
+    # very first call ever (nothing to reset yet); `.clone()` on the fresh zeros matches conv_state/recurrent_state's own
+    # init idiom (_init_state above) for the same reason -- a bare Tensor.zeros() is a broadcast view, not an assignable buffer.
+    penalty = Tensor([presence_penalty], device=self.blk[-1].device) if presence_penalty > 0 else None
+    if penalty is not None:
+      if not hasattr(self, "penalty_mask"):
+        self.penalty_mask = Tensor.zeros(1, self.token_embd.weight.shape[0], dtype=dtypes.float32, device=self.blk[-1].device).clone()
+      else: self.penalty_mask.assign(Tensor.zeros_like(self.penalty_mask)).realize()
     # assign all input tokens once, then slice from start_pos for the model call
     t = Tensor(tokens + [0] * (self.max_context - len(tokens)), dtype="int32", device=self.blk[0].device).reshape(1, self.max_context)
     # recompute start_pos from what's currently valid in the caches
@@ -1762,11 +1789,12 @@ class Transformer:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
-      if plan is None: out = cast(Tensor, self(inp, sp, temp)).realize()
+      if plan is None: out = cast(Tensor, self(inp, sp, temp, presence_penalty=penalty)).realize()
       elif start_pos < prompt_len:
         e, m, p3 = plan.chunk(start_pos, n_toks)
-        out = cast(Tensor, self(inp, sp, temp, vis_e=e, vis_m=m, vis_pos=p3)).realize()
-      else: out = cast(Tensor, self(inp, sp, temp, rope_start=v_rope_start.bind(start_pos - plan.delta))).realize()
+        out = cast(Tensor, self(inp, sp, temp, vis_e=e, vis_m=m, vis_pos=p3, presence_penalty=penalty)).realize()
+      else:
+        out = cast(Tensor, self(inp, sp, temp, rope_start=v_rope_start.bind(start_pos - plan.delta), presence_penalty=penalty)).realize()
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < virtual_len: continue
@@ -1779,6 +1807,12 @@ class Transformer:
       # snapshot needed there, so this stays a pre-T2.5-identical zero-extra-op path.
       elif drain_every > 1: out = out.clone().realize()
       pending.append(out)
+      # T4.92: mark this token in the presence mask -- reached only for an actually-generated token (the `continue` above
+      # skips every still-consuming-the-prompt step, so prompt tokens never enter the mask). In-place assign, device-side,
+      # no host round-trip (out is never .item()'d here) -- see forward()'s read side and the reset comment above.
+      if penalty is not None:
+        onehot = out.to(self.penalty_mask.device).reshape(1).one_hot(int(self.penalty_mask.shape[1])).cast(self.penalty_mask.dtype)
+        self.penalty_mask.assign(self.penalty_mask.maximum(onehot)).realize()
       virtual_len += 1
       # drain once the batch fills, or generation is about to stop (don't strand tokens on-device)
       if len(pending) >= drain_every or virtual_len >= self.max_context:
