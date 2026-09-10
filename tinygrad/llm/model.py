@@ -1241,6 +1241,13 @@ def sample_logits(logits:Tensor, temperature:Tensor, min_p:float=0.0) -> Tensor:
     scaled = (probs >= probs.max(-1, keepdim=True) * min_p).where(scaled, float("-inf"))
   return (scaled - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
+# T4.99: the device snapshot_state's clones are parked on. "" (default) leaves them on the live buffers' own
+# device, byte-identical to pre-T4.99; e.g. "CPU" frees the pooled map's device memory for weights/KV and uses
+# host RAM instead (restore_state copies each one back to its live buffer's device before the assign, see there).
+# On the pooled map the METAL share IS host memory already, so keep STATE_CACHE_MB modest (2048) there too --
+# only an all-on-card layout (every block on one discrete GPU) has host RAM to spare for a much bigger cap.
+STATE_CACHE_DEVICE = getenv("STATE_CACHE_DEVICE", "")
+
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     # T4.70b: FFN tensor-parallel spec, parsed from device_map's optional "tp:" segment (see parse_tp_spec)
@@ -1655,7 +1662,9 @@ class Transformer:
   # swap one back in when a new request's ids exactly extend it, instead of re-prefilling a byte-identical shared
   # prefix (e.g. a system prompt) from scratch just because the live cache currently holds some OTHER session's
   # state. Device-side only (Tensor.clone/.assign, one batched realize each, same idiom as speculative_generate's
-  # own GDN CHECKPOINT) -- no host round-trip for cache contents, only for the tiny token-id list.
+  # own GDN CHECKPOINT) -- no host round-trip for cache contents, only for the tiny token-id list. T4.99: unless
+  # STATE_CACHE_DEVICE names a different device (e.g. "CPU"), in which case the clones DO round-trip through it
+  # (restore_state copies each one back to its live buffer's device -- which never moves -- before the assign).
   def snapshot_state(self) -> dict:
     """Snapshot this model's complete sequence state at its current token boundary (len(self._cached_tokens)):
     every GDN block's conv_state/recurrent_state (whole tensors -- O(1) accumulators, not position-indexed) and
@@ -1669,21 +1678,22 @@ class Transformer:
     never correctness -- a wrong draft costs iterations, not tokens; the one slot the restored request still cannot
     fill is `pos` itself, step pos-1, whose hidden state is not recomputed on a cache hit)."""
     pos = len(self._cached_tokens)
+    dev = STATE_CACHE_DEVICE or None  # T4.99: None here means "clone stays on its source's own device" (see Tensor.clone)
     blocks: list[dict] = []
     for b in self.blk:
-      if isinstance(b, GatedDeltaNetBlock): blocks.append({"conv_state": b.conv_state.clone(), "recurrent_state": b.recurrent_state.clone()})
-      elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone()})
+      if isinstance(b, GatedDeltaNetBlock): blocks.append({"conv_state": b.conv_state.clone(dev), "recurrent_state": b.recurrent_state.clone(dev)})
+      elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone(dev)})
       elif isinstance(b, TransformerBlock):
-        bs: dict = {"cache_kv": b.cache_kv[:, :, :, :pos, :].clone()}
-        if hasattr(b, "cache_kv_scale"): bs["cache_kv_scale"] = b.cache_kv_scale[:, :, :, :pos, :].clone()  # T6.1 KV_INT8
+        bs: dict = {"cache_kv": b.cache_kv[:, :, :, :pos, :].clone(dev)}
+        if hasattr(b, "cache_kv_scale"): bs["cache_kv_scale"] = b.cache_kv_scale[:, :, :, :pos, :].clone(dev)  # T6.1 KV_INT8
         blocks.append(bs)
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
     snap: dict = {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks, "rope_delta": self._rope_delta}
     # ponytail: TransformerBlock-shaped MTP block only (every nextn head this fork loads); an MLA-shaped one would need its cache_k here.
     if self.mtp_head is not None and isinstance(self.mtp_head.block, TransformerBlock) and hasattr(self.mtp_head.block, "cache_kv"):
-      snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone()
+      snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone(dev)
       if hasattr(self.mtp_head.block, "cache_kv_scale"):  # T6.1 KV_INT8
-        snap["mtp_cache_kv_scale"] = self.mtp_head.block.cache_kv_scale[:, :, :, :pos, :].clone()
+        snap["mtp_cache_kv_scale"] = self.mtp_head.block.cache_kv_scale[:, :, :, :pos, :].clone(dev)
     Tensor.realize(*(t for bs in blocks for t in bs.values()), *(snap[key] for key in ("mtp_cache_kv", "mtp_cache_kv_scale") if key in snap))
     return snap
 
@@ -1695,22 +1705,26 @@ class Transformer:
     TOKEN-IDENTICAL to an uncached run over the same full token sequence. Pure mechanical apply, no validation:
     the caller must only call this when snap is actually safe to apply (see snapshot_matches) -- restoring a
     snapshot whose tokens are NOT an exact prefix of what comes next would silently produce wrong output, same
-    as get_start_pos's own recurrent-reuse rule would if a caller bypassed it."""
+    as get_start_pos's own recurrent-reuse rule would if a caller bypassed it. T4.99: each buffer is `.to()`d onto
+    its LIVE counterpart's device first (a no-op when snapshot_state left it there already, i.e. STATE_CACHE_DEVICE
+    unset) -- the live caches themselves never move, only where snapshot_state parked the clone."""
     assert len(snap["blocks"]) == len(self.blk), "restore_state: snapshot block count doesn't match this model"
     assigns: list[Tensor] = []
     for b, bs in zip(self.blk, snap["blocks"]):
-      if isinstance(b, GatedDeltaNetBlock): assigns += [b.conv_state.assign(bs["conv_state"]), b.recurrent_state.assign(bs["recurrent_state"])]
-      elif isinstance(b, MLATransformerBlock): assigns.append(b.cache_k[:, :, :bs["cache_k"].shape[2], :].assign(bs["cache_k"]))
+      if isinstance(b, GatedDeltaNetBlock):
+        assigns.append(b.conv_state.assign(bs["conv_state"].to(b.conv_state.device)))
+        assigns.append(b.recurrent_state.assign(bs["recurrent_state"].to(b.recurrent_state.device)))
+      elif isinstance(b, MLATransformerBlock): assigns.append(b.cache_k[:, :, :bs["cache_k"].shape[2], :].assign(bs["cache_k"].to(b.cache_k.device)))
       elif isinstance(b, TransformerBlock):
-        assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"]))
+        assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"].to(b.cache_kv.device)))
         if (bscale := bs.get("cache_kv_scale")) is not None:  # T6.1 KV_INT8
-          assigns.append(b.cache_kv_scale[:, :, :, :bscale.shape[3], :].assign(bscale))
+          assigns.append(b.cache_kv_scale[:, :, :, :bscale.shape[3], :].assign(bscale.to(b.cache_kv_scale.device)))
       else: raise TypeError(f"restore_state: unhandled block type {type(b).__name__}")
     if (mk := snap.get("mtp_cache_kv")) is not None and self.mtp_head is not None:  # T4.66l -- see snapshot_state
       mtp_block = cast(TransformerBlock, self.mtp_head.block)
-      assigns.append(mtp_block.cache_kv[:, :, :, :mk.shape[3], :].assign(mk))
+      assigns.append(mtp_block.cache_kv[:, :, :, :mk.shape[3], :].assign(mk.to(mtp_block.cache_kv.device)))
       if (mks := snap.get("mtp_cache_kv_scale")) is not None:  # T6.1 KV_INT8
-        assigns.append(mtp_block.cache_kv_scale[:, :, :, :mks.shape[3], :].assign(mks))
+        assigns.append(mtp_block.cache_kv_scale[:, :, :, :mks.shape[3], :].assign(mks.to(mtp_block.cache_kv_scale.device)))
     Tensor.realize(*assigns)
     self._cached_tokens = list(snap["tokens"])
     self._rope_delta = snap.get("rope_delta", 0)  # T5.3 (pre-T5.3 snapshots: text only, 0)
