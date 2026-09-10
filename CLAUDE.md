@@ -28,7 +28,7 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off fork `master` = **`2d38cada5`** (the PR #26 merge, 2026-09-01 — #25 WPR ceiling + #26 forensics in: the FULL chain is on master — UD quants, scan harness+split, MTP load, greedy+sampled speculative decode, --mtp serve, head-group scan split, WY scan+decode gate, draft-pos Variable, state cache, chunk-64 coverage, FFN TP, CI test-cost fix. No open PRs; WY/state-cache/MTP ship OFF by default pending T4.73/T4.74.)
+- Branch `task/T<id>-<slug>` off fork `master` = **`43ac66739`** (the PR #43 merge, 2026-09-10 — master is content-identical to the serving tree `integration/t6` 4c6b6a954: everything through T4.92/T4.95-97 and the T6.x chain is on master; earlier bases 2d38cada5 (#26, 09-01) and older apply only to their era's branches. No open PRs; task/T4.93-kquant-stage is the one unmerged code branch.)
   `integration/phase1b`
   RETIRED; dock trees = master or a descendant — plus `task/T4.40c-halt-verify` once hardware-verified. There is no local `master`, and **`origin/*` tracking refs are STALE by construction** (SSH `origin`
   is interactive-only; agents fetch/push via the explicit HTTPS URL `https://github.com/arttarawork/tinygrad.git`,
