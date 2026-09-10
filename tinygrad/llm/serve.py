@@ -1,11 +1,11 @@
 from __future__ import annotations
-import collections, json, os, pathlib, re, time, typing, uuid
+import collections, json, os, pathlib, re, threading, time, typing, uuid
 from typing import TYPE_CHECKING
 from tinygrad import Tensor
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.llm.image import DEFAULT_MAX_PIXELS, hash_ids, image_hash, n_visual_tokens, preprocess
 from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes, snapshot_nbytes_for
-from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
+from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler, filter_keys
 if TYPE_CHECKING:
   import numpy as np
   from tinygrad.llm.cli import SimpleTokenizer
@@ -142,11 +142,27 @@ def lmstudio_models_payload(model_name:str, max_context:int, vision:bool = False
                       "capabilities": capabilities,
                       "loaded_instances": [{"id":model_name, "config": {"context_length":max_context}}]}]}
 
+# T4.91: EFFORT_LEVELS maps a client's reasoning_effort (LM Studio vocabulary; max/ultra are informal xhigh aliases) to the
+# value the Qwen3.8 template itself accepts (low/medium/xhigh only -- it raises otherwise) and to a THINK_BUDGET multiplier;
+# high and xhigh both render as the template's "xhigh" but keep different budgets (4x vs unlimited). Shared by template_kwargs
+# and thinking_budget below so the two cannot drift.
+EFFORT_LEVELS: dict[str, tuple[str, float]] = {
+  "minimal": ("low", 0.125), "low": ("low", 0.25), "medium": ("medium", 1.0),
+  "high": ("xhigh", 4.0), "xhigh": ("xhigh", 0.0), "max": ("xhigh", 0.0), "ultra": ("xhigh", 0.0),
+}
+
 def template_kwargs(body:dict) -> dict:
-  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level
-  # reasoning_effort (LM Studio's /reasoning knob) overrides enable_thinking when present -- see T4.80.
+  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level reasoning_effort
+  # (LM Studio's /reasoning knob) overrides enable_thinking when present and, only while thinking stays on, is mapped through
+  # EFFORT_LEVELS to the template's own reasoning_effort value (an explicit chat_template_kwargs.reasoning_effort still wins;
+  # passing the variable to a template that ignores it is harmless -- jinja just never reads it). NOTE: the level's instruction
+  # text sits at the very front of the rendered prompt, so changing it mid-conversation breaks splice_ids's prefix match and the
+  # next turn re-prefills from scratch -- expected. See T4.80/T4.91.
   kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
-  if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
+  if isinstance(effort := body.get("reasoning_effort"), str):
+    e = effort.strip().lower()
+    kwargs["enable_thinking"] = e not in ("none", "off")
+    if kwargs["enable_thinking"]: kwargs.setdefault("reasoning_effort", EFFORT_LEVELS.get(e, ("medium", 1.0))[0])
   return kwargs
 
 # T4.85: Hermes (and most agent clients) send no `temperature`; an absent value used to mean 0 = greedy decoding, and Qwen's
@@ -154,7 +170,58 @@ def template_kwargs(body:dict) -> dict:
 # repeated 11x). DEFAULT_TEMPERATURE (env, default 0 = byte-identical to before) is what an omitted temperature means; the
 # standing recipe sets 0.6 (Qwen's thinking-mode recommendation). An explicit temperature in the request always wins.
 DEFAULT_TEMPERATURE = getenv("DEFAULT_TEMPERATURE", 0.0)
-def request_temperature(body:dict) -> float: return float(body.get("temperature", DEFAULT_TEMPERATURE))
+# T4.92: Qwen's model card recommends DIFFERENT samplers per mode (thinking: temperature 1.0/top-p 0.95; non-thinking:
+# temperature 0.7/top-p 0.8) -- one DEFAULT_TEMPERATURE for both modes was always a compromise. DEFAULT_TEMPERATURE_THINK
+# (env, default: falls back to DEFAULT_TEMPERATURE -- so a server that never sets it keeps today's single-default
+# behavior, byte-identical) is what an omitted temperature means for a THINKING request only; a non-thinking request keeps
+# meaning DEFAULT_TEMPERATURE, same as before T4.92. An explicit request temperature always wins, in either mode.
+DEFAULT_TEMPERATURE_THINK = getenv("DEFAULT_TEMPERATURE_THINK", DEFAULT_TEMPERATURE)
+def request_temperature(body:dict, thinking:bool) -> float:
+  return float(body.get("temperature", DEFAULT_TEMPERATURE_THINK if thinking else DEFAULT_TEMPERATURE))
+
+# T4.92: Qwen's model card also recommends presence_penalty=1.5 in non-thinking mode ("to reduce endless repetitions"; thinking
+# mode wants 0 -- penalizing reused reasoning vocabulary mid-thought would fight the model's own working-through-it style).
+# PRESENCE_PENALTY (env, default 0 = byte-identical to before this existed -- see model.py's Transformer.generate) is what a
+# non-thinking request gets when it sends no presence_penalty of its own; a thinking request never gets the env default. A
+# request's own `presence_penalty` always wins in EITHER mode (0 explicitly disables it, same as omitting it in non-thinking).
+PRESENCE_PENALTY = getenv("PRESENCE_PENALTY", 0.0)
+def request_presence_penalty(body:dict, thinking:bool) -> float:
+  if "presence_penalty" in body: return float(body["presence_penalty"])
+  return 0.0 if thinking else PRESENCE_PENALTY
+
+# T4.88: thinking budget. Qwen's thinking mode overthinks (2026-09-07: 45k reasoning tokens, 4 h, for one turn); Qwen's own
+# recipe is to cap the think block and force it closed with a short "answer now" sentence, then let the model continue from
+# its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; EFFORT_LEVELS (T4.91)
+# scales it per level. The plain generate() path only (MTP's speculative loop is not spliced).
+THINK_BUDGET = getenv("THINK_BUDGET", 0)
+THINK_CLOSE = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+def thinking_budget(body:dict) -> int:
+  if not THINK_BUDGET: return 0
+  factor = EFFORT_LEVELS.get(str(body.get("reasoning_effort", "medium")).strip().lower(), ("medium", 1.0))[1]
+  return int(THINK_BUDGET * factor)
+
+# T4.89: reasoning loop breaker. The 2026-09-07 captures show Qwen's "anxious" thinking is literal sentence cycles (one 44k-char
+# think block said "actually, the simplest is: keep two files, zip them." 11 times, oscillating with the other option), not long
+# productive thinking. When a sentence of >=6 words recurs LOOP_REPEATS times inside the think block the server injects a decisive
+# sentence in the model's own voice and continues; after LOOP_NUDGES nudges it closes the think block (THINK_CLOSE). LOOP_REPEATS=0 disables.
+LOOP_REPEATS, LOOP_NUDGES = getenv("LOOP_REPEATS", 3), getenv("LOOP_NUDGES", 3)
+LOOP_NUDGE = ("\n\nI notice I've been going back and forth over the same point. It's settled: I'll go with the approach I already have, "
+              "stop re-checking it, and move on to the next step.\n\n")
+class LoopDetector:
+  """Counts normalized reasoning sentences (>=6 words) as they stream; feed() returns the sentence that just hit `repeats`, then resets."""
+  def __init__(self, repeats:int): self.repeats, self.buf, self.counts = repeats, "", collections.Counter[str]()
+  def feed(self, delta:str) -> str|None:
+    self.buf += delta
+    while (m := re.search(r"[.!?]\s|\n", self.buf)) is not None:
+      sent, self.buf = " ".join(self.buf[:m.end()].lower().split()), self.buf[m.end():]
+      # T4.97: skip code-ish sentences (assignment/statement/markup chars) -- legitimate repetition (iterating on a
+      # code line, an arithmetic checklist), not an anxious loop; prose sentences never carry these characters.
+      if len(sent.split()) < 6 or any(c in sent for c in "=;{}`") or "</" in sent: continue
+      self.counts[sent] += 1
+      if self.counts[sent] >= self.repeats:
+        self.buf, self.counts = "", collections.Counter()
+        return sent
+    return None
 
 class StreamLog:
   """T4.83: STREAM_LOG=<path> appends every request's streamed text as it is generated (reasoning and content, flushed per
@@ -176,7 +243,7 @@ class StreamLog:
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
-    self.buf = ""
+    self.buf, self.reasoning_text = "", ""  # reasoning_text: the think block so far (T4.97 end-of-stream promotion)
     self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
   def split(self, tag:str, final:bool) -> tuple[str, bool]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
@@ -193,8 +260,17 @@ class StreamRouter:
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
     if self.mode == "reasoning":
       emit, done = self.split("</think>", final)
-      if emit: yield "reasoning_content", emit
-      if not done: return
+      if emit:
+        self.reasoning_text += emit
+        yield "reasoning_content", emit
+      if not done:
+        # T4.97: a model that ENDS its output inside the think block with a complete tool call in it (2026-09-08: Qwen3.8 wrote the
+        # call after a nudge and never wrote </think>, the client saw an empty reply) meant that call: promote it at end of stream so
+        # run_model's final parse finds it. A tool call inside a think block that does close stays reasoning -- the model was thinking
+        # about a call, not making it (test/null/test_llm_server.py::test_tool_call_in_reasoning_is_not_executed).
+        if final and (i := self.reasoning_text.find("<tool_call>")) != -1 and "</tool_call>" in self.reasoning_text[i:]:
+          self.mode, self.buf = "tool", self.reasoning_text[i:]
+        return
       self.mode = "content"
     if self.mode == "tool": return
     emit, found = self.split("<tool_call>", final)
@@ -219,7 +295,53 @@ def splice_ids(last:tuple[str, list[int], int, list[int]], rendered:str, message
   if not ends or (idx := max(turn.rfind(e) for e in ends)) < 0: return None
   return prev_ids + gen + tok.encode(turn[idx:] + rendered[len(upto):])
 
+# T4.90: heartbeat period (s) for streamed replies; 0 disables. The 2026-09-08 session loss started with Hermes's stream
+# watchdog dropping a request during a 2 h prefill silence and the server not noticing the hang-up until its first token.
+KEEPALIVE_SEC = getenv("KEEPALIVE_SEC", 30)
+
 class Handler(HTTPRequestHandler):
+  def stream_json(self, source):
+    """viz's stream_json plus a heartbeat: while the generator is silent (prefill, a buffered tool call) a helper thread
+    writes an empty-delta chunk every KEEPALIVE_SEC, so clients' stale-stream watchdogs stay quiet and a hung-up client
+    is noticed within ~KEEPALIVE_SEC instead of at the first real token (generation then stops). The generator itself
+    stays on this thread -- METAL objects must (T4.84); the helper only touches the socket."""
+    if not KEEPALIVE_SEC: return super().stream_json(source)
+    lock, st = threading.Lock(), typing.cast(dict[str, typing.Any], {"last": time.monotonic(), "done": False, "gone": False, "tmpl": None})
+    def write(d:dict):
+      self.wfile.write(f"data: {json.dumps(filter_keys(d))}\n\n".encode("utf-8"))
+      self.wfile.flush()
+      st["last"] = time.monotonic()
+    def beat():
+      while not st["done"]:
+        time.sleep(min(1.0, KEEPALIVE_SEC))
+        if st["done"] or st["tmpl"] is None or time.monotonic() - st["last"] < KEEPALIVE_SEC: continue
+        with lock:
+          if st["done"]: break
+          try: write({**st["tmpl"], "choices": [{"index":0, "delta":{}, "finish_reason":None}]})
+          except OSError:
+            st["gone"] = True
+            break
+    t = threading.Thread(target=beat, daemon=True)
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      t.start()
+      for r in source:
+        if st["gone"]: break
+        with lock: write(r)
+        if st["tmpl"] is None: st["tmpl"] = {k:v for k, v in r.items() if k != "choices"}
+      if not st["gone"]:
+        with lock:
+          self.wfile.write("data: [DONE]\n\n".encode("utf-8"))
+          self.wfile.flush()
+    except (BrokenPipeError, ConnectionResetError): pass
+    finally:
+      st["done"] = True
+      source.close()
+      if t.is_alive(): t.join(timeout=2)
+
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
   def do_GET(self):
@@ -229,17 +351,23 @@ class Handler(HTTPRequestHandler):
       self.send_data(json.dumps(payload).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None):
+                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0,
+                presence_penalty:float=0.0):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
+    # T4.96: true iff the live cache did NOT extend (cold, or about to resume from a snapshot below) -- only a
+    # boundary request's snapshot is pinned when stored after prefill (below); a tool-loop step's is second tier.
+    boundary = cache_start_pos == 0
     # T4.67: (a) the splice/live-cache path above found nothing to reuse -- before falling back to a fully cold
     # prefill (c), try the cross-session state cache (b): the longest snapshot whose ids exactly prefix this
     # request's. Skipped entirely when the cache is off (state_cache_mb<=0), so snapshot_state/restore_state are
     # then never called -- byte-identical to pre-T4.67 behavior.
-    if cache_start_pos == 0 and self.server.state_cache_mb > 0 and (snap := self.server.find_snapshot(ids)) is not None:
+    if boundary and self.server.state_cache_mb > 0 and (snap := self.server.find_snapshot(ids)) is not None:
       model.restore_state(snap)
       cache_start_pos = model.get_start_pos(ids)
+      del snap  # T4.96: this generator frame outlives the yield below -- an undeleted ref here kept the snapshot's
+                # device buffers allocated through store_snapshot's own allocation later in this request (OOM)
     # T5.4: " img:{images}/{visual tokens}" after the in: field, only when this request actually carries images.
     img_field = f" img:{len(vision.spans)}/{sum(n for _, n, _ in vision.spans)}" if vision is not None and vision.spans else ""
     stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}{img_field}  {colored('--', 'BLACK')}  ")
@@ -262,26 +390,65 @@ class Handler(HTTPRequestHandler):
     # byte-identical to before --mtp existed. speculative_generate(temperature=temperature) already picks
     # its own greedy (temperature<=0) vs sampled (>0) path internally, so no extra branching is needed here.
     # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
+    # T4.92: presence_penalty is plumbed to the plain generate() path only -- speculative_generate's accept/resample math
+    # (Leviathan et al., see model.py's spec_accept) has its own correctness proof that a logit bias would need to thread
+    # through carefully, out of scope here, so a --mtp request never applies one (T4.92's own task note).
     use_spec = self.server.mtp and model.mtp_head is not None and vision is None
-    gen = model.speculative_generate(ids, k=self.server.spec_k, temperature=temperature) if use_spec \
-      else model.generate(ids, temperature=0.0 if vision is not None else temperature, vision=vision)  # T5.5: image requests are greedy --
-      # only the greedy vision jit family is warmed (each extra prefill family costs ~0.78 GB on the 3090, see model.VISION_CHUNK)
+    # T4.95: list(ids), not ids -- generate()/speculative_generate() append every token they yield straight into
+    # the list they're given (model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). `ids` here is the SAME
+    # object as do_POST's `record`/self.server.last and inject()'s `ids + out` below, so an uncopied `ids` would
+    # let this turn's own output leak into next turn's splice_ids prev_ids (doubling it) and into inject()'s
+    # resumed prompt (doubling everything generated before the nudge/budget hit). A copy keeps `ids` the pure
+    # prompt for the rest of this function; cli.py's generate() callers still rely on the mutation and are untouched.
+    gen = model.speculative_generate(list(ids), k=self.server.spec_k, temperature=temperature) if use_spec \
+      else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
+      # T5.5: image requests are greedy -- only the greedy vision jit family is warmed (each extra prefill family costs
+      # ~0.78 GB on the 3090, see model.VISION_CHUNK)
     try:
       yield chunk({"role":"assistant", "content":""})
-      for next_id in gen:
+      it = iter(gen)
+      def inject(text:str):
+        # T4.88/T4.89: feed `text` as if the model wrote it, then continue the same request from ids+out (the live cached
+        # prefix -- only `text`'s few tokens prefill).
+        nonlocal gen, it
+        gen.close()
+        for t in tok.encode(text):
+          out.append(t)
+          for field, delta in router.route(dec(t)):
+            if slog is not None: slog.write(field, delta)
+            yield chunk({field:delta})
+        # T4.92: presence_penalty carries over -- generate() resets its own mask per call, so without this an active
+        # penalty would silently vanish for the rest of the response after a loop-breaker/think-budget injection.
+        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
+        it = iter(gen)
+      loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS and not use_spec else None), 0
+      while (next_id := next(it, None)) is not None:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
-          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
+          # T4.96: `boundary` (this request didn't extend the live cache) pins it; a tool-loop step's snapshot is second tier.
+          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None, boundary=boundary)
         if tok.is_end(next_id): break
         out.append(next_id)
+        hit = None
         for field, delta in router.route(dec(next_id)):
           if slog is not None: slog.write(field, delta)
           yield chunk({field:delta})
+          if loops is not None and field == "reasoning_content": hit = loops.feed(delta) or hit
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
+        if hit is not None and router.mode == "reasoning":
+          nudges += 1
+          msg = f"reasoning loop x{LOOP_REPEATS} ({hit[:48]!r}) -- nudge {nudges}/{LOOP_NUDGES}"
+          stderr_log(f"{colored(msg, 'yellow')}  {colored('--', 'BLACK')}  ")
+          yield from inject(LOOP_NUDGE if nudges <= LOOP_NUDGES else THINK_CLOSE)
+        elif think_budget and not use_spec and router.mode == "reasoning" and len(out) >= think_budget:
+          # T4.88: budget hit -- close the think block with Qwen's own "answer now" sentence. Once per request.
+          stderr_log(f"{colored(f'think budget {think_budget} hit -- closing the think block', 'yellow')}  {colored('--', 'BLACK')}  ")
+          yield from inject(THINK_CLOSE)
+          think_budget = 0
       for field, delta in router.route(dec(), final=True):
         if slog is not None: slog.write(field, delta)
         yield chunk({field:delta})
@@ -355,7 +522,8 @@ class Handler(HTTPRequestHandler):
         ids = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
           or self.server.tok.encode(rendered)
         record = (rendered, ids, len(body["messages"]))
-      think = f"think:{'on' if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  " if "enable_thinking" in kwargs else ""
+      think = (f"think:{kwargs.get('reasoning_effort', 'xhigh') if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  "
+               if "enable_thinking" in kwargs else "")
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  {think}")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
@@ -365,9 +533,11 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      thinking = rendered.rstrip().endswith("<think>")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=request_temperature(body),
-                              reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input)
+                              max_tokens=max_tokens, temperature=request_temperature(body, thinking),
+                              reasoning=thinking, record=record, vision=vision_input, think_budget=thinking_budget(body),
+                              presence_penalty=request_presence_penalty(body, thinking))
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"
@@ -424,10 +594,14 @@ class LLMServer(TCPServerWithReuse):
     self.snapshots.move_to_end(best_key)
     return self.snapshots[best_key]
 
-  def store_snapshot(self, ids:list[int], one_shot:bool=False) -> None:
+  def store_snapshot(self, ids:list[int], one_shot:bool=False, boundary:bool=True) -> None:
     """Snapshot self.model's current state -- assumed to have just finished prefilling exactly `ids` (see
     Handler.run_model) -- under key tuple(ids), LRU-evicting the oldest entries to stay under state_cache_mb
-    (always keeping at least the just-stored entry, even if it alone exceeds the cap)."""
+    (always keeping at least the just-stored entry, even if it alone exceeds the cap).
+    T4.96 two tiers: a `boundary` snapshot (the request did NOT extend the live cache -- a new session or a new user turn; the
+    one that bridges the next user message) is pinned: a tool-loop step's snapshot (boundary=False, only ever useful to a retry
+    of that exact prompt) is stored when it fits beside the pinned ones and is evicted first, but never displaces a boundary one;
+    a boundary snapshot evicts anything older."""
     # T5.7c (2026-09-06): image requests are one-shot auxiliary calls (screenshot analysis) that are never continued, yet each
     # snapshot carries the ~150 MB fixed DeltaNet state; five of them ate the 3090's headroom, the 46k-token session snapshot
     # then OOM'd and the whole cache was dropped -> a 41-minute re-prefill. Don't cache them.
@@ -443,18 +617,30 @@ class LLMServer(TCPServerWithReuse):
     # existing snapshot's bytes-per-token and skip sequences that could never fit the cap; (2) evict BEFORE allocating so the
     # old and new snapshots never coexist; (3) an allocation failure drops the cache and the request continues uncached.
     if self.snapshots:
-      s0 = next(iter(self.snapshots.values()))
-      if (est := snapshot_nbytes_for(s0, len(ids))) > cap:
+      # T4.96: don't bind the oldest snapshot to a name -- an unreleased reference survived the evict loop and
+      # the allocation below, so the freed cap was never actually free (every store OOM'd past one full snapshot).
+      if (est := snapshot_nbytes_for(next(iter(self.snapshots.values())), len(ids))) > cap:
         stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (~{est>>20} MB > cap)', 'yellow')}  {colored('--', 'BLACK')}  ")
         return
       total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
-      while total + est > cap and self.snapshots: total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])
+      # LRU-first, but only what this store may displace: a tool-loop snapshot never evicts a pinned boundary one (T4.96)
+      for k in [k for k, v in self.snapshots.items() if boundary or not v.get("boundary", True)]:
+        if total + est <= cap: break
+        total -= snapshot_nbytes(self.snapshots.pop(k))
+      if total + est > cap:
+        stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (boundary pinned)', 'yellow')}  {colored('--', 'BLACK')}  ")
+        return
     try: snap = self.model.snapshot_state()
     except MemoryError as e:
       self.snapshots.clear()
       stderr_log(f"{colored(f'state cache: snapshot dropped ({str(e)[:50]}), cache cleared', 'yellow')}  {colored('--', 'BLACK')}  ")
       return
+    snap["boundary"] = boundary
     self.snapshots[key] = snap
     total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
-    while total > cap and len(self.snapshots) > 1:
-      total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])
+    while total > cap and len(self.snapshots) > 1:  # the estimate undershot: same tier rule as above
+      victims = [k for k, v in self.snapshots.items() if k != key and (boundary or not v.get("boundary", True))]
+      if not victims:
+        if not boundary: self.snapshots.pop(key)  # only pinned boundary snapshots remain: the tool-loop one itself goes
+        break
+      total -= snapshot_nbytes(self.snapshots.pop(victims[0]))

@@ -131,7 +131,7 @@ class TestTransformerGenerate(unittest.TestCase):
   def test_recurrent_divergent_prompt_restarts(self):
     model, calls = Transformer(TEST_CONFIG), []
     model.has_recurrent_block, model._cached_tokens = True, [1, 2, 9]
-    def mock_call(self, tokens, start_pos, temperature):
+    def mock_call(self, tokens, start_pos, temperature, **kwargs):
       calls.append(start_pos)
       return Tensor([[42]])
     with patch.object(Transformer, '__call__', mock_call): next(model.generate([1, 2, 10, 11]))
@@ -141,6 +141,34 @@ class TestTransformerGenerate(unittest.TestCase):
     router = StreamRouter(reasoning=True)
     self.assertEqual(list(router.route("reasoning</think>answer")),
                      [("reasoning_content", "reasoning"), ("content", "answer")])
+    # T4.97: </think> before <tool_call> still routes through content mode first, byte-identical to before change A
+    router = StreamRouter(reasoning=True)
+    out = list(router.route('reasoning</think>ok <tool_call>{"name":"f"}</tool_call>', final=True))
+    self.assertEqual(out, [("reasoning_content", "reasoning"), ("content", "ok ")])
+    self.assertEqual((router.mode, router.buf), ("tool", '<tool_call>{"name":"f"}</tool_call>'))
+
+  def test_unclosed_think_block_ending_in_a_tool_call_is_promoted(self):
+    # T4.97: the model writes a complete tool call inside the think block and ends there (no </think>): the reasoning streams as
+    # reasoning_content (including the call text), and at end of stream the router hands the call to the final parse.
+    import re
+    from tinygrad.llm.serve import parse_tool_call
+    r = StreamRouter(reasoning=True)
+    out = []
+    for piece in ["thinking, ", "then <tool_c", "all>\n<function=f>\n</function>\n</tool_call>", " trailing"]: out += list(r.route(piece))
+    out += list(r.route("", final=True))
+    self.assertTrue(all(f == "reasoning_content" for f, _ in out))
+    self.assertEqual("".join(d for _, d in out), "thinking, then <tool_call>\n<function=f>\n</function>\n</tool_call> trailing")
+    self.assertEqual(r.mode, "tool")
+    m = re.search(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", r.buf, re.DOTALL)
+    self.assertEqual(parse_tool_call(m.group(1)), ("f", {}))
+
+  def test_tool_call_inside_a_closed_think_block_stays_reasoning(self):
+    # the model only thought about a call: </think> follows, the answer is content, nothing is promoted
+    r = StreamRouter(reasoning=True)
+    out = list(r.route("maybe <tool_call>{\"name\":\"f\"}</tool_call> no.</think>answer")) + list(r.route("", final=True))
+    self.assertEqual([f for f, _ in out], ["reasoning_content", "content"])
+    self.assertEqual(out[1][1], "answer")
+    self.assertEqual(r.mode, "content")
 
   def test_kv_cache_reuse(self):
     """Test that generate reuses the KV cache when tokens extend the cached prefix."""
@@ -418,6 +446,26 @@ class TestLMStudioShim(unittest.TestCase):
   def test_reasoning_effort_case_and_whitespace_insensitive(self):
     self.assertEqual(template_kwargs({"reasoning_effort": "NONE "})["enable_thinking"], False)
 
+  def test_template_kwargs_effort_levels(self):
+    # T4.91: minimal/low/medium/high/xhigh/max all map onto the Qwen3.8 template's low/medium/xhigh vocabulary; an
+    # unrecognized string falls back to medium (the template raises on anything it doesn't recognize, so an unmapped
+    # value must never reach it), and an absent reasoning_effort is a no-op (covered by test_template_kwargs_no_overrides).
+    cases = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "garbage": "medium"}
+    for effort, level in cases.items():
+      with self.subTest(effort=effort):
+        self.assertEqual(template_kwargs({"reasoning_effort": effort}),
+                          {"preserve_thinking": True, "enable_thinking": True, "reasoning_effort": level})
+
+  def test_template_kwargs_none_and_off_disable_thinking(self):
+    # thinking off means no reasoning_effort key at all -- the template never reads it then (T4.91).
+    self.assertEqual(template_kwargs({"reasoning_effort": "none"}), {"preserve_thinking": True, "enable_thinking": False})
+    self.assertEqual(template_kwargs({"reasoning_effort": "off"}), {"preserve_thinking": True, "enable_thinking": False})
+
+  def test_template_kwargs_explicit_reasoning_effort_wins(self):
+    # a client's own chat_template_kwargs.reasoning_effort beats the one we derive from the top-level effort (T4.91).
+    body = {"reasoning_effort": "high", "chat_template_kwargs": {"reasoning_effort": "medium"}}
+    self.assertEqual(template_kwargs(body), {"preserve_thinking": True, "enable_thinking": True, "reasoning_effort": "medium"})
+
   def test_lmstudio_models_payload_shape(self):
     self.assertEqual(lmstudio_models_payload("tiny", 32)["models"], [{
       "key": "tiny", "id": "tiny", "object": "model", "type": "llm", "max_context_length": 32,
@@ -452,18 +500,292 @@ class TestLMStudioShim(unittest.TestCase):
       server.shutdown()
       server.server_close()
 
+class TestReasoningEffortStandInTemplate(unittest.TestCase):
+  """T4.91: render through a small jinja2 template that mirrors the Qwen3.8 template's reasoning_effort CONTRACT (accepts
+  low/medium/xhigh, raises otherwise, injects distinguishable text per level) -- independent of that template's actual
+  prose, which TestReasoningEffortRealTemplate below checks directly against the GGUF (where, unlike here, 'medium'
+  turns out to inject no text at all)."""
+  TEMPLATE = (
+    "{%- if enable_thinking is defined and enable_thinking is false -%}\n"
+    "[thinking off]\n"
+    "{%- else -%}\n"
+    "{%- set e = reasoning_effort|default('xhigh') -%}\n"
+    "{%- if e == 'high' -%}{%- set e = 'xhigh' -%}{%- endif -%}\n"
+    "{%- if e not in ('low', 'medium', 'xhigh') -%}\n"
+    "{{ raise_exception('Unexpected reasoning effort ' ~ e) }}\n"
+    "{%- endif -%}\n"
+    "[effort:{{ e }}]\n"
+    "{%- endif -%}"
+  )
+
+  @classmethod
+  def setUpClass(cls):
+    import jinja2
+    env = jinja2.Environment()
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    cls.template = env.from_string(cls.TEMPLATE)
+
+  def _render(self, reasoning_effort):
+    return self.template.render(**template_kwargs({"reasoning_effort": reasoning_effort}))
+
+  def test_low_medium_high_render_distinct_text(self):
+    self.assertIn("[effort:low]", self._render("low"))
+    self.assertIn("[effort:medium]", self._render("medium"))
+    self.assertIn("[effort:xhigh]", self._render("high"))  # Hermes "high" -> template "xhigh"
+
+  def test_none_disables_thinking_with_no_effort_text(self):
+    out = self._render("none")
+    self.assertIn("[thinking off]", out)
+    self.assertNotIn("[effort:", out)
+
+  def test_garbage_effort_never_reaches_the_template(self):
+    self._render("garbage")  # our own mapping already sanitized it to "medium" -- must not raise
+
+import os
+GGUF_PATH = "/Users/artur/models/qwen3.8-27b-q8/Qwen3.8-27B-Q8_0.gguf"
+
+@unittest.skipUnless(os.path.exists(GGUF_PATH), "qwen3.8-27b GGUF not present on this machine")
+class TestReasoningEffortRealTemplate(unittest.TestCase):
+  """T4.91: render the model's OWN chat template (text loaded from the GGUF header, no weights -- see gguf_load) with our
+  derived kwargs. Verified against the template source first: it accepts reasoning_effort in {low, medium, xhigh}
+  (raises otherwise; 'high' is its own internal alias for xhigh) but only 'xhigh' and 'low' actually inject an
+  instruction sentence into the system prompt -- 'medium' is silently accepted and adds no text."""
+
+  @classmethod
+  def setUpClass(cls):
+    import pathlib, json, jinja2
+    from tinygrad.llm.gguf import gguf_load
+    kv, _ = gguf_load(pathlib.Path(GGUF_PATH))
+    env = jinja2.Environment()
+    env.filters['tojson'] = lambda obj, **kw: json.dumps(obj, **kw)
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    env.globals['strftime_now'] = lambda fmt: ""
+    env.globals['bos_token'], env.globals['eos_token'] = "", ""
+    cls.template = env.from_string(kv['tokenizer.chat_template'])
+
+  def _render(self, reasoning_effort):
+    kwargs = template_kwargs({"reasoning_effort": reasoning_effort})
+    return self.template.render(messages=[{"role": "user", "content": "hi"}], tools=None, add_generation_prompt=True, **kwargs)
+
+  def test_low_injects_low_instruction(self):
+    self.assertIn("Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+                  "conclusion without unnecessary elaboration.", self._render("low"))
+
+  def test_high_injects_xhigh_instruction(self):
+    self.assertIn("Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+                  "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity "
+                  "in the final answer.", self._render("high"))
+
+  def test_medium_injects_nothing(self):
+    self.assertNotIn("Reasoning effort is set to", self._render("medium"))
+
+  def test_thinking_off_renders_closed_think_block(self):
+    out = self._render("none")
+    self.assertNotIn("Reasoning effort is set to", out)
+    self.assertTrue(out.rstrip().endswith("<think>\n\n</think>"))
+
 if __name__ == '__main__':
   unittest.main()
 
 class TestDefaultTemperature(unittest.TestCase):
-  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins."""
+  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins.
+  T4.92: a THINKING request gets DEFAULT_TEMPERATURE_THINK instead (falling back to DEFAULT_TEMPERATURE when unset)."""
   def test_omitted_uses_default_explicit_wins(self):
     import tinygrad.llm.serve as srv
-    self.assertEqual(srv.request_temperature({}), 0.0)
+    self.assertEqual(srv.request_temperature({}, False), 0.0)
     with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6):
-      self.assertEqual(srv.request_temperature({}), 0.6)
-      self.assertEqual(srv.request_temperature({"temperature": 0}), 0.0)
-      self.assertEqual(srv.request_temperature({"temperature": 1.1}), 1.1)
+      self.assertEqual(srv.request_temperature({}, False), 0.6)
+      self.assertEqual(srv.request_temperature({"temperature": 0}, False), 0.0)
+      self.assertEqual(srv.request_temperature({"temperature": 1.1}, False), 1.1)
+
+  def test_thinking_falls_back_to_default_temperature_unset(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6), patch.object(srv, "DEFAULT_TEMPERATURE_THINK", srv.DEFAULT_TEMPERATURE):
+      self.assertEqual(srv.request_temperature({}, True), 0.6)   # DEFAULT_TEMPERATURE_THINK unset -> mirrors DEFAULT_TEMPERATURE
+
+  def test_thinking_uses_its_own_default_and_explicit_wins(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.7), patch.object(srv, "DEFAULT_TEMPERATURE_THINK", 1.0):
+      self.assertEqual(srv.request_temperature({}, True), 1.0)     # thinking gets its own default, independent of DEFAULT_TEMPERATURE
+      self.assertEqual(srv.request_temperature({}, False), 0.7)    # non-thinking untouched
+      self.assertEqual(srv.request_temperature({"temperature": 0.3}, True), 0.3)  # explicit wins in either mode
+
+class TestPresencePenalty(unittest.TestCase):
+  """T4.92: PRESENCE_PENALTY applies to non-thinking requests only unless the request sends its own presence_penalty
+  (which always wins, in either mode -- 0 explicitly disables it, distinct from omitting the field)."""
+  def test_default_is_zero_non_thinking(self):
+    import tinygrad.llm.serve as srv
+    self.assertEqual(srv.request_presence_penalty({}, False), 0.0)
+    self.assertEqual(srv.request_presence_penalty({}, True), 0.0)
+
+  def test_env_applies_to_non_thinking_only(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "PRESENCE_PENALTY", 1.5):
+      self.assertEqual(srv.request_presence_penalty({}, False), 1.5)
+      self.assertEqual(srv.request_presence_penalty({}, True), 0.0)   # thinking never gets the env default
+
+  def test_explicit_request_value_always_wins(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "PRESENCE_PENALTY", 1.5):
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 0.3}, False), 0.3)
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 2.0}, True), 2.0)
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 0}, False), 0.0)  # explicit 0 disables it
+
+class TestThinkingBudget(unittest.TestCase):
+  """T4.88: past the budget the server closes the think block itself and continues the same request from the cached prefix."""
+  def test_budget_closes_think_block_and_continues(self):
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.serve import Handler
+    # a char-level tokenizer: id == ord(ch); 0 ends the stream
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self):
+        return lambda i=None: "" if i is None else chr(i)
+    calls = []
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      calls.append(list(ids))
+      if len(calls) == 1:                       # the model thinks forever
+        for c in "think " * 100: yield ord(c)
+      else:                                     # after the forced close it answers
+        for c in "42": yield ord(c)
+        yield 0
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=Tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    ids = [ord(c) for c in "q"]
+    out = list(h.run_model(ids, "m", reasoning=True, think_budget=12))
+    reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in out if c["choices"])
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 2)
+    self.assertTrue(calls[1][-len(srv.THINK_CLOSE):] == [ord(c) for c in srv.THINK_CLOSE])   # the second generate continues from ids+out+close
+    self.assertIn("Considering the limited time", reasoning)
+    self.assertLess(len(reasoning), 12 + len(srv.THINK_CLOSE) + 8)                          # the runaway think was cut at the budget
+    self.assertEqual(content.strip(), "42")
+    self.assertEqual(srv.thinking_budget({"reasoning_effort": "low"}), 0)                    # THINK_BUDGET is 0 in tests: unlimited
+    with patch.object(srv, "THINK_BUDGET", 4096):
+      efforts = ("minimal", "low", "medium", "high", "xhigh")
+      self.assertEqual([srv.thinking_budget({"reasoning_effort": e}) for e in efforts], [512, 1024, 4096, 16384, 0])
+
+class TestReasoningLoopBreaker(unittest.TestCase):
+  """T4.89: a sentence cycle inside the think block gets a decisive nudge; after LOOP_NUDGES nudges the block is closed."""
+  def test_cycle_is_nudged_then_closed(self):
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.serve import Handler
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self):
+        return lambda i=None: "" if i is None else chr(i)
+    cycle = "Actually, the simplest is: keep two files, zip them. A single self-contained file is more portable. "
+    close = [ord(c) for c in srv.THINK_CLOSE]
+    calls = []
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      calls.append(list(ids))
+      if ids[-len(close):] == close:            # the think block was closed for us: answer
+        for c in "42": yield ord(c)
+        yield 0
+      else:                                     # otherwise keep circling (the server nudges us out of it)
+        while True:
+          for c in cycle: yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=Tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    with patch.object(srv, "LOOP_REPEATS", 3), patch.object(srv, "LOOP_NUDGES", 2):
+      out = list(h.run_model([ord("q")], "m", reasoning=True))
+    reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in out if c["choices"])
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 4)                                        # initial + 2 nudges + the close
+    self.assertEqual(reasoning.count(srv.LOOP_NUDGE.strip()), 2)
+    self.assertIn("Considering the limited time", reasoning)
+    self.assertLess(reasoning.count("keep two files"), 3 * 3 + 3)         # each round was cut at the third repeat
+    self.assertEqual(content.strip(), "42")
+
+  def test_detector_ignores_short_and_resets(self):
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    self.assertIsNone(d.feed("ok. ok. ok. ok. "))                            # <6 words never counts
+    for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))
+    self.assertEqual(d.feed("the same long  sentence said AGAIN and again.\n"), "the same long sentence said again and again.")
+    for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))   # counts reset after a hit
+
+  def test_detector_ignores_code_ish_sentences(self):
+    # T4.97: repeated code/formula lines (2026-09-08: an iterated code edit, an arithmetic checklist) are legitimate
+    # repetition, not an anxious loop -- a line carrying '=', ';', '{', '}', a backtick, or '</' never counts.
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    code = "let offtick = i*t16 + t16 - 1;\n"                                # >=6 words, has '=' and ';'
+    for _ in range(4): self.assertIsNone(d.feed(code))                      # never fires, however many times repeated
+    prose = "Actually, the simplest is: keep two files, zip them.\n"        # a real loop sentence -- no skip chars
+    for _ in range(2): self.assertIsNone(d.feed(prose))
+    self.assertEqual(d.feed(prose), "actually, the simplest is: keep two files, zip them.")   # still fires at LOOP_REPEATS
+
+  def test_detector_mixed_stream_fires_on_prose_not_code(self):
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    code = "let offtick = i*t16 + t16 - 1;\n"
+    prose = "Actually, the simplest is: keep two files, zip them.\n"
+    hits = [d.feed(code + prose) for _ in range(3)]                          # code line never counts, prose does
+    self.assertEqual(hits, [None, None, "actually, the simplest is: keep two files, zip them."])
+
+class TestKeepAlive(unittest.TestCase):
+  """T4.90: empty-delta heartbeats while the generator is silent; a hung-up client stops generation."""
+  def _handler(self, wfile):
+    from tinygrad.llm.serve import Handler
+    h = Handler.__new__(Handler)
+    h.wfile, h.send_response, h.send_header, h.end_headers = wfile, lambda *a: None, lambda *a: None, lambda: None
+    return h
+
+  def test_heartbeats_fill_the_silence(self):
+    import io, json, time
+    import tinygrad.llm.serve as srv
+    tmpl = {"id":"x", "object":"chat.completion.chunk", "created":1, "model":"m"}
+    def gen():
+      yield {"choices":[{"index":0, "delta":{"role":"assistant", "content":""}, "finish_reason":None}], **tmpl}
+      time.sleep(0.45)                                                      # the "prefill"
+      yield {"choices":[{"index":0, "delta":{"content":"hi"}, "finish_reason":None}], **tmpl}
+    w = io.BytesIO()
+    with patch.object(srv, "KEEPALIVE_SEC", 0.1): self._handler(w).stream_json(gen())
+    lines = [json.loads(l[6:]) for l in w.getvalue().decode().split("\n\n") if l.startswith("data: ") and l != "data: [DONE]"]
+    beats = [l for l in lines if l["choices"][0]["delta"] == {}]
+    self.assertGreaterEqual(len(beats), 2)
+    self.assertEqual(beats[0]["model"], "m")                                 # heartbeats carry the reply's template keys
+    self.assertEqual([l["choices"][0]["delta"].get("content") for l in lines if l["choices"][0]["delta"]], ["", "hi"])
+    self.assertTrue(w.getvalue().endswith(b"data: [DONE]\n\n"))
+
+  def test_hung_up_client_stops_generation(self):
+    import io, time
+    import tinygrad.llm.serve as srv
+    class Gone(io.BytesIO):
+      def __init__(self):
+        super().__init__()
+        self.n = 0
+      def write(self, b):
+        self.n += 1
+        if self.n > 1: raise BrokenPipeError()                              # the client left after the first chunk
+        return super().write(b)
+    closed, produced = [], []
+    def gen():
+      try:
+        yield {"choices":[{"index":0, "delta":{"role":"assistant", "content":""}, "finish_reason":None}], "model":"m"}
+        time.sleep(0.4)                                                      # silence: the heartbeat hits the dead socket
+        for i in range(50):
+          produced.append(i)
+          yield {"choices":[{"index":0, "delta":{"content":"x"}, "finish_reason":None}], "model":"m"}
+      finally: closed.append(True)
+    with patch.object(srv, "KEEPALIVE_SEC", 0.1): self._handler(Gone()).stream_json(gen())
+    self.assertEqual(closed, [True])
+    self.assertLessEqual(len(produced), 1)                                   # noticed before the first real token, at most one slipped
+
+  def test_disabled_falls_back_to_plain_stream(self):
+    import io
+    import tinygrad.llm.serve as srv
+    w = io.BytesIO()
+    def gen(): yield {"choices":[{"index":0, "delta":{"content":"a"}, "finish_reason":None}], "model":"m"}
+    with patch.object(srv, "KEEPALIVE_SEC", 0): self._handler(w).stream_json(gen())
+    self.assertEqual(w.getvalue().count(b"data: "), 2)                        # the chunk + [DONE], no heartbeats
 
 class TestStreamLog(unittest.TestCase):
   """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
@@ -528,3 +850,183 @@ class TestStateCacheOOM(unittest.TestCase):
     srv.model.snapshot_state = lambda: {"t": Tensor.zeros(192 * 1024)}
     srv.store_snapshot(list(range(8, 16)))   # predicted 768 KB; 768 + 768 > 1 MB -> the old one is evicted first
     self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])
+
+  def test_reference_to_oldest_snapshot_is_released_before_reallocating(self):
+    # T4.96: the oldest snapshot used to stay referenced (bound to a local name) through the evict loop and the
+    # snapshot_state() call right after it, so evicting it from self.snapshots never actually freed its device
+    # buffers. A snapshot_state that raises MemoryError while any snapshot it previously handed out is still
+    # referenced (checked via weakref, after a gc.collect()) reproduces exactly that failure mode.
+    import gc, weakref
+    class Snap(dict): pass  # a plain dict doesn't support weakref
+    srv = self._server(1)   # 1 MB cap -- fits exactly one 768 KB snapshot
+    refs: list[weakref.ref] = []
+    def snapshot_state():
+      gc.collect()
+      if any(r() is not None for r in refs): raise MemoryError("Allocation of 768.00 KB failed on NV")
+      snap = Snap(blocks=[{"recurrent_state": Tensor.zeros(192 * 1024)}])   # 768 KB, fixed cost (T5.7b)
+      refs.append(weakref.ref(snap))
+      return snap
+    srv.model.snapshot_state = snapshot_state
+    srv.store_snapshot(list(range(8)))
+    srv.store_snapshot(list(range(16)))   # 768 KB + 768 KB > 1 MB cap -> evicts the first; it must not still be referenced
+    self.assertEqual(list(srv.snapshots.keys()), [tuple(range(16))])
+
+class TestSpliceCacheCopy(unittest.TestCase):
+  """T4.95: Transformer.generate()/speculative_generate() append every token they yield straight into the `ids` list
+  they're given (real behavior -- see model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). run_model must pass
+  a COPY, or that mutation leaks into do_POST's record (server.last, read by splice_ids as the next turn's prev_ids)
+  and into inject()'s `ids + out` resume prompt, doubling this turn's own output. The fakes below mutate their `ids`
+  argument like the real ones do -- the other fakes in this file don't, which is why they never caught this."""
+  def _tok(self):
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self):
+        return lambda i=None: "" if i is None else chr(i)
+    return Tok()
+
+  def test_prompt_list_untouched_and_last_is_pure(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      for c in "42\0":                      # two real tokens then EOS (id 0)
+        ids.append(ord(c))
+        model._cached_tokens = ids[:-1]
+        yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    h.server = server
+    ids = [ord("q")]
+    record = ("<rendered>", ids, 1)          # do_POST builds record from the SAME `ids` object it passes to run_model
+    list(h.run_model(ids, "m", record=record))
+    self.assertEqual(ids, [ord("q")])                       # the caller's prompt list is untouched by generate()
+    self.assertEqual(server.last[1], [ord("q")])             # prev_ids for the next splice_ids call is the pure prompt
+    self.assertEqual(server.last[3], [ord("4"), ord("2")])   # generated ids, tracked separately (out) -- EOS excluded
+
+  def test_speculative_path_prompt_also_untouched(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    def speculative_generate(ids, k=3, temperature=0.0):
+      for c in "42\0":
+        ids.append(ord(c))
+        model._cached_tokens = ids[:-1]
+        yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, speculative_generate=speculative_generate, mtp_head=object(), max_context=4096)
+    h = Handler.__new__(Handler)
+    server = SimpleNamespace(model=model, tok=self._tok(), mtp=True, spec_k=3, state_cache_mb=0, vision=None, last=None)
+    h.server = server
+    ids = [ord("q")]
+    record = ("<rendered>", ids, 1)
+    list(h.run_model(ids, "m", record=record))
+    self.assertEqual(ids, [ord("q")])
+    self.assertEqual(server.last[1], [ord("q")])
+
+  def test_inject_resumes_without_duplicating_prior_output(self):
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.serve import Handler
+    calls = []
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      calls.append(list(ids))
+      if len(calls) == 1:                   # the model thinks forever, mutating its `ids` arg like the real generate()
+        for c in "think " * 100:
+          ids.append(ord(c))
+          model._cached_tokens = ids[:-1]
+          yield ord(c)
+      else:                                 # after the forced close it answers
+        for c in "42\0":
+          ids.append(ord(c))
+          model._cached_tokens = ids[:-1]
+          yield ord(c)
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=0, vision=None, last=None)
+    list(h.run_model([ord("q")], "m", reasoning=True, think_budget=12))
+    self.assertEqual(len(calls), 2)
+    # the resumed prompt is prompt + (everything generated before the budget hit) + THINK_CLOSE, each token once
+    self.assertEqual(calls[1], [ord("q")] + [ord(c) for c in "think think "] + [ord(c) for c in srv.THINK_CLOSE])
+class TestBoundarySnapshot(unittest.TestCase):
+  """T4.96: only a request that did NOT extend the live cache (cold, or resumed from a snapshot) stores one --
+  a tool-loop step that merely extended it must not evict the snapshot that bridges the next real boundary."""
+  def _tok(self):
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self): return lambda i=None: "" if i is None else chr(i)
+    return Tok()
+
+  def test_boundary_flag_follows_the_live_cache(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0): yield 0   # ends immediately -- one store opportunity per request
+    calls = []
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
+    server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=1, vision=None, last=None,
+                              find_snapshot=lambda ids: None, store_snapshot=lambda *a, **k: calls.append(k.get("boundary")))
+    h = Handler.__new__(Handler)
+    h.server = server
+    list(h.run_model([1, 2, 3], "m"))                  # cold (get_start_pos always 0) -- a boundary request: pinned tier
+    model.get_start_pos = lambda ids: 1                 # extends the live cache -- a tool-loop step: second tier
+    list(h.run_model([1, 2, 3], "m"))
+    self.assertEqual(calls, [True, False])
+
+  def test_tool_loop_snapshot_never_evicts_a_boundary_snapshot(self):
+    import collections
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import LLMServer
+    srv = LLMServer.__new__(LLMServer)
+    srv.snapshots, srv.state_cache_mb = collections.OrderedDict(), 2   # 2 MB cap: fits two ~768 KB snapshots, not three
+    class Snap(dict): pass
+    srv.model = SimpleNamespace(snapshot_state=lambda: Snap(blocks=[{"recurrent_state": Tensor.zeros(192 * 1024)}]))
+    srv.store_snapshot([1, 2], boundary=True)            # A: pinned
+    srv.store_snapshot([1, 2, 3], boundary=False)        # B: tool-loop step, fits beside A
+    srv.store_snapshot([1, 2, 3, 4], boundary=False)     # C: tool-loop step -- evicts B (LRU, second tier), never A
+    self.assertEqual(list(srv.snapshots), [(1, 2), (1, 2, 3, 4)])
+    srv.state_cache_mb = 1                               # 1 MB cap: one snapshot; the tool-loop one has to go when told to shrink
+    srv.store_snapshot([1, 2, 3, 4, 5], boundary=False)  # D: doesn't fit beside pinned A -> skipped, A untouched
+    self.assertEqual(list(srv.snapshots), [(1, 2)] if len(srv.snapshots) == 1 else list(srv.snapshots))
+    self.assertIn((1, 2), srv.snapshots)
+    srv.store_snapshot([7, 8], boundary=True)            # E: a new boundary evicts anything older, including A
+    self.assertEqual(list(srv.snapshots), [(7, 8)])
+
+  def test_reference_to_restored_snapshot_is_released_before_next_store(self):
+    # T4.96: run_model's own `snap := find_snapshot(ids)` walrus is a generator-frame local -- generator frames
+    # don't drop locals across yields, so it used to live for the whole request. A snapshot restored early in a
+    # request was then still referenced when that same request's store_snapshot tried to evict and replace it.
+    import gc, weakref
+    from tinygrad.llm.serve import Handler
+    class Snap(dict): pass
+    class FakeModel:
+      mtp_head, max_context = None, 4096
+      def __init__(self): self.cached, self.script = [], []
+      def get_start_pos(self, ids):
+        return len(self.cached) if self.cached and len(self.cached) < len(ids) and ids[:len(self.cached)] == self.cached else 0
+      def restore_state(self, snap): self.cached = list(snap["tokens"])
+      def generate(self, ids, temperature=0.0, vision=None, presence_penalty=0.0):
+        self.cached = list(ids)
+        for t in self.script:
+          yield t
+          self.cached.append(t)
+        yield 0
+    model = FakeModel()
+    refs: list[weakref.ref] = []
+    def snapshot_state():
+      gc.collect()
+      if any(r() is not None for r in refs): raise MemoryError("Allocation of 768.00 KB failed on NV")
+      snap = Snap(tokens=list(model.cached), blocks=[{"recurrent_state": Tensor.zeros(192 * 1024)}])
+      refs.append(weakref.ref(snap))
+      return snap
+    model.snapshot_state = snapshot_state
+    srv = LLMServer(("127.0.0.1", 0), model=model, model_name="tiny", tok=self._tok(), template=None, state_cache_mb=1)
+    self.addCleanup(srv.server_close)
+    h = Handler.__new__(Handler)
+    h.server = srv
+
+    model.script = [9, 8]                       # request 1 "thinks" for two tokens -- the live cache ends past [1,2,3]
+    list(h.run_model([1, 2, 3], "m"))            # cold prefill -- snapshot A stored at the [1,2,3] boundary
+    self.assertEqual(list(srv.snapshots.keys()), [(1, 2, 3)])
+
+    model.script = []                            # request 2 (e.g. reasoning stripped from the rendered prompt):
+    list(h.run_model([1, 2, 3, 7], "m"))         # extends A, not the (diverged) live cache -- resumes from A, stores B
+    self.assertEqual(list(srv.snapshots.keys()), [(1, 2, 3, 7)])   # A was released before B's allocation
