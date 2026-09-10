@@ -243,7 +243,7 @@ class StreamLog:
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
-    self.buf = ""
+    self.buf, self.reasoning_text = "", ""  # reasoning_text: the think block so far (T4.97 end-of-stream promotion)
     self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
   def split(self, tag:str, final:bool) -> tuple[str, bool]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
@@ -253,31 +253,25 @@ class StreamRouter:
     hold = max((i for i in range(1, min(len(self.buf), len(tag))+1) if tag.startswith(self.buf[-i:])), default=0) if not final else 0
     emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
     return emit, False
-  def split2(self, tag_a:str, tag_b:str, final:bool) -> tuple[str, str|None]:
-    # like split(), but for two candidate tags: whichever fully appears first wins (None if neither yet); the holdback
-    # at the end covers a partial suffix match of EITHER tag, so a chunk ending mid-tag is never emitted early.
-    ia, ib = self.buf.find(tag_a), self.buf.find(tag_b)
-    tag = tag_a if ia != -1 and (ib == -1 or ia < ib) else tag_b if ib != -1 else None
-    if tag is not None:
-      before, self.buf = self.buf.split(tag, 1)
-      return before, tag
-    hold = max((i for t in (tag_a, tag_b) for i in range(1, min(len(self.buf), len(t))+1) if t.startswith(self.buf[-i:])),
-              default=0) if not final else 0
-    emit, self.buf = self.buf[:len(self.buf)-hold], self.buf[len(self.buf)-hold:]
-    return emit, None
   def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
     self.buf += piece
     if self.mode == "undecided":  # decide whether the output starts with a think block
       if not final and len(self.buf) < len("<think>") and "<think>".startswith(self.buf): return
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
     if self.mode == "reasoning":
-      # T4.97: a <tool_call> emitted before </think> (the model never closes the block) still ends reasoning mode here --
-      # same tool-mode handoff as the content-mode case below, so the final parse in run_model still finds the call.
-      emit, tag = self.split2("</think>", "<tool_call>", final)
-      if emit: yield "reasoning_content", emit
-      if tag is None: return
-      if tag == "<tool_call>": self.mode, self.buf = "tool", "<tool_call>" + self.buf
-      else: self.mode = "content"
+      emit, done = self.split("</think>", final)
+      if emit:
+        self.reasoning_text += emit
+        yield "reasoning_content", emit
+      if not done:
+        # T4.97: a model that ENDS its output inside the think block with a complete tool call in it (2026-09-08: Qwen3.8 wrote the
+        # call after a nudge and never wrote </think>, the client saw an empty reply) meant that call: promote it at end of stream so
+        # run_model's final parse finds it. A tool call inside a think block that does close stays reasoning -- the model was thinking
+        # about a call, not making it (test/null/test_llm_server.py::test_tool_call_in_reasoning_is_not_executed).
+        if final and (i := self.reasoning_text.find("<tool_call>")) != -1 and "</tool_call>" in self.reasoning_text[i:]:
+          self.mode, self.buf = "tool", self.reasoning_text[i:]
+        return
+      self.mode = "content"
     if self.mode == "tool": return
     emit, found = self.split("<tool_call>", final)
     if emit: yield "content", emit
