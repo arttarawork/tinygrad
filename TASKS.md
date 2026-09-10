@@ -1,6 +1,6 @@
 # TASKS.md — agent handoff for the Ampere-over-Thunderbolt effort
 
-> **Next arc (drafted 2026-09-09, not started):** T4.91 `reasoning_effort` passthrough (every think:on request has run at the template default xhigh) → T4.92 model-card sampler defaults + presence penalty → T4.93 the 27B on the 3090 ALONE at 4-bit (measure first) → T4.94 MTP on that build. Entries at the end of the T4 section. **2026-09-09 PM: T4.91, T4.92 (code), T4.95, T4.96, T4.97 LANDED on integration/t6 (bb39b6f26) and serving; T4.93 parked (Q4 does not fit the 3090 alone under the current loader — see the entry); T4.94 blocked on T4.93.**
+> **Next arc (drafted 2026-09-09, not started):** T4.91 `reasoning_effort` passthrough (every think:on request has run at the template default xhigh) → T4.92 model-card sampler defaults + presence penalty → T4.93 the 27B on the 3090 ALONE at 4-bit (measure first) → T4.94 MTP on that build. Entries at the end of the T4 section. **2026-09-10: all of the above is on master (43ac66739 == integration/t6). T4.93 measured and parked (K-quant 5.4 / Q4_0 6.9 tok/s: the generated gemv kernels cap every quant). NOW: T4.98 (hand-written NV quantized gemv, 6 subtasks, agents running), T4.99 host snapshots, T4.93b quality gate. Hermes/server deliberately DOWN for the experiments (Artur 09-10: \"Don't hesitate to stop it\").**
 
 Task breakdown of `NV_LLM_DESIGN.md` (WS refs point there; context in `memory.md` — read both first).
 Baseline `af2a43c85`; rebase on upstream master weekly. Written 2026-08-18, while the eGPU dock
@@ -409,6 +409,38 @@ can be built and proven before the dock ships.
   cases the immediate close would have been better; (b) router: `<tool_call>` inside reasoning mode ends the think block (promote to tool
   mode); (c) skip code-ish sentences (containing `=` `;` `(`) in the detector. *Done when:* a week of log lines with no "nudge n/3" chains
   and no empty-response nudges from Hermes. STOP if (a) truncates answers on the 09-08 capture prompts — then keep LOOP_NUDGES=1.
+
+- **T4.98 🔄 — Hand-written NV quantized matmul kernels (the sm_86 gemv ceiling)** `[MAC+dock]` deps: — (from the 2026-09-10 Q4 legs)
+  Every quant format measured on the 3090 decodes at ~100-120 GB/s effective (Q4_K_XL 5.42 tok/s, Q4_0 6.92, the Q8 map's NV share the same) — the
+  tinygrad-generated gemv kernels, not the format, are the ceiling (isolated probe: a 44 MB gemv takes 585 µs = 75 GB/s; bytes alone would be 47 µs).
+  `kernels/amd.py` already has the whole quantized-linear design for RDNA3 (q8 activation quantizer, dp4a per 32-weight group, one warp per output,
+  Q4_K/Q5_K/Q6_K/IQ4_XS unpack, a WMMA gemm for prefill); `kernels/nv.py` (T6.2) has the NV custom-kernel mechanism (UOp graph + CUDA intrinsics via
+  Ops.CUSTOM, nvrtc lane, JIT-captured). Subtasks:
+  - **T4.98a 📋 launch floor** (mine, device): time a jitted graph of N tiny kernels for N=50/200/600 (≈ the per-token launch count) → µs per launch
+    over the dock. If >20 µs/launch the floor is ~12 ms/token = 80 tok/s and kernel fusion matters as much as kernel speed.
+  - **T4.98b 📋 upstream scan** (agent, read-only): NV/CUDA codegen, tensor-core and BEAM-space changes upstream since our base af2a43c85 (08-18);
+    cherry-pick candidates vs our patched files. If upstream's generated gemv already reaches >300 GB/s on sm_86, cherry-picking beats hand-writing.
+  - **T4.98c 📋 gemv port** (agent): `kernels/nv_quant.py` — amd.py's decode kernel with `__dp4a`/`__byte_perm`/`__ldg` in place of the AMD builtins and
+    nv.py's `__shfl_xor_sync` reduce; formats Q4_K/Q5_K/Q6_K/IQ4_XS (ported) + **Q8_0 and Q4_0 (new; 34/18-byte blocks are not 4-byte aligned → byte view)**;
+    `NV_CUSTOM_QUANT=1` env gate in the Linear dispatch (default 0 = unchanged), single-token calls only; device-free tests (graph builds, CUDA source
+    renders through the NULL backend's CUDA renderer, format decoders vs gguf.py's dequant on CPU); NV numerics + speed are mine on the device.
+  - **T4.98d 📋 device validation** (mine): tolerance check vs the fused baseline (dp4a changes accumulation order — not bit-exact), the T6.4 verifier
+    pattern re-applied to custom kernels, per-kernel GB/s, then the Q8 pooled map and the Q4 all-on-card decode numbers.
+  - **T4.98e 📋 tooling** (agent): `extra/launch_floor.py` and `extra/flip_rate.py` (teacher-forced top-1 flip rate between two model runs; the T4.93b
+    quality metric), tested on the tiny model.
+  - **T4.98f 📋 gemm for prefill** (later): the WMMA path needs the sm_80 mma.sync fragment layout (different from RDNA3's wmma); prefill stays 16-19 tok/s
+    until this lands. MTP verify (T4.94) rides on it.
+  *Done when:* NV decode gemv ≥ 400 GB/s effective on the isolated probe, model decode on the Q4 all-on-card config ≥ 20 tok/s with a flip rate vs the fused
+  path within noise. STOP if (a) shows the dock launch floor above ~30 µs (then fusion/launch batching is the real task) or (b) finds an upstream path.
+- **T4.99 📋 — Host-memory state-cache snapshots (`STATE_CACHE_DEVICE`)** `[MAC]` deps: T4.96 (agent)
+  Snapshots live on the model's devices, so on the 3090 they compete with the weights (2 GB cap → nothing above ~58k tokens). With the LLM on the card the
+  Mac's RAM is idle: `STATE_CACHE_DEVICE=CPU` (default unset = today) clones snapshots to the host and `restore_state` copies back (1.6-3.4 GB over
+  USB4 ≈ 1-2 s vs a 50-min re-prefill); `STATE_CACHE_MB` then bounds host memory (raise to ~12288 once the model is off the Mac; on the pooled map the
+  METAL share IS host memory — keep 2048 there). Tests on the tiny model with a second CPU device instance (`CPU:1`) for a real copy. *Done when:* the
+  round-trip test passes and a served boundary resume logs `in:<boundary>` with the snapshot on the host.
+- **T4.93b 📋 — Quality gate for any quant/kernel change** `[dock]` deps: T4.98e
+  Teacher-forced top-1 flip rate on ~5k captured assistant tokens (Q8 fused path = reference), the vision battery (3 images), tool-call JSON on the
+  get_time smoke. Run before any recipe change. *Done when:* a table per configuration in the Status log.
 
 ## Phase 1 — dock arrives (`DOCK`)
 
