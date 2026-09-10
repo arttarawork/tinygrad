@@ -149,6 +149,30 @@ def template_kwargs(body:dict) -> dict:
   if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
   return kwargs
 
+# T4.85: Hermes (and most agent clients) send no `temperature`; an absent value used to mean 0 = greedy decoding, and Qwen's
+# thinking mode under greedy decoding degenerates into endless repetition (2026-09-07: 12k chars of reasoning, three sentences
+# repeated 11x). DEFAULT_TEMPERATURE (env, default 0 = byte-identical to before) is what an omitted temperature means; the
+# standing recipe sets 0.6 (Qwen's thinking-mode recommendation). An explicit temperature in the request always wins.
+DEFAULT_TEMPERATURE = getenv("DEFAULT_TEMPERATURE", 0.0)
+def request_temperature(body:dict) -> float: return float(body.get("temperature", DEFAULT_TEMPERATURE))
+
+class StreamLog:
+  """T4.83: STREAM_LOG=<path> appends every request's streamed text as it is generated (reasoning and content, flushed per
+  token) so `tail -f` or the LAN viewer page (~/.hermes/stream-viewer) shows the thinking LIVE -- Hermes itself only shows
+  reasoning once the turn completes. One rotation at 8 MB keeps the file small."""
+  def __init__(self, path:str, header:str):
+    if os.path.exists(path) and os.path.getsize(path) > 8_000_000: os.replace(path, path + ".1")
+    self.f, self.field = open(path, "a", encoding="utf-8"), ""
+    self.f.write(f"\n\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {header} =====\n")
+    self.f.flush()
+  def write(self, field:str, text:str) -> None:
+    if field != self.field:
+      self.f.write(f"\n--- {field} ---\n")
+      self.field = field
+    self.f.write(text)
+    self.f.flush()
+  def close(self) -> None: self.f.close()
+
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
@@ -226,6 +250,7 @@ class Handler(HTTPRequestHandler):
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
     router = StreamRouter(reasoning)
+    slog = StreamLog(p, f"{model_name} in:{cache_start_pos}+{len(ids)-cache_start_pos}{img_field}") if (p := os.environ.get("STREAM_LOG")) else None
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -248,14 +273,18 @@ class Handler(HTTPRequestHandler):
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
-          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids)
+          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
         if tok.is_end(next_id): break
         out.append(next_id)
-        for field, delta in router.route(dec(next_id)): yield chunk({field:delta})
+        for field, delta in router.route(dec(next_id)):
+          if slog is not None: slog.write(field, delta)
+          yield chunk({field:delta})
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
-      for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
+      for field, delta in router.route(dec(), final=True):
+        if slog is not None: slog.write(field, delta)
+        yield chunk({field:delta})
       tool_calls: list[dict] = []
       for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
         if (parsed := parse_tool_call(m.group(1))) is None:
@@ -278,6 +307,8 @@ class Handler(HTTPRequestHandler):
     except GeneratorExit:
       if not completed: log_stats(interrupted=True)
       raise
+    finally:
+      if slog is not None: slog.close()
 
   def do_POST(self):
     request_st = time.perf_counter()
@@ -335,7 +366,7 @@ class Handler(HTTPRequestHandler):
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
+                              max_tokens=max_tokens, temperature=request_temperature(body),
                               reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input)
       if body.get("stream"): self.stream_json(chunks)
       else:
@@ -393,10 +424,14 @@ class LLMServer(TCPServerWithReuse):
     self.snapshots.move_to_end(best_key)
     return self.snapshots[best_key]
 
-  def store_snapshot(self, ids:list[int]) -> None:
+  def store_snapshot(self, ids:list[int], one_shot:bool=False) -> None:
     """Snapshot self.model's current state -- assumed to have just finished prefilling exactly `ids` (see
     Handler.run_model) -- under key tuple(ids), LRU-evicting the oldest entries to stay under state_cache_mb
     (always keeping at least the just-stored entry, even if it alone exceeds the cap)."""
+    # T5.7c (2026-09-06): image requests are one-shot auxiliary calls (screenshot analysis) that are never continued, yet each
+    # snapshot carries the ~150 MB fixed DeltaNet state; five of them ate the 3090's headroom, the 46k-token session snapshot
+    # then OOM'd and the whole cache was dropped -> a 41-minute re-prefill. Don't cache them.
+    if one_shot: return
     key = tuple(ids)
     if key in self.snapshots:
       self.snapshots.move_to_end(key)

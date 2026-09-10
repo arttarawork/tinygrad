@@ -455,6 +455,32 @@ class TestLMStudioShim(unittest.TestCase):
 if __name__ == '__main__':
   unittest.main()
 
+class TestDefaultTemperature(unittest.TestCase):
+  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins."""
+  def test_omitted_uses_default_explicit_wins(self):
+    import tinygrad.llm.serve as srv
+    self.assertEqual(srv.request_temperature({}), 0.0)
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6):
+      self.assertEqual(srv.request_temperature({}), 0.6)
+      self.assertEqual(srv.request_temperature({"temperature": 0}), 0.0)
+      self.assertEqual(srv.request_temperature({"temperature": 1.1}), 1.1)
+
+class TestStreamLog(unittest.TestCase):
+  """T4.83: STREAM_LOG appends the streamed text live, field-tagged, and rotates once past 8 MB."""
+  def test_fields_and_rotation(self):
+    import os, tempfile
+    from tinygrad.llm.serve import StreamLog
+    with tempfile.TemporaryDirectory() as d:
+      p = os.path.join(d, "s.log")
+      with open(p, "w") as f: f.write("x" * 9_000_000)   # oversized leftover -> rotated away first
+      log = StreamLog(p, "tiny in:0+3")
+      for field, text in (("reasoning_content", "let me "), ("reasoning_content", "think"), ("content", "42")): log.write(field, text)
+      log.close()
+      self.assertTrue(os.path.exists(p + ".1"))
+      body = open(p).read()
+      self.assertIn("tiny in:0+3 =====", body)
+      self.assertIn("--- reasoning_content ---\nlet me think\n--- content ---\n42", body)
+
 class TestStateCacheOOM(unittest.TestCase):
   """T5.7: a failed snapshot must never abort the request; oversized sequences are skipped; eviction happens before allocation."""
   def _server(self, mb):
@@ -464,6 +490,13 @@ class TestStateCacheOOM(unittest.TestCase):
                     state_cache_mb=mb)
     self.addCleanup(srv.server_close)
     return srv
+  def test_one_shot_image_requests_are_not_cached(self):
+    srv = self._server(1024)
+    srv.store_snapshot([1, 2, 3], True)   # T5.7c: an image request never lands in the cache
+    self.assertEqual(len(srv.snapshots), 0)
+    srv.store_snapshot([1, 2, 3])
+    self.assertEqual(len(srv.snapshots), 1)
+
   def test_memoryerror_is_swallowed_and_cache_cleared(self):
     srv = self._server(1)
     srv.snapshots[(1, 2)] = {"t": Tensor.zeros(4)}

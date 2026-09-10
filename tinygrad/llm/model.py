@@ -1228,6 +1228,19 @@ def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng
   bonus = int(rng.choice(p_probs.shape[1], p=p_probs[k_eff]))
   return draft_ids + [bonus], k_eff
 
+MIN_P = getenv("MIN_P", 0.0)  # T4.85: min-p tail cut for sampled decoding (0 = off, byte-identical to the plain Gumbel-max sampler)
+
+def sample_logits(logits:Tensor, temperature:Tensor, min_p:float=0.0) -> Tensor:
+  """One sampled token id per row of `logits` (B, vocab) -> (B, 1). Gumbel-max: argmax(logits/temp - log(-log(u))) is a sample
+  from softmax(logits/temp). min_p > 0 first drops every token whose probability is below min_p x the top token's (the tail
+  that makes a 0.6-temperature sample emit garbage); there is no sort here (the tensor library has none), so this is the
+  sort-free stand-in for top-k/top-p. The top token always survives, so the masked argmax is always defined."""
+  scaled = logits / temperature.maximum(1e-12)
+  if min_p > 0:
+    probs = scaled.softmax(-1)
+    scaled = (probs >= probs.max(-1, keepdim=True) * min_p).where(scaled, float("-inf"))
+  return (scaled - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+
 class Transformer:
   def __init__(self, config:TransformerConfig, device_map:str|dict[int|str,str]|None=None):
     # T4.70b: FFN tensor-parallel spec, parsed from device_map's optional "tp:" segment (see parse_tp_spec)
@@ -1355,9 +1368,7 @@ class Transformer:
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     # greedy (temperature is None): plain argmax, no RNG kernels
     if temperature is None: return logits.argmax(-1, keepdim=True)
-    temperature = temperature.to(logits.device)
-    # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
+    return sample_logits(logits, temperature.to(logits.device), MIN_P)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
                vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
