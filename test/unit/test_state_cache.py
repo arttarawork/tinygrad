@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 from tinygrad import Tensor, nn
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, snapshot_nbytes, snapshot_matches, kv_cache_dtype
 
@@ -35,11 +36,19 @@ def _cold(model:Transformer, tokens:list[int], n:int) -> list[int]:
   return [v for _, v in zip(range(n), model.generate(list(tokens), temperature=0.0))]
 
 class TestSnapshotRestoreRoundTrip(unittest.TestCase):
-  def _round_trip(self, cfg:TransformerConfig):
+  def _round_trip(self, cfg:TransformerConfig, state_cache_device:str=""):
+    import tinygrad.llm.model as model_mod
     model = _tiny_model(cfg)
     prefix, full = [1, 2, 3], [1, 2, 3, 4, 5]
     _prime(model, prefix)
-    snap = model.snapshot_state()
+    with patch.object(model_mod, "STATE_CACHE_DEVICE", state_cache_device):
+      snap = model.snapshot_state()
+    # T4.99: "" (default, patched here to match the module's own unset default) leaves every clone on the
+    # block's own device, byte-identical to pre-T4.99; a real device name (e.g. "CPU:1") means every clone
+    # actually left it for there -- same assertion, a different expected device.
+    for b, bs in zip(model.blk, snap["blocks"]):
+      live_dev = (b.cache_kv if hasattr(b, "cache_kv") else b.conv_state).device
+      for t in bs.values(): self.assertEqual(t.device, state_cache_device or live_dev)
     _prime(model, [9, 9, 9, 9])  # unrelated traffic clobbers _cached_tokens and the live caches/GDN state
     model.restore_state(snap)
     got = [v for _, v in zip(range(6), model.generate(list(full), temperature=0.0))]
@@ -47,6 +56,10 @@ class TestSnapshotRestoreRoundTrip(unittest.TestCase):
 
   def test_round_trip_attention_only(self): self._round_trip(ATTN_CFG)
   def test_round_trip_gdn_hybrid(self): self._round_trip(GDN_CFG)
+  # T4.99: same round trips, but snapshot_state's clones are parked on a distinct real device (CPU:1) --
+  # restore_state must copy each one back to its live buffer's own device before the assign.
+  def test_round_trip_attention_only_via_state_cache_device(self): self._round_trip(ATTN_CFG, "CPU:1")
+  def test_round_trip_gdn_hybrid_via_state_cache_device(self): self._round_trip(GDN_CFG, "CPU:1")
 
   def _longer_prompt_after_restore(self, cfg:TransformerConfig):
     # a bigger extension than the round-trip test above -- proves the TAIL prefill (not just a trivial
@@ -102,6 +115,17 @@ class TestSnapshotNbytes(unittest.TestCase):
     _prime(model, [1, 2, 3, 4, 5])
     gdn_bytes2 = sum(snapshot_nbytes(bs) for bs in model.snapshot_state()["blocks"] if "conv_state" in bs)
     self.assertEqual(gdn_bytes, gdn_bytes2)
+
+  def test_unchanged_by_state_cache_device(self):
+    # T4.99: STATE_CACHE_DEVICE only changes WHERE the clones live, never their shape/dtype -- the byte count
+    # serve.py's LRU cap sizes against must be identical either way.
+    import tinygrad.llm.model as model_mod
+    model = _tiny_model(ATTN_CFG, seed=1)
+    _prime(model, [1, 2, 3])
+    local = snapshot_nbytes(model.snapshot_state())
+    with patch.object(model_mod, "STATE_CACHE_DEVICE", "CPU:1"):
+      remote = snapshot_nbytes(model.snapshot_state())
+    self.assertEqual(local, remote)
 
 if __name__ == '__main__':
   unittest.main()
