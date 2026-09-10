@@ -142,11 +142,27 @@ def lmstudio_models_payload(model_name:str, max_context:int, vision:bool = False
                       "capabilities": capabilities,
                       "loaded_instances": [{"id":model_name, "config": {"context_length":max_context}}]}]}
 
+# T4.91: EFFORT_LEVELS maps a client's reasoning_effort (LM Studio vocabulary; max/ultra are informal xhigh aliases) to the
+# value the Qwen3.8 template itself accepts (low/medium/xhigh only -- it raises otherwise) and to a THINK_BUDGET multiplier;
+# high and xhigh both render as the template's "xhigh" but keep different budgets (4x vs unlimited). Shared by template_kwargs
+# and thinking_budget below so the two cannot drift.
+EFFORT_LEVELS: dict[str, tuple[str, float]] = {
+  "minimal": ("low", 0.125), "low": ("low", 0.25), "medium": ("medium", 1.0),
+  "high": ("xhigh", 4.0), "xhigh": ("xhigh", 0.0), "max": ("xhigh", 0.0), "ultra": ("xhigh", 0.0),
+}
+
 def template_kwargs(body:dict) -> dict:
-  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level
-  # reasoning_effort (LM Studio's /reasoning knob) overrides enable_thinking when present -- see T4.80.
+  # chat_template_kwargs (e.g. {"enable_thinking": false}) go to the template, as llama-server does; a top-level reasoning_effort
+  # (LM Studio's /reasoning knob) overrides enable_thinking when present and, only while thinking stays on, is mapped through
+  # EFFORT_LEVELS to the template's own reasoning_effort value (an explicit chat_template_kwargs.reasoning_effort still wins;
+  # passing the variable to a template that ignores it is harmless -- jinja just never reads it). NOTE: the level's instruction
+  # text sits at the very front of the rendered prompt, so changing it mid-conversation breaks splice_ids's prefix match and the
+  # next turn re-prefills from scratch -- expected. See T4.80/T4.91.
   kwargs = {"preserve_thinking": True, **(body.get("chat_template_kwargs") or {})}
-  if isinstance(effort := body.get("reasoning_effort"), str): kwargs["enable_thinking"] = effort.strip().lower() != "none"
+  if isinstance(effort := body.get("reasoning_effort"), str):
+    e = effort.strip().lower()
+    kwargs["enable_thinking"] = e not in ("none", "off")
+    if kwargs["enable_thinking"]: kwargs.setdefault("reasoning_effort", EFFORT_LEVELS.get(e, ("medium", 1.0))[0])
   return kwargs
 
 # T4.85: Hermes (and most agent clients) send no `temperature`; an absent value used to mean 0 = greedy decoding, and Qwen's
@@ -154,18 +170,35 @@ def template_kwargs(body:dict) -> dict:
 # repeated 11x). DEFAULT_TEMPERATURE (env, default 0 = byte-identical to before) is what an omitted temperature means; the
 # standing recipe sets 0.6 (Qwen's thinking-mode recommendation). An explicit temperature in the request always wins.
 DEFAULT_TEMPERATURE = getenv("DEFAULT_TEMPERATURE", 0.0)
-def request_temperature(body:dict) -> float: return float(body.get("temperature", DEFAULT_TEMPERATURE))
+# T4.92: Qwen's model card recommends DIFFERENT samplers per mode (thinking: temperature 1.0/top-p 0.95; non-thinking:
+# temperature 0.7/top-p 0.8) -- one DEFAULT_TEMPERATURE for both modes was always a compromise. DEFAULT_TEMPERATURE_THINK
+# (env, default: falls back to DEFAULT_TEMPERATURE -- so a server that never sets it keeps today's single-default
+# behavior, byte-identical) is what an omitted temperature means for a THINKING request only; a non-thinking request keeps
+# meaning DEFAULT_TEMPERATURE, same as before T4.92. An explicit request temperature always wins, in either mode.
+DEFAULT_TEMPERATURE_THINK = getenv("DEFAULT_TEMPERATURE_THINK", DEFAULT_TEMPERATURE)
+def request_temperature(body:dict, thinking:bool) -> float:
+  return float(body.get("temperature", DEFAULT_TEMPERATURE_THINK if thinking else DEFAULT_TEMPERATURE))
+
+# T4.92: Qwen's model card also recommends presence_penalty=1.5 in non-thinking mode ("to reduce endless repetitions"; thinking
+# mode wants 0 -- penalizing reused reasoning vocabulary mid-thought would fight the model's own working-through-it style).
+# PRESENCE_PENALTY (env, default 0 = byte-identical to before this existed -- see model.py's Transformer.generate) is what a
+# non-thinking request gets when it sends no presence_penalty of its own; a thinking request never gets the env default. A
+# request's own `presence_penalty` always wins in EITHER mode (0 explicitly disables it, same as omitting it in non-thinking).
+PRESENCE_PENALTY = getenv("PRESENCE_PENALTY", 0.0)
+def request_presence_penalty(body:dict, thinking:bool) -> float:
+  if "presence_penalty" in body: return float(body["presence_penalty"])
+  return 0.0 if thinking else PRESENCE_PENALTY
 
 # T4.88: thinking budget. Qwen's thinking mode overthinks (2026-09-07: 45k reasoning tokens, 4 h, for one turn); Qwen's own
 # recipe is to cap the think block and force it closed with a short "answer now" sentence, then let the model continue from
-# its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; low/minimal get a
-# quarter/eighth, high 4x, xhigh unlimited. The plain generate() path only (MTP's speculative loop is not spliced).
+# its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; EFFORT_LEVELS (T4.91)
+# scales it per level. The plain generate() path only (MTP's speculative loop is not spliced).
 THINK_BUDGET = getenv("THINK_BUDGET", 0)
 THINK_CLOSE = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
 def thinking_budget(body:dict) -> int:
   if not THINK_BUDGET: return 0
-  e = str(body.get("reasoning_effort", "medium")).strip().lower()
-  return {"minimal": THINK_BUDGET // 8, "low": THINK_BUDGET // 4, "high": THINK_BUDGET * 4, "xhigh": 0}.get(e, THINK_BUDGET)
+  factor = EFFORT_LEVELS.get(str(body.get("reasoning_effort", "medium")).strip().lower(), ("medium", 1.0))[1]
+  return int(THINK_BUDGET * factor)
 
 # T4.89: reasoning loop breaker. The 2026-09-07 captures show Qwen's "anxious" thinking is literal sentence cycles (one 44k-char
 # think block said "actually, the simplest is: keep two files, zip them." 11 times, oscillating with the other option), not long
@@ -181,7 +214,9 @@ class LoopDetector:
     self.buf += delta
     while (m := re.search(r"[.!?]\s|\n", self.buf)) is not None:
       sent, self.buf = " ".join(self.buf[:m.end()].lower().split()), self.buf[m.end():]
-      if len(sent.split()) < 6: continue
+      # T4.97: skip code-ish sentences (assignment/statement/markup chars) -- legitimate repetition (iterating on a
+      # code line, an arithmetic checklist), not an anxious loop; prose sentences never carry these characters.
+      if len(sent.split()) < 6 or any(c in sent for c in "=;{}`") or "</" in sent: continue
       self.counts[sent] += 1
       if self.counts[sent] >= self.repeats:
         self.buf, self.counts = "", collections.Counter()
@@ -208,7 +243,7 @@ class StreamLog:
 class StreamRouter:
   # routes streamed output text to (field, text) deltas, keeping tool_call regions in .buf for the final parse
   def __init__(self, reasoning:bool=False):
-    self.buf = ""
+    self.buf, self.reasoning_text = "", ""  # reasoning_text: the think block so far (T4.97 end-of-stream promotion)
     self.mode = "reasoning" if reasoning else "undecided"  # output inside a think block is sent as reasoning_content
   def split(self, tag:str, final:bool) -> tuple[str, bool]:
     # split buf on the first full tag, holding back a partial tag at the end unless final
@@ -225,8 +260,17 @@ class StreamRouter:
       self.mode, self.buf = ("reasoning", self.buf[len("<think>"):]) if self.buf.startswith("<think>") else ("content", self.buf)
     if self.mode == "reasoning":
       emit, done = self.split("</think>", final)
-      if emit: yield "reasoning_content", emit
-      if not done: return
+      if emit:
+        self.reasoning_text += emit
+        yield "reasoning_content", emit
+      if not done:
+        # T4.97: a model that ENDS its output inside the think block with a complete tool call in it (2026-09-08: Qwen3.8 wrote the
+        # call after a nudge and never wrote </think>, the client saw an empty reply) meant that call: promote it at end of stream so
+        # run_model's final parse finds it. A tool call inside a think block that does close stays reasoning -- the model was thinking
+        # about a call, not making it (test/null/test_llm_server.py::test_tool_call_in_reasoning_is_not_executed).
+        if final and (i := self.reasoning_text.find("<tool_call>")) != -1 and "</tool_call>" in self.reasoning_text[i:]:
+          self.mode, self.buf = "tool", self.reasoning_text[i:]
+        return
       self.mode = "content"
     if self.mode == "tool": return
     emit, found = self.split("<tool_call>", final)
@@ -307,7 +351,8 @@ class Handler(HTTPRequestHandler):
       self.send_data(json.dumps(payload).encode())
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0):
+                reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0,
+                presence_penalty:float=0.0):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -345,6 +390,9 @@ class Handler(HTTPRequestHandler):
     # byte-identical to before --mtp existed. speculative_generate(temperature=temperature) already picks
     # its own greedy (temperature<=0) vs sampled (>0) path internally, so no extra branching is needed here.
     # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
+    # T4.92: presence_penalty is plumbed to the plain generate() path only -- speculative_generate's accept/resample math
+    # (Leviathan et al., see model.py's spec_accept) has its own correctness proof that a logit bias would need to thread
+    # through carefully, out of scope here, so a --mtp request never applies one (T4.92's own task note).
     use_spec = self.server.mtp and model.mtp_head is not None and vision is None
     # T4.95: list(ids), not ids -- generate()/speculative_generate() append every token they yield straight into
     # the list they're given (model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). `ids` here is the SAME
@@ -353,8 +401,9 @@ class Handler(HTTPRequestHandler):
     # resumed prompt (doubling everything generated before the nudge/budget hit). A copy keeps `ids` the pure
     # prompt for the rest of this function; cli.py's generate() callers still rely on the mutation and are untouched.
     gen = model.speculative_generate(list(ids), k=self.server.spec_k, temperature=temperature) if use_spec \
-      else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision)  # T5.5: image requests are greedy --
-      # only the greedy vision jit family is warmed (each extra prefill family costs ~0.78 GB on the 3090, see model.VISION_CHUNK)
+      else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
+      # T5.5: image requests are greedy -- only the greedy vision jit family is warmed (each extra prefill family costs
+      # ~0.78 GB on the 3090, see model.VISION_CHUNK)
     try:
       yield chunk({"role":"assistant", "content":""})
       it = iter(gen)
@@ -368,7 +417,9 @@ class Handler(HTTPRequestHandler):
           for field, delta in router.route(dec(t)):
             if slog is not None: slog.write(field, delta)
             yield chunk({field:delta})
-        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision)
+        # T4.92: presence_penalty carries over -- generate() resets its own mask per call, so without this an active
+        # penalty would silently vanish for the rest of the response after a loop-breaker/think-budget injection.
+        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
         it = iter(gen)
       loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS and not use_spec else None), 0
       while (next_id := next(it, None)) is not None:
@@ -471,7 +522,8 @@ class Handler(HTTPRequestHandler):
         ids = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
           or self.server.tok.encode(rendered)
         record = (rendered, ids, len(body["messages"]))
-      think = f"think:{'on' if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  " if "enable_thinking" in kwargs else ""
+      think = (f"think:{kwargs.get('reasoning_effort', 'xhigh') if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  "
+               if "enable_thinking" in kwargs else "")
       stderr_log(f"prep:{(time.perf_counter()-request_st)*1e3:5.0f} ms  {colored('--', 'BLACK')}  {think}")
       if len(ids) >= self.server.model.max_context:
         stderr_log(f"{colored('context length exceeded', 'red')}  in:{len(ids):5d}  max:{self.server.model.max_context:5d}\n")
@@ -481,10 +533,11 @@ class Handler(HTTPRequestHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      thinking = rendered.rstrip().endswith("<think>")
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=request_temperature(body),
-                              reasoning=rendered.rstrip().endswith("<think>"), record=record, vision=vision_input,
-                              think_budget=thinking_budget(body))
+                              max_tokens=max_tokens, temperature=request_temperature(body, thinking),
+                              reasoning=thinking, record=record, vision=vision_input, think_budget=thinking_budget(body),
+                              presence_penalty=request_presence_penalty(body, thinking))
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"

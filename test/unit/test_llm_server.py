@@ -131,7 +131,7 @@ class TestTransformerGenerate(unittest.TestCase):
   def test_recurrent_divergent_prompt_restarts(self):
     model, calls = Transformer(TEST_CONFIG), []
     model.has_recurrent_block, model._cached_tokens = True, [1, 2, 9]
-    def mock_call(self, tokens, start_pos, temperature):
+    def mock_call(self, tokens, start_pos, temperature, **kwargs):
       calls.append(start_pos)
       return Tensor([[42]])
     with patch.object(Transformer, '__call__', mock_call): next(model.generate([1, 2, 10, 11]))
@@ -141,6 +141,34 @@ class TestTransformerGenerate(unittest.TestCase):
     router = StreamRouter(reasoning=True)
     self.assertEqual(list(router.route("reasoning</think>answer")),
                      [("reasoning_content", "reasoning"), ("content", "answer")])
+    # T4.97: </think> before <tool_call> still routes through content mode first, byte-identical to before change A
+    router = StreamRouter(reasoning=True)
+    out = list(router.route('reasoning</think>ok <tool_call>{"name":"f"}</tool_call>', final=True))
+    self.assertEqual(out, [("reasoning_content", "reasoning"), ("content", "ok ")])
+    self.assertEqual((router.mode, router.buf), ("tool", '<tool_call>{"name":"f"}</tool_call>'))
+
+  def test_unclosed_think_block_ending_in_a_tool_call_is_promoted(self):
+    # T4.97: the model writes a complete tool call inside the think block and ends there (no </think>): the reasoning streams as
+    # reasoning_content (including the call text), and at end of stream the router hands the call to the final parse.
+    import re
+    from tinygrad.llm.serve import parse_tool_call
+    r = StreamRouter(reasoning=True)
+    out = []
+    for piece in ["thinking, ", "then <tool_c", "all>\n<function=f>\n</function>\n</tool_call>", " trailing"]: out += list(r.route(piece))
+    out += list(r.route("", final=True))
+    self.assertTrue(all(f == "reasoning_content" for f, _ in out))
+    self.assertEqual("".join(d for _, d in out), "thinking, then <tool_call>\n<function=f>\n</function>\n</tool_call> trailing")
+    self.assertEqual(r.mode, "tool")
+    m = re.search(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", r.buf, re.DOTALL)
+    self.assertEqual(parse_tool_call(m.group(1)), ("f", {}))
+
+  def test_tool_call_inside_a_closed_think_block_stays_reasoning(self):
+    # the model only thought about a call: </think> follows, the answer is content, nothing is promoted
+    r = StreamRouter(reasoning=True)
+    out = list(r.route("maybe <tool_call>{\"name\":\"f\"}</tool_call> no.</think>answer")) + list(r.route("", final=True))
+    self.assertEqual([f for f, _ in out], ["reasoning_content", "content"])
+    self.assertEqual(out[1][1], "answer")
+    self.assertEqual(r.mode, "content")
 
   def test_kv_cache_reuse(self):
     """Test that generate reuses the KV cache when tokens extend the cached prefix."""
@@ -418,6 +446,26 @@ class TestLMStudioShim(unittest.TestCase):
   def test_reasoning_effort_case_and_whitespace_insensitive(self):
     self.assertEqual(template_kwargs({"reasoning_effort": "NONE "})["enable_thinking"], False)
 
+  def test_template_kwargs_effort_levels(self):
+    # T4.91: minimal/low/medium/high/xhigh/max all map onto the Qwen3.8 template's low/medium/xhigh vocabulary; an
+    # unrecognized string falls back to medium (the template raises on anything it doesn't recognize, so an unmapped
+    # value must never reach it), and an absent reasoning_effort is a no-op (covered by test_template_kwargs_no_overrides).
+    cases = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "garbage": "medium"}
+    for effort, level in cases.items():
+      with self.subTest(effort=effort):
+        self.assertEqual(template_kwargs({"reasoning_effort": effort}),
+                          {"preserve_thinking": True, "enable_thinking": True, "reasoning_effort": level})
+
+  def test_template_kwargs_none_and_off_disable_thinking(self):
+    # thinking off means no reasoning_effort key at all -- the template never reads it then (T4.91).
+    self.assertEqual(template_kwargs({"reasoning_effort": "none"}), {"preserve_thinking": True, "enable_thinking": False})
+    self.assertEqual(template_kwargs({"reasoning_effort": "off"}), {"preserve_thinking": True, "enable_thinking": False})
+
+  def test_template_kwargs_explicit_reasoning_effort_wins(self):
+    # a client's own chat_template_kwargs.reasoning_effort beats the one we derive from the top-level effort (T4.91).
+    body = {"reasoning_effort": "high", "chat_template_kwargs": {"reasoning_effort": "medium"}}
+    self.assertEqual(template_kwargs(body), {"preserve_thinking": True, "enable_thinking": True, "reasoning_effort": "medium"})
+
   def test_lmstudio_models_payload_shape(self):
     self.assertEqual(lmstudio_models_payload("tiny", 32)["models"], [{
       "key": "tiny", "id": "tiny", "object": "model", "type": "llm", "max_context_length": 32,
@@ -452,18 +500,136 @@ class TestLMStudioShim(unittest.TestCase):
       server.shutdown()
       server.server_close()
 
+class TestReasoningEffortStandInTemplate(unittest.TestCase):
+  """T4.91: render through a small jinja2 template that mirrors the Qwen3.8 template's reasoning_effort CONTRACT (accepts
+  low/medium/xhigh, raises otherwise, injects distinguishable text per level) -- independent of that template's actual
+  prose, which TestReasoningEffortRealTemplate below checks directly against the GGUF (where, unlike here, 'medium'
+  turns out to inject no text at all)."""
+  TEMPLATE = (
+    "{%- if enable_thinking is defined and enable_thinking is false -%}\n"
+    "[thinking off]\n"
+    "{%- else -%}\n"
+    "{%- set e = reasoning_effort|default('xhigh') -%}\n"
+    "{%- if e == 'high' -%}{%- set e = 'xhigh' -%}{%- endif -%}\n"
+    "{%- if e not in ('low', 'medium', 'xhigh') -%}\n"
+    "{{ raise_exception('Unexpected reasoning effort ' ~ e) }}\n"
+    "{%- endif -%}\n"
+    "[effort:{{ e }}]\n"
+    "{%- endif -%}"
+  )
+
+  @classmethod
+  def setUpClass(cls):
+    import jinja2
+    env = jinja2.Environment()
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    cls.template = env.from_string(cls.TEMPLATE)
+
+  def _render(self, reasoning_effort):
+    return self.template.render(**template_kwargs({"reasoning_effort": reasoning_effort}))
+
+  def test_low_medium_high_render_distinct_text(self):
+    self.assertIn("[effort:low]", self._render("low"))
+    self.assertIn("[effort:medium]", self._render("medium"))
+    self.assertIn("[effort:xhigh]", self._render("high"))  # Hermes "high" -> template "xhigh"
+
+  def test_none_disables_thinking_with_no_effort_text(self):
+    out = self._render("none")
+    self.assertIn("[thinking off]", out)
+    self.assertNotIn("[effort:", out)
+
+  def test_garbage_effort_never_reaches_the_template(self):
+    self._render("garbage")  # our own mapping already sanitized it to "medium" -- must not raise
+
+import os
+GGUF_PATH = "/Users/artur/models/qwen3.8-27b-q8/Qwen3.8-27B-Q8_0.gguf"
+
+@unittest.skipUnless(os.path.exists(GGUF_PATH), "qwen3.8-27b GGUF not present on this machine")
+class TestReasoningEffortRealTemplate(unittest.TestCase):
+  """T4.91: render the model's OWN chat template (text loaded from the GGUF header, no weights -- see gguf_load) with our
+  derived kwargs. Verified against the template source first: it accepts reasoning_effort in {low, medium, xhigh}
+  (raises otherwise; 'high' is its own internal alias for xhigh) but only 'xhigh' and 'low' actually inject an
+  instruction sentence into the system prompt -- 'medium' is silently accepted and adds no text."""
+
+  @classmethod
+  def setUpClass(cls):
+    import pathlib, json, jinja2
+    from tinygrad.llm.gguf import gguf_load
+    kv, _ = gguf_load(pathlib.Path(GGUF_PATH))
+    env = jinja2.Environment()
+    env.filters['tojson'] = lambda obj, **kw: json.dumps(obj, **kw)
+    env.globals['raise_exception'] = lambda msg: (_ for _ in ()).throw(RuntimeError(msg))
+    env.globals['strftime_now'] = lambda fmt: ""
+    env.globals['bos_token'], env.globals['eos_token'] = "", ""
+    cls.template = env.from_string(kv['tokenizer.chat_template'])
+
+  def _render(self, reasoning_effort):
+    kwargs = template_kwargs({"reasoning_effort": reasoning_effort})
+    return self.template.render(messages=[{"role": "user", "content": "hi"}], tools=None, add_generation_prompt=True, **kwargs)
+
+  def test_low_injects_low_instruction(self):
+    self.assertIn("Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+                  "conclusion without unnecessary elaboration.", self._render("low"))
+
+  def test_high_injects_xhigh_instruction(self):
+    self.assertIn("Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+                  "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity "
+                  "in the final answer.", self._render("high"))
+
+  def test_medium_injects_nothing(self):
+    self.assertNotIn("Reasoning effort is set to", self._render("medium"))
+
+  def test_thinking_off_renders_closed_think_block(self):
+    out = self._render("none")
+    self.assertNotIn("Reasoning effort is set to", out)
+    self.assertTrue(out.rstrip().endswith("<think>\n\n</think>"))
+
 if __name__ == '__main__':
   unittest.main()
 
 class TestDefaultTemperature(unittest.TestCase):
-  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins."""
+  """T4.85: an omitted temperature means DEFAULT_TEMPERATURE (0 = greedy, as before); an explicit one always wins.
+  T4.92: a THINKING request gets DEFAULT_TEMPERATURE_THINK instead (falling back to DEFAULT_TEMPERATURE when unset)."""
   def test_omitted_uses_default_explicit_wins(self):
     import tinygrad.llm.serve as srv
-    self.assertEqual(srv.request_temperature({}), 0.0)
+    self.assertEqual(srv.request_temperature({}, False), 0.0)
     with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6):
-      self.assertEqual(srv.request_temperature({}), 0.6)
-      self.assertEqual(srv.request_temperature({"temperature": 0}), 0.0)
-      self.assertEqual(srv.request_temperature({"temperature": 1.1}), 1.1)
+      self.assertEqual(srv.request_temperature({}, False), 0.6)
+      self.assertEqual(srv.request_temperature({"temperature": 0}, False), 0.0)
+      self.assertEqual(srv.request_temperature({"temperature": 1.1}, False), 1.1)
+
+  def test_thinking_falls_back_to_default_temperature_unset(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.6), patch.object(srv, "DEFAULT_TEMPERATURE_THINK", srv.DEFAULT_TEMPERATURE):
+      self.assertEqual(srv.request_temperature({}, True), 0.6)   # DEFAULT_TEMPERATURE_THINK unset -> mirrors DEFAULT_TEMPERATURE
+
+  def test_thinking_uses_its_own_default_and_explicit_wins(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "DEFAULT_TEMPERATURE", 0.7), patch.object(srv, "DEFAULT_TEMPERATURE_THINK", 1.0):
+      self.assertEqual(srv.request_temperature({}, True), 1.0)     # thinking gets its own default, independent of DEFAULT_TEMPERATURE
+      self.assertEqual(srv.request_temperature({}, False), 0.7)    # non-thinking untouched
+      self.assertEqual(srv.request_temperature({"temperature": 0.3}, True), 0.3)  # explicit wins in either mode
+
+class TestPresencePenalty(unittest.TestCase):
+  """T4.92: PRESENCE_PENALTY applies to non-thinking requests only unless the request sends its own presence_penalty
+  (which always wins, in either mode -- 0 explicitly disables it, distinct from omitting the field)."""
+  def test_default_is_zero_non_thinking(self):
+    import tinygrad.llm.serve as srv
+    self.assertEqual(srv.request_presence_penalty({}, False), 0.0)
+    self.assertEqual(srv.request_presence_penalty({}, True), 0.0)
+
+  def test_env_applies_to_non_thinking_only(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "PRESENCE_PENALTY", 1.5):
+      self.assertEqual(srv.request_presence_penalty({}, False), 1.5)
+      self.assertEqual(srv.request_presence_penalty({}, True), 0.0)   # thinking never gets the env default
+
+  def test_explicit_request_value_always_wins(self):
+    import tinygrad.llm.serve as srv
+    with patch.object(srv, "PRESENCE_PENALTY", 1.5):
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 0.3}, False), 0.3)
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 2.0}, True), 2.0)
+      self.assertEqual(srv.request_presence_penalty({"presence_penalty": 0}, False), 0.0)  # explicit 0 disables it
 
 class TestThinkingBudget(unittest.TestCase):
   """T4.88: past the budget the server closes the think block itself and continues the same request from the cached prefix."""
@@ -478,7 +644,7 @@ class TestThinkingBudget(unittest.TestCase):
       def stream_decoder(self):
         return lambda i=None: "" if i is None else chr(i)
     calls = []
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       calls.append(list(ids))
       if len(calls) == 1:                       # the model thinks forever
         for c in "think " * 100: yield ord(c)
@@ -516,7 +682,7 @@ class TestReasoningLoopBreaker(unittest.TestCase):
     cycle = "Actually, the simplest is: keep two files, zip them. A single self-contained file is more portable. "
     close = [ord(c) for c in srv.THINK_CLOSE]
     calls = []
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       calls.append(list(ids))
       if ids[-len(close):] == close:            # the think block was closed for us: answer
         for c in "42": yield ord(c)
@@ -544,6 +710,25 @@ class TestReasoningLoopBreaker(unittest.TestCase):
     for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))
     self.assertEqual(d.feed("the same long  sentence said AGAIN and again.\n"), "the same long sentence said again and again.")
     for _ in range(2): self.assertIsNone(d.feed("The same long sentence said again and again. "))   # counts reset after a hit
+
+  def test_detector_ignores_code_ish_sentences(self):
+    # T4.97: repeated code/formula lines (2026-09-08: an iterated code edit, an arithmetic checklist) are legitimate
+    # repetition, not an anxious loop -- a line carrying '=', ';', '{', '}', a backtick, or '</' never counts.
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    code = "let offtick = i*t16 + t16 - 1;\n"                                # >=6 words, has '=' and ';'
+    for _ in range(4): self.assertIsNone(d.feed(code))                      # never fires, however many times repeated
+    prose = "Actually, the simplest is: keep two files, zip them.\n"        # a real loop sentence -- no skip chars
+    for _ in range(2): self.assertIsNone(d.feed(prose))
+    self.assertEqual(d.feed(prose), "actually, the simplest is: keep two files, zip them.")   # still fires at LOOP_REPEATS
+
+  def test_detector_mixed_stream_fires_on_prose_not_code(self):
+    from tinygrad.llm.serve import LoopDetector
+    d = LoopDetector(3)
+    code = "let offtick = i*t16 + t16 - 1;\n"
+    prose = "Actually, the simplest is: keep two files, zip them.\n"
+    hits = [d.feed(code + prose) for _ in range(3)]                          # code line never counts, prose does
+    self.assertEqual(hits, [None, None, "actually, the simplest is: keep two files, zip them."])
 
 class TestKeepAlive(unittest.TestCase):
   """T4.90: empty-delta heartbeats while the generator is silent; a hung-up client stops generation."""
@@ -703,7 +888,7 @@ class TestSpliceCacheCopy(unittest.TestCase):
   def test_prompt_list_untouched_and_last_is_pure(self):
     from types import SimpleNamespace
     from tinygrad.llm.serve import Handler
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       for c in "42\0":                      # two real tokens then EOS (id 0)
         ids.append(ord(c))
         model._cached_tokens = ids[:-1]
@@ -742,7 +927,7 @@ class TestSpliceCacheCopy(unittest.TestCase):
     import tinygrad.llm.serve as srv
     from tinygrad.llm.serve import Handler
     calls = []
-    def generate(ids, temperature=0.0, vision=None):
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
       calls.append(list(ids))
       if len(calls) == 1:                   # the model thinks forever, mutating its `ids` arg like the real generate()
         for c in "think " * 100:
@@ -774,7 +959,7 @@ class TestBoundarySnapshot(unittest.TestCase):
   def test_boundary_flag_follows_the_live_cache(self):
     from types import SimpleNamespace
     from tinygrad.llm.serve import Handler
-    def generate(ids, temperature=0.0, vision=None): yield 0   # ends immediately -- one store opportunity per request
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0): yield 0   # ends immediately -- one store opportunity per request
     calls = []
     model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
     server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=1, vision=None, last=None,
@@ -818,7 +1003,7 @@ class TestBoundarySnapshot(unittest.TestCase):
       def get_start_pos(self, ids):
         return len(self.cached) if self.cached and len(self.cached) < len(ids) and ids[:len(self.cached)] == self.cached else 0
       def restore_state(self, snap): self.cached = list(snap["tokens"])
-      def generate(self, ids, temperature=0.0, vision=None):
+      def generate(self, ids, temperature=0.0, vision=None, presence_penalty=0.0):
         self.cached = list(ids)
         for t in self.script:
           yield t
