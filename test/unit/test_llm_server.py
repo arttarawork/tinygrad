@@ -147,20 +147,28 @@ class TestTransformerGenerate(unittest.TestCase):
     self.assertEqual(out, [("reasoning_content", "reasoning"), ("content", "ok ")])
     self.assertEqual((router.mode, router.buf), ("tool", '<tool_call>{"name":"f"}</tool_call>'))
 
-  def test_tool_call_inside_think_block_ends_reasoning(self):
-    # T4.97: a well-formed tool call emitted INSIDE the think block, with no </think> at all, must still end up
-    # routed for the final tool-call parse, not swallowed as reasoning_content (2026-09-08 production incident).
+  def test_unclosed_think_block_ending_in_a_tool_call_is_promoted(self):
+    # T4.97: the model writes a complete tool call inside the think block and ends there (no </think>): the reasoning streams as
+    # reasoning_content (including the call text), and at end of stream the router hands the call to the final parse.
     import re
     from tinygrad.llm.serve import parse_tool_call
-    router = StreamRouter(reasoning=True)
-    chunks = ["let me call the tool. ", "<tool_c", 'all>{"name":"f","arguments":{}}</tool_call>']  # mid-tag split
-    out = [d for c in chunks for d in router.route(c)]
-    out += list(router.route("", final=True))
-    self.assertEqual(out, [("reasoning_content", "let me call the tool. ")])  # never leaked as reasoning_content
-    self.assertEqual(router.mode, "tool")
-    self.assertTrue(router.buf.startswith("<tool_call>"))
-    calls = [parse_tool_call(m.group(1)) for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL)]
-    self.assertEqual(calls, [("f", {})])
+    r = StreamRouter(reasoning=True)
+    out = []
+    for piece in ["thinking, ", "then <tool_c", "all>\n<function=f>\n</function>\n</tool_call>", " trailing"]: out += list(r.route(piece))
+    out += list(r.route("", final=True))
+    self.assertTrue(all(f == "reasoning_content" for f, _ in out))
+    self.assertEqual("".join(d for _, d in out), "thinking, then <tool_call>\n<function=f>\n</function>\n</tool_call> trailing")
+    self.assertEqual(r.mode, "tool")
+    m = re.search(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", r.buf, re.DOTALL)
+    self.assertEqual(parse_tool_call(m.group(1)), ("f", {}))
+
+  def test_tool_call_inside_a_closed_think_block_stays_reasoning(self):
+    # the model only thought about a call: </think> follows, the answer is content, nothing is promoted
+    r = StreamRouter(reasoning=True)
+    out = list(r.route("maybe <tool_call>{\"name\":\"f\"}</tool_call> no.</think>answer")) + list(r.route("", final=True))
+    self.assertEqual([f for f, _ in out], ["reasoning_content", "content"])
+    self.assertEqual(out[1][1], "answer")
+    self.assertEqual(r.mode, "content")
 
   def test_kv_cache_reuse(self):
     """Test that generate reuses the KV cache when tokens extend the cached prefix."""
