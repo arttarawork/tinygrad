@@ -312,7 +312,7 @@ class Handler(HTTPRequestHandler):
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
     # T4.96: true iff the live cache did NOT extend (cold, or about to resume from a snapshot below) -- only a
-    # boundary request stores a snapshot after prefill (below): a tool-loop step's snapshot would just evict it.
+    # boundary request's snapshot is pinned when stored after prefill (below); a tool-loop step's is second tier.
     boundary = cache_start_pos == 0
     # T4.67: (a) the splice/live-cache path above found nothing to reuse -- before falling back to a fully cold
     # prefill (c), try the cross-session state cache (b): the longest snapshot whose ids exactly prefix this
@@ -376,8 +376,8 @@ class Handler(HTTPRequestHandler):
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
-          # T4.96: only if `boundary` (this request didn't extend the live cache) -- else it's a tool-loop step.
-          if boundary and self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None)
+          # T4.96: `boundary` (this request didn't extend the live cache) pins it; a tool-loop step's snapshot is second tier.
+          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None, boundary=boundary)
         if tok.is_end(next_id): break
         out.append(next_id)
         hit = None
@@ -541,10 +541,14 @@ class LLMServer(TCPServerWithReuse):
     self.snapshots.move_to_end(best_key)
     return self.snapshots[best_key]
 
-  def store_snapshot(self, ids:list[int], one_shot:bool=False) -> None:
+  def store_snapshot(self, ids:list[int], one_shot:bool=False, boundary:bool=True) -> None:
     """Snapshot self.model's current state -- assumed to have just finished prefilling exactly `ids` (see
     Handler.run_model) -- under key tuple(ids), LRU-evicting the oldest entries to stay under state_cache_mb
-    (always keeping at least the just-stored entry, even if it alone exceeds the cap)."""
+    (always keeping at least the just-stored entry, even if it alone exceeds the cap).
+    T4.96 two tiers: a `boundary` snapshot (the request did NOT extend the live cache -- a new session or a new user turn; the
+    one that bridges the next user message) is pinned: a tool-loop step's snapshot (boundary=False, only ever useful to a retry
+    of that exact prompt) is stored when it fits beside the pinned ones and is evicted first, but never displaces a boundary one;
+    a boundary snapshot evicts anything older."""
     # T5.7c (2026-09-06): image requests are one-shot auxiliary calls (screenshot analysis) that are never continued, yet each
     # snapshot carries the ~150 MB fixed DeltaNet state; five of them ate the 3090's headroom, the 46k-token session snapshot
     # then OOM'd and the whole cache was dropped -> a 41-minute re-prefill. Don't cache them.
@@ -566,13 +570,24 @@ class LLMServer(TCPServerWithReuse):
         stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (~{est>>20} MB > cap)', 'yellow')}  {colored('--', 'BLACK')}  ")
         return
       total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
-      while total + est > cap and self.snapshots: total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])
+      # LRU-first, but only what this store may displace: a tool-loop snapshot never evicts a pinned boundary one (T4.96)
+      for k in [k for k, v in self.snapshots.items() if boundary or not v.get("boundary", True)]:
+        if total + est <= cap: break
+        total -= snapshot_nbytes(self.snapshots.pop(k))
+      if total + est > cap:
+        stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (boundary pinned)', 'yellow')}  {colored('--', 'BLACK')}  ")
+        return
     try: snap = self.model.snapshot_state()
     except MemoryError as e:
       self.snapshots.clear()
       stderr_log(f"{colored(f'state cache: snapshot dropped ({str(e)[:50]}), cache cleared', 'yellow')}  {colored('--', 'BLACK')}  ")
       return
+    snap["boundary"] = boundary
     self.snapshots[key] = snap
     total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
-    while total > cap and len(self.snapshots) > 1:
-      total -= snapshot_nbytes(self.snapshots.popitem(last=False)[1])
+    while total > cap and len(self.snapshots) > 1:  # the estimate undershot: same tier rule as above
+      victims = [k for k, v in self.snapshots.items() if k != key and (boundary or not v.get("boundary", True))]
+      if not victims:
+        if not boundary: self.snapshots.pop(key)  # only pinned boundary snapshots remain: the tool-loop one itself goes
+        break
+      total -= snapshot_nbytes(self.snapshots.pop(victims[0]))

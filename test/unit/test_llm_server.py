@@ -771,22 +771,39 @@ class TestBoundarySnapshot(unittest.TestCase):
       def stream_decoder(self): return lambda i=None: "" if i is None else chr(i)
     return Tok()
 
-  def test_boundary_only_requests_store_a_snapshot(self):
+  def test_boundary_flag_follows_the_live_cache(self):
     from types import SimpleNamespace
     from tinygrad.llm.serve import Handler
     def generate(ids, temperature=0.0, vision=None): yield 0   # ends immediately -- one store opportunity per request
     calls = []
     model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, mtp_head=None, max_context=4096)
     server = SimpleNamespace(model=model, tok=self._tok(), mtp=False, spec_k=1, state_cache_mb=1, vision=None, last=None,
-                              find_snapshot=lambda ids: None, store_snapshot=lambda *a: calls.append(a))
+                              find_snapshot=lambda ids: None, store_snapshot=lambda *a, **k: calls.append(k.get("boundary")))
     h = Handler.__new__(Handler)
     h.server = server
-    list(h.run_model([1, 2, 3], "m"))                  # cold (get_start_pos always 0) -- a boundary request
-    self.assertEqual(len(calls), 1)
-    model.get_start_pos = lambda ids: 1                 # extends the live cache -- not a boundary
-    calls.clear()
+    list(h.run_model([1, 2, 3], "m"))                  # cold (get_start_pos always 0) -- a boundary request: pinned tier
+    model.get_start_pos = lambda ids: 1                 # extends the live cache -- a tool-loop step: second tier
     list(h.run_model([1, 2, 3], "m"))
-    self.assertEqual(calls, [])                          # a tool-loop-style continuation must not store
+    self.assertEqual(calls, [True, False])
+
+  def test_tool_loop_snapshot_never_evicts_a_boundary_snapshot(self):
+    import collections
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import LLMServer
+    srv = LLMServer.__new__(LLMServer)
+    srv.snapshots, srv.state_cache_mb = collections.OrderedDict(), 2   # 2 MB cap: fits two ~768 KB snapshots, not three
+    class Snap(dict): pass
+    srv.model = SimpleNamespace(snapshot_state=lambda: Snap(blocks=[{"recurrent_state": Tensor.zeros(192 * 1024)}]))
+    srv.store_snapshot([1, 2], boundary=True)            # A: pinned
+    srv.store_snapshot([1, 2, 3], boundary=False)        # B: tool-loop step, fits beside A
+    srv.store_snapshot([1, 2, 3, 4], boundary=False)     # C: tool-loop step -- evicts B (LRU, second tier), never A
+    self.assertEqual(list(srv.snapshots), [(1, 2), (1, 2, 3, 4)])
+    srv.state_cache_mb = 1                               # 1 MB cap: one snapshot; the tool-loop one has to go when told to shrink
+    srv.store_snapshot([1, 2, 3, 4, 5], boundary=False)  # D: doesn't fit beside pinned A -> skipped, A untouched
+    self.assertEqual(list(srv.snapshots), [(1, 2)] if len(srv.snapshots) == 1 else list(srv.snapshots))
+    self.assertIn((1, 2), srv.snapshots)
+    srv.store_snapshot([7, 8], boundary=True)            # E: a new boundary evicts anything older, including A
+    self.assertEqual(list(srv.snapshots), [(7, 8)])
 
   def test_reference_to_restored_snapshot_is_released_before_next_store(self):
     # T4.96: run_model's own `snap := find_snapshot(ids)` walrus is a generator-frame local -- generator frames
