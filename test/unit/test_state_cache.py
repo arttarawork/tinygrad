@@ -1,6 +1,7 @@
-import unittest
+import os, unittest
 from unittest.mock import patch
 from tinygrad import Tensor, nn
+from tinygrad.helpers import getenv
 from tinygrad.llm.model import Transformer, TransformerConfig, SSMConfig, snapshot_nbytes, snapshot_matches, kv_cache_dtype
 
 # T4.67: snapshot_state/restore_state round-trip tests. Tiny synthetic models built directly from a
@@ -89,6 +90,21 @@ class TestSnapshotRestoreRoundTrip(unittest.TestCase):
     # (whatever unrelated partial-prefix reuse get_start_pos finds on its own) must still match a cold run.
     got = [v for _, v in zip(range(6), model.generate(list(mismatched), temperature=0.0))]
     self.assertEqual(got, _cold(model, mismatched, 6))
+
+class TestSnapshotRestoreRoundTripKVInt4(TestSnapshotRestoreRoundTrip):
+  """T4.100: the exact same round trips as TestSnapshotRestoreRoundTrip above (every test method is
+  inherited, unmodified), just under KV_INT4=1 -- attention blocks' cache_kv packs to uint8 (two 4-bit
+  values/byte) and gets a cache_kv_scale alongside it (model.py's TransformerBlock._init_state); GDN blocks
+  (GDN_CFG's one GatedDeltaNetBlock) are untouched by this flag, same as KV_INT8."""
+  def setUp(self):
+    self._old_env, self._had_env = os.environ.get("KV_INT4", ""), "KV_INT4" in os.environ
+    os.environ["KV_INT4"] = "1"
+    getenv.cache_clear()  # type: ignore[attr-defined]
+
+  def tearDown(self):
+    if self._had_env: os.environ["KV_INT4"] = self._old_env
+    else: os.environ.pop("KV_INT4", None)
+    getenv.cache_clear()  # type: ignore[attr-defined]
 
 class TestSnapshotNbytes(unittest.TestCase):
   def test_matches_hand_computed_size_and_grows_with_longer_prefix(self):

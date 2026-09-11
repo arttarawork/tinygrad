@@ -834,6 +834,20 @@ class TestStateCacheOOM(unittest.TestCase):
     self.assertEqual(snapshot_nbytes_for(snap, 4), 1024 * 1024 + 4 * 4096)
     self.assertEqual(snapshot_nbytes_for(snap, 4000), 1024 * 1024 + 4000 * 4096)
     self.assertLess(snapshot_nbytes_for(snap, 4000), 20 * 1024 * 1024)   # the naive extrapolation would say ~1 GB
+  def test_size_estimate_scales_cache_kv_scale_per_token_too(self):
+    # T4.100: cache_kv_scale (T6.1 KV_INT8 / T4.100 KV_INT4's per-block absmax scales) is position-indexed
+    # exactly like cache_kv -- it used to fall through to the `else: fixed += nb` branch (only "cache_kv"/
+    # "cache_k" were ever checked), charging its CURRENT size once instead of scaling with n_tokens, the same
+    # bug class T5.7b's test above guards cache_kv itself against. Same 4 KB/token cache_kv as T5.7b's test,
+    # plus 256 B/token of fp16 cache_kv_scale (2, 1, 1, 4, 64) at pos=4 -- both must extrapolate together.
+    from tinygrad import dtypes
+    from tinygrad.llm.model import snapshot_nbytes_for
+    snap = {"tokens": [1, 2, 3, 4], "pos": 4,
+            "blocks": [{"recurrent_state": Tensor.zeros(256 * 1024)},                                    # 1 MB fixed (fp32)
+                       {"cache_kv": Tensor.zeros(2, 1, 1, 4, 512),                                        # 4 KB/token (fp32)
+                        "cache_kv_scale": Tensor.zeros(2, 1, 1, 4, 64, dtype=dtypes.float16)}]}            # 256 B/token (fp16)
+    self.assertEqual(snapshot_nbytes_for(snap, 4), 1024 * 1024 + 4 * (4096 + 256))
+    self.assertEqual(snapshot_nbytes_for(snap, 4000), 1024 * 1024 + 4000 * (4096 + 256))
   def test_oversized_sequence_is_skipped(self):
     srv = self._server(1)   # 1 MB cap
     # 1 MB of KV for 8 tokens = 128 KB/token
