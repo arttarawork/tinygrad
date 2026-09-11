@@ -10,6 +10,11 @@ from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import kernel_var
 
 GDN_NV_FUSED = ContextVar("GDN_NV_FUSED", 1)  # 0 = never take the fused path, even on NV (A/B vs the loop/WY scan)
+# T4.98g: the SAME kernel also serves the T_pad==1 decode step (its token loop is a REDUCE range sized `tokens`;
+# tokens==1 is just one iteration of the identical readout+state-update math -- see model.py's dispatch). A
+# separate gate, default 0 (byte-identical), independent of GDN_NV_FUSED: the pooled recipe leaves that one 0
+# under BEAM_CACHE_ONLY for reasons specific to PREFILL's neighbouring kernels (CLAUDE.md), unrelated to decode.
+GDN_NV_FUSED_DECODE = ContextVar("GDN_NV_FUSED_DECODE", 0)
 
 @functools.cache
 def _nv_device_ok(device:str) -> bool:
@@ -22,6 +27,14 @@ def _nv_device_ok(device:str) -> bool:
 def nv_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
   if device is None or device.split(":")[0] != "NV" or not GDN_NV_FUSED.value: return False
+  return _nv_device_ok(device)
+
+def nv_decode_kernel_supported(device:str|tuple[str, ...]|None) -> bool:
+  # T4.98g: same shape as nv_custom_kernels_supported, keyed on GDN_NV_FUSED_DECODE instead -- kept as its own
+  # small function (not a shared helper) so the well-tested prefill gate above stays untouched, same idiom this
+  # file already uses to keep the AMD kernel untouched (see the module docstring).
+  if isinstance(device, tuple): device = device[0]
+  if device is None or device.split(":")[0] != "NV" or not GDN_NV_FUSED_DECODE.value: return False
   return _nv_device_ok(device)
 
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
