@@ -62,7 +62,7 @@ def _nv_wmma_ok(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
   if device is None or not _nv_device_ok(device): return False
   with Context(ALLOW_DEVICE_USAGE=1):
-    arch = getattr(getattr(Device[device], "target", None), "arch", "")
+    arch = getattr(getattr(Device[device].renderer, "target", None), "arch", "")  # the renderer carries the target (nv.py does the same)
   return arch.startswith("sm_") and int(arch[3:]) >= 80
 
 def _wmma_layout_nv(out:UOp, out_features:int, token_tile:int, output_tiles:int):
