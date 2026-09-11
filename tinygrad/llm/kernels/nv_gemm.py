@@ -44,12 +44,12 @@ the same logical N axis -- that is how the ISA actually wires it (cross-checked 
 """
 from __future__ import annotations
 import functools
-from typing import cast
+from typing import cast, Callable
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
-from tinygrad.llm.kernels.amd import Linear, Q4_0, Q8_0, Q8_GROUP_SIZE, _half  # Q8_GROUP_SIZE==32 doubles here as
-                                                                                # the ggml block width of Q4_0/Q8_0
+from tinygrad.llm.kernels.amd import Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_GROUP_SIZE, QUANT_SIZES, _half
+from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok
 
@@ -120,45 +120,149 @@ def _quant_linear_wmma_nv(out:UOp, raw:UOp, x:UOp, out_features:int, in_features
                  out[row+8, n0].store(c2.cast(out.dtype)), out[row+8, n0+1].store(c3.cast(out.dtype))]
   return UOp.group(*stores).end(token_block, output_block, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
+# ******** per-format B-fragment decoders (T4.98f: Q8_0/Q4_0; T4.98j: Q4_1, IQ4_NL and the 256-weight K-quants) ********
+# Each returns the 4 fp16 weight values a lane's B fragment needs -- elements kk, kk+1, kk+8, kk+9 of the 32-wide K group
+# `group` of output row `output_row` -- decoded straight from the packed bytes with the exact math of gguf.py's
+# ggml_data_to_tensor. The 4 lanes sharing an output row recompute the same block scales; that redundancy is cheap next
+# to the mma and keeps every decoder a few lines of scalar byte arithmetic.
+
+def _byte(raw:UOp, b:UOp) -> UOp:
+  # packed byte b as int32. raw is always a BYTE view (amd.py's packed_bytes for the word-view formats): extracting bytes
+  # from uint32 words needs b//4 and b%4 on a lane-dependent index, which makes the lowerer re-split the lane range
+  # and breaks the (4, 8) mapping _wmma_layout_nv relies on (T4.98j, caught by test_render_pins_the_lane_split)
+  assert raw.dtype.itemsize == 1, raw.dtype
+  return raw[b].cast(dtypes.int32)
+
+def _half_at(raw:UOp, b:UOp) -> UOp: return _half(_byte(raw, b) | (_byte(raw, b + 1) << 8))  # little-endian f16 at bytes b, b+1
+
+def _select_const(idx:UOp, vals:tuple[int, ...], lo:int=0) -> UOp:
+  # vals[idx] as a compile-time balanced where-tree (gguf.py's select_const idiom): the 16-entry kvalues_iq4nl codebook
+  if len(vals) == 1: return UOp.const(float(vals[0]), dtypes.float32)
+  mid = len(vals) // 2
+  return (idx < lo + mid).where(_select_const(idx, vals[:mid], lo), _select_const(idx, vals[mid:], lo + mid))
+
+def _nibble(byte:UOp, high:UOp) -> UOp: return high.where(byte >> 4, byte & 0xF)
+
 def _q8_0_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
   # ggml type 8: value = d * qs[i], qs already signed int8 in element order (gguf.py, ref_q8_0)
   base = (output_row * group_count + group) * 34
-  d = _half(raw[base].cast(dtypes.uint16) | (raw[base+1].cast(dtypes.uint16) << 8))
+  d = _half_at(raw, base)
   return tuple((d * raw[base+2+(kk+o)].bitcast(dtypes.int8).float()).cast(dtypes.float16) for o in (0, 1, 8, 9))
 
 def _q4_0_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
   # ggml type 2: value = d*(nibble-8); q_to_uint8(.,4)'s order is elements 0-15 = low nibbles of qs[0:16],
   # elements 16-31 = high nibbles of the SAME qs[0:16] (gguf.py, ref_q4_0)
   base = (output_row * group_count + group) * 18
-  d = _half(raw[base].cast(dtypes.uint16) | (raw[base+1].cast(dtypes.uint16) << 8))
+  d = _half_at(raw, base)
   def elem(o):
     k = kk + o
-    byte = raw[base + 2 + (k % 16)]
-    nib = (k >= 16).where(byte >> 4, byte & 0x0F)
-    return (d * (nib.cast(dtypes.int32) - 8).float()).cast(dtypes.float16)
+    return (d * (_nibble(_byte(raw, base + 2 + (k % 16)), k >= 16) - 8).float()).cast(dtypes.float16)
   return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _q4_1_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 3: 20-byte block d, m, qs[16]; value = d*nibble + m, same nibble order as Q4_0 (T4.98i's decode gemv)
+  base = (output_row * group_count + group) * 20
+  d, m = _half_at(raw, base), _half_at(raw, base + 2)
+  def elem(o):
+    k = kk + o
+    return (d * _nibble(_byte(raw, base + 4 + (k % 16)), k >= 16).float() + m).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _iq4_nl_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 20: Q4_0's 18-byte layout, value = d * kvalues_iq4nl[nibble] (no sub-block scale)
+  base = (output_row * group_count + group) * 18
+  d = _half_at(raw, base)
+  def elem(o):
+    k = kk + o
+    return (d * _select_const(_nibble(_byte(raw, base + 2 + (k % 16)), k >= 16), _ggml.kvalues_iq4nl)).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _kquant_base(output_row:UOp, group_count:int, group:UOp, block_bytes:int) -> tuple[UOp, UOp]:
+  # 256-weight super-blocks: 8 consecutive 32-wide groups share one block; returns (block byte base, sub-block j in 0..7)
+  return (output_row * (group_count // 8) + group // 8) * block_bytes, group % 8
+
+def _q4q5_k_scales(raw:UOp, base:UOp, j:UOp) -> tuple[UOp, UOp]:
+  # Q4_K/Q5_K: d, dmin then 12 scale bytes: 6-bit sc[0-3] (bytes 0-3), 6-bit mn[0-3] (bytes 4-7), and for j>=4 the low
+  # nibbles/high nibbles of bytes 8-11 topped up with the two spare high bits of bytes j-4 / j (gguf.py ggml_type 12/13)
+  d, dmin = _half_at(raw, base), _half_at(raw, base + 2)
+  def s(i): return _byte(raw, base + 4 + i)
+  low = j < 4
+  sc = low.where(s(j) & 63, (s(j + 4) & 0xF) | ((s(j - 4) >> 6) << 4))
+  mn = low.where(s(j + 4) & 63, (s(j + 4) >> 4) | ((s(j) >> 6) << 4))
+  return d * sc.float(), dmin * mn.float()
+
+def _q4_k_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 12 (144 bytes): sub-block j's 32 elements are the low (j even) / high (j odd) nibbles of qs[(j//2)*32 : +32]
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[Q4_K])
+  dsc, dmn = _q4q5_k_scales(raw, base, j)
+  high = (j % 2).ne(0)
+  def elem(o): return (dsc * _nibble(_byte(raw, base + 16 + (j // 2) * 32 + (kk + o)), high).float() - dmn).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _q5_k_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 13 (176 bytes): Q4_K's layout with 32 qh bytes at 16 (bit j of qh[i] is element i's 5th bit) and qs at 48
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[Q5_K])
+  dsc, dmn = _q4q5_k_scales(raw, base, j)
+  high = (j % 2).ne(0)
+  def elem(o):
+    i = kk + o
+    q = _nibble(_byte(raw, base + 48 + (j // 2) * 32 + i), high) | (((_byte(raw, base + 16 + i) >> j) & 1) << 4)
+    return (dsc * q.float() - dmn).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _q6_k_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 14 (210 bytes): ql[128] (two 64-byte halves, low nibbles then high nibbles), qh[64] (two 32-byte halves, 2-bit
+  # pairs), 16 int8 scales per 16 elements, d at 208; value = d * ((ql | qh<<4) - 32) * scale (gguf.py ggml_type 14)
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[Q6_K])
+  d = _half_at(raw, base + 208)
+  h, q4 = j // 4, j % 4            # 128-element half, 32-element quarter within it (qh pair index)
+  high = (q4 // 2).ne(0)           # elements 64-127 of the half are the high nibbles
+  def elem(o):
+    i = kk + o
+    lo = _nibble(_byte(raw, base + h * 64 + (q4 % 2) * 32 + i), high)
+    hi = (_byte(raw, base + 128 + h * 32 + i) >> (2 * q4)) & 3
+    scale = ((_byte(raw, base + 192 + j * 2 + i // 16) ^ 0x80) - 0x80).float()  # int8 from the unsigned byte
+    return (d * ((lo | (hi << 4)) - 32).float() * scale).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _iq4_xs_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 23 (136 bytes): d, 16-bit scales_h, 4 bytes scales_l, qs[128]; sub-block j = 16 bytes (low nibbles = elements
+  # 0-15, high = 16-31), scale = ((scales_l[j] | scales_h[j]<<4) - 32), value = d * scale * kvalues_iq4nl[q]
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[IQ4_XS])
+  d = _half_at(raw, base)
+  scales_h = _byte(raw, base + 2) | (_byte(raw, base + 3) << 8)
+  sl = _nibble(_byte(raw, base + 4 + j // 2), (j % 2).ne(0))
+  scale = ((sl | (((scales_h >> (2 * j)) & 3) << 4)) - 32).float()
+  def elem(o):
+    k = kk + o
+    return (d * scale * _select_const(_nibble(_byte(raw, base + 8 + j * 16 + (k % 16)), k >= 16), _ggml.kvalues_iq4nl)).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+# ggml_type -> (fragment decoder, K alignment the decoder needs, kernel name)
+WMMA_FORMATS: dict[int, tuple[Callable, int, str]] = {
+  Q8_0: (_q8_0_dequant4, 32, "linear_q8_0_wmma_nv"), Q4_0: (_q4_0_dequant4, 32, "linear_q4_0_wmma_nv"),
+  Q4_1: (_q4_1_dequant4, 32, "linear_q4_1_wmma_nv"), IQ4_NL: (_iq4_nl_dequant4, 32, "linear_iq4_nl_wmma_nv"),
+  Q4_K: (_q4_k_dequant4, 256, "linear_q4_k_wmma_nv"), Q5_K: (_q5_k_dequant4, 256, "linear_q5_k_wmma_nv"),
+  Q6_K: (_q6_k_dequant4, 256, "linear_q6_k_wmma_nv"), IQ4_XS: (_iq4_xs_dequant4, 256, "linear_iq4_xs_wmma_nv")}
 
 def _token_tile_for(tokens:int) -> int: return 64 if tokens % 64 == 0 else 32 if tokens % 32 == 0 else WMMA_M
 def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA_N*4) == 0 else 1
 
 @functools.cache
-def _q8_0_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
+def _wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+  dequant4, _, name = WMMA_FORMATS[ggml_type]
   layout = _wmma_layout_nv(out, out_features, _token_tile_for(cast(int, out.shape[0])), _output_tiles_for(out_features))
-  return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, _q8_0_dequant4, "linear_q8_0_wmma_nv")
-
-@functools.cache
-def _q4_0_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
-  layout = _wmma_layout_nv(out, out_features, _token_tile_for(cast(int, out.shape[0])), _output_tiles_for(out_features))
-  return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, _q4_0_dequant4, "linear_q4_0_wmma_nv")
+  return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, dequant4, name)
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
-  """WMMA gemm for Q8_0/Q4_0 prefill (tokens > 4, multiple of 16 -- or symbolic, padded to `x.max_shape` the way
-  amd.py's q8_linear pads for a symbolic chunk size). Returns None when it doesn't cover this call (unsupported
-  format, an out_features/in_features that isn't tile-aligned, tokens<=4, or an arch below sm_80) so
-  Linear.__call__ (amd.py) falls back to the generic dequant+matmul path or nv_quant.py's decode gemv."""
-  if not NV_WMMA.value or layer.ggml_type not in (Q4_0, Q8_0): return None
+  """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to
+  `x.max_shape` the way amd.py's q8_linear pads for a symbolic chunk size). Returns None when it doesn't cover this
+  call (unsupported format, an out_features/in_features that isn't tile/block-aligned, tokens<=4, or an arch below
+  sm_80) so Linear.__call__ (amd.py) falls back to the generic dequant+matmul path or nv_quant.py's decode gemv."""
+  fmt = WMMA_FORMATS.get(layer.ggml_type) if layer.ggml_type is not None else None
+  if not NV_WMMA.value or fmt is None: return None
   out_features, in_features = layer.out_features, layer.in_features
-  if out_features % WMMA_N != 0 or in_features % Q8_GROUP_SIZE != 0: return None
+  if out_features % WMMA_N != 0 or in_features % fmt[1] != 0: return None
   numel = x.numel()
   symbolic = not isinstance(numel, int)
   tokens = x.max_shape[-2] if symbolic else numel // in_features
@@ -166,12 +270,11 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   if not _nv_wmma_ok(x.device): return None
   x_pad = x.pad_to(x.max_shape) if symbolic else x  # concrete shape from here on
   xh = x_pad.cast(dtypes.float16).contiguous().reshape(tokens, in_features)
-  raw = layer.weight.uop.buf_uop
+  raw = (layer.packed_bytes if layer.packed_bytes is not None else layer.weight).uop.buf_uop  # always the byte view, see _byte
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
   all_srcs = (out, raw, xh.uop)
   params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
-  fxn = _q8_0_wmma_kernel if layer.ggml_type == Q8_0 else _q4_0_wmma_kernel
-  kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
+  kernel = _wmma_kernel(*params, out_features=out_features, in_features=in_features, ggml_type=layer.ggml_type).call(*all_srcs)
   result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)
   if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], out_features)))
   return result if layer.bias is None else result + layer.bias

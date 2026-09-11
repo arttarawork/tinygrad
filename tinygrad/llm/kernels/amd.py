@@ -69,6 +69,8 @@ class Linear(nn.Linear):
   dequant_weight:Tensor|None = None  # T4.98c: the pre-quantization lazy dequant graph, kept so a custom kernel that
                                       # only covers some token counts (nv_quant.py's decode-only gemv) can fall back
                                       # to a real float matmul on the rest, without losing the packed view below
+  packed_bytes:Tensor|None = None  # T4.98j: a uint8 view of the packed weight when self.weight is a uint32 word view (the WMMA
+                                   # gemm decodes bytes; a word view's byte extraction (b//4, b%4) re-splits its lane range)
   dense_weight:Tensor|None = None  # T4.98h: cached realized-fp16 copy of a non-quantized dense weight (nv_dense.py's
                                     # gemv) -- cast+.contiguous() is real work, cached so it runs once, not every decode step
   def __init__(self, in_features:int, out_features:int, bias=True):
@@ -97,8 +99,9 @@ class Linear(nn.Linear):
     # (20 bytes) IS 4-byte aligned but kept on the byte view anyway -- simplest, matches Q4_0's kernel structure
     # (T4.98i). IQ4_NL shares Q4_0's 18-byte width so it's on the byte view too, no choice involved.
     packed_dtype = dtypes.uint32 if self.ggml_type in (Q4_K, Q5_K, IQ4_XS) else dtypes.uint8
-    self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
-      .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
+    buffer, nbytes = cast(Buffer, raw.buf_uop.buffer), raw.max_numel() * raw.dtype.itemsize
+    self.weight = Tensor(UOp.from_buffer(buffer.view(nbytes // packed_dtype.itemsize, packed_dtype, raw_offset)))
+    self.packed_bytes = Tensor(UOp.from_buffer(buffer.view(nbytes, dtypes.uint8, raw_offset))) if packed_dtype != dtypes.uint8 else None
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels import nv_quant, nv_dense, nv_gemm  # local: both import Linear/QUANT_SIZES etc. from here --
                                                           # a module-level import there of this module would cycle (T4.98c)
