@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse, json, time
 from typing import cast, TYPE_CHECKING
 import numpy as np
-from tinygrad import Tensor
+from tinygrad import Tensor, UOp
 from tinygrad.llm.model import Transformer, GatedDeltaNetBlock
 from tinygrad.llm.cli import SimpleTokenizer, FallbackTemplate
 if TYPE_CHECKING: import jinja2
@@ -36,15 +36,17 @@ def reset_recurrent_state(model:Transformer) -> None:
       b.conv_state.assign(Tensor.zeros_like(b.conv_state)).realize()
       b.recurrent_state.assign(Tensor.zeros_like(b.recurrent_state)).realize()
 
-def _step_logits(model:Transformer, ids:list[int], start_pos:int) -> Tensor:
-  """One eager (non-JIT) forward over a concrete chunk at start_pos; returns the last position's (1, vocab)
-  logits. spec=True is forward()'s existing full-logits path (built for speculative_generate's prefill-tail
-  probe) -- reusing it directly here needs no new hook into model.py, and plain python ints for tokens/start_pos
-  (instead of generate()'s bound UOp Variables) keep this eager and simple rather than fighting JIT replay
-  shape rules we don't need for an offline measurement tool."""
-  t = Tensor([ids], dtype="int32", device=model.blk[0].device)
-  logits, _ = cast(tuple[Tensor, Tensor], model.forward(t, start_pos, None, spec=True))
-  return logits[:, -1, :]
+def _spec_step(model:Transformer, tokens:Tensor, sp:UOp, n:int) -> Tensor:
+  """One Transformer.__call__(spec=True) step -- returns the (1, vocab) logits at the n-th (host-known,
+  1-indexed) real position. T4.98e2: this goes through __call__ (JIT'd, keyed on (is_prefill, greedy,
+  chunk_size, spec) -- see __call__'s own comment), not forward() directly, so a chunk/decode shape seen
+  before replays a captured graph instead of retracing forward() from scratch every step (measured ~5x
+  slower that way -- the whole point of this rewrite). `n` is passed explicitly rather than read off
+  tokens' own shape: a replayed JIT output's lazy shape can still report an EARLIER call's bound width for
+  a negative index (model.py's T4.66h comment covers the exact same hazard in speculative_generate's own
+  prefill-tail read), so this always indexes by the width THIS call actually asked for, like T4.66h's fix."""
+  full, _ = cast(tuple[Tensor, Tensor], model(tokens, sp, None, spec=True))
+  return full[:, n - 1, :]
 
 def _top1_and_gap(logits:Tensor) -> tuple[int, float]:
   vals = logits[0].numpy()
@@ -54,26 +56,36 @@ def _top1_and_gap(logits:Tensor) -> tuple[int, float]:
 
 def teacher_forced_run(model:Transformer, prompt_ids:list[int], n_tokens:int, chunk_size:int=32,
                         force_ids:list[int]|None=None) -> tuple[list[int], list[float]]:
-  """Prefill prompt_ids in chunk_size-wide chunks (mirrors generate()'s own chunking/start_pos plumbing,
-  minus the JIT/Variable machinery it needs and we don't), then take n_tokens greedy decode steps. Each step
-  feeds back either this model's own just-computed argmax (force_ids=None, free-running) or force_ids[i] (teacher
+  """Prefill prompt_ids in chunk_size-wide chunks, then take n_tokens greedy decode steps, both through
+  Transformer.__call__ with the same bound-Variable slicing generate() uses for its own prefill/decode loop
+  (T4.98e2 -- see _spec_step): one Tensor of max_context tokens, v_start_pos/v_toks bound per step. This
+  reuses generate()'s served JIT graphs (captured once per (prefill, decode) family across the whole run,
+  replayed every later step/prompt) instead of retracing forward() eagerly every step. Each step feeds back
+  either this model's own just-computed argmax (force_ids=None, free-running) or force_ids[i] (teacher
   forcing onto a reference run's sequence -- module docstring). Returns (argmax id, top-2 logit gap) per step."""
   assert prompt_ids, "prompt_ids must be non-empty"
   assert force_ids is None or len(force_ids) == n_tokens, f"force_ids must have {n_tokens} entries, got {len(force_ids)}"
   reset_recurrent_state(model)
+  dev = model.blk[0].device
+  v_start_pos = UOp.variable("start_pos", 0, model.max_context - 1)
+  v_toks = UOp.variable("toks", 1, chunk_size)
+  t = Tensor(prompt_ids + [0] * (model.max_context - len(prompt_ids)), dtype="int32", device=dev).reshape(1, model.max_context)
   pos = 0
+  logits: Tensor|None = None
   while pos < len(prompt_ids):
     n = min(chunk_size, len(prompt_ids) - pos)
-    logits = _step_logits(model, prompt_ids[pos:pos + n], pos)
+    sp, nt = v_start_pos.bind(pos), v_toks.bind(n)
+    logits = _spec_step(model, t[:, sp:sp + nt], sp, n)
     pos += n
   argmax_ids: list[int] = []
   gaps: list[float] = []
   for i in range(n_tokens):
-    idx, gap = _top1_and_gap(logits)
+    idx, gap = _top1_and_gap(cast(Tensor, logits))
     argmax_ids.append(idx)
     gaps.append(gap)
     if i == n_tokens - 1: break
-    logits = _step_logits(model, [force_ids[i] if force_ids is not None else idx], pos)
+    tok = force_ids[i] if force_ids is not None else idx
+    logits = _spec_step(model, Tensor([[tok]], dtype="int32", device=dev), v_start_pos.bind(pos), 1)
     pos += 1
   return argmax_ids, gaps
 
