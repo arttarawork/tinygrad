@@ -9,16 +9,15 @@ on an NV device with a supported ggml_type; nv_q8_linear returns None for anythi
 symbolic token counts, unsupported formats) and the caller falls back to the generic dequant+matmul path."""
 from __future__ import annotations
 import functools, math
-from typing import Callable
+from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import ContextVar
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import (
   Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS,
-  _half, _q5_scales, _iq4_scales,
-)
-from tinygrad.llm.kernels.nv import warp_reduce, _nv_device_ok
+  _half, _q5_scales, _iq4_scales, IQ_GRID_SIZES)
+from tinygrad.llm.kernels.nv import warp_reduce, _nv_device_ok, iq_grid
 
 NV_CUSTOM_QUANT = ContextVar("NV_CUSTOM_QUANT", 0)  # 0 = never take this path, even on NV (default: byte-identical everywhere)
 NV_QUANT_TYPES = (Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL)
@@ -98,7 +97,8 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
   return q, scale
 
 @functools.cache
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int) -> UOp:
+  # grid: the IQ3 codebook (nv.py iq_grid) as a 5th kernel input for IQ3_XXS/IQ3_S (T4.98k), None for every other format
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     xwords = _nv_load(xq[token, group, 0], 8)
@@ -200,4 +200,5 @@ def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
   xq, xd = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
-  return run(decode, out, raw, xq.uop, xd.uop)
+  grids = (iq_grid(layer.ggml_type, cast(str, x.device)).uop,) if layer.ggml_type in IQ_GRID_SIZES else ()  # T4.98k: IQ3 codebook input
+  return run(decode, out, raw, xq.uop, xd.uop, *grids)

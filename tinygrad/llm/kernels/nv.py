@@ -17,6 +17,17 @@ GDN_NV_FUSED = ContextVar("GDN_NV_FUSED", 1)  # 0 = never take the fused path, e
 GDN_NV_FUSED_DECODE = ContextVar("GDN_NV_FUSED_DECODE", 0)
 
 @functools.cache
+@functools.cache
+def iq_grid(ggml_type:int, device:str) -> Tensor:
+  """The IQ3 codebook (iq3xxs_grid: 256 words, iq3s_grid: 512 words; 4 uint8 magnitudes per uint32 word) as a realized
+  uint32 tensor on `device` -- the IQ3 decoders in nv_quant.py/nv_gemm.py take it as an extra kernel input and index it
+  by code (one 1-2 KB table, L1-resident). Realized here ONCE per device: call from prepare_dense_weights (load time),
+  never first inside a @function/JIT capture (T4.98h's lesson)."""
+  from tinygrad.runtime.autogen import ggml_common as _ggml
+  from tinygrad.llm.kernels.amd import IQ3_XXS, IQ3_S
+  words = {IQ3_XXS: _ggml.iq3xxs_grid, IQ3_S: _ggml.iq3s_grid}[ggml_type]
+  with Context(ALLOW_DEVICE_USAGE=1): return Tensor(list(words), dtype=dtypes.uint32, device=device).realize()
+
 def _nv_device_ok(device:str) -> bool:
   from tinygrad.renderer.cstyle import CUDARenderer  # PTX=1 renders no Ops.CUSTOM: only the C renderer can emit the shuffle
   with Context(ALLOW_DEVICE_USAGE=1):

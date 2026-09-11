@@ -48,10 +48,11 @@ from typing import cast, Callable
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
-from tinygrad.llm.kernels.amd import Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_GROUP_SIZE, QUANT_SIZES, _half
+from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ_GRID_SIZES, Q8_GROUP_SIZE,
+                                      QUANT_SIZES, _half)
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
-from tinygrad.llm.kernels.nv import _nv_device_ok
+from tinygrad.llm.kernels.nv import _nv_device_ok, iq_grid
 
 NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the generic prefill matmul (A/B lever for the bench)
 
@@ -249,8 +250,10 @@ def _token_tile_for(tokens:int) -> int: return 64 if tokens % 64 == 0 else 32 if
 def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA_N*4) == 0 else 1
 
 @functools.cache
-def _wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int) -> UOp:
+  # grid: the IQ3 codebook (nv.py iq_grid) as a 4th kernel input for IQ3_XXS/IQ3_S (T4.98k); the decoder receives it by keyword
   dequant4, _, name = WMMA_FORMATS[ggml_type]
+  if ggml_type in IQ_GRID_SIZES: dequant4 = functools.partial(dequant4, grid=grid)
   layout = _wmma_layout_nv(out, out_features, _token_tile_for(cast(int, out.shape[0])), _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, dequant4, name)
 
@@ -272,7 +275,8 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   xh = x_pad.cast(dtypes.float16).contiguous().reshape(tokens, in_features)
   raw = (layer.packed_bytes if layer.packed_bytes is not None else layer.weight).uop.buf_uop  # always the byte view, see _byte
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-  all_srcs = (out, raw, xh.uop)
+  grids = (iq_grid(layer.ggml_type, cast(str, x.device)).uop,) if layer.ggml_type in IQ_GRID_SIZES else ()  # T4.98k: IQ3 codebook input
+  all_srcs = (out, raw, xh.uop, *grids)
   params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
   kernel = _wmma_kernel(*params, out_features=out_features, in_features=in_features, ggml_type=layer.ggml_type).call(*all_srcs)
   result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)

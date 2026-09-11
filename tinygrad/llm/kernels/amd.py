@@ -15,7 +15,9 @@ LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(m
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
 Q8_0, Q4_0 = 8, 2  # ggml type ids for the two 32-weight formats nv_quant.py adds (T4.98c)
 Q4_1, IQ4_NL = 3, 20  # T4.98i: two more 32-weight formats (20-byte and 18-byte blocks)
-QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
+Q3_K, IQ3_XXS, IQ3_S = 11, 18, 21  # T4.98k: the 3-bit formats of the UD-Q4_K_S / UD-IQ4_XS files (110/98/110-byte 256-weight blocks)
+IQ_GRID_SIZES = {IQ3_XXS: 256, IQ3_S: 512}  # codebook entries (uint32 words, 4 values each) the IQ3 decoders index -- see nv.py iq_grid
+QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4, Q3_K: 110, IQ3_XXS: 98, IQ3_S: 110}  # bytes/256-weight block
 # true on-disk bytes per ggml block, keyed byte-count -> type (the other way round from QUANT_SIZES). QUANT_SIZES's
 # 4 values already equal their per-block byte count since those formats use 256-wide blocks; Q8_0/Q4_0/Q4_1 use
 # 32-wide blocks so their 34/18/20 must be listed directly rather than scaled to a "per 256 weights" figure --
@@ -23,7 +25,7 @@ QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_W
 # set_quantized below identifies the format from the ggml_data_to_tensor reshape's actual block width, never from
 # the packed byte total, so this collision can't bite. T4.98c. IQ4_NL's block width (18) collides with Q4_0's own
 # (T4.98i) -- see _is_iq4_nl below for how set_quantized tells those two apart.
-BLOCK_BYTES = {18: Q4_0, 20: Q4_1, 34: Q8_0, **{v: k for k, v in QUANT_SIZES.items()}}
+BLOCK_BYTES = {18: Q4_0, 20: Q4_1, 34: Q8_0, **{v: k for k, v in QUANT_SIZES.items() if k != IQ3_S}}  # 110 -> Q3_K; IQ3_S promoted below
 
 def _is_iq4_nl(graph:Iterable[UOp]) -> bool:
   # IQ4_NL's dequant (gguf.py ggml_type==20) indexes a 16-entry kvalues_iq4nl codebook: `Tensor(list(
@@ -31,6 +33,12 @@ def _is_iq4_nl(graph:Iterable[UOp]) -> bool:
   # float32 BUFFER -- Q4_0's dequant graph (same 18-byte block width, BLOCK_BYTES can't tell them apart) never
   # contains one. Verified against both graphs directly (T4.98i).
   return any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and u.shape == (16,) for u in graph)
+
+def _is_iq3_s(graph:Iterable[UOp]) -> bool:
+  # IQ3_S's dequant (gguf.py ggml_type==21) gathers from _ggml_iq_grid(iq3s_grid, (512, 4)): a realized 2048-float BUFFER in
+  # the toposort. Q3_K (same 110-byte block width) has no float32 buffer at all; IQ3_XXS builds its 256-entry grid as a
+  # where-tree, no buffer; IQ2_S's grid buffer is 8192 floats (T4.98k)
+  return any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and u.shape == (2048,) for u in graph)
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -93,6 +101,7 @@ class Linear(nn.Linear):
     self.dequant_weight = decoded
     self.ggml_type = BLOCK_BYTES[cast(int, reshape.shape[1])]
     if self.ggml_type == Q4_0 and _is_iq4_nl(graph): self.ggml_type = IQ4_NL
+    if self.ggml_type == Q3_K and _is_iq3_s(graph): self.ggml_type = IQ3_S
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
     # scheduling and would copy the entire packed weight on every JIT graph. Q6_K/Q8_0/Q4_0 blocks aren't 4-byte
     # aligned (210/34/18 bytes) so those three keep a byte view; the rest pack into uint32 words (T4.98c). Q4_1

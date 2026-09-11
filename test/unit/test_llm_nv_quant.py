@@ -272,6 +272,36 @@ class TestDispatch(unittest.TestCase):
     x = Tensor.randn(1, 32)
     np.testing.assert_allclose(linear(x).numpy(), (x @ decoded.T).numpy(), rtol=1e-4, atol=1e-5)  # CPU: generic path, swapped back
 
+  def test_q3_k_and_iq3_s_disambiguated_at_the_colliding_110_byte_width(self):
+    # T4.98k: both are 110-byte 256-weight blocks; IQ3_S carries the 512x4 codebook buffer in its dequant graph, Q3_K doesn't
+    from tinygrad.llm.kernels.amd import Q3_K, IQ3_S, IQ3_XXS, IQ_GRID_SIZES
+    rng = np.random.default_rng(3)
+    for ggml_type, nbytes in ((Q3_K, 110), (IQ3_S, 110), (IQ3_XXS, 98)):
+      packed = rng.integers(0, 256, nbytes * 2, dtype=np.uint8)
+      for b in range(2):  # sane f16 scale (d) at the format's offset: Q3_K at 108, IQ3_* at 0
+        off = b * nbytes + (108 if ggml_type == Q3_K else 0)
+        packed[off:off + 2] = np.frombuffer(np.float16(0.02).tobytes(), dtype=np.uint8)
+      raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+      decoded = ggml_data_to_tensor(raw, 512, ggml_type).reshape(2, 256)
+      linear = Linear(256, 2, bias=False)
+      nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+      linear.set_quantized(linear.weight)
+      self.assertEqual(linear.ggml_type, ggml_type)
+      self.assertEqual(linear.weight.dtype, dtypes.uint8)  # all three stay on the byte view
+      x = Tensor.randn(1, 256)
+      np.testing.assert_allclose(linear(x).numpy(), (x @ decoded.T).numpy(), rtol=1e-4, atol=1e-5)  # CPU: generic path
+    self.assertEqual(IQ_GRID_SIZES, {IQ3_XXS: 256, IQ3_S: 512})
+
+  def test_iq_grid_matches_the_reference_tables(self):
+    from tinygrad.llm.kernels.nv import iq_grid
+    from tinygrad.llm.kernels.amd import IQ3_XXS, IQ3_S
+    from tinygrad.runtime.autogen import ggml_common as _ggml
+    for ggml_type, table in ((IQ3_XXS, _ggml.iq3xxs_grid), (IQ3_S, _ggml.iq3s_grid)):
+      g = iq_grid(ggml_type, "CPU")
+      self.assertEqual(g.dtype, dtypes.uint32)
+      self.assertEqual(g.numpy().tolist(), list(table))
+      self.assertIs(iq_grid(ggml_type, "CPU"), g)  # cached per (format, device)
+
   def test_gate_closed_by_default(self):
     self.assertFalse(nv_quant_supported("NV"))
     self.assertEqual(NV_CUSTOM_QUANT.value, 0)

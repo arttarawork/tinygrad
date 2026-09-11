@@ -18,8 +18,8 @@ from tinygrad.helpers import ALLOW_DEVICE_USAGE
 from tinygrad.engine.realize import capturing
 from tinygrad.dtype import dtypes, least_upper_dtype
 from tinygrad.uop.ops import AxisType, KernelInfo
-from tinygrad.llm.kernels.amd import Linear
-from tinygrad.llm.kernels.nv import warp_reduce
+from tinygrad.llm.kernels.amd import Linear, IQ_GRID_SIZES
+from tinygrad.llm.kernels.nv import warp_reduce, iq_grid
 
 WARP_SIZE, VAL_CHUNK = 32, 4
 
@@ -61,12 +61,17 @@ def prepare_dense_weights(model) -> int:
   from tinygrad.llm.kernels.nv_quant import nv_quant_supported  # local: nv_quant imports amd, which nv_dense's caller imports
   n = 0
   for layer in cast(dict[str, Linear], nn.state.get_state_dict(model, tensor_type=Linear)).values():  # typed as Tensors by get_state_dict
-    if layer.dense_weight is not None or not layer.use_custom_quant or not nv_dense_eligible(layer): continue
+    if layer.dense_weight is not None or not layer.use_custom_quant: continue
     if not nv_quant_supported(layer.weight.device): continue
+    if not nv_dense_eligible(layer):  # a quantized layer: only the IQ3 codebook needs preparing
+      if layer.ggml_type is None: layer.set_quantized(layer.weight)
+      if layer.ggml_type in IQ_GRID_SIZES: iq_grid(layer.ggml_type, cast(str, layer.weight.device))
+      continue
     if layer.ggml_type is None: layer.set_quantized(layer.weight)
     if layer.ggml_type is None:
       layer.dense_weight = _fp16_copy(layer)
       n += 1
+    elif layer.ggml_type in IQ_GRID_SIZES: iq_grid(layer.ggml_type, cast(str, layer.weight.device))  # T4.98k: codebook realized now, not in a capture
   return n
 
 def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
