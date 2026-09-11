@@ -191,6 +191,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
       d = _half(raw[base+108].cast(dtypes.uint16) | (raw[base+109].cast(dtypes.uint16) << 8))
       return (dots[0].float()*_q3_scale(0) + dots[1].float()*_q3_scale(1)) * xd[token, group] * d
     if ggml_type == IQ3_XXS:
+      assert grid is not None, "IQ3 codebook input missing (nv.py iq_grid)"  # also narrows the Optional for mypy
       # gguf.py ggml_type==18: 98-byte block (d f16, qs[64] one code/4 weights, 8 uint32 scale+sign words at 66).
       # One db (no two-scale split -- unlike Q3_K/Q6_K, the whole 32-group shares one scale) and a codebook gather:
       # code c=subgroup*8+word_idx indexes qs, `grid[qs[c]]` (grid = nv.py iq_grid's 256-entry uint32 table, byte
@@ -220,6 +221,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         dot = _nv_dp4a(word, xwords[word_idx], dot)
       return dot.float() * db * xd[token, group]
     if ggml_type == IQ3_S:
+      assert grid is not None, "IQ3 codebook input missing (nv.py iq_grid)"  # also narrows the Optional for mypy
       # gguf.py ggml_type==21: 110-byte block (d f16, qs[64], qh[8] one high-bit byte per group, signs[32],
       # scales[4] nibble-packed). idx = qs[c] | (bit `word_idx` of qh[subgroup] << 8) into the 512-entry grid (same
       # magnitude/sign packing as IQ3_XXS); scale(subgroup) is 1+2*nib, nib the low/high nibble (subgroup%2) of
