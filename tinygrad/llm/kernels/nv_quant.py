@@ -15,12 +15,12 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import ContextVar
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import (
-  Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS,
-  _half, _q5_scales, _iq4_scales, IQ_GRID_SIZES)
+  Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, Q3_K, IQ3_XXS, IQ3_S, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS,
+  Q6_BYTES, IQ4_WORDS, _half, _q5_scales, _iq4_scales, IQ_GRID_SIZES)
 from tinygrad.llm.kernels.nv import warp_reduce, _nv_device_ok, iq_grid
 
 NV_CUSTOM_QUANT = ContextVar("NV_CUSTOM_QUANT", 0)  # 0 = never take this path, even on NV (default: byte-identical everywhere)
-NV_QUANT_TYPES = (Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL)
+NV_QUANT_TYPES = (Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, Q3_K, IQ3_XXS, IQ3_S)  # T4.98k adds the three 3-bit formats
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
@@ -163,6 +163,92 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         dot = _nv_dp4a(_iq4_bytes(packed, 4*(word_idx//4)), xwords[word_idx], dot)
       d, scale = _iq4_scales(raw, base, subgroup)
       return dot.float() * xd[token, group] * d * scale
+    if ggml_type == Q3_K:
+      # gguf.py ggml_type==11: 110-byte block (hmask[32], qs[64], scales[12], d f16). Each element e (i=e%32 in this
+      # group) is q2 + 4*qh - 4 (q2 = 2-bit field p=subgroup%4 of qs byte at row=subgroup//4; qh = bit `subgroup` of
+      # hmask[i]) -- packs straight into int8 like every other format. The 6-bit sub-block scale sc(k) (k=0..15,
+      # int8, -32 offset) covers 16 elements, two per 32-group (k=2*subgroup, 2*subgroup+1), so this needs the same
+      # two-dot/two-scale split as Q6_K below. sc's own two bit-fields (low nibble, byte 96+k or 96+(k-8); high 2
+      # bits, byte 104+k%4) are read with k clamped to each branch's valid range (k.minimum(7)/.maximum(8)) so the
+      # unused branch's address never walks past the 110-byte block (T4.98k)
+      base = (output * in_features//GGML_BLOCK_SIZE + block) * 110
+      row, p = subgroup // 4, (subgroup % 4).cast(dtypes.uint8)
+      dots = [UOp.const(0, dtypes.int32)] * 2
+      for word_idx in range(8):
+        q2_bytes = _nv_load(raw[base + 32 + row*32 + word_idx*4], 4)
+        qh_bytes = _nv_load(raw[base + word_idx*4], 4)
+        q2 = (q2_bytes >> (2*p)) & 3
+        qh = (qh_bytes >> subgroup.cast(dtypes.uint8)) & 1
+        quant = (q2 | (qh << 2)).bitcast(dtypes.int8) - 4
+        word = sum((quant[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+        dots[word_idx//4] = _nv_dp4a(word, xwords[word_idx], dots[word_idx//4])
+      def _q3_scale(half:int) -> UOp:
+        k = 2*subgroup + half
+        k_lo, k_hi = k.minimum(7), k.maximum(8)
+        low4 = (k < 8).where(raw[base + 96 + k_lo].cast(dtypes.uint8) & 0xf, (raw[base + 88 + k_hi].cast(dtypes.uint8) >> 4) & 0xf)
+        high2 = (raw[base + 104 + k % 4].cast(dtypes.uint8) >> (2*(k//4)).cast(dtypes.uint8)) & 3
+        return ((low4 | (high2 << 4)).bitcast(dtypes.int8) - 32).float()
+      d = _half(raw[base+108].cast(dtypes.uint16) | (raw[base+109].cast(dtypes.uint16) << 8))
+      return (dots[0].float()*_q3_scale(0) + dots[1].float()*_q3_scale(1)) * xd[token, group] * d
+    if ggml_type == IQ3_XXS:
+      # gguf.py ggml_type==18: 98-byte block (d f16, qs[64] one code/4 weights, 8 uint32 scale+sign words at 66).
+      # One db (no two-scale split -- unlike Q3_K/Q6_K, the whole 32-group shares one scale) and a codebook gather:
+      # code c=subgroup*8+word_idx indexes qs, `grid[qs[c]]` (grid = nv.py iq_grid's 256-entry uint32 table, byte
+      # `lane` of the word is the magnitude); the parity-derived sign bit per lane negates the magnitude via the
+      # (mag^mask)-mask trick (mask = 0 or all-ones) before packing into the dp4a word (T4.98k)
+      base = (output * in_features//GGML_BLOCK_SIZE + block) * 98
+      d = _half(raw[base].cast(dtypes.uint16) | (raw[base+1].cast(dtypes.uint16) << 8))
+      sbytes = _nv_load(raw[base + 66 + subgroup*4], 4)
+      sword = sum((sbytes[i].cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+      db = d * ((sword >> 28).float() + 0.5) * 0.5
+      dot = UOp.const(0, dtypes.int32)
+      for word_idx in range(8):
+        code = raw[base + 2 + subgroup*8 + word_idx].cast(dtypes.uint32)
+        gword = grid[code.cast(dtypes.int32)]
+        s7 = (sword >> (7*(word_idx//2))) & 0x7f
+        px = s7 ^ (s7 >> 4)
+        px = px ^ (px >> 2)
+        px = px ^ (px >> 1)
+        s8 = s7 | ((px & 1) << 7)
+        v0 = (word_idx & 1) * 4
+        lanes = []
+        for l in range(4):
+          mag = (gword >> (8*l)) & 0xff
+          mask = UOp.const(0, dtypes.uint32) - ((s8 >> (v0+l)) & 1)
+          lanes.append(((mag ^ mask) - mask).cast(dtypes.uint8))
+        word = sum((lanes[l].cast(dtypes.uint32) << (l*8) for l in range(4)), UOp.const(0, dtypes.uint32))
+        dot = _nv_dp4a(word, xwords[word_idx], dot)
+      return dot.float() * db * xd[token, group]
+    if ggml_type == IQ3_S:
+      # gguf.py ggml_type==21: 110-byte block (d f16, qs[64], qh[8] one high-bit byte per group, signs[32],
+      # scales[4] nibble-packed). idx = qs[c] | (bit `word_idx` of qh[subgroup] << 8) into the 512-entry grid (same
+      # magnitude/sign packing as IQ3_XXS); scale(subgroup) is 1+2*nib, nib the low/high nibble (subgroup%2) of
+      # scales byte subgroup//2 -- byte-major order (q_to_uint8 on a (-1,4,1)-reshaped input keeps the byte index
+      # outer and only bit-splits within each byte), verified against gguf.py's ggml_data_to_tensor directly since
+      # it does NOT match a naive low-nibbles-then-high-nibbles reading (T4.98k)
+      base = (output * in_features//GGML_BLOCK_SIZE + block) * 110
+      d = _half(raw[base].cast(dtypes.uint16) | (raw[base+1].cast(dtypes.uint16) << 8))
+      nib = (raw[base + 106 + subgroup//2].cast(dtypes.uint8) >> ((subgroup%2)*4).cast(dtypes.uint8)) & 0xf
+      scale = (1 + 2*nib).float()
+      qh_byte = raw[base + 66 + subgroup].cast(dtypes.uint32)
+      dot = UOp.const(0, dtypes.int32)
+      for word_idx in range(8):
+        code = raw[base + 2 + subgroup*8 + word_idx].cast(dtypes.uint32)
+        qh_bit = (qh_byte >> word_idx) & 1
+        # + not | : disjoint bit ranges (code is 0..255, qh_bit<<8 only ever sets bit 8) so they're numerically
+        # identical, but the z3 OOB checker (CHECK_OOB=1) has no rule for OR between two non-constant ArithRefs
+        # inside an index expression -- T4.98k, caught by test_renders_and_compiles_for_sm86
+        gword = grid[(code + (qh_bit << 8)).cast(dtypes.int32)]
+        sign_byte = raw[base + 74 + subgroup*4 + word_idx//2].cast(dtypes.uint32)
+        v0 = (word_idx & 1) * 4
+        lanes = []
+        for l in range(4):
+          mag = (gword >> (8*l)) & 0xff
+          mask = UOp.const(0, dtypes.uint32) - ((sign_byte >> (v0+l)) & 1)
+          lanes.append(((mag ^ mask) - mask).cast(dtypes.uint8))
+        word = sum((lanes[l].cast(dtypes.uint32) << (l*8) for l in range(4)), UOp.const(0, dtypes.uint32))
+        dot = _nv_dp4a(word, xwords[word_idx], dot)
+      return dot.float() * d * scale * xd[token, group]
     base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_BYTES
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
@@ -176,7 +262,8 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
     dbits = raw[base+208].cast(dtypes.uint16) | (raw[base+209].cast(dtypes.uint16) << 8)
     return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(dbits)
   names = {Q4_K: "linear_q4_k_nv", Q5_K: "linear_q5_k_nv", IQ4_XS: "linear_iq4_xs_nv", Q6_K: "linear_q6_nv",
-           Q8_0: "linear_q8_0_nv", Q4_0: "linear_q4_0_nv", Q4_1: "linear_q4_1_nv", IQ4_NL: "linear_iq4_nl_nv"}
+           Q8_0: "linear_q8_0_nv", Q4_0: "linear_q4_0_nv", Q4_1: "linear_q4_1_nv", IQ4_NL: "linear_iq4_nl_nv",
+           Q3_K: "linear_q3_k_nv", IQ3_XXS: "linear_iq3_xxs_nv", IQ3_S: "linear_iq3_s_nv"}
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
 
 def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:

@@ -11,12 +11,17 @@ import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS
+from tinygrad.llm.kernels.amd import (
+  Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, IQ4_WORDS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES)
 from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
 )
 
 KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+
+def _iq3_grids() -> tuple[list, list]:  # (iq3xxs_grid, iq3s_grid), 256 and 512 uint32 words -- loaded once, lazily
+  from tinygrad.runtime.autogen import ggml_common as _ggml
+  return list(_ggml.iq3xxs_grid), list(_ggml.iq3s_grid)
 
 # ******** pure-numpy re-implementations of the per-block unpack group_dot does, vs gguf.py's reference ********
 
@@ -96,6 +101,63 @@ def ref_iq4_nl(b:np.ndarray) -> np.ndarray:  # b: uint8[18]
   q = np.concatenate([qs & 0x0F, qs >> 4]).astype(np.int32)  # Q4_0's byte layout, no sub-block scale
   return (d * np.array(KVALUES_IQ4NL, dtype=np.float32)[q]).astype(np.float32)
 
+def ref_q3_k(b:np.ndarray) -> np.ndarray:  # b: uint8[110] (hmask:32, qs:64, scales:12, d:2)
+  d = _f16(b[108:110])
+  out = np.zeros(256, dtype=np.float32)
+  for e in range(256):
+    j, i = e // 32, e % 32
+    row, p = j // 4, j % 4
+    q2 = (int(b[32 + 32*row + i]) >> (2*p)) & 3
+    qh = (int(b[i]) >> j) & 1
+    val = q2 + 4*qh - 4  # -4..3, gguf's (q - (~hmask_bit)*4) folded into one add
+    s = e // 16  # 16-wide sub-block, two per 32-group (2j, 2j+1)
+    low4 = (int(b[96+s]) & 0xF) if s < 8 else ((int(b[88+s]) >> 4) & 0xF)  # q_to_uint8(scales[0:8],4): field-major (no reshape trick)
+    high2 = (int(b[104 + s % 4]) >> (2*(s//4))) & 3
+    sc = np.int8(np.uint8(low4 | (high2 << 4))).astype(np.int32) - 32
+    out[e] = d * sc * val
+  return out.astype(np.float32)
+
+def ref_iq3_xxs(b:np.ndarray) -> np.ndarray:  # b: uint8[98] (d:2, qs:64, 8 scale+sign uint32 words at 66)
+  d = _f16(b[0:2])
+  grid, _ = _iq3_grids()
+  out = np.zeros(256, dtype=np.float32)
+  for g in range(8):
+    w = int(b[66+4*g]) | (int(b[67+4*g]) << 8) | (int(b[68+4*g]) << 16) | (int(b[69+4*g]) << 24)
+    db = d * (((w >> 28) & 0xF) + 0.5) * 0.5
+    for i in range(32):
+      c = g*8 + i//4  # code index into qs[0:64]: one 8-bit code per 4 weights
+      mag = (grid[int(b[2+c])] >> (8*(i % 4))) & 0xFF
+      u, v = i // 8, i % 8  # 8-weight sub-chunk (parity-derived sign byte) and bit position within it
+      s7 = (w >> (7*u)) & 0x7F
+      px = s7 ^ (s7 >> 4)  # XOR-fold parity of s7 (ggml derives the 8th sign bit from it)
+      px ^= px >> 2
+      px ^= px >> 1
+      s8 = s7 | ((px & 1) << 7)
+      sign = -1 if (s8 >> v) & 1 else 1
+      out[g*32+i] = db * sign * mag
+  return out.astype(np.float32)
+
+def ref_iq3_s(b:np.ndarray) -> np.ndarray:  # b: uint8[110] (d:2, qs:64, qh:8, signs:32, scales:4)
+  d = _f16(b[0:2])
+  _, grid = _iq3_grids()
+  out = np.zeros(256, dtype=np.float32)
+  for g in range(8):
+    # scale nibble is BYTE-MAJOR (byte 106+g//2, low nibble if g even else high) -- q_to_uint8 on the (-1,4,1)-
+    # reshaped scales bytes keeps the byte index outer and only bit-splits within each byte (checked directly
+    # against ggml_data_to_tensor: a naive low-nibbles-then-high-nibbles reading does NOT match)
+    nib = (int(b[106 + g//2]) >> ((g % 2)*4)) & 0xF
+    scale = 1 + 2*nib
+    qh_byte = int(b[66+g])
+    for i in range(32):
+      c = g*8 + i//4
+      qh_bit = (qh_byte >> (i//4)) & 1  # bit `word_idx` (=i//4=c-g*8) of qh[g] -- one qh byte per group
+      idx = int(b[2+c]) | (qh_bit << 8)
+      mag = (grid[idx] >> (8*(i % 4))) & 0xFF
+      sign_byte = int(b[74 + g*4 + i//8])
+      sign = -1 if (sign_byte >> (i % 8)) & 1 else 1
+      out[g*32+i] = d * scale * sign * mag
+  return out.astype(np.float32)
+
 class TestFormatUnpackMath(unittest.TestCase):
   """group_dot's per-group unpack (nibble/byte extraction, scales, the Q4_0 -8 and Q4_K/Q5_K min terms), transcribed
   to pure numpy, must reproduce gguf.py's ggml_data_to_tensor dequantized values exactly -- the kernel itself can't
@@ -105,7 +167,9 @@ class TestFormatUnpackMath(unittest.TestCase):
     rng = np.random.default_rng(seed)
     packed = rng.integers(0, 256, nbytes, dtype=np.uint8)
     raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
-    n = 256 if nbytes >= 100 else 32
+    # 32-weight formats vs 256-weight superblocks: nbytes alone doesn't tell them apart (IQ3_XXS packs 256
+    # weights into 98 bytes, under the 32-weight formats' widest 34)
+    n = 32 if ggml_type in (Q4_0, Q8_0, Q4_1, IQ4_NL) else 256
     expected = ggml_data_to_tensor(raw, n, ggml_type).numpy().reshape(-1)
     np.testing.assert_allclose(ref(packed), expected, rtol=1e-3, atol=1e-3)
 
@@ -125,6 +189,12 @@ class TestFormatUnpackMath(unittest.TestCase):
     for seed in range(5): self._check(IQ4_XS, 136, ref_iq4_xs, seed)
   def test_iq4_nl(self):
     for seed in range(5): self._check(IQ4_NL, 18, ref_iq4_nl, seed)
+  def test_q3_k(self):
+    for seed in range(5): self._check(Q3_K, 110, ref_q3_k, seed)
+  def test_iq3_xxs(self):
+    for seed in range(5): self._check(IQ3_XXS, 98, ref_iq3_xxs, seed)
+  def test_iq3_s(self):
+    for seed in range(5): self._check(IQ3_S, 110, ref_iq3_s, seed)
 
 class TestByteParityIntrinsics(unittest.TestCase):
   """_nv_byte_perm is the highest-risk translation in this port (AMD's v_perm_b32 and CUDA's __byte_perm disagree
@@ -202,7 +272,7 @@ class TestKernelGraphAndRender(unittest.TestCase):
     blocks = in_features // 256
     words = {Q4_K: Q4_WORDS, Q5_K: Q5_WORDS, IQ4_XS: IQ4_WORDS}.get(ggml_type)
     if words is not None: return (out_features*blocks*words,), dtypes.uint32
-    return (out_features*blocks*Q6_BYTES,), dtypes.uint8  # Q6_K
+    return (out_features*blocks*QUANT_SIZES[ggml_type],), dtypes.uint8  # Q6_K/Q3_K/IQ3_XXS/IQ3_S
 
   def _build(self, ggml_type:int, out_features:int):
     in_features, tokens = self.IN_FEATURES, 1
@@ -212,7 +282,10 @@ class TestKernelGraphAndRender(unittest.TestCase):
     raw = UOp.placeholder(raw_shape, raw_dtype, slot=1)
     xq = UOp.placeholder((tokens, group_count, 8), dtypes.uint32, slot=2)
     xd = UOp.placeholder((tokens, group_count), dtypes.float32, slot=3)
-    return _quant_decode_kernel(out, raw, xq, xd, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
+    # T4.98k: IQ3_XXS/IQ3_S need the codebook as a 5th input, built the way nv_q8_linear does (a placeholder of the
+    # right uint32 length) -- every other format leaves grid at its default None
+    grid = UOp.placeholder((IQ_GRID_SIZES[ggml_type],), dtypes.uint32, slot=4) if ggml_type in IQ_GRID_SIZES else None
+    return _quant_decode_kernel(out, raw, xq, xd, grid, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
 
   def test_graph_builds_for_every_format_and_shape(self):
     for ggml_type in NV_QUANT_TYPES:
