@@ -12,6 +12,7 @@ nv_dense_eligible's docstring for why the shape/dtype check is split out from th
 does internally: they feed two different decisions in Linear.__call__."""
 from __future__ import annotations
 import functools
+from typing import cast
 from tinygrad import Tensor, UOp
 from tinygrad.helpers import ALLOW_DEVICE_USAGE
 from tinygrad.engine.realize import capturing
@@ -59,7 +60,7 @@ def prepare_dense_weights(model) -> int:
   from tinygrad import nn
   from tinygrad.llm.kernels.nv_quant import nv_quant_supported  # local: nv_quant imports amd, which nv_dense's caller imports
   n = 0
-  for layer in nn.state.get_state_dict(model, tensor_type=Linear).values():
+  for layer in cast(dict[str, Linear], nn.state.get_state_dict(model, tensor_type=Linear)).values():  # typed as Tensors by get_state_dict
     if layer.dense_weight is not None or not layer.use_custom_quant or not nv_dense_eligible(layer): continue
     if not nv_quant_supported(layer.weight.device): continue
     if layer.ggml_type is None: layer.set_quantized(layer.weight)

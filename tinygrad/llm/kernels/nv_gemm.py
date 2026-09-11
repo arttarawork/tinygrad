@@ -44,6 +44,7 @@ the same logical N axis -- that is how the ISA actually wires it (cross-checked 
 """
 from __future__ import annotations
 import functools
+from typing import cast
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
@@ -142,12 +143,12 @@ def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA
 
 @functools.cache
 def _q8_0_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
-  layout = _wmma_layout_nv(out, out_features, _token_tile_for(out.shape[0]), _output_tiles_for(out_features))
+  layout = _wmma_layout_nv(out, out_features, _token_tile_for(cast(int, out.shape[0])), _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, _q8_0_dequant4, "linear_q8_0_wmma_nv")
 
 @functools.cache
 def _q4_0_wmma_kernel(out:UOp, raw:UOp, x:UOp, out_features:int, in_features:int) -> UOp:
-  layout = _wmma_layout_nv(out, out_features, _token_tile_for(out.shape[0]), _output_tiles_for(out_features))
+  layout = _wmma_layout_nv(out, out_features, _token_tile_for(cast(int, out.shape[0])), _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, _q4_0_dequant4, "linear_q4_0_wmma_nv")
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:

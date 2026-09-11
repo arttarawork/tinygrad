@@ -1,6 +1,7 @@
 from __future__ import annotations
 import functools, math
 from typing import Callable, cast
+from collections.abc import Iterable
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
@@ -24,7 +25,7 @@ QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_W
 # (T4.98i) -- see _is_iq4_nl below for how set_quantized tells those two apart.
 BLOCK_BYTES = {18: Q4_0, 20: Q4_1, 34: Q8_0, **{v: k for k, v in QUANT_SIZES.items()}}
 
-def _is_iq4_nl(graph:list[UOp]) -> bool:
+def _is_iq4_nl(graph:Iterable[UOp]) -> bool:
   # IQ4_NL's dequant (gguf.py ggml_type==20) indexes a 16-entry kvalues_iq4nl codebook: `Tensor(list(
   # _ggml.kvalues_iq4nl), dtype=float32)[...]`, which shows up in the toposort as its own realized 16-element
   # float32 BUFFER -- Q4_0's dequant graph (same 18-byte block width, BLOCK_BYTES can't tell them apart) never
