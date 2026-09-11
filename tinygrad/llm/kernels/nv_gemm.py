@@ -49,7 +49,10 @@ from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
 from tinygrad.llm.kernels.amd import Linear, Q4_0, Q8_0, Q8_GROUP_SIZE, _half  # Q8_GROUP_SIZE==32 doubles here as
                                                                                 # the ggml block width of Q4_0/Q8_0
+from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok
+
+NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the generic prefill matmul (A/B lever for the bench)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -152,7 +155,7 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   amd.py's q8_linear pads for a symbolic chunk size). Returns None when it doesn't cover this call (unsupported
   format, an out_features/in_features that isn't tile-aligned, tokens<=4, or an arch below sm_80) so
   Linear.__call__ (amd.py) falls back to the generic dequant+matmul path or nv_quant.py's decode gemv."""
-  if layer.ggml_type not in (Q4_0, Q8_0): return None
+  if not NV_WMMA.value or layer.ggml_type not in (Q4_0, Q8_0): return None
   out_features, in_features = layer.out_features, layer.in_features
   if out_features % WMMA_N != 0 or in_features % Q8_GROUP_SIZE != 0: return None
   numel = x.numel()

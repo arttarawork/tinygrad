@@ -99,7 +99,7 @@ class Linear(nn.Linear):
     self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
   def __call__(self, x:Tensor) -> Tensor:
-    from tinygrad.llm.kernels import nv_quant, nv_dense  # local: both import Linear/QUANT_SIZES etc. from here --
+    from tinygrad.llm.kernels import nv_quant, nv_dense, nv_gemm  # local: both import Linear/QUANT_SIZES etc. from here --
                                                           # a module-level import there of this module would cycle (T4.98c)
     amd_supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     nv_supported = self.use_custom_quant and nv_quant.nv_quant_supported(self.weight.device)
@@ -120,6 +120,9 @@ class Linear(nn.Linear):
     # nv_quant.py covers small-batch decode only (tokens<=4; the WMMA gemm path is T4.98f) and returns None for
     # anything bigger or unsupported -- fall through to the generic path below rather than guess
     if nv_supported and self.ggml_type is not None and (nv_out := nv_quant.nv_q8_linear(self, x)) is not None: return nv_out
+    # nv_gemm.py covers the prefill side of the same two byte-view formats (Q8_0/Q4_0, tokens > 4) with the tensor cores
+    # (T4.98f); same None-means-fall-through contract, NV_WMMA=0 keeps the generic matmul for A/B
+    if nv_supported and self.ggml_type is not None and (nv_out := nv_gemm.nv_wmma_linear(self, x)) is not None: return nv_out
     # nv_dense.py covers the same decode-only range for a non-quantized (plain dense) small Linear layer, e.g.
     # GatedDeltaNet's ssm_alpha/ssm_beta head projections (T4.98h) -- same None-means-fall-through contract
     if nv_supported and self.ggml_type is None and (nv_out := nv_dense.nv_f16_gemv(self, x)) is not None: return nv_out

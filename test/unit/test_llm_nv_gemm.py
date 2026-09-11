@@ -4,6 +4,7 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.kernels import nv_gemm
+from tinygrad.llm.kernels.nv_quant import NV_CUSTOM_QUANT  # importing nv_quant registers the ContextVar the dispatch test sets
 
 def _sink(ggml_type_kernel, tokens:int, out_features:int, in_features:int, block_bytes:int):
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32).uop
@@ -43,6 +44,28 @@ class TestKernelGraphAndRender(unittest.TestCase):
           self.assertEqual(src.count("threadIdx.z"), 0)
 
 class TestGates(unittest.TestCase):
+  def test_dispatch_stays_generic_off_nv(self):
+    # CPU: nv_quant_supported is False, so Linear.__call__ never reaches nv_wmma_linear; and called directly it returns None
+    import numpy as np
+    from tinygrad import nn, Context
+    from tinygrad.llm.gguf import ggml_data_to_tensor
+    from tinygrad.llm.kernels.amd import Linear, Q8_0
+    rng = np.random.default_rng(0)
+    blocks = [np.float16(0.5).tobytes() + rng.integers(-4, 5, 32).astype(np.int8).tobytes() for _ in range(16)]
+    packed = np.frombuffer(b"".join(blocks), dtype=np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, 16 * 32, Q8_0).reshape(16, 32)
+    lin = Linear(32, 16, bias=False)
+    nn.state.load_state_dict(lin, {"weight": decoded}, verbose=False, realize=False)
+    x = Tensor.randn(1, 32, 32, dtype=dtypes.float16)
+    with Context(NV_CUSTOM_QUANT=1):
+      self.assertEqual(NV_CUSTOM_QUANT.value, 1)
+      np.testing.assert_allclose(lin(x).numpy(), (x.float() @ decoded.T).numpy(), rtol=1e-3, atol=1e-3)
+      lin.set_quantized(lin.weight)
+      self.assertEqual(lin.ggml_type, Q8_0)
+      self.assertIsNone(nv_gemm.nv_wmma_linear(lin, x))          # CPU: the sm_80 gate is closed
+      with Context(NV_WMMA=0): self.assertIsNone(nv_gemm.nv_wmma_linear(lin, x))
+
   def test_wmma_gate_closed_off_nv(self):
     for dev in ("CPU", "NULL", None, ("CPU", "CPU:1")): self.assertFalse(nv_gemm._nv_wmma_ok(dev), dev)
 
