@@ -1628,6 +1628,8 @@ class Transformer:
       # device_map's cross-device placements MUST realize -- see Transformer.realize_placement's docstring.
       # No-op when device_map is None (nothing moved off Device.DEFAULT to begin with).
       model.realize_placement()
+    from tinygrad.llm.kernels.nv_dense import prepare_dense_weights  # local: mirrors amd.py's import discipline
+    prepare_dense_weights(model)  # T4.98h: the fp16 head copies must exist before the first (@function, JIT-captured) call
     return model, kv
 
   def warmup(self, vision:bool=False):
