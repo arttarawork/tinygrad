@@ -59,6 +59,8 @@ class Linear(nn.Linear):
   dequant_weight:Tensor|None = None  # T4.98c: the pre-quantization lazy dequant graph, kept so a custom kernel that
                                       # only covers some token counts (nv_quant.py's decode-only gemv) can fall back
                                       # to a real float matmul on the rest, without losing the packed view below
+  dense_weight:Tensor|None = None  # T4.98h: cached realized-fp16 copy of a non-quantized dense weight (nv_dense.py's
+                                    # gemv) -- cast+.contiguous() is real work, cached so it runs once, not every decode step
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
@@ -82,13 +84,19 @@ class Linear(nn.Linear):
     self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
       .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
   def __call__(self, x:Tensor) -> Tensor:
-    from tinygrad.llm.kernels import nv_quant  # local: nv_quant imports Linear/QUANT_SIZES etc. from here -- a
-                                                # module-level import there of this module would cycle (T4.98c)
+    from tinygrad.llm.kernels import nv_quant, nv_dense  # local: both import Linear/QUANT_SIZES etc. from here --
+                                                          # a module-level import there of this module would cycle (T4.98c)
     amd_supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     nv_supported = self.use_custom_quant and nv_quant.nv_quant_supported(self.weight.device)
     if self.ggml_type is None and (amd_supported or nv_supported):
       self.set_quantized(self.weight)
-      if self.ggml_type is None: self.use_custom_quant = amd_supported = nv_supported = False  # not a supported quant format
+      if self.ggml_type is None and not (nv_supported and nv_dense.nv_dense_eligible(self)):
+        # neither a supported ggml quant format nor a small-enough dense layer for the NV gemv (T4.98h) -- never
+        # true again for this layer instance (shape/dtype are fixed for its lifetime), so stop re-probing every
+        # call. When it IS gemv-eligible, leave nv_supported alone: a >4-token prefill call must not permanently
+        # disable the 1-token decode calls that follow it -- nv_f16_gemv (below) re-checks the token count itself,
+        # every call, and returns None (falls through) rather than guess when it doesn't cover this call's shape
+        self.use_custom_quant = amd_supported = nv_supported = False
     if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and amd_supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
@@ -97,6 +105,9 @@ class Linear(nn.Linear):
     # nv_quant.py covers small-batch decode only (tokens<=4; the WMMA gemm path is T4.98f) and returns None for
     # anything bigger or unsupported -- fall through to the generic path below rather than guess
     if nv_supported and self.ggml_type is not None and (nv_out := nv_quant.nv_q8_linear(self, x)) is not None: return nv_out
+    # nv_dense.py covers the same decode-only range for a non-quantized (plain dense) small Linear layer, e.g.
+    # GatedDeltaNet's ssm_alpha/ssm_beta head projections (T4.98h) -- same None-means-fall-through contract
+    if nv_supported and self.ggml_type is None and (nv_out := nv_dense.nv_f16_gemv(self, x)) is not None: return nv_out
     if (dequant_weight := self.dequant_weight) is None: return super().__call__(x)
     # self.weight is the packed view once ggml_type is set -- swap the pre-quantization dequant graph back in for
     # nn.Linear's generic matmul on this one call (T4.98c)
