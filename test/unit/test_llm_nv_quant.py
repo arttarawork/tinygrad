@@ -236,6 +236,24 @@ class TestDispatch(unittest.TestCase):
     nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
     return linear
 
+  def test_set_quantized_accepts_an_unsliced_staged_buffer(self):
+    # gguf.py stages tensors over 64 MB alone: their raw bytes are the whole realized batch, not a SHRINK into it
+    # (a full-extent slice is a no-op). set_quantized used to assert Ops.SHRINK and crash on output.weight, token_embd
+    # and every Q8_0 ffn_gate/up/down of the 27B the moment NV_CUSTOM_QUANT=1 reached a real model (2026-09-11)
+    rng = np.random.default_rng(0)
+    packed = rng.integers(0, 256, 18 * 4, dtype=np.uint8)
+    raw = Tensor(packed).contiguous().realize()
+    self.assertIsNot(raw.uop.op, Ops.SHRINK)
+    decoded = ggml_data_to_tensor(raw, 128, Q4_0).reshape(4, 32)
+    linear = Linear(32, 4, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    self.assertEqual(linear.ggml_type, Q4_0)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    self.assertEqual(linear.weight.shape, (18 * 4,))
+    x = Tensor.randn(1, 32)
+    np.testing.assert_allclose(linear(x).numpy(), (x @ decoded.T).numpy(), rtol=1e-4, atol=1e-5)  # CPU: generic path, swapped back
+
   def test_gate_closed_by_default(self):
     self.assertFalse(nv_quant_supported("NV"))
     self.assertEqual(NV_CUSTOM_QUANT.value, 0)
