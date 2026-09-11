@@ -68,7 +68,15 @@ def _nv_wmma_ok(device:str|tuple[str, ...]|None) -> bool:
 def _wmma_layout_nv(out:UOp, out_features:int, token_tile:int, output_tiles:int):
   token_block, output_block = UOp.range(out.shape[0]//token_tile, 0), UOp.range(out_features//(WMMA_N*output_tiles), 1)
   lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
-  lane_hi, lane_lo = lane // 4, lane % 4  # lane_hi: A's/B's shared row/col index (0-7); lane_lo: the k/n sub-index (0-3)
+  # The mma fragments are keyed on the HARDWARE warp lane L = threadIdx.x + blockDim.x*threadIdx.y (x fastest), with
+  # g = L//4 the A/B row/col index (0-7) and t = L%4 the k/n sub-index (0-3). The lowerer splits this 32-wide LOCAL
+  # range by the div/mod structure it sees and hands the MOST significant digit to threadIdx.x: written as lane//4 and
+  # lane%4 it rendered as an (8, 4) block with L = lane//4 + 8*(lane%4) -- a consistent scramble (rel err ~1.0 on the
+  # 3090, 2026-09-11 probe: a lane bit-permutation fit it exactly). Written as lane%8 / lane//8 it renders as a (4, 8)
+  # block, lidx0 = lane//8 (x), lidx1 = lane%8 (y), so L = lane//8 + 4*(lane%8) = 4*lane_hi + lane_lo: the identity the
+  # fragments need. test_llm_nv_gemm pins that render. nv_quant/nv_dense never noticed: their lane use is a shuffle
+  # reduction, which is permutation-invariant.
+  lane_hi, lane_lo = lane % 8, lane // 8  # lane_hi = g: A's/B's shared row/col index (0-7); lane_lo = t: the k/n sub-index (0-3)
   output_bases = tuple((output_block*output_tiles+tile)*WMMA_N for tile in range(output_tiles))
   input_rows = tuple(token_block*token_tile + mt*WMMA_M + lane_hi for mt in range(token_tile // WMMA_M))
   return token_block, output_block, lane, lane_hi, lane_lo, output_bases, input_rows
