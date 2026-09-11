@@ -155,7 +155,20 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
   try:
     if k.unrollable_dims and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UNROLL)) and (k.upcast_size() < 64):
-      if (s:=k.full_shape[k.unrollable_dims[-1]]) <= 32:
+      s = k.full_shape[k.unrollable_dims[-1]]
+      # T4.102: a full unroll (arg=0) below gives every one of the `s` reduce iterations its own private
+      # registers -- combined with whatever's already upcasted (k.upcast_size()), the per-thread register/
+      # spill footprint scales with their PRODUCT, not `s` alone. A reduce whose trailing axis lands at
+      # exactly 32 after upstream GROUPTOP/LOCAL splits (context-length-dependent for the pooled 27B's
+      # attention: some max_context factorizations divide down to a small residual, others don't) combined
+      # with an already-nonzero upcast blew a real kernel from a safe partial-unroll shape to
+      # regs_usage=255 (the SASS max) with a local-memory spill past the device's configured
+      # slm_per_thread (measured 2026-09-11, ctx=180224 on a 3090 -- ops_nv.py's NVProgram.__call__ launch
+      # check; the analogous ctx=163840 kernel's trailing axis didn't land at <=32 and stayed on the
+      # partial-unroll branch below, unaffected). Route anything over budget to that same safe branch.
+      # ponytail: upcast_size()*s is a rough proxy for register pressure, not a real regs_usage estimate;
+      # tighten with per-dtype register costs if this budget ever mis-fires on another shape.
+      if s <= 32 and k.upcast_size() * s <= 128:
         k.apply_opt(Opt(OptOps.UNROLL, len(k.unrollable_dims)-1, 0))
         # if it's small, upcast a second reduce dimension too
         if k.unrollable_dims and s <= 3 and k.full_shape[k.unrollable_dims[-1]] <= 3:
