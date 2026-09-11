@@ -265,6 +265,8 @@ def kv_cache_dtype() -> DType:
 # Per-(position, kv-head) symmetric absmax scales, kv_int8_block(head_dim)-wide blocks along head_dim
 # (llama.cpp's q8_0 KV granularity), one scale per block for K and one for V -- see TransformerBlock's
 # _init_state (allocation) and _attention (the quantize-on-write/dequantize-on-read idiom).
+# T4.100: KV_INT4=1 reuses this exact same block width for its own absmax scale ("the int8-style scale
+# layout") -- only cache_kv's own per-element packing differs between the two flags, see _attention.
 def kv_int8_block(head_dim:int) -> int:
   """Quantization block width along head_dim: 32 (every real model config in this fork has head_dim a
   multiple of 32) when it divides evenly, else the whole head_dim as a single block -- keeps tiny test
@@ -627,6 +629,34 @@ class TransformerBlock(FFNBlock):
         qv, sv = assigned_kv[idx, :, :, 0:start_pos+T, :], assigned_scale[idx, :, :, 0:start_pos+T, :]
         return (qv.cast(x.dtype).reshape(*qv.shape[:-1], qv.shape[-1] // blk, blk) * sv.cast(x.dtype).unsqueeze(-1)).reshape(qv.shape)
       k, v = _dequant(0), _dequant(1)
+    elif self.cache_kv.dtype == dtypes.uint8:
+      # T4.100 KV_INT4: same kv_int8_block(head_dim)-wide absmax-scale layout as KV_INT8 above (cache_kv_scale
+      # is byte-identical between the two flags -- shape, dtype, allocation, all shared, see _init_state).
+      # Only cache_kv's own encoding differs: two adjacent head_dim elements pack into one stored byte, so
+      # cache_kv's last dim is head_dim//2 (_init_state again). Quant: q = round(x/scale) clipped to the full
+      # 4-bit two's-complement range [-8,7] (scale is picked the same way as KV_INT8's /127.0, just /7.0 for
+      # the smaller range); nibble = q+8 in [0,15] -- an unsigned OFFSET/biased encoding (ggml's own Q4_0
+      # convention) rather than raw two's-complement-in-a-nibble, so packing only ever needs
+      # bitwise_or/lshift/rshift/bitwise_and on non-negative small ints, never shift-of-a-negative-value
+      # (backend-dependent for signed types). Dequant undoes this exactly: unpack the two nibbles, subtract
+      # the 8 bias, multiply by scale -- algebraically round(x/scale)*scale, same as KV_INT8 (per-element
+      # error <= scale/2, the same round-to-nearest guarantee any such quantizer gives -- see
+      # test_llm_kv_dtype.py's direct pack/unpack round-trip test).
+      blk, hd = kv_int8_block(self.config.head_dim), self.config.head_dim
+      blocks = Tensor.stack(k, v).reshape(2, B, self.config.n_kv_heads, T, hd // blk, blk)
+      scale = (blocks.abs().max(axis=-1, keepdim=True) / 7.0).maximum(1e-8)               # (2,B,KvH,T,Hd//blk,1)
+      nibble = ((blocks / scale).round().clip(-8, 7) + 8).cast(dtypes.uint8).reshape(2, B, self.config.n_kv_heads, T, hd // 2, 2)
+      packed = nibble[..., 0].bitwise_or(nibble[..., 1].lshift(4))                        # (2,B,KvH,T,Hd//2) uint8, [0,15]|[0,15]<<4
+      assigned_kv = Tensor(self.cache_kv.uop.after(
+        self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(packed.uop)))
+      assigned_scale = Tensor(self.cache_kv_scale.uop.after(
+        self.cache_kv_scale[:, :, :, start_pos:start_pos+T, :].uop.store(scale.squeeze(-1).cast(self.cache_kv_scale.dtype).uop)))
+      def _dequant(idx:int) -> Tensor:
+        pv, sv = assigned_kv[idx, :, :, 0:start_pos+T, :], assigned_scale[idx, :, :, 0:start_pos+T, :]
+        lo, hi = pv.bitwise_and(0xF), pv.rshift(4)                                        # unpacked nibbles, both [0,15]
+        qv = Tensor.stack(lo, hi, dim=-1).reshape(*pv.shape[:-1], hd).cast(x.dtype) - 8    # interleaved back to (...,Hd), debiased
+        return (qv.reshape(*qv.shape[:-1], qv.shape[-1] // blk, blk) * sv.cast(x.dtype).unsqueeze(-1)).reshape(qv.shape)
+      k, v = _dequant(0), _dequant(1)
     else:
       assigned_kv = Tensor(self.cache_kv.uop.after(
         self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)))
@@ -672,14 +702,20 @@ class TransformerBlock(FFNBlock):
     self._positions(x)
     if not hasattr(self, "cache_kv"):
       int8 = bool(getenv("KV_INT8", 0))
+      int4 = bool(getenv("KV_INT4", 0))  # T4.100: wins if both are set somehow (arbitrary but deterministic tie-break)
+      if int4: assert self.config.head_dim % 2 == 0, f"KV_INT4 packs pairs of head_dim elements per byte, {self.config.head_dim=} is odd"
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
-                                   dtype=dtypes.int8 if int8 else kv_cache_dtype(), device=x.device)
-      if int8:
-        # T6.1 KV_INT8: one absmax scale per kv_int8_block(head_dim)-wide chunk of head_dim, same leading
-        # shape as cache_kv. Zeroed like cache_kv itself: a position never written is never read either (see
-        # _attention's 0:start_pos+T reads), so leftover-zero scale there is inert (0 dequants to 0 regardless
-        # of scale) -- same reasoning as cache_kv's own zero-fill above.
+      # T4.100 KV_INT4: cache_kv's last dim is head_dim//2 -- two 4-bit values packed per stored byte, see _attention
+      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context,
+                                   self.config.head_dim // 2 if int4 else self.config.head_dim,
+                                   dtype=dtypes.uint8 if int4 else dtypes.int8 if int8 else kv_cache_dtype(), device=x.device)
+      if int8 or int4:
+        # T6.1 KV_INT8 / T4.100 KV_INT4: one absmax scale per kv_int8_block(head_dim)-wide chunk of the
+        # UNPACKED head_dim, same leading shape as cache_kv, same fp16 dtype for both flags (KV_INT4 "implies
+        # the int8-style scale layout" -- see kv_int8_block's own comment). Zeroed like cache_kv itself: a
+        # position never written is never read either (see _attention's 0:start_pos+T reads), so leftover-
+        # zero scale there is inert (0 dequants to 0 regardless of scale) -- same reasoning as cache_kv's own
+        # zero-fill above.
         self.cache_kv_scale = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context,
                                            self.config.head_dim // kv_int8_block(self.config.head_dim),
                                            dtype=dtypes.float16, device=x.device)
@@ -1592,6 +1628,8 @@ class Transformer:
       # device_map's cross-device placements MUST realize -- see Transformer.realize_placement's docstring.
       # No-op when device_map is None (nothing moved off Device.DEFAULT to begin with).
       model.realize_placement()
+    from tinygrad.llm.kernels.nv_dense import prepare_dense_weights  # local: mirrors amd.py's import discipline
+    prepare_dense_weights(model)  # T4.98h: the fp16 head copies must exist before the first (@function, JIT-captured) call
     return model, kv
 
   def warmup(self, vision:bool=False):
@@ -1688,14 +1726,14 @@ class Transformer:
       elif isinstance(b, MLATransformerBlock): blocks.append({"cache_k": b.cache_k[:, :, :pos, :].clone(dev)})
       elif isinstance(b, TransformerBlock):
         bs: dict = {"cache_kv": b.cache_kv[:, :, :, :pos, :].clone(dev)}
-        if hasattr(b, "cache_kv_scale"): bs["cache_kv_scale"] = b.cache_kv_scale[:, :, :, :pos, :].clone(dev)  # T6.1 KV_INT8
+        if hasattr(b, "cache_kv_scale"): bs["cache_kv_scale"] = b.cache_kv_scale[:, :, :, :pos, :].clone(dev)  # T6.1 KV_INT8 / T4.100 KV_INT4
         blocks.append(bs)
       else: raise TypeError(f"snapshot_state: unhandled block type {type(b).__name__}")
     snap: dict = {"tokens": list(self._cached_tokens), "pos": pos, "blocks": blocks, "rope_delta": self._rope_delta}
     # ponytail: TransformerBlock-shaped MTP block only (every nextn head this fork loads); an MLA-shaped one would need its cache_k here.
     if self.mtp_head is not None and isinstance(self.mtp_head.block, TransformerBlock) and hasattr(self.mtp_head.block, "cache_kv"):
       snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone(dev)
-      if hasattr(self.mtp_head.block, "cache_kv_scale"):  # T6.1 KV_INT8
+      if hasattr(self.mtp_head.block, "cache_kv_scale"):  # T6.1 KV_INT8 / T4.100 KV_INT4
         snap["mtp_cache_kv_scale"] = self.mtp_head.block.cache_kv_scale[:, :, :, :pos, :].clone(dev)
     Tensor.realize(*(t for bs in blocks for t in bs.values()), *(snap[key] for key in ("mtp_cache_kv", "mtp_cache_kv_scale") if key in snap))
     return snap
@@ -1720,13 +1758,13 @@ class Transformer:
       elif isinstance(b, MLATransformerBlock): assigns.append(b.cache_k[:, :, :bs["cache_k"].shape[2], :].assign(bs["cache_k"].to(b.cache_k.device)))
       elif isinstance(b, TransformerBlock):
         assigns.append(b.cache_kv[:, :, :, :bs["cache_kv"].shape[3], :].assign(bs["cache_kv"].to(b.cache_kv.device)))
-        if (bscale := bs.get("cache_kv_scale")) is not None:  # T6.1 KV_INT8
+        if (bscale := bs.get("cache_kv_scale")) is not None:  # T6.1 KV_INT8 / T4.100 KV_INT4
           assigns.append(b.cache_kv_scale[:, :, :, :bscale.shape[3], :].assign(bscale.to(b.cache_kv_scale.device)))
       else: raise TypeError(f"restore_state: unhandled block type {type(b).__name__}")
     if (mk := snap.get("mtp_cache_kv")) is not None and self.mtp_head is not None:  # T4.66l -- see snapshot_state
       mtp_block = cast(TransformerBlock, self.mtp_head.block)
       assigns.append(mtp_block.cache_kv[:, :, :, :mk.shape[3], :].assign(mk.to(mtp_block.cache_kv.device)))
-      if (mks := snap.get("mtp_cache_kv_scale")) is not None:  # T6.1 KV_INT8
+      if (mks := snap.get("mtp_cache_kv_scale")) is not None:  # T6.1 KV_INT8 / T4.100 KV_INT4
         assigns.append(mtp_block.cache_kv_scale[:, :, :, :mks.shape[3], :].assign(mks.to(mtp_block.cache_kv_scale.device)))
     Tensor.realize(*assigns)
     self._cached_tokens = list(snap["tokens"])
@@ -2361,16 +2399,19 @@ def snapshot_nbytes(snap:dict) -> int:
 
 def snapshot_nbytes_for(snap:dict, n_tokens:int) -> int:
   """Predict the bytes a snapshot of an n_tokens-long sequence would take, from an existing snapshot: KV-cache slices
-  (`cache_kv`/`cache_k`, one row per token) scale with the length; GDN conv/recurrent states (and everything else) are
-  fixed-size accumulators and count once. A plain nbytes*n/len(tokens) extrapolation charges the fixed states per token
-  and predicts ~29 GB for a 39k-token session (T5.7b) -- then serve.py skips snapshots that would fit."""
+  (`cache_kv`/`cache_k`/`cache_kv_scale`, one row per token) scale with the length; GDN conv/recurrent states (and
+  everything else) are fixed-size accumulators and count once. A plain nbytes*n/len(tokens) extrapolation charges the
+  fixed states per token and predicts ~29 GB for a 39k-token session (T5.7b) -- then serve.py skips snapshots that
+  would fit. T4.100: `cache_kv_scale` (T6.1 KV_INT8 / T4.100 KV_INT4's per-block absmax scales, see kv_int8_block)
+  is position-indexed exactly like `cache_kv` itself -- it used to fall into the `else` branch below and get
+  charged as a one-off fixed cost instead of scaling with n_tokens, silently under-predicting int8/int4 KV sessions."""
   pos = max(int(snap.get("pos", len(snap.get("tokens", [])))), 1)
   per_token, fixed = 0.0, 0
   for blk in snap.get("blocks", []):
     for k, v in blk.items():
       if not isinstance(v, Tensor): continue
       nb = math.prod(int(d) for d in v.shape) * v.dtype.itemsize
-      if k in ("cache_kv", "cache_k"): per_token += nb / pos
+      if k in ("cache_kv", "cache_k", "cache_kv_scale"): per_token += nb / pos
       else: fixed += nb
   # MTP cache slice (T4.66l) and any other per-token entries at the top level
   for k, v in snap.items():

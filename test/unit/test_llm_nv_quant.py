@@ -12,7 +12,9 @@ from tinygrad import Tensor, UOp, Context, dtypes, nn
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS
-from tinygrad.llm.kernels.nv_quant import Q8_0, Q4_0, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm
+from tinygrad.llm.kernels.nv_quant import (
+  Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
+)
 
 KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 
@@ -25,6 +27,12 @@ def ref_q4_0(b:np.ndarray) -> np.ndarray:  # b: uint8[18]
   qs = b[2:18]
   q = np.concatenate([qs & 0x0F, qs >> 4]).astype(np.int32)  # gguf q_to_uint8(.,4): low nibbles 0-15, then high 16-31
   return (d * (q - 8)).astype(np.float32)
+
+def ref_q4_1(b:np.ndarray) -> np.ndarray:  # b: uint8[20]
+  d, m = _f16(b[0:2]), _f16(b[2:4])
+  qs = b[4:20]
+  q = np.concatenate([qs & 0x0F, qs >> 4]).astype(np.int32)  # same q_to_uint8(.,4) order as Q4_0, no -8 bias
+  return (d * q + m).astype(np.float32)
 
 def ref_q8_0(b:np.ndarray) -> np.ndarray:  # b: uint8[34]
   d = _f16(b[0:2])
@@ -82,6 +90,12 @@ def ref_iq4_xs(b:np.ndarray) -> np.ndarray:  # b: uint8[136]
       out[sg*32+jj] = KVALUES_IQ4NL[nib] * d * scale
   return out
 
+def ref_iq4_nl(b:np.ndarray) -> np.ndarray:  # b: uint8[18]
+  d = _f16(b[0:2])
+  qs = b[2:18]
+  q = np.concatenate([qs & 0x0F, qs >> 4]).astype(np.int32)  # Q4_0's byte layout, no sub-block scale
+  return (d * np.array(KVALUES_IQ4NL, dtype=np.float32)[q]).astype(np.float32)
+
 class TestFormatUnpackMath(unittest.TestCase):
   """group_dot's per-group unpack (nibble/byte extraction, scales, the Q4_0 -8 and Q4_K/Q5_K min terms), transcribed
   to pure numpy, must reproduce gguf.py's ggml_data_to_tensor dequantized values exactly -- the kernel itself can't
@@ -97,6 +111,8 @@ class TestFormatUnpackMath(unittest.TestCase):
 
   def test_q4_0(self):
     for seed in range(5): self._check(Q4_0, 18, ref_q4_0, seed)
+  def test_q4_1(self):
+    for seed in range(5): self._check(Q4_1, 20, ref_q4_1, seed)
   def test_q8_0(self):
     for seed in range(5): self._check(Q8_0, 34, ref_q8_0, seed)
   def test_q4_k(self):
@@ -107,6 +123,8 @@ class TestFormatUnpackMath(unittest.TestCase):
     for seed in range(5): self._check(Q6_K, 210, ref_q6_k, seed)
   def test_iq4_xs(self):
     for seed in range(5): self._check(IQ4_XS, 136, ref_iq4_xs, seed)
+  def test_iq4_nl(self):
+    for seed in range(5): self._check(IQ4_NL, 18, ref_iq4_nl, seed)
 
 class TestByteParityIntrinsics(unittest.TestCase):
   """_nv_byte_perm is the highest-risk translation in this port (AMD's v_perm_b32 and CUDA's __byte_perm disagree
@@ -177,9 +195,9 @@ class TestKernelGraphAndRender(unittest.TestCase):
 
   @staticmethod
   def _raw_shape(ggml_type:int, out_features:int, in_features:int) -> tuple[tuple[int, ...], object]:
-    if ggml_type in (Q4_0, Q8_0):
+    if ggml_type in (Q4_0, Q8_0, Q4_1, IQ4_NL):
       blocks = in_features // 32
-      nbytes = 18 if ggml_type == Q4_0 else 34
+      nbytes = {Q8_0: 34, Q4_1: 20}.get(ggml_type, 18)  # Q4_0 and IQ4_NL are both 18
       return (out_features*blocks*nbytes,), dtypes.uint8
     blocks = in_features // 256
     words = {Q4_K: Q4_WORDS, Q5_K: Q5_WORDS, IQ4_XS: IQ4_WORDS}.get(ggml_type)
@@ -221,7 +239,7 @@ class TestKernelGraphAndRender(unittest.TestCase):
           self.assertIn("__dp4a", src)
           self.assertIn("__shfl_xor_sync(0xffffffff", src)
           self.assertNotIn("amdgcn", src)
-          if ggml_type == IQ4_XS: self.assertIn("__byte_perm", src)
+          if ggml_type in (IQ4_XS, IQ4_NL): self.assertIn("__byte_perm", src)
 
 class TestDispatch(unittest.TestCase):
   """With NV_CUSTOM_QUANT unset (default 0), or set on a non-NV device, Linear must never construct a custom
@@ -310,6 +328,29 @@ class TestSetQuantizedIdentifiesFormat(unittest.TestCase):
     self.assertEqual(linear.ggml_type, Q4_K)
     self.assertEqual(linear.weight.dtype, dtypes.uint32)
     self.assertEqual(linear.weight.nbytes(), 144)
+
+  def test_q4_1_identified(self):
+    linear = self._linear_for(Q4_1, 32, 20)
+    linear.set_quantized(linear.weight)
+    self.assertEqual(linear.ggml_type, Q4_1)
+    self.assertEqual(linear.weight.dtype, dtypes.uint8)
+    self.assertEqual(linear.weight.nbytes(), 20)
+
+  def test_iq4_nl_disambiguated_from_q4_0_at_the_colliding_block_width(self):
+    # IQ4_NL's 18-byte block is byte-identical in width to Q4_0's -- BLOCK_BYTES[18] alone can't tell them apart;
+    # _is_iq4_nl's toposort marker (a 16-element float32 BUFFER for the kvalues_iq4nl codebook) must. The CPU
+    # generic path (no NV/AMD device open) must still compute the right numbers for both once ggml_type is set.
+    q4_0 = self._linear_for(Q4_0, 32, 18)
+    q4_0.set_quantized(q4_0.weight)
+    self.assertEqual(q4_0.ggml_type, Q4_0)
+
+    iq4_nl = self._linear_for(IQ4_NL, 32, 18, seed=1)
+    iq4_nl.set_quantized(iq4_nl.weight)
+    self.assertEqual(iq4_nl.ggml_type, IQ4_NL)
+
+    for linear in (q4_0, iq4_nl):
+      decoded, x = linear.dequant_weight, Tensor.randn(1, 32)
+      np.testing.assert_allclose(linear(x).numpy(), (x @ decoded.T).numpy(), rtol=1e-4, atol=1e-5)
 
   def test_q8_0_identified(self):
     linear = self._linear_for(Q8_0, 32, 34)

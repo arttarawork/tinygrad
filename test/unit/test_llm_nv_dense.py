@@ -16,7 +16,8 @@ from tinygrad.llm.kernels import nv_dense, nv_quant  # module objects: mock.patc
                                                       # importing nv_quant registers its NV_CUSTOM_QUANT ContextVar
                                                       # (Context(NV_CUSTOM_QUANT=1) KeyErrors otherwise -- amd.py's
                                                       # Linear.__call__ only imports nv_quant lazily, on first call)
-from tinygrad.llm.kernels.nv_dense import nv_dense_eligible, nv_f16_gemv, _nv_f16_gemv_kernel, WARP_SIZE, VAL_CHUNK
+from tinygrad.llm.kernels.nv_dense import nv_dense_eligible, nv_f16_gemv, _nv_f16_gemv_kernel, WARP_SIZE, VAL_CHUNK, prepare_dense_weights
+from tinygrad.engine.realize import capturing
 
 # ******** pure-numpy transcription of the kernel's lane/accumulation math ********
 
@@ -110,6 +111,39 @@ class TestEligibility(unittest.TestCase):
     self.assertFalse(nv_dense_eligible(self._linear(5121, 48)))
 
 # ******** nv_f16_gemv: token-count gating + the realize-once weight cache ********
+
+class TestPrepareDenseWeights(unittest.TestCase):
+  """The fp16 copy must be made at load time: inside a @function context (ALLOW_DEVICE_USAGE=0) or a JIT capture
+  nv_f16_gemv must fall through (return None) instead of realizing -- that assert took down every
+  NV_CUSTOM_QUANT=1 model load on 2026-09-11."""
+  class _Model:
+    def __init__(self):
+      self.head = Linear(256, 8, bias=False)          # eligible shape, plain fp32 weight
+      self.wide = Linear(256, 4096, bias=False)       # out_features > 2048: not eligible
+      self.blk = [Linear(256, 8, bias=False)]         # nested in a list, like model.blk
+
+  def test_no_eager_realize_inside_function_or_capture(self):
+    layer = Linear(256, 8, bias=False)
+    x = Tensor.randn(1, 1, 256)
+    with Context(ALLOW_DEVICE_USAGE=0): self.assertIsNone(nv_f16_gemv(layer, x))
+    capturing.append(object())
+    try: self.assertIsNone(nv_f16_gemv(layer, x))
+    finally: capturing.clear()
+    self.assertIsNone(layer.dense_weight)
+
+  def test_prepare_makes_fp16_copies_for_eligible_layers_only(self):
+    model = self._Model()
+    with unittest.mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True):
+      self.assertEqual(prepare_dense_weights(model), 2)
+      self.assertEqual(prepare_dense_weights(model), 0)  # idempotent
+    for layer in (model.head, model.blk[0]):
+      self.assertEqual(layer.dense_weight.dtype, dtypes.float16)
+      self.assertEqual(layer.dense_weight.shape, (8, 256))
+      np.testing.assert_allclose(layer.dense_weight.float().numpy(), layer.weight.numpy(), rtol=2e-3, atol=1e-3)
+    self.assertIsNone(model.wide.dense_weight)
+
+  def test_prepare_skips_unsupported_devices(self):
+    self.assertEqual(prepare_dense_weights(self._Model()), 0)  # CPU: nv_quant_supported is False
 
 class TestNvF16Gemv(unittest.TestCase):
   IN_FEATURES, OUT_FEATURES = 5120, 48
