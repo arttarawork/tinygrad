@@ -71,8 +71,11 @@ class Linear(nn.Linear):
     # actual last dim, 18 vs 144, tells them apart)
     reshape = next((u for u in graph if u.op is Ops.RESHAPE and u.dtype == dtypes.uint8 and len(u.shape) == 2 and u.shape[1] in BLOCK_BYTES), None)
     if reshape is None: return
+    # raw is the loader's SHRINK into a staged batch -- or the whole realized batch itself when the tensor was staged
+    # alone (every tensor over gguf.py's 64 MB _STAGE_BATCH: output/token_embd, a Q8_0 ffn_gate): a full-extent slice
+    # is a no-op, so no SHRINK. Both carry a contiguous view; only the byte dtype is structural (T4.98c fix, 09-11)
     raw = reshape.src[0]
-    assert raw.op is Ops.SHRINK and raw.dtype == dtypes.uint8
+    assert raw.dtype == dtypes.uint8, raw.op
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
     self.dequant_weight = decoded
