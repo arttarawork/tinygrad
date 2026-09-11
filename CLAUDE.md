@@ -42,13 +42,17 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   `DEV=CPU` — with the METAL default `-n` spawns one real TinyGPU server per worker, T4.38; `DEV=CPU` gates never
   open NV except `test/device/test_hcq.py`, which opens `Device["NV"]` unconditionally);
   typecheck `.venv/bin/python -m mypy tinygrad/`; lint `.venv/bin/python -m ruff check .` AND the CI whitespace lint
-  `.venv/bin/python -m pylint --disable=all -e W0311 -e C0303 --jobs=0 --indent-string='  ' --recursive=y .` (2-space indent — 4-space
+  `.venv/bin/python -m pylint --disable=all -e W0311 -e C0303 --jobs=2 --indent-string='  ' --recursive=y .` (2-space indent — 4-space
   scripts in `extra/` fail CI's Linters job; pylint must be installed in the venv — it wasn't until 2026-09-03)
   (from a worktree, the venv is at `/Users/artur/Documents/tinygrad/.venv` — `PYTHONPATH=.` makes
   the worktree's tinygrad win over anything installed).
+- **Memory discipline (36 GB Mac; the 2026-09-11 00:34 kernel panic):** one verification wave at a time. Two agents' waves overlapped
+  (a `pytest -n12` next to a `pylint --jobs=0` over the whole tree, plus mypy) → 28 GB in the compressor, 37 swapfiles, jetsam storm,
+  watchdog panic. Agents run only the unit tests for the files they touched, serially (never `-n`), never pylint/mypy; the orchestrator
+  runs the full lint once at merge time (`--jobs=2`) and never alongside another wave or a device run. The colima VM holds ~7.5 GB.
 - Perf claims need before/after tok/s from the T0.3 harness on named hardware. Upstream PRs:
   one small lever each, hand-verified — upstream has reverted AI-generated slop before.
 - Don't remove the deliberate `.contiguous()` in the MoE expert path (`tinygrad/llm/model.py:27,129`).
 - Subagents: when work breaks into discrete, well-defined ("Sonnet-proof") subtasks, hand them to
   **Sonnet 5 at max effort** (`model: "sonnet"`, request max reasoning in the prompt) — one tight
-  objective, explicit done-when + STOP conditions. Don't spawn inherited-Fable agents for these.
+  objective, explicit done-when + STOP conditions. Don't spawn inherited-Fable agents for these. Every agent prompt carries the memory rule above.
