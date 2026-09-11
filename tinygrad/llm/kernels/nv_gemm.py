@@ -48,8 +48,8 @@ from typing import cast, Callable
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
-from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, IQ_GRID_SIZES, Q8_GROUP_SIZE,
-                                      QUANT_SIZES, _half)
+from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS, IQ3_S,
+                                      IQ_GRID_SIZES, Q8_GROUP_SIZE, QUANT_SIZES, _half)
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok, iq_grid
@@ -239,12 +239,126 @@ def _iq4_xs_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp
     return (d * scale * _select_const(_nibble(_byte(raw, base + 8 + j * 16 + (k % 16)), k >= 16), _ggml.kvalues_iq4nl)).cast(dtypes.float16)
   return tuple(elem(o) for o in (0, 1, 8, 9))
 
+# ******** T4.98k: the three 3-bit formats (Q3_K, IQ3_XXS, IQ3_S) -- 256-weight blocks, same _kquant_base sub-block
+# j = group % 8. Two (IQ3_XXS/IQ3_S) index a codebook (nv.py iq_grid, an extra kernel input bound like raw/x) by an
+# 8-bit "code" covering 4 weights (code index e//4, e = 32*j+i the block-relative element, i = kk+o the group-
+# relative one); the grid word's byte e%4 is the magnitude. Both e//4 and e%4 divide/mod the lane-dependent `i` by
+# 4 -- the exact hazard _wmma_layout_nv's docstring warns about (kk = half*WMMA_K + 2*lane_lo; lane_lo is a LOCAL-
+# range UOp) -- so _div4_mod4 below builds them from `kk` alone via comparisons/subtraction (never // or % on an
+# expression containing lane_lo), and the per-o `o//4`/`o%4` terms are plain Python ints (o is a compile-time
+# constant, unrolled by the elem() loop), safe to add in directly. Ditto for i//8/i%8 (IQ3_XXS's sign sub-group,
+# IQ3_S's sign byte): built from a (kk>=16) comparison plus the compile-time o//8, never dividing kk/i themselves.
+# All three decoders' exact per-element formulas were cross-checked against gguf.py's ggml_data_to_tensor (numpy
+# port of its q_to_uint8/reshape pipeline, 1000 random 256-weight blocks + all-0x00/all-0xFF edge blocks, every one
+# of the 256 elements/block) in the T4.98k report's verify_iq3.py -- notably IQ3_S's scale-nibble and qh byte/bit
+# split turned out BYTE-major (nibble(j) = j%2==0 ? low : high nibble of byte(106+j//2); qh bit = c%8 of byte
+# (66+c//8)), not the field-major grouping a literal reading of ggml's C reference suggests once gguf.py's own
+# q_to_uint8 is fed a (-1, N, 1)-reshaped input (Q3_K and IQ3_XXS never reshape that way, so they stay field-major
+# and match the naive reading).
+
+def _div4_mod4(kk:UOp) -> tuple[UOp, UOp]:
+  # (kk//4, kk%4) via a comparison/subtraction where-tree on kk itself -- kk only ever takes the 8 values
+  # {0,2,4,6,16,18,20,22} in this kernel (half*WMMA_K + 2*lane_lo, half in {0,1}, lane_lo in 0..3), so this never
+  # applies // or % to an expression containing lane_lo (comparisons/where/subtraction don't split the LOCAL range)
+  hi = kk >= 16
+  base = kk - hi.where(16, 0)  # 0, 2, 4 or 6, regardless of half
+  return hi.where(4, 0) + (base >= 4).where(1, 0), (base.eq(2) | base.eq(6)).where(2, 0)
+
+def _grid_byte(grid:UOp, idx:UOp, byte_in_word:UOp) -> UOp:
+  # byte `byte_in_word` (0..3) of the codebook's uint32 word at `idx` -- grid is the IQ3 codebook (nv.py iq_grid),
+  # an extra kernel input bound the same way `raw` is (see nv_wmma_linear/_wmma_kernel)
+  return (grid[idx].cast(dtypes.int32) >> (8 * byte_in_word)) & 0xFF
+
+def _q3_k_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp):
+  # ggml type 11 (110 bytes): hmask[32] at 0, qs[64] at 32, scales[12] at 96, d (f16) at 108 (gguf.py ggml_type==11,
+  # field-major -- no (-1,N,1) reshape trick here). e = 32*j+i (i = kk+o) needs the scale index s = 2*j + (i>=16):
+  # s is only ever compared/added below, and the real ggml s//4 (nibble-pair shift) / s%4 (byte offset) split is
+  # rewritten purely from j (a REDUCE sub-block index, not lane-dependent -- safe to divide) plus the (i>=16) flag
+  # folded in through .where() branches, never a // or % on an expression containing kk.
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[Q3_K])
+  d = _half_at(raw, base + 108)
+  p, half_j, j_par = j % 4, j // 2, j % 2
+  def elem(o):
+    i = kk + o
+    q2 = (_byte(raw, base + 32 + 32 * (j // 4) + i) >> (2 * p)) & 3
+    qh = (_byte(raw, base + i) >> j) & 1
+    hi = i >= 16
+    # scale index s = 2*j+hi (0..15) is only ever used through this byte offset -- 2*p+hi is tightly bounded [0,7]
+    # on BOTH .where() branches (unlike addressing directly by the wide-ranging s, which reads up to base+96+15,
+    # one byte past the 110-byte block on the last row/group: CHECK_OOB's z3 index validator caught it, T4.98k) --
+    # and the s<8 nibble selector, which reduces to j<4 (independent of hi -- verified by truth table, j in 0..7)
+    lo4_byte = _byte(raw, base + 96 + hi.where(2 * p + 1, 2 * p))
+    low4 = (j < 4).where(lo4_byte & 0xF, lo4_byte >> 4)
+    high2 = (_byte(raw, base + 104 + hi.where(2 * j_par + 1, 2 * j_par)) >> (2 * half_j)) & 3
+    sc = (((low4 | (high2 << 4)) ^ 0x80) - 0x80).float() - 32
+    return (d * sc * (q2 + 4 * qh - 4).float()).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _iq3_xxs_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp, *, grid:UOp):
+  # ggml type 18 (98 bytes): d (f16) at 0, qs[64] at 2 (8-bit grid code per 4 weights), 8 little-endian uint32
+  # scale/sign words at 66, one per 32-wide sub-block j (gguf.py ggml_type==18, field-major). See the module-level
+  # comment above for the e//4 / e%4 / i//8 / i%8 restructuring (_div4_mod4, kk_hi2 below).
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[IQ3_XXS])
+  d = _half_at(raw, base)
+  w = _byte(raw, base+66+4*j) | (_byte(raw, base+67+4*j) << 8) | (_byte(raw, base+68+4*j) << 16) | (_byte(raw, base+69+4*j) << 24)
+  scale = (w >> 28) & 0xF
+  db = d * (scale.float() + 0.5) * 0.5
+  kk_div4, kk_mod4 = _div4_mod4(kk)
+  kk_hi2 = (kk >= 16).where(2, 0)
+  def elem(o):
+    i = kk + o
+    code_idx = 8 * j + kk_div4 + o // 4       # e//4 (0..63): o is compile-time, safe to // /% directly
+    byte_in_word = kk_mod4 + o % 4            # e%4
+    magnitude = _grid_byte(grid, _byte(raw, base + 2 + code_idx), byte_in_word)
+    k_sub = kk_hi2 + o // 8                   # i//8 (0..3): the 8-weight sign sub-group
+    v = i - 8 * k_sub                         # i%8, via subtraction instead of a raw % on i
+    s7 = (w >> (7 * k_sub)) & 0x7F
+    par = s7 ^ (s7 >> 4)  # XOR-fold parity (bit0), same idiom as gguf.py's even_signs derivation
+    par = par ^ (par >> 2)
+    par = par ^ (par >> 1)
+    sign = 1 - 2 * (((s7 | ((par & 1) << 7)) >> v) & 1)
+    return (db * magnitude.float() * sign.float()).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
+def _iq3_s_dequant4(raw:UOp, output_row:UOp, group_count:int, group:UOp, kk:UOp, *, grid:UOp):
+  # ggml type 21 (110 bytes): d (f16) at 0, qs[64] at 2, qh[8] at 66, signs[32] at 74, scales[4] at 106 (gguf.py
+  # ggml_type==21). scale/qh/signs all go through gguf.py's (-1,N,1)-reshaped q_to_uint8 calls -- BYTE-major, see
+  # the module-level comment above. code index (e//4) and grid-byte (e%4): same _div4_mod4 restructuring as
+  # IQ3_XXS; since the resulting per-o delta is always < 8, the qh code's c//8 collapses to j exactly (no division
+  # of a lane-dependent value needed) and c%8 IS that delta.
+  base, j = _kquant_base(output_row, group_count, group, QUANT_SIZES[IQ3_S])
+  d = _half_at(raw, base)
+  nib = _nibble(_byte(raw, base + 106 + j // 2), (j % 2).ne(0))
+  scale = (1 + 2 * nib).float()
+  kk_div4, kk_mod4 = _div4_mod4(kk)
+  kk_hi2 = (kk >= 16).where(2, 0)
+  def elem(o):
+    i = kk + o
+    delta = kk_div4 + o // 4                  # e//4 mod 8 == c%8 (c//8 == j, since delta is always < 8)
+    c = 8 * j + delta                          # code index e//4 (0..63)
+    byte_in_word = kk_mod4 + o % 4             # e%4
+    qh_bit = (_byte(raw, base + 66 + j) >> delta) & 1
+    # + not | : the operands are bit-disjoint (qs_byte < 256, qh_bit<<8 in {0,256}) so the value is identical, but
+    # tinygrad's vmin/vmax for a non-bool OR is unbounded (always dtype.min/max) while ADD gets a tight interval --
+    # an unbounded index forces CHECK_OOB's z3 prover, which then crashes on the dynamic-amount shift in `delta`'s
+    # ancestry (AttributeError: 'ArithRef' object has no attribute 'as_long'); ADD keeps idx providably in [0,511)
+    # and the fast vmin/vmax check passes without ever reaching z3 (T4.98k).
+    idx = _byte(raw, base + 2 + c) + (qh_bit << 8)
+    magnitude = _grid_byte(grid, idx, byte_in_word)
+    k_sub = kk_hi2 + o // 8                    # i//8 (0..3): sign byte sub-index
+    sign_bit = (_byte(raw, base + 74 + 4 * j + k_sub) >> (i - 8 * k_sub)) & 1
+    sign = 1 - 2 * sign_bit
+    return (d * scale * magnitude.float() * sign.float()).cast(dtypes.float16)
+  return tuple(elem(o) for o in (0, 1, 8, 9))
+
 # ggml_type -> (fragment decoder, K alignment the decoder needs, kernel name)
 WMMA_FORMATS: dict[int, tuple[Callable, int, str]] = {
   Q8_0: (_q8_0_dequant4, 32, "linear_q8_0_wmma_nv"), Q4_0: (_q4_0_dequant4, 32, "linear_q4_0_wmma_nv"),
   Q4_1: (_q4_1_dequant4, 32, "linear_q4_1_wmma_nv"), IQ4_NL: (_iq4_nl_dequant4, 32, "linear_iq4_nl_wmma_nv"),
   Q4_K: (_q4_k_dequant4, 256, "linear_q4_k_wmma_nv"), Q5_K: (_q5_k_dequant4, 256, "linear_q5_k_wmma_nv"),
-  Q6_K: (_q6_k_dequant4, 256, "linear_q6_k_wmma_nv"), IQ4_XS: (_iq4_xs_dequant4, 256, "linear_iq4_xs_wmma_nv")}
+  Q6_K: (_q6_k_dequant4, 256, "linear_q6_k_wmma_nv"), IQ4_XS: (_iq4_xs_dequant4, 256, "linear_iq4_xs_wmma_nv"),
+  Q3_K: (_q3_k_dequant4, 256, "linear_q3_k_wmma_nv"), IQ3_XXS: (_iq3_xxs_dequant4, 256, "linear_iq3_xxs_wmma_nv"),
+  IQ3_S: (_iq3_s_dequant4, 256, "linear_iq3_s_wmma_nv")}
 
 def _token_tile_for(tokens:int) -> int: return 64 if tokens % 64 == 0 else 32 if tokens % 32 == 0 else WMMA_M
 def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA_N*4) == 0 else 1

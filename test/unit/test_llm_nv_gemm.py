@@ -5,10 +5,11 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.kernels import nv_gemm
-from tinygrad.llm.kernels.amd import Q8_0, Q4_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, QUANT_SIZES
+from tinygrad.llm.kernels.amd import Q8_0, Q4_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES
 from tinygrad.llm.kernels.nv_quant import NV_CUSTOM_QUANT  # importing nv_quant registers the ContextVar the dispatch test sets
 
-BLOCK = {Q8_0: (32, 34), Q4_0: (32, 18), Q4_1: (32, 20), IQ4_NL: (32, 18), **{t: (256, QUANT_SIZES[t]) for t in (Q4_K, Q5_K, Q6_K, IQ4_XS)}}
+BLOCK = {Q8_0: (32, 34), Q4_0: (32, 18), Q4_1: (32, 20), IQ4_NL: (32, 18),
+         **{t: (256, QUANT_SIZES[t]) for t in (Q4_K, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS, IQ3_S)}}
 
 def _sink(ggml_type:int, tokens:int, out_features:int, in_features:int):
   weights, block_bytes = BLOCK[ggml_type]
@@ -16,7 +17,10 @@ def _sink(ggml_type:int, tokens:int, out_features:int, in_features:int):
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32).uop
   raw = Tensor.empty(out_features * in_features // weights * block_bytes // dt.itemsize, dtype=dt).uop
   x = Tensor.empty(tokens, in_features, dtype=dtypes.float16).uop
-  params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate((out, raw, x)))
+  srcs = [out, raw, x]
+  if ggml_type in IQ_GRID_SIZES:  # T4.98k: the IQ3 codebook, bound the same way nv_wmma_linear binds it (see iq_grid)
+    srcs.append(Tensor.empty(IQ_GRID_SIZES[ggml_type], dtype=dtypes.uint32).uop)
+  params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate(srcs))
   return nv_gemm._wmma_kernel(*params, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
 
 def _shapes(ggml_type:int):  # (tokens, out, in): 1-4 M tiles, 1/4 N tiles, several K blocks; K a multiple of the format's block
@@ -50,6 +54,8 @@ class TestKernelGraphAndRender(unittest.TestCase):
           self.assertIn("int lidx0 = threadIdx.x; /* 4 */", src)
           self.assertIn("int lidx1 = threadIdx.y; /* 8 */", src)
           self.assertEqual(src.count("threadIdx.z"), 0)
+          if ggml_type in IQ_GRID_SIZES:  # T4.98k: the codebook (slot 3) must actually be read, not optimized away
+            self.assertIn("data3_", src)
 
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):
