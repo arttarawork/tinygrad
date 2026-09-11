@@ -50,6 +50,9 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   (a `pytest -n12` next to a `pylint --jobs=0` over the whole tree, plus mypy) → 28 GB in the compressor, 37 swapfiles, jetsam storm,
   watchdog panic. Agents run only the unit tests for the files they touched, serially (never `-n`), never pylint/mypy; the orchestrator
   runs the full lint once at merge time (`--jobs=2`) and never alongside another wave or a device run. The colima VM holds ~7.5 GB.
+  **The pooled server itself holds ~20 GB of PAGEABLE host memory (the METAL blocks' weights)**: a test wave next to a running server
+  swaps the server out (09-11 08:50: 17 GB of it compressed, 27 GB of swapfiles, the wave killed by the low-memory watchdog). Stop the
+  server before any test/lint wave (`pooled-serve.sh stop`, restart with `t4x/deploy.sh`) and run pytest one file per process.
 - Perf claims need before/after tok/s from the T0.3 harness on named hardware. Upstream PRs:
   one small lever each, hand-verified — upstream has reverted AI-generated slop before.
 - Don't remove the deliberate `.contiguous()` in the MoE expert path (`tinygrad/llm/model.py:27,129`).
