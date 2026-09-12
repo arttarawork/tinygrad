@@ -578,17 +578,24 @@ class FFNBlock:
 # already broadcasts in matmul); SDPA_HEAD_GROUPS=1 takes the identical, untouched single-call path (today's
 # behavior, byte-identical). The kernels still loop over start_pos+T (mask/k/v slicing is unchanged) --
 # grouping only slices the *head* axis, never introduces a static KV tile.
-# Measured effect on the arena (test_llm_prefill_arena.py's test_group_count_scales_arena_down): the reduction
-# is real but smaller than a naive 1/G, because the groups have no data dependency on each other and
-# memory_plan_rewrite (schedule/memory.py) assigns buffer lifetimes from POSITION IN THE LINEARIZED KERNEL
-# LIST -- the linearizer is free to interleave independent groups' kernels (e.g. every group's QK^T before any
-# group's softmax), which keeps several groups' score buffers concurrently live. Slot-count grows ~G+1 instead
-# of staying at 2, capping the real reduction at ~2x/(1+1/G): measured ratio(G=2)=1.33x, ratio(G=4)=1.59x. The
-# only way found to force true per-group draining (~1/G, ~3.98x measured at G=4) is a `.realize()` at the end
-# of each group -- rejected: `_attention` always runs inside TransformerBlock.__call__'s
-# `@function(precompile=True)` trace (`_run`, above), which sets ALLOW_DEVICE_USAGE=0 (tinygrad/function.py)
-# specifically to forbid mid-trace device compilation; a `.realize()` there raises `AssertionError: usage of
-# device CPU disallowed` in real generation (reproduced against Transformer.generate()), not just a test.
+# Plain independent groups aren't enough: they have no data dependency on each other, and memory_plan_rewrite
+# (schedule/memory.py) assigns buffer lifetimes from POSITION IN THE LINEARIZED KERNEL LIST -- the linearizer
+# is free to interleave independent groups' kernels (e.g. every group's QK^T before any group's softmax),
+# which keeps several groups' score buffers concurrently live (measured: only ~1.33-1.59x smaller at G=2..4,
+# not ~1/G). A per-group `.realize()` fixes that (measured ~3.98x at G=4) but is not viable here: `_attention`
+# always runs inside TransformerBlock.__call__'s `@function(precompile=True)` trace (`_run`, above), which sets
+# ALLOW_DEVICE_USAGE=0 (tinygrad/function.py) specifically to forbid mid-trace device compilation -- a
+# `.realize()` there raises `AssertionError: usage of device CPU disallowed` against real Transformer.generate().
+# The fix that IS legal in that trace: an explicit ORDERING EDGE via UOp.after (no device touched -- pure graph
+# construction, same idiom `_attention` already uses for the KV-cache write above, and the hand-written kernels
+# in tinygrad/llm/kernels/*.py use for their `Tensor(out.after(kernel))` results). For group i>0, round-trip
+# group i-1's OUTPUT (small, (B,H/G,T,Hd) -- NOT the score buffer, so this scratch doesn't scale with context)
+# through a fresh buffer via `.assign()` (itself a lazy STORE, no realize), then gate group i's q slice on that
+# buffer's AFTER: `.after()` doesn't change the q slice's VALUE, only its position in the linearized kernel
+# list, so group i's first kernel (QK^T, which reads this q) cannot be scheduled before group i-1's last kernel
+# has run -- collapsing the two groups' liveness windows to non-overlapping. Verified: bit-exact vs the
+# unchained version, and ~3.93-3.98x smaller at G=4 through both a raw JIT harness and the real
+# `Transformer.generate()` path (see test_llm_prefill_arena.py's test_group_count_scales_arena_down).
 SDPA_HEAD_GROUPS = ContextVar("SDPA_HEAD_GROUPS", 0)
 def sdpa_head_groups_for(n_kv_heads:int) -> int: return SDPA_HEAD_GROUPS.value if SDPA_HEAD_GROUPS.value > 0 else n_kv_heads
 
@@ -598,8 +605,15 @@ def _sdpa_default(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
   if G <= 1: return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   assert H % G == 0 and KvH % G == 0, f"SDPA_HEAD_GROUPS={G} must divide both n_heads={H} and n_kv_heads={KvH}"
   hg, kg = H // G, KvH // G
-  outs = [q[:, i*hg:(i+1)*hg].scaled_dot_product_attention(k[:, i*kg:(i+1)*kg], v[:, i*kg:(i+1)*kg],
-                                                            attn_mask=mask, enable_gqa=True) for i in range(G)]
+  outs, prev = [], None
+  for i in range(G):
+    qg = q[:, i*hg:(i+1)*hg]
+    if prev is not None:
+      scratch = Tensor.empty(*prev.shape, dtype=prev.dtype, device=prev.device).assign(prev)
+      qg = Tensor(qg.uop.after(scratch.uop))
+    o = qg.scaled_dot_product_attention(k[:, i*kg:(i+1)*kg], v[:, i*kg:(i+1)*kg], attn_mask=mask, enable_gqa=True)
+    outs.append(o)
+    prev = o
   return outs[0].cat(*outs[1:], dim=1)
 
 attention_impl: Callable[[Tensor, Tensor, Tensor, Tensor|None], Tensor] = _sdpa_default

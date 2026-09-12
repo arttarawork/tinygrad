@@ -47,24 +47,18 @@ class TestPrefillArena(unittest.TestCase):
 
   def test_group_count_scales_arena_down(self):
     # T4.103a: SDPA_HEAD_GROUPS splits the score pipeline into G groups of query heads (default: one KV head
-    # per group), each group calling the same SDPA math on its own q/k/v slice with no data dependency on any
-    # other group. A group's OWN score buffer is H/G heads wide instead of H, so if the planner fully drained
-    # one group (freed its buffers) before starting the next, the whole arena would be ~1/G of the G=1 arena.
-    # It does NOT: memory_plan_rewrite (schedule/memory.py) assigns buffer lifetimes from POSITION IN THE
-    # LINEARIZED KERNEL LIST, and the linearizer is free to interleave independent groups' kernels (e.g. every
-    # group's QK^T before any group's softmax) since nothing but the final `cat` forces an order -- so several
-    # groups' score buffers end up concurrently live. Measured law (H=8, KvH=4, Hd=T=32, N=8192, this test's
-    # shape): G=1 -> 2.03 slots (the T5.6 pairwise-overlap packing), G=2 -> 3.05 slots, G=4 -> 5.11 slots (a
-    # "slot" = one group's own (B,H/G,T,Tk_max) fp32 buffer) -- i.e. slot-count grows ~G+1, not staying at 2,
-    # which caps the REAL reduction at ~2x/(1+1/G) regardless of G: ratio(G=2)=1.33x, ratio(G=4)=1.59x here.
-    # The only way found to force true per-group draining is a `.realize()` at the end of each group (verified
-    # separately to bring G=4 to ~3.98x, i.e. genuinely ~1/4) -- but `_attention` always runs inside
-    # TransformerBlock.__call__'s `@function(precompile=True)` trace (model.py's `_run`), which sets
-    # ALLOW_DEVICE_USAGE=0 (tinygrad/function.py) specifically to forbid mid-trace device compilation; a
-    # `.realize()` there raises `AssertionError: usage of device CPU disallowed` (reproduced directly against
-    # Transformer.generate()), i.e. it would break real generation, not just this test. So the shipped grouping
-    # keeps the plain loop + cat (no realize): still real, byte-identical-at-G=1, and here ~1.59x smaller at
-    # the default G=4 -- just not the ~1/4 a naive per-group-slot count would suggest.
+    # per group), each group calling the same SDPA math on its own q/k/v slice. A group's OWN score buffer is
+    # H/G heads wide instead of H, so IF the planner fully drains one group (frees its buffers) before starting
+    # the next, the whole arena is ~1/G of the G=1 arena. It does NOT do that on its own: memory_plan_rewrite
+    # (schedule/memory.py) assigns buffer lifetimes from POSITION IN THE LINEARIZED KERNEL LIST, and with no
+    # data dependency between groups the linearizer is free to interleave their kernels (e.g. every group's
+    # QK^T before any group's softmax), keeping several groups' score buffers concurrently live -- measured
+    # only ~1.33-1.59x smaller at G=2..4 that way, not ~1/G. _sdpa_default fixes this with an explicit ordering
+    # edge (UOp.after, see its docstring): group i>0's q slice is gated on a fresh, output-sized scratch buffer
+    # holding group i-1's result, so group i's first kernel cannot be scheduled before group i-1's last kernel
+    # has run -- collapsing the groups' liveness windows to non-overlapping, with no `.realize()` (device
+    # execution) anywhere. Measured here (H=8, KvH=4, Hd=T=32, N=8192): ratio ~3.9-4.0x at the default G=4,
+    # i.e. genuinely ~1/G -- assert a wide-ish band since TLSF bucket rounding moves it a few percent run to run.
     N, KvH, Hd, H, T = 8192, 4, 32, 8, 32
     def run(groups):
       cache = Tensor.zeros(2, 1, KvH, N, Hd, dtype=dtypes.float16).contiguous().realize()
@@ -77,13 +71,16 @@ class TestPrefillArena(unittest.TestCase):
       for i in range(2):
         Tb = v_t.bind(T)
         attn(Tensor.rand(1, H, T, Hd)[:, :, :Tb], Tensor.rand(2, 1, KvH, T, Hd)[:, :, :, :Tb], v_sp.bind(i*T), Tb)
-    arenas1, arenas4 = capture_arenas(lambda: run(1)), capture_arenas(lambda: run(4))
-    self.assertEqual((len(arenas1), len(arenas4)), (1, 1))
-    slot1, slot4 = max(arenas1[0]), max(arenas4[0])
-    self.assertLess(slot4, slot1, f"1-group {slot1/1e6:.2f} MB vs 4-group {slot4/1e6:.2f} MB: grouping must shrink the arena")
-    ratio = slot1 / slot4
-    self.assertGreater(ratio, 1.4, f"1-group {slot1/1e6:.2f} MB vs 4-group {slot4/1e6:.2f} MB, ratio {ratio:.2f}")
-    self.assertLess(ratio, 1.8, f"1-group {slot1/1e6:.2f} MB vs 4-group {slot4/1e6:.2f} MB, ratio {ratio:.2f}")
+    arenas1, arenas2, arenas4 = capture_arenas(lambda: run(1)), capture_arenas(lambda: run(2)), capture_arenas(lambda: run(4))
+    self.assertEqual((len(arenas1), len(arenas2), len(arenas4)), (1, 1, 1))
+    slot1, slot2, slot4 = max(arenas1[0]), max(arenas2[0]), max(arenas4[0])
+    self.assertLess(slot4, slot2, f"2-group {slot2/1e6:.2f} MB vs 4-group {slot4/1e6:.2f} MB: more groups must shrink further")
+    self.assertLess(slot2, slot1, f"1-group {slot1/1e6:.2f} MB vs 2-group {slot2/1e6:.2f} MB: grouping must shrink the arena")
+    ratio2, ratio4 = slot1 / slot2, slot1 / slot4
+    self.assertGreater(ratio2, 1.75, f"1-group {slot1/1e6:.2f} MB vs 2-group {slot2/1e6:.2f} MB, ratio {ratio2:.2f}")
+    self.assertLess(ratio2, 2.25, f"1-group {slot1/1e6:.2f} MB vs 2-group {slot2/1e6:.2f} MB, ratio {ratio2:.2f}")
+    self.assertGreater(ratio4, 3.5, f"1-group {slot1/1e6:.2f} MB vs 4-group {slot4/1e6:.2f} MB, ratio {ratio4:.2f}")
+    self.assertLess(ratio4, 4.3, f"1-group {slot1/1e6:.2f} MB vs 4-group {slot4/1e6:.2f} MB, ratio {ratio4:.2f}")
 
   def test_model_prefill_arena_is_two_score_slots(self):
     # the tiny attention model's prefill family: (B,H,T,Tk_max) fp32 slots with H=2, T=32 -> ~2 slots + small stuff, not 3
