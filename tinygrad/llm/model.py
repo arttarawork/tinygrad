@@ -600,7 +600,7 @@ SDPA_HEAD_GROUPS = ContextVar("SDPA_HEAD_GROUPS", 0)
 def sdpa_head_groups_for(n_kv_heads:int) -> int: return SDPA_HEAD_GROUPS.value if SDPA_HEAD_GROUPS.value > 0 else n_kv_heads
 
 def _sdpa_default(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
-  H, KvH = q.shape[1], k.shape[1]
+  H, KvH = cast(int, q.shape[1]), cast(int, k.shape[1])  # head counts are concrete
   G = sdpa_head_groups_for(KvH)
   if G <= 1: return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   assert H % G == 0 and KvH % G == 0, f"SDPA_HEAD_GROUPS={G} must divide both n_heads={H} and n_kv_heads={KvH}"
