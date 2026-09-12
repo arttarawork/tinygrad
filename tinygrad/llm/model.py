@@ -568,8 +568,39 @@ class FFNBlock:
 #   q:(B,H,T,Hd)  k,v:(B,KvH,Tk,Hd)  mask:(1,1,T,Tk)|None  ->  (B,H,T,Hd)
 # A custom impl that only handles some shapes (e.g. decode-only, T==1, unmasked) must fall back
 # to `_sdpa_default` itself for everything else (prefill, sliding-window masks, etc).
+# T4.103a: the JIT memory planner's scratch arena for this call (T5.6: ~2 x (B,H,T,Tk_max) fp32, the whole
+# planned scratch of a prefill jit family) scales with H = n_heads, not the per-head work -- on a wide-head,
+# few-kv-head geometry (qwen3.8-27B: H=24, n_kv_heads=4) that arena dwarfs the actual attention math. Splitting
+# the score pipeline into G groups of q heads (each group calling the same SDPA math on its own q/k/v slice,
+# same shared mask) and concatenating the outputs doesn't change any number computed -- softmax and the two
+# matmuls are per-(batch,head) independent, no cross-head reduction. Default G = n_kv_heads (inferred from k's
+# own head-count axis -- one KV head per group, no repeat_interleave copy needed since a size-1 batch dim
+# already broadcasts in matmul); SDPA_HEAD_GROUPS=1 takes the identical, untouched single-call path (today's
+# behavior, byte-identical). The kernels still loop over start_pos+T (mask/k/v slicing is unchanged) --
+# grouping only slices the *head* axis, never introduces a static KV tile.
+# Measured effect on the arena (test_llm_prefill_arena.py's test_group_count_scales_arena_down): the reduction
+# is real but smaller than a naive 1/G, because the groups have no data dependency on each other and
+# memory_plan_rewrite (schedule/memory.py) assigns buffer lifetimes from POSITION IN THE LINEARIZED KERNEL
+# LIST -- the linearizer is free to interleave independent groups' kernels (e.g. every group's QK^T before any
+# group's softmax), which keeps several groups' score buffers concurrently live. Slot-count grows ~G+1 instead
+# of staying at 2, capping the real reduction at ~2x/(1+1/G): measured ratio(G=2)=1.33x, ratio(G=4)=1.59x. The
+# only way found to force true per-group draining (~1/G, ~3.98x measured at G=4) is a `.realize()` at the end
+# of each group -- rejected: `_attention` always runs inside TransformerBlock.__call__'s
+# `@function(precompile=True)` trace (`_run`, above), which sets ALLOW_DEVICE_USAGE=0 (tinygrad/function.py)
+# specifically to forbid mid-trace device compilation; a `.realize()` there raises `AssertionError: usage of
+# device CPU disallowed` in real generation (reproduced against Transformer.generate()), not just a test.
+SDPA_HEAD_GROUPS = ContextVar("SDPA_HEAD_GROUPS", 0)
+def sdpa_head_groups_for(n_kv_heads:int) -> int: return SDPA_HEAD_GROUPS.value if SDPA_HEAD_GROUPS.value > 0 else n_kv_heads
+
 def _sdpa_default(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
-  return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+  H, KvH = q.shape[1], k.shape[1]
+  G = sdpa_head_groups_for(KvH)
+  if G <= 1: return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+  assert H % G == 0 and KvH % G == 0, f"SDPA_HEAD_GROUPS={G} must divide both n_heads={H} and n_kv_heads={KvH}"
+  hg, kg = H // G, KvH // G
+  outs = [q[:, i*hg:(i+1)*hg].scaled_dot_product_attention(k[:, i*kg:(i+1)*kg], v[:, i*kg:(i+1)*kg],
+                                                            attn_mask=mask, enable_gqa=True) for i in range(G)]
+  return outs[0].cat(*outs[1:], dim=1)
 
 attention_impl: Callable[[Tensor, Tensor, Tensor, Tensor|None], Tensor] = _sdpa_default
 
