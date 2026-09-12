@@ -121,3 +121,58 @@ class TestPrefillArena(unittest.TestCase):
     self.assertEqual(ids(1), ids(0))
 
 if __name__ == "__main__": unittest.main()
+
+class TestSharedArena(unittest.TestCase):
+  """T4.105: JIT_SHARED_ARENA=1 -- every capture on a device aliases one planned arena (grown to the largest capture)."""
+  def _two_jits(self):
+    from tinygrad import TinyJit
+    w1, w2, w3 = (Tensor.randn(256, 256).realize(), Tensor.randn(256, 64).realize(), Tensor.randn(8, 16).realize())
+    @TinyJit
+    def big(x:Tensor) -> Tensor: return ((x @ w1).relu() @ w2).sum(-1, keepdim=True).contiguous()   # two matmuls: a (64,256) intermediate
+    @TinyJit
+    def small(x:Tensor) -> Tensor: return ((x[:, :8] @ w3).relu() @ w3.T).sum(-1, keepdim=True).contiguous()
+    def ref_big(x): return ((x @ w1).relu() @ w2).sum(-1, keepdim=True).numpy()
+    def ref_small(x): return ((x[:, :8] @ w3).relu() @ w3.T).sum(-1, keepdim=True).numpy()
+    return big, small, ref_big, ref_small
+
+  def test_off_by_default_distinct_arenas(self):
+    from tinygrad.schedule import memory as mem
+    big, small, _, _ = self._two_jits()
+    x = Tensor.randn(64, 256).realize()
+    arenas = capture_arenas(lambda: [big(x).realize(), big(x).realize(), small(x).realize(), small(x).realize()])
+    self.assertEqual(mem.JIT_SHARED_ARENA.value, 0)
+    self.assertEqual(len(arenas), 2)
+    self.assertTrue(all(len(a) >= 1 for a in arenas), arenas)  # both captures plan at least one arena
+
+  def test_shared_arena_aliases_captures_and_keeps_results(self):
+    import numpy as np
+    from tinygrad import Context
+    from tinygrad.schedule import memory as mem
+    big, small, ref_big, ref_small = self._two_jits()
+    x = Tensor.randn(64, 256).realize()
+    rb, rs = ref_big(x), ref_small(x)
+    mem._shared_arenas.clear()
+    with Context(JIT_SHARED_ARENA=1):
+      for _ in range(2):
+        big(x).realize()
+        small(x).realize()   # capture big first, then small
+      shared = dict(mem._shared_arenas)
+      for _ in range(3):   # alternate replays: both graphs' intermediates alias the same memory, results stay right
+        np.testing.assert_allclose(big(x).numpy(), rb, rtol=1e-4, atol=1e-3)
+        np.testing.assert_allclose(small(x).numpy(), rs, rtol=1e-4, atol=1e-3)
+    mem._shared_arenas.clear()
+    self.assertEqual(len(shared), 1, shared)  # one (device, lane) key on CPU, one arena for both captures
+
+  def test_shared_arena_grows_to_the_largest_capture(self):
+    from tinygrad import Context
+    from tinygrad.schedule import memory as mem
+    big, small, _, _ = self._two_jits()
+    x = Tensor.randn(64, 256).realize()
+    mem._shared_arenas.clear()
+    with Context(JIT_SHARED_ARENA=1):
+      for _ in range(2): small(x).realize()   # small first: allocates a small shared arena
+      first = next(iter(mem._shared_arenas.values())).max_numel()
+      for _ in range(2): big(x).realize()     # bigger: replaces the shared arena with a larger one
+      second = next(iter(mem._shared_arenas.values())).max_numel()
+    mem._shared_arenas.clear()
+    self.assertGreater(second, first)

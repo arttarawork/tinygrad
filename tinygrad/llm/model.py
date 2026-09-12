@@ -1469,9 +1469,13 @@ class Transformer:
     # temperature is: its MAGNITUDE can then vary across replays of this same captured graph -- only "is it None" (part of
     # __call__'s jit key) may ever change which graph gets captured. None (every pre-T4.92 caller) skips this entirely.
     if presence_penalty is not None: logits = logits - self.penalty_mask.to(logits.device) * presence_penalty.to(logits.device)
-    # greedy (temperature is None): plain argmax, no RNG kernels
-    if temperature is None: return logits.argmax(-1, keepdim=True)
-    return sample_logits(logits, temperature.to(logits.device), MIN_P)
+    # greedy: temperature None (explicit-greedy callers, the spec path) -> plain argmax, no RNG kernels. generate() always passes a
+    # Tensor (T4.105), so its graph carries both the argmax and the Gumbel sampler and picks at runtime: temperature <= 0 = greedy.
+    # The unused branch costs a vocab-sized argmax/softmax per token (~1 % of a decode step); it buys one jit family instead of two.
+    greedy = logits.argmax(-1, keepdim=True)
+    if temperature is None: return greedy
+    temperature = temperature.to(logits.device)
+    return (temperature > 0).reshape(1, 1).where(sample_logits(logits, temperature, MIN_P), greedy)
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
                vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
@@ -1851,7 +1855,9 @@ class Transformer:
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
     # create helper tensors on the block devices that consume them, so device_map'd models don't replay a cross-device copy every step
-    temp = Tensor([temperature], device=self.blk[-1].device) if temperature > 0 else None
+    # T4.105: always a Tensor -- temperature 0 is decided INSIDE the captured graph (forward's where-select), so greedy and sampled
+    # requests share one jit family (the greedy family's own planned arena was ~1.6 GB at a 131k window on the 3090)
+    temp = Tensor([temperature], device=self.blk[-1].device)
     # T4.92: penalty_mask must be reset IN PLACE, never reassigned -- a jit family already captured with presence_penalty active
     # baked in a read of THIS buffer object; reassigning self.penalty_mask here would silently detach every future replay of
     # that graph from the reset (same reasoning as T4.66i's in-place MTP cache-reset, see its comment). hasattr guards the

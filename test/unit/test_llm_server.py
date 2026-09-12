@@ -14,6 +14,8 @@ TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2,
 V_START_POS = UOp.variable("start_pos", 0, TEST_CONFIG.max_context-1)
 V_TOKS = UOp.variable("toks", 1, 32)  # 32 is the default chunk_size in generate
 
+# T4.105: generate() always passes a temperature Tensor, so its jit keys carry `temperature is None` = False for greedy AND sampled
+# runs (one family each for prefill/decode); the greedy-keyed twins these tests used to expect no longer exist.
 class TestTransformerGenerate(unittest.TestCase):
   def test_warmup(self):
     model, calls = Transformer(TEST_CONFIG), []
@@ -68,15 +70,15 @@ class TestTransformerGenerate(unittest.TestCase):
 
     run(range(1, 6), 32)
     run(range(6, 11), 32)  # 2nd use of chunk_size=32 -> captures
-    prefill_32 = model.jit[(True, True, 32, False)]
+    prefill_32 = model.jit[(True, False, 32, False)]
     self.assertIsNotNone(prefill_32.captured)
 
     run(range(20, 25), 64)  # 1st use of chunk_size=64
     run(range(25, 30), 32)  # 3rd use of chunk_size=32 -> must reuse, not recapture
 
-    self.assertIs(model.jit[(True, True, 32, False)], prefill_32)  # same object, no fresh capture
+    self.assertIs(model.jit[(True, False, 32, False)], prefill_32)  # same object, no fresh capture
     # bounded to exactly the variants actually used: prefill@32, decode, prefill@64 -- no per-call growth
-    self.assertEqual(set(model.jit.keys()), {(True, True, 32, False), (False, True, None, False), (True, True, 64, False)})
+    self.assertEqual(set(model.jit.keys()), {(True, False, 32, False), (False, False, None, False), (True, False, 64, False)})
 
   def test_recurrent_warmup_unchanged(self):
     # T4.12: recurrent models force chunk_size=1 in generate() (get_start_pos/generate's ssm branch), so
@@ -85,7 +87,7 @@ class TestTransformerGenerate(unittest.TestCase):
     model = Transformer(TEST_CONFIG)
     model.has_recurrent_block = True
     with Context(GDN_CHUNK=1): model.warmup()
-    self.assertEqual(set(model.jit.keys()), {(False, True, None, False), (False, False, None, False)})
+    self.assertEqual(set(model.jit.keys()), {(False, False, None, False), (False, False, None, False)})
     for key, jit in model.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
   def test_generate_at_boundary_yields_one_token(self):
@@ -356,7 +358,7 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
     (o1, s1, _), (o4, s4, m4) = self._run(1, prompt), self._run(4, prompt)
     self.assertEqual(o1, o4)
     for a, b in zip(s1, s4): np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
-    self.assertIn((True, True, 4, False), m4.jit)  # the prefill jit really was captured at the chunk width
+    self.assertIn((True, False, 4, False), m4.jit)  # the prefill jit really was captured at the chunk width
 
   def test_auto_chunk_is_device_aware(self):
     # auto (GDN_CHUNK=0): 32 only on the GPU backends it was measured on; CPU keeps the one-token-per-step prefill (x86 clang 18
@@ -370,7 +372,7 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
   def test_warmup_captures_chunked_prefill(self):
     m = Transformer(SSM_CFG)
     with Context(GDN_CHUNK=4): m.warmup()
-    self.assertEqual(set(m.jit.keys()), {(False, True, None, False), (False, False, None, False), (True, True, 4, False), (True, False, 4, False)})
+    self.assertEqual(set(m.jit.keys()), {(False, False, None, False), (False, False, None, False), (True, False, 4, False), (True, False, 4, False)})
     for key, jit in m.jit.items(): self.assertIsNotNone(jit.captured, f"jit[{key}] wasn't warmed")
 
 def _byte_tok() -> SimpleTokenizer:

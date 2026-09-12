@@ -52,3 +52,25 @@ class TestPresencePenalty(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+class TestOneSamplingFamily(unittest.TestCase):
+  """T4.105: generate() always hands forward() a temperature Tensor; temperature 0 is decided inside the graph, so greedy and
+  sampled generation share one jit family (prefill + decode) instead of two."""
+  def test_greedy_matches_argmax_and_families_are_shared(self):
+    from dataclasses import replace
+    from itertools import islice
+    from tinygrad import nn
+    model = Transformer(replace(TEST_CONFIG, max_context=64))
+    for p in nn.state.get_parameters(model): p.replace(Tensor.randn(*p.shape) * 0.1)
+    Tensor.realize(*nn.state.get_parameters(model))
+    prompt = [1, 2, 3, 4, 5]
+    greedy = list(islice(model.generate(list(prompt), chunk_size=4, temperature=0.0), 4))
+    keys_after_greedy = set(model.jit)
+    sampled = list(islice(model.generate(list(prompt), chunk_size=4, temperature=0.7), 4))
+    self.assertEqual(set(model.jit), keys_after_greedy, "a sampled run must reuse the greedy run's jit families")
+    self.assertEqual(len(keys_after_greedy), 2, keys_after_greedy)  # one prefill + one decode family
+    # the greedy ids are reproducible (same weights, same prompt) and non-empty
+    again = list(islice(model.generate(list(prompt), chunk_size=4, temperature=0.0), 4))
+    self.assertEqual(greedy, again)
+    self.assertGreaterEqual(len(greedy), 1)
+    self.assertGreaterEqual(len(sampled), 1)

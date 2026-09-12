@@ -1,5 +1,5 @@
 from collections import defaultdict
-from tinygrad.helpers import NO_MEMORY_PLANNER, DEBUG, round_up
+from tinygrad.helpers import NO_MEMORY_PLANNER, DEBUG, round_up, ContextVar
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.support.memory import TLSFAllocator
@@ -25,6 +25,21 @@ def planned_size(n:int, block_size:int=256, lv2_cnt:int=32) -> int:
   block_size multiple: all offsets stay block_size-aligned (the LLVM renderer declares kernel pointers `align 32`)."""
   n = max(block_size, n)
   return round_up(n, max(block_size, 1 << (n.bit_length() - lv2_cnt.bit_length())))
+
+# T4.105: JIT_SHARED_ARENA=1 makes every capture on a device alias ONE planned arena instead of allocating its own. A captured graph's
+# planned buffers are its dead-after-execution intermediates (inputs, weights, outputs and every live Tensor are held_bufs and never
+# planned), so two graphs that never run concurrently can share the memory. The pooled LLM server captures a prefill+decode family per
+# (greedy/sampled, vision, ...) key and runs one request at a time; at a 131k window each family's arena is ~1.5 GB on the 3090, three
+# families ~4.6 GB, one shared ~1.6 GB. The shared arena grows to the largest capture seen (a bigger capture allocates a new, larger
+# buffer and becomes the new shared one; earlier captures keep the old smaller buffer alive -- capture the big prefill family first).
+# Off by default: a program that runs two jitted functions concurrently (threads, async) must not alias their scratch.
+JIT_SHARED_ARENA = ContextVar("JIT_SHARED_ARENA", 0)
+_shared_arenas: dict[tuple, UOp] = {}
+def _arena_for(key:tuple, sz:int) -> UOp:
+  if not JIT_SHARED_ARENA.value: return UOp.new_buffer(key[0], sz, dtypes.int8)
+  cur = _shared_arenas.get(key)
+  if cur is None or cur.max_numel() < sz: cur = _shared_arenas[key] = UOp.new_buffer(key[0], sz, dtypes.int8)
+  return cur
 
 def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
   if NO_MEMORY_PLANNER: return linear
@@ -62,7 +77,7 @@ def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
   arena_sizes = {key: round_up(peak, block_size) for key, (peak, _) in peaks.items()}
 
   # build replace_map: each buffer becomes a SHRINK/BITCAST into a shared per-device-lane arena
-  arenas = {key: UOp.new_buffer(key[0], sz, dtypes.int8) for key, sz in arena_sizes.items()}
+  arenas = {key: _arena_for(key, sz) for key, sz in arena_sizes.items()}  # T4.105: shared across captures when JIT_SHARED_ARENA=1
   replace_map = {buf_uop:arenas[_key(buf_uop)][offset:offset+buf_uop.nbytes()].bitcast(buf_uop.dtype) for buf_uop, offset in offsets.items()}
 
   if DEBUG >= 1 and (omem:=sum(nbytes.values()) / 1e6) != (nmem:=sum(arena_sizes.values()) / 1e6):
