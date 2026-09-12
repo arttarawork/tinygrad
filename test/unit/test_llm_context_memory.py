@@ -139,7 +139,6 @@ class TestPrefillArenaScalesWithMaxContext(unittest.TestCase):
   def test_arena_grows_linearly_with_max_context_independent_of_block_count(self):
     from test.unit.test_llm_server import TEST_CONFIG
     from tinygrad import Context
-    from tinygrad.llm.model import sdpa_head_groups_for
     with Context(SDPA_HEAD_GROUPS=1):  # the ungrouped pipeline: the formula T4.101 derived
       a1024_1blk = self._arena_bytes(1024, num_blocks=1)
       a2048_1blk = self._arena_bytes(2048, num_blocks=1)
@@ -149,8 +148,8 @@ class TestPrefillArenaScalesWithMaxContext(unittest.TestCase):
     predicted = 2 * TEST_CONFIG.n_heads * 32 * 4  # 2 planner slots x (B,H,T,Tk_max) fp32, T=chunk_size=32
     self.assertLess(abs(per_token - predicted) / predicted, 0.10, f"{per_token=} vs {predicted=}")
     # T4.103a: the default (one group per KV head, ordered by a dependency edge) divides that arena by the group count
-    g = sdpa_head_groups_for(TEST_CONFIG.n_kv_heads)
-    grouped = (self._arena_bytes(2048, num_blocks=1) - self._arena_bytes(1024, num_blocks=1)) / 1024
+    g = TEST_CONFIG.n_kv_heads  # opt-in: SDPA_HEAD_GROUPS=0 means one group per KV head
+    with Context(SDPA_HEAD_GROUPS=0): grouped = (self._arena_bytes(2048, num_blocks=1) - self._arena_bytes(1024, num_blocks=1)) / 1024
     self.assertLess(abs(grouped - predicted / g) / (predicted / g), 0.15, f"{grouped=} vs {predicted / g=} ({g=})")
 
 if __name__ == '__main__':

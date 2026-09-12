@@ -573,7 +573,7 @@ class FFNBlock:
 # few-kv-head geometry (qwen3.8-27B: H=24, n_kv_heads=4) that arena dwarfs the actual attention math. Splitting
 # the score pipeline into G groups of q heads (each group calling the same SDPA math on its own q/k/v slice,
 # same shared mask) and concatenating the outputs doesn't change any number computed -- softmax and the two
-# matmuls are per-(batch,head) independent, no cross-head reduction. Default G = n_kv_heads (inferred from k's
+# matmuls are per-(batch,head) independent, no cross-head reduction. SDPA_HEAD_GROUPS=0 = n_kv_heads (inferred from k's
 # own head-count axis -- one KV head per group, no repeat_interleave copy needed since a size-1 batch dim
 # already broadcasts in matmul); SDPA_HEAD_GROUPS=1 takes the identical, untouched single-call path (today's
 # behavior, byte-identical). The kernels still loop over start_pos+T (mask/k/v slicing is unchanged) --
@@ -596,13 +596,18 @@ class FFNBlock:
 # has run -- collapsing the two groups' liveness windows to non-overlapping. Verified: bit-exact vs the
 # unchained version, and ~3.93-3.98x smaller at G=4 through both a raw JIT harness and the real
 # `Transformer.generate()` path (see test_llm_prefill_arena.py's test_group_count_scales_arena_down).
-SDPA_HEAD_GROUPS = ContextVar("SDPA_HEAD_GROUPS", 0)
-def sdpa_head_groups_for(n_kv_heads:int) -> int: return SDPA_HEAD_GROUPS.value if SDPA_HEAD_GROUPS.value > 0 else n_kv_heads
+# Measured on the 3090 (09-11, chain 19, Q4_0 card map): 4 groups = flips unchanged, int8 context ceilings +16k tokens each, but prefill
+# 119 -> 109 tok/s and (before the T>4 gate below) decode 23.4 -> 17.6 -- the dependency chain serializes the groups and each SDPA kernel
+# is 4x smaller. So: OPT-IN (default 1 = the single call), and grouping only applies to prefill chunks (T > 4) where the arena is
+# large; a decode step's score row (H x 1 x Tk) is ~25 MB at 262k and not worth the split.
+SDPA_HEAD_GROUPS = ContextVar("SDPA_HEAD_GROUPS", 1)
+def sdpa_head_groups_for(n_kv_heads:int) -> int: return n_kv_heads if SDPA_HEAD_GROUPS.value == 0 else SDPA_HEAD_GROUPS.value  # 0 = one per KV head
 
 def _sdpa_default(q:Tensor, k:Tensor, v:Tensor, mask:Tensor|None) -> Tensor:
   H, KvH = cast(int, q.shape[1]), cast(int, k.shape[1])  # head counts are concrete
   G = sdpa_head_groups_for(KvH)
-  if G <= 1: return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
+  T = q.shape[2]  # a bound Variable for prefill chunks (group), a concrete int for decode steps (never split)
+  if G <= 1 or (isinstance(T, int) and T <= 4): return q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)
   assert H % G == 0 and KvH % G == 0, f"SDPA_HEAD_GROUPS={G} must divide both n_heads={H} and n_kv_heads={KvH}"
   hg, kg = H // G, KvH // G
   outs, prev = [], None

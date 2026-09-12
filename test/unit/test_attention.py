@@ -605,7 +605,7 @@ class TestSDPAHeadGroups(unittest.TestCase):
         self._attend(block, prompt, 0, 1)
       x = Tensor.randn(1, T, config.dim, dtype=dtypes.float32).contiguous().realize()
       ref = self._attend(block, x, start_pos, 1)
-      out = self._attend(block, x, start_pos, sdpa_head_groups_for(config.n_kv_heads))
+      out = self._attend(block, x, start_pos, config.n_kv_heads)  # opt-in grouping (the default is 1 since chain 19: decode -25%)
     finally:
       if int8:
         if had: os.environ["KV_INT8"] = old
