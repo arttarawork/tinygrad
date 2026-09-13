@@ -560,6 +560,17 @@ class HCQAllocatorBase(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
     buf.mapped_devs.append(self.dev)
     return buf
 
+  def free_cache(self):
+    # T4.112 (09-13): an OOM-triggered flush of the LRU cache used to pay _free's per-buffer dev.synchronize() for EVERY cached
+    # buffer -- hundreds of device round trips (41 s per state-cache snapshot on the 3090 once the 262144-token window left no
+    # headroom). All queued work is the same for every buffer, so synchronize each mapped device ONCE, then free without the
+    # per-buffer sync. Nothing enqueues in between: this runs synchronously on the host thread.
+    for dev in {d for opaques in self.cache.values() for buf in opaques for d in buf.mapped_devs}:
+      if not _dev_already_faulted(dev): dev.synchronize()
+    self._synced_for_free_cache = True
+    try: super().free_cache()
+    finally: self._synced_for_free_cache = False
+
   @suppress_finalizing
   def _free(self, buf:HCQBuffer, options:BufferSpec|None=None):
     # T4.52: a device already known to be in an unrecoverable fault state can never complete a wait -- every
@@ -567,7 +578,7 @@ class HCQAllocatorBase(LRUAllocator[HCQDeviceType], Generic[HCQDeviceType]):
     # from scratch (an observed ~120-buffer echo storm, ~490s of teardown). Bus-master is already cleared by
     # then (T4.37/T4.40b) and the mappings die with the process regardless, so skip the pointless sync and free
     # only client-side bookkeeping below (_unmap/_do_free are local VA/mmap bookkeeping, not device RPCs).
-    for dev in buf.mapped_devs:
+    for dev in ([] if getattr(self, "_synced_for_free_cache", False) else buf.mapped_devs):  # T4.112: free_cache synced once already
       if _dev_already_faulted(dev): continue
       dev.synchronize()
     for d, mb in buf.mappings.items(): d.allocator._unmap(mb)

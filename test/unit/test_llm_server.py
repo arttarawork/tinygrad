@@ -867,6 +867,30 @@ class TestStateCacheOOM(unittest.TestCase):
     srv.store_snapshot(list(range(8, 16)))   # predicted 768 KB; 768 + 768 > 1 MB -> the old one is evicted first
     self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])
 
+  def test_evicted_snapshot_frees_state_cache_device_lru(self):
+    # T4.106: an evicted snapshot dict dropping tinygrad's own reference isn't enough -- the freed device buffer
+    # still sits in STATE_CACHE_DEVICE's LRUAllocator.cache (tinygrad/device.py) forever on a backend (METAL
+    # unified memory in production) that never hits the alloc failure that would flush it on its own. Patch
+    # STATE_CACHE_DEVICE onto whatever device this test's Tensors actually land on -- srv.model is a stub here
+    # like every other test in this class, so the real Transformer.snapshot_state's own device choice is moot.
+    from unittest.mock import patch
+    from tinygrad import Device
+    from tinygrad.device import LRUAllocator
+    dev = Tensor.zeros(1).device
+    alloc = Device[dev].allocator
+    if not isinstance(alloc, LRUAllocator): self.skipTest(f"{dev}'s allocator isn't LRU-backed (run under DEV=CPU)")
+    with patch("tinygrad.llm.serve.STATE_CACHE_DEVICE", dev):
+      srv = self._server(1)   # 1 MB cap -- fits exactly one 768 KB snapshot
+      seed = Tensor.zeros(192 * 1024).contiguous().realize()   # 768 KB -- the snapshot about to be evicted
+      srv.snapshots[tuple(range(8))] = {"pos": 8, "tokens": list(range(8)), "blocks": [{"cache_kv": seed}]}
+      del seed   # T4.96: no stray name may outlive store_snapshot's own evict loop
+      # a DIFFERENT size than the evicted 768 KB buffer -- same-size reuse would pop it straight back off the
+      # LRUAllocator's cache and mask the leak (that's normal, correct reuse, not what this test is checking).
+      srv.model.snapshot_state = lambda: {"t": Tensor.zeros(4096).contiguous().realize()}
+      srv.store_snapshot(list(range(8, 16)))   # 768 KB (predicted) > 1 MB cap alongside the new one -- old one evicted
+      self.assertEqual(list(srv.snapshots.keys()), [tuple(range(8, 16))])
+      self.assertFalse(any(alloc.cache.values()), f"evicted snapshot buffer still cached: {dict(alloc.cache)}")
+
   def test_reference_to_oldest_snapshot_is_released_before_reallocating(self):
     # T4.96: the oldest snapshot used to stay referenced (bound to a local name) through the evict loop and the
     # snapshot_state() call right after it, so evicting it from self.snapshots never actually freed its device

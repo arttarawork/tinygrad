@@ -1,10 +1,11 @@
 from __future__ import annotations
 import collections, json, os, pathlib, re, threading, time, typing, uuid
 from typing import TYPE_CHECKING
-from tinygrad import Tensor
+from tinygrad import Device, Tensor
+from tinygrad.device import LRUAllocator
 from tinygrad.helpers import DEBUG, colored, getenv, stderr_log
 from tinygrad.llm.image import DEFAULT_MAX_PIXELS, hash_ids, image_hash, n_visual_tokens, preprocess
-from tinygrad.llm.model import VisionInput, snapshot_matches, snapshot_nbytes, snapshot_nbytes_for
+from tinygrad.llm.model import STATE_CACHE_DEVICE, VisionInput, snapshot_matches, snapshot_nbytes, snapshot_nbytes_for
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler, filter_keys
 if TYPE_CHECKING:
   import numpy as np
@@ -428,7 +429,11 @@ class Handler(HTTPRequestHandler):
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
           # T4.96: `boundary` (this request didn't extend the live cache) pins it; a tool-loop step's snapshot is second tier.
-          if self.server.state_cache_mb > 0: self.server.store_snapshot(ids, vision is not None, boundary=boundary)
+          if self.server.state_cache_mb > 0:
+            t_snap = time.perf_counter()
+            self.server.store_snapshot(ids, vision is not None, boundary=boundary)
+            # 09-13: the store sits between the first token and its delivery -- log it when it is not negligible
+            if (t_snap := time.perf_counter() - t_snap) > 0.5: stderr_log(f"snap:{t_snap:5.1f}s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
         out.append(next_id)
         hit = None
@@ -562,6 +567,19 @@ class Handler(HTTPRequestHandler):
       self.send_data(json.dumps({"error": {"message": f"unknown path {self.path}", "type": "invalid_request_error"}}).encode(),
                      status_code=404)
 
+# T4.106: dropping an evicted snapshot dict only drops tinygrad's OWN references -- the size-keyed LRUAllocator
+# (tinygrad/device.py) still holds every freed buffer in self.cache, and unified-memory METAL (STATE_CACHE_DEVICE=METAL
+# in production) never hits the RuntimeError/MemoryError that would make LRUAllocator.alloc() call free_cache() on its
+# own. Left alone, a long session's differently-sized evicted snapshots pile up in that cache forever (28 GB / 24 GB
+# swapped, observed 2026-09-11). Flush ONLY STATE_CACHE_DEVICE's LRU cache right after an eviction -- snapshot buffers
+# are the only thing ever cloned onto that device (model.py's snapshot_state), so this can't touch anything else.
+# Deliberately NOT every opened device: the NV card's own LRU cache holds hot buffers the live model reuses every
+# decode step (that's the whole point of LRU=1), and flushing it there would force reallocation and cost real
+# tok/s -- exactly the throughput hit the blunter global LRU=0 mitigation already causes. When STATE_CACHE_DEVICE
+# is unset, snapshot buffers stay on each block's own live device (T4.99) and this is a no-op -- out of scope here.
+def _free_state_cache_lru() -> None:
+  if STATE_CACHE_DEVICE and isinstance(alloc := Device[STATE_CACHE_DEVICE].allocator, LRUAllocator): alloc.free_cache()
+
 class LLMServer(TCPServerWithReuse):
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
                mtp:bool=False, spec_k:int=SPEC_TOKENS, state_cache_mb:int=0, vision:VisionEncoder|None=None):
@@ -624,23 +642,32 @@ class LLMServer(TCPServerWithReuse):
         return
       total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
       # LRU-first, but only what this store may displace: a tool-loop snapshot never evicts a pinned boundary one (T4.96)
+      evicted = False
       for k in [k for k, v in self.snapshots.items() if boundary or not v.get("boundary", True)]:
         if total + est <= cap: break
         total -= snapshot_nbytes(self.snapshots.pop(k))
+        evicted = True
+      if evicted: _free_state_cache_lru()  # T4.106: return the just-dropped snapshot's device buffers to the OS
       if total + est > cap:
         stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (boundary pinned)', 'yellow')}  {colored('--', 'BLACK')}  ")
         return
     try: snap = self.model.snapshot_state()
     except MemoryError as e:
       self.snapshots.clear()
+      _free_state_cache_lru()  # T4.106: same as above -- every dropped snapshot's buffers must actually be freed
       stderr_log(f"{colored(f'state cache: snapshot dropped ({str(e)[:50]}), cache cleared', 'yellow')}  {colored('--', 'BLACK')}  ")
       return
     snap["boundary"] = boundary
     self.snapshots[key] = snap
     total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
+    evicted = False
     while total > cap and len(self.snapshots) > 1:  # the estimate undershot: same tier rule as above
       victims = [k for k, v in self.snapshots.items() if k != key and (boundary or not v.get("boundary", True))]
       if not victims:
-        if not boundary: self.snapshots.pop(key)  # only pinned boundary snapshots remain: the tool-loop one itself goes
+        if not boundary:  # only pinned boundary snapshots remain: the tool-loop one itself goes
+          self.snapshots.pop(key)
+          evicted = True
         break
       total -= snapshot_nbytes(self.snapshots.pop(victims[0]))
+      evicted = True
+    if evicted: _free_state_cache_lru()  # T4.106

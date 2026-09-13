@@ -262,7 +262,10 @@ class LRUAllocator(Allocator, Generic[DeviceType]):
       self.free_cache()
       return super().alloc(size, options)
   def free_cache(self):
-    for (sz,options),opaques in self.cache.items():
+    # T4.106: list() -- an HCQAllocator's super().free() calls dev.synchronize(), which lazily allocates (and
+    # caches) timeline signal buffers on first use; that alloc() reads self.cache[(size,options)], and on a
+    # defaultdict a **read** of a missing key inserts it, growing self.cache while this loop iterates it live.
+    for (sz,options),opaques in list(self.cache.items()):
       for opaque in opaques: super().free(opaque, sz, options)
       opaques.clear()
   def free(self, opaque:Any, size:int, options:BufferSpec|None=None):
