@@ -430,7 +430,8 @@ class Handler(HTTPRequestHandler):
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
           # T4.96: `boundary` (this request didn't extend the live cache) pins it; a tool-loop step's snapshot is second tier.
           if self.server.state_cache_mb > 0:
-            t_snap = time.perf_counter(); self.server.store_snapshot(ids, vision is not None, boundary=boundary)
+            t_snap = time.perf_counter()
+            self.server.store_snapshot(ids, vision is not None, boundary=boundary)
             # 09-13: the store sits between the first token and its delivery -- log it when it is not negligible
             if (t_snap := time.perf_counter() - t_snap) > 0.5: stderr_log(f"snap:{t_snap:5.1f}s  {colored('--', 'BLACK')}  ")
         if tok.is_end(next_id): break
