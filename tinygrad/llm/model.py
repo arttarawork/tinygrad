@@ -9,6 +9,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported
+from tinygrad.llm.kernels.nv_attn import nv_decode_attention, nv_decode_attention_ok
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, next_power2, DEBUG, GlobalCounters
@@ -678,7 +679,8 @@ class TransformerBlock(FFNBlock):
       def _dequant(idx:int) -> Tensor:
         qv, sv = assigned_kv[idx, :, :, 0:start_pos+T, :], assigned_scale[idx, :, :, 0:start_pos+T, :]
         return (qv.cast(x.dtype).reshape(*qv.shape[:-1], qv.shape[-1] // blk, blk) * sv.cast(x.dtype).unsqueeze(-1)).reshape(qv.shape)
-      k, v = _dequant(0), _dequant(1)
+      nv_fast = self._nv_decode_attn(q, assigned_kv, assigned_scale, start_pos, T)
+      if nv_fast is None: k, v = _dequant(0), _dequant(1)
     elif self.cache_kv.dtype == dtypes.uint8:
       # T4.100 KV_INT4: same kv_int8_block(head_dim)-wide absmax-scale layout as KV_INT8 above (cache_kv_scale
       # is byte-identical between the two flags -- shape, dtype, allocation, all shared, see _init_state).
@@ -706,7 +708,8 @@ class TransformerBlock(FFNBlock):
         lo, hi = pv.bitwise_and(0xF), pv.rshift(4)                                        # unpacked nibbles, both [0,15]
         qv = Tensor.stack(lo, hi, dim=-1).reshape(*pv.shape[:-1], hd).cast(x.dtype) - 8    # interleaved back to (...,Hd), debiased
         return (qv.reshape(*qv.shape[:-1], qv.shape[-1] // blk, blk) * sv.cast(x.dtype).unsqueeze(-1)).reshape(qv.shape)
-      k, v = _dequant(0), _dequant(1)
+      nv_fast = self._nv_decode_attn(q, assigned_kv, assigned_scale, start_pos, T)
+      if nv_fast is None: k, v = _dequant(0), _dequant(1)
     else:
       assigned_kv = Tensor(self.cache_kv.uop.after(
         self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)))
@@ -715,8 +718,10 @@ class TransformerBlock(FFNBlock):
         attn = flash_attention(q, assigned_kv, start_pos+T)
         attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
         return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
-      k = assigned_kv[0, :, :, 0:start_pos+T, :].cast(x.dtype)
-      v = assigned_kv[1, :, :, 0:start_pos+T, :].cast(x.dtype)
+      nv_fast = self._nv_decode_attn(q, assigned_kv, None, start_pos, T)
+      if nv_fast is None:
+        k = assigned_kv[0, :, :, 0:start_pos+T, :].cast(x.dtype)
+        v = assigned_kv[1, :, :, 0:start_pos+T, :].cast(x.dtype)
 
     #self.cache_kv[:, :, :, start_pos:start_pos+T, :].assign(Tensor.stack(k, v))
     #k = self.cache_kv[0, :, :, 0:start_pos+T, :]
@@ -742,9 +747,16 @@ class TransformerBlock(FFNBlock):
       w = (e / (e.sum(-1, keepdim=True) + (sink - m).exp())).cast(x.dtype)
       attn = (w @ vg.cast(x.dtype)).reshape(B, self.config.n_heads, T, self.config.head_dim)
     else:
-      attn = attention_impl(q, k, v, mask)                                            # (B,H,T,Hd)
+      attn = nv_fast if nv_fast is not None else attention_impl(q, k, v, mask)      # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+
+  def _nv_decode_attn(self, q:Tensor, assigned_kv:Tensor, assigned_scale:Tensor|None, start_pos:int|UOp, T:int|UOp) -> Tensor|None:
+    """T4.107a: the split-KV NV decode kernel (kernels/nv_attn.py, NV_CUSTOM_ATTN=1) on the cache as stored, for a plain T==1 step;
+    None = take the generic dequant + attention_impl path (prefill chunks, sliding windows, attention sinks, other devices)."""
+    if not (isinstance(T, int) and T == 1) or self.config.sliding_window or hasattr(self, "attn_sinks"): return None
+    if not nv_decode_attention_ok(q.device, self.config.head_dim, self.cache_kv): return None
+    return nv_decode_attention(q, assigned_kv, assigned_scale, start_pos+T).cast(q.dtype)
 
   def _init_state(self, x:Tensor):
     # every call, not just the first: a new chunk size needs its own (larger) position buffer, and it must be realized HERE --
