@@ -3,7 +3,7 @@
 This is Artur's fork of tinygrad for making the NVIDIA/TinyGPU eGPU path fast for local LLMs
 and pooling the MacBook (Metal) with an RTX 3090. Before doing any work, read in order:
 
-1. **`HANDOFF_2026-09-12.md` — THE entry point** (the finished card path: every format on NV kernels, the shared JIT arena, the five-file
+1. **`HANDOFF_2026-09-13.md` — THE entry point** (the checkpoint before the dock disconnect: exact defaults, reconnect procedure, open list); then **`HANDOFF_2026-09-12.md`** (the finished card path: every format on NV kernels, the shared JIT arena, the five-file
    table, the memory model, the rules); `HANDOFF_2026-09-10.md` = the card-path plan + the 09-11 measurement tables (§3b/§3c); `HANDOFF_2026-09-01.md` = the fault-era/WY history (08-31 = 3.8-chain history, 08-27 = TD.5 history) (fault era closed, the two-bug WY record, the board,
    standing rules/grants, verification gotchas, open board); then `TASKS.md` — the "RESUME HERE"
    section, then the task list + Status log. (`HANDOFF_2026-08-26.md` is the panic-era history.)
