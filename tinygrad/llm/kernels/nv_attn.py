@@ -169,7 +169,7 @@ def _prefill_partial_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp,
   chunk = block_n + (offset // groups_per_chunk) * group_count
   keys = tuple(chunk * BLOCK_N + (offset % groups_per_chunk) * KEY_GROUP + i for i in range(KEY_GROUP))
   loadable = tuple(key < valid_kv_len for key in keys)
-  kvals, vvals = (tuple(tuple(kv_value(cache_kv, sc, kv, b, kv_head, key.valid(ok), d) for d in dims) for key, ok in zip(keys, loadable))
+  kvals, vvals = (tuple(tuple(kv_value(cache_kv, sc, kv, b, kv_head, cast(UOp, key).valid(ok), d) for d in dims) for key, ok in zip(keys, loadable))
                   for kv in range(2))
   def dot(qv:tuple[UOp, ...], kv:tuple[UOp, ...]) -> UOp:
     s = sum((a * k for a, k in zip(qv, kv)), UOp.const(0, dtypes.float))
