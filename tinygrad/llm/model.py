@@ -1804,7 +1804,12 @@ class Transformer:
       snap["mtp_cache_kv"] = self.mtp_head.block.cache_kv[:, :, :, :pos, :].clone(dev)
       if hasattr(self.mtp_head.block, "cache_kv_scale"):  # T6.1 KV_INT8 / T4.100 KV_INT4
         snap["mtp_cache_kv_scale"] = self.mtp_head.block.cache_kv_scale[:, :, :, :pos, :].clone(dev)
-    Tensor.realize(*(t for bs in blocks for t in bs.values()), *(snap[key] for key in ("mtp_cache_kv", "mtp_cache_kv_scale") if key in snap))
+    # T4.112 (09-13): one realize PER BLOCK, not one batched realize -- the planner folded all 32 attention-block clone temporaries
+    # (the contiguous NV-side slices before the copy to STATE_CACHE_DEVICE) into a single 405 MB buffer at 21.6k tokens (1.1 GB at
+    # 60k), which does not fit beside a 262144-token KV cache on the 3090 and turned every snapshot into an allocator OOM flush
+    # (41 s on the wire). Per block the temporary is one slice (~25 MB) and always fits; the extra realizes cost milliseconds.
+    for bs in blocks: Tensor.realize(*bs.values())
+    if (mtp := [snap[key] for key in ("mtp_cache_kv", "mtp_cache_kv_scale") if key in snap]): Tensor.realize(*mtp)
     return snap
 
   def restore_state(self, snap:dict) -> None:
