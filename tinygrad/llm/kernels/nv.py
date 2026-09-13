@@ -10,8 +10,24 @@ from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import kernel_var
 
 GDN_NV_FUSED = ContextVar("GDN_NV_FUSED", 1)  # 0 = never take the fused path, even on NV (A/B vs the loop/WY scan)
+# T4.98g: the SAME kernel also serves the T_pad==1 decode step (its token loop is a REDUCE range sized `tokens`;
+# tokens==1 is just one iteration of the identical readout+state-update math -- see model.py's dispatch). A
+# separate gate, default 0 (byte-identical), independent of GDN_NV_FUSED: the pooled recipe leaves that one 0
+# under BEAM_CACHE_ONLY for reasons specific to PREFILL's neighbouring kernels (CLAUDE.md), unrelated to decode.
+GDN_NV_FUSED_DECODE = ContextVar("GDN_NV_FUSED_DECODE", 0)
 
 @functools.cache
+@functools.cache
+def iq_grid(ggml_type:int, device:str) -> Tensor:
+  """The IQ3 codebook (iq3xxs_grid: 256 words, iq3s_grid: 512 words; 4 uint8 magnitudes per uint32 word) as a realized
+  uint32 tensor on `device` -- the IQ3 decoders in nv_quant.py/nv_gemm.py take it as an extra kernel input and index it
+  by code (one 1-2 KB table, L1-resident). Realized here ONCE per device: call from prepare_dense_weights (load time),
+  never first inside a @function/JIT capture (T4.98h's lesson)."""
+  from tinygrad.runtime.autogen import ggml_common as _ggml
+  from tinygrad.llm.kernels.amd import IQ3_XXS, IQ3_S
+  words = {IQ3_XXS: _ggml.iq3xxs_grid, IQ3_S: _ggml.iq3s_grid}[ggml_type]
+  with Context(ALLOW_DEVICE_USAGE=1): return Tensor(list(words), dtype=dtypes.uint32, device=device).realize()
+
 def _nv_device_ok(device:str) -> bool:
   from tinygrad.renderer.cstyle import CUDARenderer  # PTX=1 renders no Ops.CUSTOM: only the C renderer can emit the shuffle
   with Context(ALLOW_DEVICE_USAGE=1):
@@ -22,6 +38,14 @@ def _nv_device_ok(device:str) -> bool:
 def nv_custom_kernels_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
   if device is None or device.split(":")[0] != "NV" or not GDN_NV_FUSED.value: return False
+  return _nv_device_ok(device)
+
+def nv_decode_kernel_supported(device:str|tuple[str, ...]|None) -> bool:
+  # T4.98g: same shape as nv_custom_kernels_supported, keyed on GDN_NV_FUSED_DECODE instead -- kept as its own
+  # small function (not a shared helper) so the well-tested prefill gate above stays untouched, same idiom this
+  # file already uses to keep the AMD kernel untouched (see the module docstring).
+  if isinstance(device, tuple): device = device[0]
+  if device is None or device.split(":")[0] != "NV" or not GDN_NV_FUSED_DECODE.value: return False
   return _nv_device_ok(device)
 
 def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:

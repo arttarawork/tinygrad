@@ -3,7 +3,12 @@ from typing import Any, Callable
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, round_up
+from tinygrad.helpers import prod, round_up, getenv
+# T4.93: the Q4_K/Q5_K per-block d*scale / dmin*min staging below (T4.2) costs 0.25 B/weight of fp32 (8 floats x 2 per 256-weight
+# block) -- ~5 GB for a 27B on one 24 GB card -- and, being lazy `.contiguous()` results, it is captured INSIDE the jitted step of a
+# device_map'd model (recomputed per token, planned into one multi-GB arena: the 2026-09-09 UD-Q4_K_XL OOM on the 3090). KQUANT_STAGE=0
+# uses the fused form instead (bit-exact; slower gemv on METAL per T4.2, the trade the 3090-alone config wants). Default 1 = unchanged.
+KQUANT_STAGE = getenv("KQUANT_STAGE", 1)
 from tinygrad.nn.state import TensorIO
 
 # ggml packs each iq grid entry as N bytes (N=4 for uint32 grids, N=8 for uint64 grids) in a single word. See ggml-common.h.
@@ -106,7 +111,8 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       # that for one cheap extra kernel (reads ~same 12+4 scale bytes/block, writes 2 floats/sub-block) that only
       # runs once at weight-load time, since the result is reused unchanged across every subsequent decode token.
       # Q4_K 4096x4096 gemv on METAL: ~410us -> ~205us kernel time (bit-exact vs the fused form; T4.2).
-      dsc, dminmn = (d * sc.unsqueeze(-1)).contiguous(), (dmin * mn.unsqueeze(-1)).contiguous()
+      dsc, dminmn = d * sc.unsqueeze(-1), dmin * mn.unsqueeze(-1)
+      if KQUANT_STAGE: dsc, dminmn = dsc.contiguous(), dminmn.contiguous()  # T4.93: see KQUANT_STAGE at the top
       qs_off = 48 if ggml_type == 13 else 16
       q = Tensor.stack((qs:=blocks[:,qs_off:qs_off+128].reshape(-1,4,32)).bitwise_and(0xF), qs.rshift(4), dim=2).reshape(-1,8,32)
       if ggml_type == 13: q = q + q_to_uint8(blocks[:,16:48], 1).reshape(-1, 8, 32) * 16

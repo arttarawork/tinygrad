@@ -1,10 +1,10 @@
 from __future__ import annotations
 import functools, math
 from typing import Callable, cast
+from collections.abc import Iterable
 from tinygrad import Tensor, UOp, nn, Device, Context
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes
-from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 
 BLOCK_M, BLOCK_N, DECODE_HEAD_TILE, WARP_SIZE = 32, 32, 8, 32
@@ -13,7 +13,32 @@ WAVES_M, WAVES_N, LANES_PER_WAVE_M, LANES_PER_WAVE_N = 2, 2, 2, 16
 WMMA_ACC, THREADS_PER_BLOCK = WMMA_M // LANES_PER_WAVE_M, WARP_SIZE * WAVES_M * WAVES_N
 LDS_PAD, WMMA_ARG, LOG2E = 4, ((WMMA_M, WMMA_N, WMMA_K), 'AMD', 32), math.log2(math.e)
 Q4_K, Q5_K, Q6_K, IQ4_XS, GGML_BLOCK_SIZE, Q8_GROUP_SIZE, Q4_WORDS, Q5_WORDS, Q6_BYTES, IQ4_WORDS = 12, 13, 14, 23, 256, 32, 36, 44, 210, 34
-QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4}  # bytes per 256-weight block
+Q8_0, Q4_0 = 8, 2  # ggml type ids for the two 32-weight formats nv_quant.py adds (T4.98c)
+Q4_1, IQ4_NL = 3, 20  # T4.98i: two more 32-weight formats (20-byte and 18-byte blocks)
+Q3_K, IQ3_XXS, IQ3_S = 11, 18, 21  # T4.98k: the 3-bit formats of the UD-Q4_K_S / UD-IQ4_XS files (110/98/110-byte 256-weight blocks)
+IQ_GRID_SIZES = {IQ3_XXS: 256, IQ3_S: 512}  # codebook entries (uint32 words, 4 values each) the IQ3 decoders index -- see nv.py iq_grid
+QUANT_SIZES = {Q4_K: Q4_WORDS*4, Q5_K: Q5_WORDS*4, Q6_K: Q6_BYTES, IQ4_XS: IQ4_WORDS*4, Q3_K: 110, IQ3_XXS: 98, IQ3_S: 110}  # bytes/256-weight block
+# true on-disk bytes per ggml block, keyed byte-count -> type (the other way round from QUANT_SIZES). QUANT_SIZES's
+# 4 values already equal their per-block byte count since those formats use 256-wide blocks; Q8_0/Q4_0/Q4_1 use
+# 32-wide blocks so their 34/18/20 must be listed directly rather than scaled to a "per 256 weights" figure --
+# scaled, Q4_0 would be 18*8=144, an exact collision with Q4_K's real 144 (same byte RATE, different block width).
+# set_quantized below identifies the format from the ggml_data_to_tensor reshape's actual block width, never from
+# the packed byte total, so this collision can't bite. T4.98c. IQ4_NL's block width (18) collides with Q4_0's own
+# (T4.98i) -- see _is_iq4_nl below for how set_quantized tells those two apart.
+BLOCK_BYTES = {18: Q4_0, 20: Q4_1, 34: Q8_0, **{v: k for k, v in QUANT_SIZES.items() if k != IQ3_S}}  # 110 -> Q3_K; IQ3_S promoted below
+
+def _is_iq4_nl(graph:Iterable[UOp]) -> bool:
+  # IQ4_NL's dequant (gguf.py ggml_type==20) indexes a 16-entry kvalues_iq4nl codebook: `Tensor(list(
+  # _ggml.kvalues_iq4nl), dtype=float32)[...]`, which shows up in the toposort as its own realized 16-element
+  # float32 BUFFER -- Q4_0's dequant graph (same 18-byte block width, BLOCK_BYTES can't tell them apart) never
+  # contains one. Verified against both graphs directly (T4.98i).
+  return any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and u.shape == (16,) for u in graph)
+
+def _is_iq3_s(graph:Iterable[UOp]) -> bool:
+  # IQ3_S's dequant (gguf.py ggml_type==21) gathers from _ggml_iq_grid(iq3s_grid, (512, 4)): a realized 2048-float BUFFER in
+  # the toposort. Q3_K (same 110-byte block width) has no float32 buffer at all; IQ3_XXS builds its 256-entry grid as a
+  # where-tree, no buffer; IQ2_S's grid buffer is 8192 floats (T4.98k)
+  return any(u.op is Ops.BUFFER and u.dtype == dtypes.float32 and u.shape == (2048,) for u in graph)
 
 def kernel_var(x:UOp) -> UOp:
   # a Variable is a 0-d ALU BUFFER in the tensor graph; inside kernels it takes the ALU PARAM form (same name keeps the value binding)
@@ -49,32 +74,77 @@ def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
+  dequant_weight:Tensor|None = None  # T4.98c: the pre-quantization lazy dequant graph, kept so a custom kernel that
+                                      # only covers some token counts (nv_quant.py's decode-only gemv) can fall back
+                                      # to a real float matmul on the rest, without losing the packed view below
+  packed_bytes:Tensor|None = None  # T4.98j: a uint8 view of the packed weight when self.weight is a uint32 word view (the WMMA
+                                   # gemm decodes bytes; a word view's byte extraction (b//4, b%4) re-splits its lane range)
+  dense_weight:Tensor|None = None  # T4.98h: cached realized-fp16 copy of a non-quantized dense weight (nv_dense.py's
+                                    # gemv) -- cast+.contiguous() is real work, cached so it runs once, not every decode step
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
   def set_quantized(self, decoded:Tensor):
-    packed_sizes = {decoded.numel() // 256 * type_size:typ for typ,type_size in QUANT_SIZES.items()}
-    raw = next((u for u in decoded.uop.toposort() if u.op is Ops.SHRINK and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes), None)
-    if raw is None: return
+    graph = decoded.uop.toposort()
+    # identify the format from the ggml_data_to_tensor reshape's own block width (BLOCK_BYTES), not the packed
+    # byte total (T4.98c: Q4_0's total bytes for a tensor equals Q4_K's -- 18*8 == 144 -- only the reshape's
+    # actual last dim, 18 vs 144, tells them apart)
+    reshape = next((u for u in graph if u.op is Ops.RESHAPE and u.dtype == dtypes.uint8 and len(u.shape) == 2 and u.shape[1] in BLOCK_BYTES), None)
+    if reshape is None: return
+    # raw is the loader's SHRINK into a staged batch -- or the whole realized batch itself when the tensor was staged
+    # alone (every tensor over gguf.py's 64 MB _STAGE_BATCH: output/token_embd, a Q8_0 ffn_gate): a full-extent slice
+    # is a no-op, so no SHRINK. Both carry a contiguous view; only the byte dtype is structural (T4.98c fix, 09-11)
+    raw = reshape.src[0]
+    assert raw.dtype == dtypes.uint8, raw.op
     raw_offset = raw.contiguous_view_offset()
     assert raw_offset is not None and raw_offset % 4 == 0 and raw.buf_uop.dtype == dtypes.uint8
-    self.ggml_type = packed_sizes[prod(raw.shape)]
+    self.dequant_weight = decoded
+    self.ggml_type = BLOCK_BYTES[cast(int, reshape.shape[1])]
+    if self.ggml_type == Q4_0 and _is_iq4_nl(graph): self.ggml_type = IQ4_NL
+    if self.ggml_type == Q3_K and _is_iq3_s(graph): self.ggml_type = IQ3_S
     # store a typed buffer view: a lazy BITCAST is decomposed into byte-combining ALU before custom-kernel
-    # scheduling and would copy the entire packed weight on every JIT graph
-    packed_dtype = dtypes.uint8 if self.ggml_type == Q6_K else dtypes.uint32
-    self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
-      .view(raw.max_numel() * raw.dtype.itemsize // packed_dtype.itemsize, packed_dtype, raw_offset)))
+    # scheduling and would copy the entire packed weight on every JIT graph. Q6_K/Q8_0/Q4_0 blocks aren't 4-byte
+    # aligned (210/34/18 bytes) so those three keep a byte view; the rest pack into uint32 words (T4.98c). Q4_1
+    # (20 bytes) IS 4-byte aligned but kept on the byte view anyway -- simplest, matches Q4_0's kernel structure
+    # (T4.98i). IQ4_NL shares Q4_0's 18-byte width so it's on the byte view too, no choice involved.
+    packed_dtype = dtypes.uint32 if self.ggml_type in (Q4_K, Q5_K, IQ4_XS) else dtypes.uint8
+    buffer, nbytes = cast(Buffer, raw.buf_uop.buffer), raw.max_numel() * raw.dtype.itemsize
+    self.weight = Tensor(UOp.from_buffer(buffer.view(nbytes // packed_dtype.itemsize, packed_dtype, raw_offset)))
+    self.packed_bytes = Tensor(UOp.from_buffer(buffer.view(nbytes, dtypes.uint8, raw_offset))) if packed_dtype != dtypes.uint8 else None
   def __call__(self, x:Tensor) -> Tensor:
-    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
-    if self.ggml_type is None and supported:
+    from tinygrad.llm.kernels import nv_quant, nv_dense, nv_gemm  # local: both import Linear/QUANT_SIZES etc. from here --
+                                                          # a module-level import there of this module would cycle (T4.98c)
+    amd_supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
+    nv_supported = self.use_custom_quant and nv_quant.nv_quant_supported(self.weight.device)
+    if self.ggml_type is None and (amd_supported or nv_supported):
       self.set_quantized(self.weight)
-      if self.ggml_type is None: self.use_custom_quant = supported = False  # not a supported quant format
-    if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and supported:
+      if self.ggml_type is None and not (nv_supported and nv_dense.nv_dense_eligible(self)):
+        # neither a supported ggml quant format nor a small-enough dense layer for the NV gemv (T4.98h) -- never
+        # true again for this layer instance (shape/dtype are fixed for its lifetime), so stop re-probing every
+        # call. When it IS gemv-eligible, leave nv_supported alone: a >4-token prefill call must not permanently
+        # disable the 1-token decode calls that follow it -- nv_f16_gemv (below) re-checks the token count itself,
+        # every call, and returns None (falls through) rather than guess when it doesn't cover this call's shape
+        self.use_custom_quant = amd_supported = nv_supported = False
+    if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and amd_supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
       return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
-    return super().__call__(x)
+    # nv_quant.py covers small-batch decode only (tokens<=4; the WMMA gemm path is T4.98f) and returns None for
+    # anything bigger or unsupported -- fall through to the generic path below rather than guess
+    if nv_supported and self.ggml_type is not None and (nv_out := nv_quant.nv_q8_linear(self, x)) is not None: return nv_out
+    # nv_gemm.py covers the prefill side of the same two byte-view formats (Q8_0/Q4_0, tokens > 4) with the tensor cores
+    # (T4.98f); same None-means-fall-through contract, NV_WMMA=0 keeps the generic matmul for A/B
+    if nv_supported and self.ggml_type is not None and (nv_out := nv_gemm.nv_wmma_linear(self, x)) is not None: return nv_out
+    # nv_dense.py covers the same decode-only range for a non-quantized (plain dense) small Linear layer, e.g.
+    # GatedDeltaNet's ssm_alpha/ssm_beta head projections (T4.98h) -- same None-means-fall-through contract
+    if nv_supported and self.ggml_type is None and (nv_out := nv_dense.nv_f16_gemv(self, x)) is not None: return nv_out
+    if (dequant_weight := self.dequant_weight) is None: return super().__call__(x)
+    # self.weight is the packed view once ggml_type is set -- swap the pre-quantization dequant graph back in for
+    # nn.Linear's generic matmul on this one call (T4.98c)
+    weight, self.weight = self.weight, dequant_weight
+    try: return super().__call__(x)
+    finally: self.weight = weight
 
 def _amd_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOMI, src=(a.int(), b.int(), c), arg=("__builtin_amdgcn_sudot4(true, {}, true, {}, {}, false)", dtypes.int32))

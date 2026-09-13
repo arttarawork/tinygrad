@@ -1,14 +1,14 @@
-import unittest
+import os, unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, nn, GlobalCounters, Variable, TinyJit, Device
 from tinygrad.dtype import AddrSpace
-from tinygrad.helpers import Context
+from tinygrad.helpers import Context, getenv
 from tinygrad.uop.ops import UOp, KernelInfo, AxisType
 from tinygrad.llm import model
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, gdn_head_groups_for,
-  GDN_SCAN_LOOP, GDN_SCAN_WY,
+  GDN_SCAN_LOOP, GDN_SCAN_WY, sdpa_head_groups_for,
 )
 from tinygrad.llm.attn_kernel import tuned_decode_attention, CHUNK
 from test.helpers import assert_kernel_count, assert_jit_cache_len
@@ -569,6 +569,63 @@ class TestAttentionHook(unittest.TestCase):
     out = block._attention(decode_norm, 5).realize().numpy()  # same decode step, hook active
 
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)
+
+class TestSDPAHeadGroups(unittest.TestCase):
+  """T4.103a: SDPA_HEAD_GROUPS splits _sdpa_default's score pipeline into G sequential groups of query
+  heads (one KV head per group by default, inferred from k's own head axis) to shrink the JIT memory
+  planner's (B,H,T,Tk_max) score-buffer arena (see test_llm_prefill_arena.py) -- softmax and both matmuls
+  are per-(batch,head) independent, so grouping is pure head-axis slicing + concat and must match G=1
+  numerically (fp32 rounding, not bit-exact: the grouped matmuls/softmax reductions run at a different
+  batch width, which can reorder the underlying accumulation). Runs the SAME block/cache twice
+  (SDPA_HEAD_GROUPS=1, then the default) at the SAME (start_pos, input) -- the KV cache write is
+  idempotent (same q/k/v computed from the same input), so both calls read/write identical cache content
+  and differ only in how the attention math is split. Covers prefill (T=9, T=17) and a decode step
+  (T=1, start_pos>0) after a real prefill, x2 for the plain fp16 cache and KV_INT8's quantized cache.
+  """
+  def _config(self) -> TransformerConfig:
+    return TransformerConfig(num_blocks=1, dim=32, hidden_dim=64, n_heads=8, n_kv_heads=4, norm_eps=1e-5,
+                              vocab_size=32, head_dim=8, rope_theta=10000.0, rope_dim=8, v_head_dim=8, max_context=64)
+
+  def _attend(self, block:TransformerBlock, x:Tensor, start_pos:int, groups:int) -> np.ndarray:
+    x_norm = block.attn_norm(x)
+    block._init_state(x_norm)
+    with Context(SDPA_HEAD_GROUPS=groups): return block._attention(x_norm, start_pos).realize().numpy()
+
+  def _check(self, T:int, start_pos:int, int8:bool):
+    config = self._config()
+    if int8:
+      had, old = "KV_INT8" in os.environ, os.environ.get("KV_INT8", "")
+      os.environ["KV_INT8"] = "1"
+      getenv.cache_clear()
+    try:
+      block = TransformerBlock(config)
+      Tensor.manual_seed(0)
+      if start_pos:  # decode: fill the cache with a real prefill first (G irrelevant to the write itself)
+        prompt = Tensor.randn(1, start_pos, config.dim, dtype=dtypes.float32).contiguous().realize()
+        self._attend(block, prompt, 0, 1)
+      x = Tensor.randn(1, T, config.dim, dtype=dtypes.float32).contiguous().realize()
+      ref = self._attend(block, x, start_pos, 1)
+      out = self._attend(block, x, start_pos, config.n_kv_heads)  # opt-in grouping (the default is 1 since chain 19: decode -25%)
+    finally:
+      if int8:
+        if had: os.environ["KV_INT8"] = old
+        else: os.environ.pop("KV_INT8", None)
+        getenv.cache_clear()
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5, err_msg=f"{T=} {start_pos=} {int8=}")
+
+  def test_auto_defaults_to_kv_head_count(self):
+    with Context(SDPA_HEAD_GROUPS=0):
+      self.assertEqual(sdpa_head_groups_for(4), 4)
+      self.assertEqual(sdpa_head_groups_for(1), 1)
+    with Context(SDPA_HEAD_GROUPS=2):
+      self.assertEqual(sdpa_head_groups_for(4), 2)
+
+# parametrized over chunk width (T, start_pos) x KV cache dtype -- 6 combos, see class docstring
+for _T, _sp in ((9, 0), (17, 0), (1, 12)):
+  for _int8 in (False, True):
+    def _sdpa_test(self, _T=_T, _sp=_sp, _int8=_int8): self._check(_T, _sp, _int8)
+    _sdpa_test.__name__ = f"test_t{_T}_sp{_sp}_int8{int(_int8)}"
+    setattr(TestSDPAHeadGroups, _sdpa_test.__name__, _sdpa_test)
 
 @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "tuned attention kernel needs LOCAL axis support")
 class TestTunedAttentionKernel(unittest.TestCase):

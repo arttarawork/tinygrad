@@ -145,6 +145,52 @@ class TestKernelOpts(unittest.TestCase):
       heuristic_mod.hand_coded_optimizations = orig
     self.assertIn([OptOps.GROUP, OptOps.LOCAL, OptOps.UPCAST], seen)
 
+  def test_trailing_unroll_respects_register_budget(self):
+    # T4.102: measured 2026-09-11 on a 3090 -- the pooled 27B's standard-attention reduce landed on a trailing
+    # (unrollable) axis of exactly 32 at ctx=180224 (context-length-dependent: upstream GROUPTOP/LOCAL splits
+    # leave a different residual depending on max_context's own factorization) with upcast_size() already 16
+    # from earlier axes, and hand_coded_optimizations's "if last reduce dim is small(ish)" branch fully unrolled
+    # it (Opt(UNROLL, ..., 0)) unconditionally -- landing regs_usage=255 (the SASS max) with an lcmem spill past
+    # the device's configured slm_per_thread (ops_nv.py's NVProgram.__call__ launch check: "Too many resources
+    # requested for launch"). The analogous ctx=163840 kernel's trailing axis didn't land at <=32 there, so it
+    # never took the full-unroll branch at all -- this test reproduces the risky (small trailing axis, nonzero
+    # prior upcast) shape directly instead of needing the full 27B model/device.
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    a = Tensor.empty(4, 4, 32)
+    r = a.sum(axis=-1)
+    k = Scheduler(r.schedule_linear().src[-1].src[0], Device[Device.DEFAULT].renderer)
+    k.convert_loop_to_global()
+    # seed the pre-existing upcast_size()=16 the real attention kernel already had by the time its own
+    # trailing-unroll decision ran (from its own earlier GROUPTOP/UPCAST heuristic stages)
+    k.apply_opt(Opt(OptOps.UPCAST, 0, 4))
+    k.apply_opt(Opt(OptOps.UPCAST, 0, 4))
+    self.assertEqual(k.upcast_size(), 16)
+    ret = hand_coded_optimizations(k)
+    unroll_opts = [o for o in ret.applied_opts if o.op is OptOps.UNROLL]
+    self.assertEqual(len(unroll_opts), 1)
+    # 16 (pre-existing upcast) * 32 (the reduce axis) = 512 -- over budget, so this must NOT be a full
+    # unroll (arg=0): compiled through the real sm_86 nvrtc lane, arg=0 here measured regs_usage=130 vs
+    # arg=4's 88 (test/unit/test_llm_nv_quant.py's test_renders_and_compiles_for_sm86 is the precedent for
+    # compiling through that lane from a CPU-only test; skipped here to keep this test device/docker-free).
+    self.assertNotEqual(unroll_opts[0].arg, 0, f"full unroll chosen despite upcast_size()*32={16*32} over budget: {ret.applied_opts}")
+
+  def test_trailing_unroll_full_unroll_unchanged_without_prior_upcast(self):
+    # regression guard for the fix above: a trailing reduce axis of 32 with little/no pre-existing upcast
+    # (the common case -- upcast_size() ends up 4 here, from this same heuristic's own earlier "more upcasts"
+    # pass) must still get the pre-T4.102 full unroll (Opt(UNROLL, ..., 0)); 4*32=128 sits right at the new
+    # budget, so this also pins the boundary doesn't regress real, already-shipping kernels of this shape.
+    from tinygrad.codegen.opt.postrange import Scheduler
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    a = Tensor.empty(1024, 32)
+    r = a.sum(axis=-1)
+    k = Scheduler(r.schedule_linear().src[-1].src[0], Device[Device.DEFAULT].renderer)
+    k.convert_loop_to_global()
+    ret = hand_coded_optimizations(k)
+    unroll_opts = [o for o in ret.applied_opts if o.op is OptOps.UNROLL]
+    self.assertEqual(len(unroll_opts), 1)
+    self.assertEqual(unroll_opts[0].arg, 0)
+
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
   def test_double_reduce(self):

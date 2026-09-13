@@ -30,7 +30,7 @@ class TestGreedySampling(unittest.TestCase):
     def take(n, temp): return [t for _, t in zip(range(n), model.generate([1, 2, 3], temperature=temp))]
     a = take(4, 0.0)
     caps = {k: j.captured for k, j in model.jit.items()}
-    self.assertIsNotNone(caps[(False, True, None, False)])  # greedy rollout was jitted
+    self.assertIsNotNone(caps[(False, False, None, False)])  # greedy rollout was jitted
     take(4, 0.7)
     b = take(4, 0.0)
     self.assertEqual(a, b)  # greedy is deterministic and unaffected by sampled runs

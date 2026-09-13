@@ -398,3 +398,21 @@ class TestGGUFGC(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
+
+
+class TestKQuantStaging(unittest.TestCase):
+  # T4.93: KQUANT_STAGE=0 (fused form, no per-block staging tensors) must dequantize Q4_K/Q5_K bit-exactly like the default.
+  def _check(self, ggml_type:int, block_bytes:int):
+    import numpy as np
+    import tinygrad.llm.gguf as gguf
+    n = 256 * 64
+    raw = Tensor(np.random.default_rng(ggml_type).integers(0, 256, size=(n // 256 * block_bytes,), dtype=np.uint8))
+    staged = gguf.ggml_data_to_tensor(raw, n, ggml_type).numpy()
+    old = gguf.KQUANT_STAGE
+    try:
+      gguf.KQUANT_STAGE = 0
+      fused = gguf.ggml_data_to_tensor(raw, n, ggml_type).numpy()
+    finally: gguf.KQUANT_STAGE = old
+    np.testing.assert_array_equal(staged, fused)
+  def test_q4_k_fused_matches_staged(self): self._check(12, 144)
+  def test_q5_k_fused_matches_staged(self): self._check(13, 176)
