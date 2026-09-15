@@ -21,6 +21,9 @@ SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
 # (e.g. every existing test/null/test_llm_server*.py, constructing LLMServer with no state_cache_mb= kwarg)
 # gets byte-identical pre-T4.67 behavior -- snapshot_state/restore_state are never called (see Handler.run_model).
 STATE_CACHE_MB = getenv("STATE_CACHE_MB", 2048)
+# 2026-09-15 (Artur): tool-loop snapshots only serve a retry of the identical prompt; Hermes's skill authoring keeps what a loop learned.
+# 0 = a request whose last message is a tool result stores no snapshot; user turns and the prefix snapshot are unaffected.
+STATE_CACHE_TOOL_SNAPSHOTS = getenv("STATE_CACHE_TOOL_SNAPSHOTS", 1)
 # T4.111: minimum length (tokens) of a request's FIXED PREFIX -- everything before its first user message --
 # worth its own pinned state-cache snapshot (see Handler.run_model). A short prefix isn't worth a whole extra
 # snapshot slot under LLMServer.store_snapshot's own MB cap; a real system prompt + tool schemas is 9k-13k.
@@ -454,7 +457,9 @@ class Handler(HTTPRequestHandler):
           # T4.67: prefill for `ids` just completed (model._cached_tokens now covers exactly `ids` -- same
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
           # T4.96: `boundary` (this request didn't extend the live cache) pins it; a tool-loop step's snapshot is second tier.
-          if self.server.state_cache_mb > 0:
+          # a tool-loop step = the request ends with a tool result; user turns (cold or extending the live cache) always store.
+          tool_step = bool(messages) and messages[-1].get("role") == "tool"
+          if self.server.state_cache_mb > 0 and (STATE_CACHE_TOOL_SNAPSHOTS or not tool_step):
             t_snap = time.perf_counter()
             self.server.store_snapshot(ids, vision is not None, boundary=boundary)
             # 09-13: the store sits between the first token and its delivery -- log it when it is not negligible
