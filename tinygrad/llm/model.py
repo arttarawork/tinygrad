@@ -1844,6 +1844,33 @@ class Transformer:
     self._cached_tokens = list(snap["tokens"])
     self._rope_delta = snap.get("rope_delta", 0)  # T5.3 (pre-T5.3 snapshots: text only, 0)
 
+  # T4.111: run generate()'s own chunked prefill over `tokens` and stop, discarding the one token it samples once
+  # the prefill completes -- serve.py calls this once per distinct FIXED PREFIX (the system prompt + tool schemas,
+  # byte-stable across every session that starts the same way) so store_snapshot can pin it under that prefix's own
+  # key. T4.67's find_snapshot already resumes from ANY stored snapshot that's an exact token prefix of a request's
+  # ids -- this just gives it one to find before any session-specific request ever completes, so a brand-new session
+  # sharing only the prefix skips straight to prefilling its own tail instead of re-prefilling the whole thing cold.
+  def prefill_only(self, tokens:list[int], chunk_size:int=32) -> None:
+    """Leaves this model exactly where generate() would leave it mid-response to `tokens` as the whole prompt:
+    self._cached_tokens == list(tokens), so get_start_pos(tokens + more) == len(tokens) and a following
+    generate(tokens + more) is TOKEN-IDENTICAL to a cold generate(tokens + more) -- same chunked prefill loop, same
+    JIT families, same bound-Variable slicing (this IS generate(), see below). No separate mirror of the loop: this
+    runs generate() itself, greedy (temperature is irrelevant -- the one token it samples is thrown away), and stops
+    right after its first yield. Up to that point generate() has done nothing but chunked prefill (the `continue`
+    branch, every chunk through the last); the last chunk's forward call also produces the first decode logit as an
+    ordinary side effect of processing that chunk -- no extra forward call is spent to get it, and discarding the
+    token it turns into costs nothing further. At the yield, generate() has already set
+    `self._cached_tokens = tokens[:-1]` on ITS OWN (copied) token list, which by construction is exactly the ORIGINAL
+    `tokens` we were given (the only thing ever appended past it is the one sampled token now being thrown away).
+    No separate recurrent-state reset is needed either: generate()'s own start_pos==0 device-side branch
+    (Transformer._attention's `initial = start_pos.eq(0)` mask -- the same one a genuinely cold prefill hits) already
+    zeros a GatedDeltaNetBlock's conv_state/recurrent_state whenever `tokens` doesn't already extend this model's
+    CURRENT _cached_tokens (get_start_pos returns 0 in exactly that case); if it does happen to extend it, reusing
+    that live state is exactly correct, not a bug -- get_start_pos's own prefix-reuse rule, unchanged here."""
+    it = self.generate(list(tokens), chunk_size=chunk_size, temperature=0.0)
+    next(it, None)
+    it.close()
+
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1, vision:VisionInput|None=None,
                presence_penalty:float=0.0):
     """vision (T5.3): the prompt's images -- see VisionInput. None (every pre-T5.3 caller) is the byte-identical text path.

@@ -21,6 +21,10 @@ SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
 # (e.g. every existing test/null/test_llm_server*.py, constructing LLMServer with no state_cache_mb= kwarg)
 # gets byte-identical pre-T4.67 behavior -- snapshot_state/restore_state are never called (see Handler.run_model).
 STATE_CACHE_MB = getenv("STATE_CACHE_MB", 2048)
+# T4.111: minimum length (tokens) of a request's FIXED PREFIX -- everything before its first user message --
+# worth its own pinned state-cache snapshot (see Handler.run_model). A short prefix isn't worth a whole extra
+# snapshot slot under LLMServer.store_snapshot's own MB cap; a real system prompt + tool schemas is 9k-13k.
+PREFIX_SNAPSHOT_MIN = getenv("PREFIX_SNAPSHOT_MIN", 256)
 
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
@@ -353,7 +357,8 @@ class Handler(HTTPRequestHandler):
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
                 reasoning:bool=False, record:tuple[str, list[int], int]|None=None, vision:VisionInput|None=None, think_budget:int=0,
-                presence_penalty:float=0.0):
+                presence_penalty:float=0.0, messages:list[dict]|None=None,
+                render:typing.Callable[[list[dict], bool], str]|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -369,9 +374,29 @@ class Handler(HTTPRequestHandler):
       cache_start_pos = model.get_start_pos(ids)
       del snap  # T4.96: this generator frame outlives the yield below -- an undeleted ref here kept the snapshot's
                 # device buffers allocated through store_snapshot's own allocation later in this request (OOM)
+    # T4.111: still fully cold after the lookup above -- this exact prompt was never snapshotted before. Every
+    # session sharing this request's FIXED PREFIX (everything before its first user message -- a system prompt +
+    # tool schemas, byte-stable per client) pays the same cold prefill unless SOMEONE'S request snapshots the
+    # prefix on its own; do that here, once, on the first request that has one worth it. Skipped for a vision
+    # request (one_shot -- store_snapshot never caches those) and for the MTP path (prefill_only mirrors plain
+    # generate()'s chunked loop, not speculative_generate's).
+    prefix_len = 0
+    if (boundary and cache_start_pos == 0 and self.server.state_cache_mb > 0 and vision is None
+        and not (self.server.mtp and model.mtp_head is not None) and messages is not None and render is not None):
+      first_user = next((i for i, m in enumerate(messages) if m.get("role") == "user"), None)
+      if first_user is not None:
+        prefix_ids = tok.encode(render(messages[:first_user], False))
+        k = len(prefix_ids)
+        if k >= PREFIX_SNAPSHOT_MIN and ids[:k] == prefix_ids and tuple(prefix_ids) not in self.server.snapshots:
+          model.prefill_only(prefix_ids)
+          self.server.store_snapshot(prefix_ids, boundary=True)
+          cache_start_pos = model.get_start_pos(ids)
+          prefix_len = k
     # T5.4: " img:{images}/{visual tokens}" after the in: field, only when this request actually carries images.
     img_field = f" img:{len(vision.spans)}/{sum(n for _, n, _ in vision.spans)}" if vision is not None and vision.spans else ""
-    stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}{img_field}  {colored('--', 'BLACK')}  ")
+    prefix_field = f" prefix:{prefix_len}" if prefix_len else ""
+    stderr_log(f"in:{colored(f'{cache_start_pos:5d}', 'green')} +{len(ids)-cache_start_pos:5d}{img_field}{prefix_field}  "
+               f"{colored('--', 'BLACK')}  ")
     tmpl = {"id":f"chatcmpl-{uuid.uuid4().hex[:24]}", "object":"chat.completion.chunk", "created":int(time.time()), "model":model_name}
     def chunk(d:dict): return {"choices": [{"index":0, "delta":d, "finish_reason":None}], **tmpl}
     out: list[int] = []
@@ -542,7 +567,7 @@ class Handler(HTTPRequestHandler):
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
                               max_tokens=max_tokens, temperature=request_temperature(body, thinking),
                               reasoning=thinking, record=record, vision=vision_input, think_budget=thinking_budget(body),
-                              presence_penalty=request_presence_penalty(body, thinking))
+                              presence_penalty=request_presence_penalty(body, thinking), messages=body["messages"], render=render)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"

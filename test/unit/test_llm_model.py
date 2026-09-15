@@ -74,3 +74,52 @@ class TestOneSamplingFamily(unittest.TestCase):
     self.assertEqual(greedy, again)
     self.assertGreaterEqual(len(greedy), 1)
     self.assertGreaterEqual(len(sampled), 1)
+
+class TestPrefillOnly(unittest.TestCase):
+  """T4.111: prefill_only must leave the model exactly where generate() would mid-response to `tokens` as the
+  whole prompt -- serve.py resumes a real request from it as if it were a genuinely cold prefill of the combined
+  (prefix + tail) prompt."""
+
+  def test_matches_cold_generate_token_identical(self):
+    from dataclasses import replace
+    from tinygrad import nn
+    cfg = replace(TEST_CONFIG, max_context=64)
+    prefix, tail = [1, 2, 3, 4, 5, 6, 7], [8, 9, 10]
+    def fresh_model():
+      Tensor.manual_seed(11)
+      m = Transformer(cfg)
+      for p in nn.state.get_parameters(m): p.replace(Tensor.randn(*p.shape) * 0.1)
+      Tensor.realize(*nn.state.get_parameters(m))
+      return m
+    # chunk_size=3 deliberately doesn't divide len(prefix)=7 evenly, so prefill_only's own chunk boundary (0,3,6,7)
+    # never lines up with a monolithic cold run's chunk boundary over prefix+tail (0,3,6,9,10) -- exactly the case
+    # a real request hits (its own tail length is never aligned to whatever chunked a prior session's prefix).
+    warm = fresh_model()
+    warm.prefill_only(prefix, chunk_size=3)
+    warm_out = [t for _, t in zip(range(5), warm.generate(prefix + tail, chunk_size=3, temperature=0.0))]
+
+    cold = fresh_model()
+    cold_out = [t for _, t in zip(range(5), cold.generate(prefix + tail, chunk_size=3, temperature=0.0))]
+
+    self.assertEqual(warm_out, cold_out)
+
+  def test_get_start_pos_after_prefill_only(self):
+    from dataclasses import replace
+    model = Transformer(replace(TEST_CONFIG, max_context=64))
+    prefix = [1, 2, 3, 4, 5]
+    model.prefill_only(prefix)
+    self.assertEqual(model._cached_tokens, prefix)
+    self.assertEqual(model.get_start_pos(prefix + [6, 7]), len(prefix))
+
+  def test_recurrent_get_start_pos_after_prefill_only(self):
+    # has_recurrent_block routes get_start_pos through the exact-prefix-or-nothing rule (model.py's own comment
+    # on GDN state) -- prefill_only must leave _cached_tokens in a shape that rule accepts too, not just the
+    # attention-only rule above.
+    from unittest.mock import patch
+    model = Transformer(TEST_CONFIG)
+    model.has_recurrent_block = True
+    with patch.object(Transformer, '__call__', return_value=Tensor([[42]])):
+      model.prefill_only([1, 2, 3])
+    self.assertEqual(model._cached_tokens, [1, 2, 3])
+    self.assertEqual(model.get_start_pos([1, 2, 3, 9, 9]), 3)   # extends the prefix -- reused
+    self.assertEqual(model.get_start_pos([1, 2, 9, 9]), 0)       # diverges at position 2 -- must NOT reuse

@@ -1070,3 +1070,112 @@ class TestBoundarySnapshot(unittest.TestCase):
     model.script = []                            # request 2 (e.g. reasoning stripped from the rendered prompt):
     list(h.run_model([1, 2, 3, 7], "m"))         # extends A, not the (diverged) live cache -- resumes from A, stores B
     self.assertEqual(list(srv.snapshots.keys()), [(1, 2, 3, 7)])   # A was released before B's allocation
+
+class TestPrefixSnapshot(unittest.TestCase):
+  """T4.111: the FIXED PREFIX (everything before a request's first user message -- a system prompt + tool
+  schemas, byte-stable per client) gets its own pinned boundary snapshot on the first cold request that has one
+  worth it, so a LATER, unrelated session sharing only that prefix (a new session, same system prompt, different
+  first user message) resumes at the prefix via the existing T4.67 find_snapshot lookup instead of re-prefilling
+  the whole thing cold."""
+
+  def _tok(self):
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self): return lambda i=None: "" if i is None else chr(i)
+    return Tok()
+
+  @staticmethod
+  def _render(messages, add_generation_prompt):
+    # a trivial, exactly-prefix-stable "template": character tokenization below makes ids[:k] == prefix_ids exact.
+    s = "".join(f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages)
+    return s + "<assistant>" if add_generation_prompt else s
+
+  class FakeModel:
+    mtp_head, max_context = None, 4096
+    def __init__(self):
+      self.cached: list[int] = []
+      self.prefill_calls: list[list[int]] = []
+    def get_start_pos(self, ids):
+      return len(self.cached) if self.cached and len(self.cached) < len(ids) and ids[:len(self.cached)] == self.cached else 0
+    def restore_state(self, snap): self.cached = list(snap["tokens"])
+    def prefill_only(self, tokens, chunk_size=32):
+      self.prefill_calls.append(list(tokens))
+      self.cached = list(tokens)
+    def snapshot_state(self): return {"tokens": list(self.cached), "blocks": []}
+    def generate(self, ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      self.cached = list(ids)
+      for c in str(sum(ids) % 100): yield ord(c)   # a deterministic "answer" -- a pure function of ids' content only
+      yield 0
+
+  def _server(self):
+    from tinygrad.llm.serve import LLMServer
+    srv = LLMServer(("127.0.0.1", 0), model=self.FakeModel(), model_name="tiny", tok=self._tok(), template=None, state_cache_mb=1)
+    self.addCleanup(srv.server_close)
+    return srv
+
+  def _content(self, chunks):
+    return "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
+
+  def test_second_session_resumes_at_the_shared_prefix_with_cold_identical_output(self):
+    import tinygrad.llm.serve as srv_mod
+    from tinygrad.llm.serve import Handler
+    sys_msg = {"role": "system", "content": "you are a helpful assistant with a long fixed system prompt"}
+    msgs1 = [sys_msg, {"role": "user", "content": "hello there"}]
+    msgs2 = [sys_msg, {"role": "user", "content": "totally different question"}]
+    prefix_ids = [ord(c) for c in self._render([sys_msg], False)]
+    k = len(prefix_ids)
+    ids1 = [ord(c) for c in self._render(msgs1, True)]
+    ids2 = [ord(c) for c in self._render(msgs2, True)]
+
+    srv = self._server()
+    h = Handler.__new__(Handler)
+    h.server = srv
+    log: list[str] = []
+    with patch.object(srv_mod, "PREFIX_SNAPSHOT_MIN", 1), patch.object(srv_mod, "stderr_log", log.append):
+      list(h.run_model(ids1, "m", messages=msgs1, render=self._render))
+      self.assertEqual(srv.model.prefill_calls, [prefix_ids])           # prefill_only ran once, on exactly the prefix
+      self.assertIn(tuple(prefix_ids), srv.snapshots)                   # pinned under the prefix's own key
+      self.assertTrue(srv.snapshots[tuple(prefix_ids)]["boundary"])
+      self.assertIn(f"prefix:{k}", "".join(log))                        # T4.111's own stats-line field
+
+      log.clear()
+      out2 = list(h.run_model(ids2, "m", messages=msgs2, render=self._render))
+      # a DIFFERENT session (different user message) that never went through T4.111's own block (it was already
+      # warm from request 1's snapshot via the pre-existing T4.67 find_snapshot lookup) -- no second prefill_only.
+      self.assertEqual(srv.model.prefill_calls, [prefix_ids])
+      from tinygrad.helpers import ansistrip
+      self.assertIn(f"in:{k:5d}", ansistrip("".join(log)))   # resumed at the prefix, via T4.67's own find_snapshot
+      self.assertNotIn("prefix:", "".join(log))
+
+    cold_srv = self._server()
+    cold_h = Handler.__new__(Handler)
+    cold_h.server = cold_srv
+    cold_out2 = list(cold_h.run_model(ids2, "m", messages=msgs2, render=self._render))
+    self.assertEqual(self._content(out2), self._content(cold_out2))     # same output as a genuinely cold run
+
+  def test_no_user_message_is_a_no_op(self):
+    from tinygrad.llm.serve import Handler
+    import tinygrad.llm.serve as srv_mod
+    msgs = [{"role": "system", "content": "just a system prompt, no user turn yet"}]
+    ids = [ord(c) for c in self._render(msgs, True)]
+    srv = self._server()
+    h = Handler.__new__(Handler)
+    h.server = srv
+    with patch.object(srv_mod, "PREFIX_SNAPSHOT_MIN", 1):
+      list(h.run_model(ids, "m", messages=msgs, render=self._render))
+    self.assertEqual(srv.model.prefill_calls, [])
+    self.assertEqual(len(srv.snapshots), 1)   # only the normal full-prompt store_snapshot after the first token
+
+  def test_below_min_length_is_a_no_op(self):
+    from tinygrad.llm.serve import Handler
+    sys_msg = {"role": "system", "content": "hi"}   # tiny -- well under PREFIX_SNAPSHOT_MIN's real default (256)
+    msgs = [sys_msg, {"role": "user", "content": "hello"}]
+    ids = [ord(c) for c in self._render(msgs, True)]
+    srv = self._server()
+    h = Handler.__new__(Handler)
+    h.server = srv
+    list(h.run_model(ids, "m", messages=msgs, render=self._render))   # PREFIX_SNAPSHOT_MIN left at its real default
+    self.assertEqual(srv.model.prefill_calls, [])
+    prefix_ids = [ord(c) for c in self._render([sys_msg], False)]
+    self.assertNotIn(tuple(prefix_ids), srv.snapshots)
