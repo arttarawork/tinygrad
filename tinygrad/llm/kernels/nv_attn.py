@@ -216,7 +216,9 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
   row in fp32 (chunk max/sum over the 4 lanes of a fragment row by two xor shuffles), then O += P.V with P cast to fp16 as the A
   operand -- the C layout of two adjacent S tiles IS the A layout of a 16-key k-step (nv_gemm.py's fragment map: rows lane_hi/+8,
   cols 2*lane_lo/+1 and +8/+9), so P never leaves the registers. d_split > 1 gives each block a D/d_split slice of the output
-  (O accumulators / d_split at the price of computing S d_split times). Renders only on the CUDA renderer (no CPU form)."""
+  (O accumulators / d_split at the price of computing S d_split times). The k-steps of S and the key-steps of P.V are RANGE loops
+  (static register files, ~85 KB of CUDA): fully unrolled, the lowered program could not be pickled back from the compile worker pool
+  (C-stack overflow, 2026-09-16). Renders only on the CUDA renderer (no CPU form)."""
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start)
   sc = scale[0] if scale else None
   _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
@@ -258,21 +260,22 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
       v = cache_kv[1, b, kv_head, key, dim_base + lane_hi].load().float() * sc[1, b, kv_head, key, dim_base // blk].load().float()
       return v.cast(dtypes.float16)
     return cache_kv[1, b, kv_head, key, dim_base + lane_hi].load().cast(dtypes.float16)
-  # S = Q.K^T: A = Q (rows x head_dim), B = K^T (head_dim x keys); accumulate the 16 k-steps per n-tile
-  s_vals:list[UOp] = []
+  # S = Q.K^T: A = Q (rows x head_dim), B = K^T (head_dim x keys). The k-steps are a RANGE (not unrolled): the 16 n-tile accumulators
+  # stay static register files while the linear program stays short -- fully unrolled (512 mma + ~4k loads per chunk) the lowered
+  # PROGRAM UOp was too deep to pickle across the compile worker pool (C-stack overflow in the worker; 2026-09-16 card run).
+  s_acc = tuple(_reg((4,), 50 + j, 0, offset) for j in range(s_tiles))  # zeroed per chunk
+  ks = UOp.range(k_steps, 101, AxisType.REDUCE)
+  k0 = ks * WMMA_K + 2 * lane_lo
+  afrag = UOp.stack(*(q[b, q_head, row, k0 + dk].load().cast(dtypes.float16) for row in rows for dk in (0, 1)),
+                    *(q[b, q_head, row, k0 + 8 + dk].load().cast(dtypes.float16) for row in rows for dk in (0, 1)))
+  s_stores = []
   for j in range(s_tiles):
     key = key_base + j * WMMA_N + lane_hi
     key_ok = key.valid(key < valid_kv_len)
-    s_acc = _reg((4,), 50 + j, 0, offset)  # zeroed per chunk
-    val: UOp = s_acc
-    for ks in range(k_steps):
-      k0 = ks * WMMA_K + 2 * lane_lo
-      afrag = UOp.stack(*(q[b, q_head, row, k0 + dk].load().cast(dtypes.float16) for row in rows for dk in (0, 1)),
-                        *(q[b, q_head, row, k0 + 8 + dk].load().cast(dtypes.float16) for row in rows for dk in (0, 1)))
-      bfrag = UOp.stack(kval(0, key_ok, k0), kval(0, key_ok, k0 + 1), kval(0, key_ok, k0 + 8), kval(0, key_ok, k0 + 9))
-      val = UOp.wmma(afrag, bfrag, val, *WMMA_ARG)
-    st = s_acc.store(val)
-    s_vals.append(s_acc.after(st))
+    bfrag = UOp.stack(kval(0, key_ok, k0), kval(0, key_ok, k0 + 1), kval(0, key_ok, k0 + 8), kval(0, key_ok, k0 + 9))
+    s_stores.append(s_acc[j].store(UOp.wmma(afrag, bfrag, s_acc[j].after(ks), *WMMA_ARG)))
+  s_done = UOp.group(*s_stores).end(ks)
+  s_vals = [acc.after(s_done) for acc in s_acc]
   # masked scores (this lane: rows[0] at c0/c1, rows[1] at c2/c3; keys 2*lane_lo, +1 of each 8-key tile), chunk max per row
   scale_log2 = LOG2E / math.sqrt(D)
   scores, oks = [], []
@@ -294,19 +297,26 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
     ps.append(ok.where((s - new_max[idx % 4 // 2]).exp2(), UOp.const(0, dtypes.float)))
   lane_sums = [functools.reduce(lambda a, p: a + p, [p for idx, p in enumerate(ps) if idx % 4 // 2 == r], UOp.const(0, dtypes.float))
                for r in range(2)]
-  # O += P.V: A = P (rows x 16 keys) from two adjacent S tiles, B = V (16 keys x 8 dims)
-  o_vals = []
+  # P parked in a (16 tiles x 4) register file so the key-step RANGE below can index it; O rescaled by alpha once per chunk
+  p_reg = UOp.placeholder((s_tiles, 4), dtypes.float, slot=90, addrspace=AddrSpace.REG).after(offset)
+  p_ready = UOp.group(*(p_reg[j, i].store(ps[j * 4 + i]) for j in range(s_tiles) for i in range(4)))
+  p_reg = p_reg.after(p_ready)
+  rescaled = []
   for n in range(o_tiles):
     prev = o_acc[n].after(offset)
-    val = UOp.stack(prev[0].load() * alphas[0], prev[1].load() * alphas[0], prev[2].load() * alphas[1], prev[3].load() * alphas[1])
-    dim_base = dbase + n * WMMA_N
-    for t in range(BLOCK_N // WMMA_K):
-      afrag = UOp.stack(*(ps[tt * 4 + i].cast(dtypes.float16) for tt in (2 * t, 2 * t + 1) for i in range(4)))
-      keys = tuple(key_base + t * WMMA_K + 2 * lane_lo + dk for dk in (0, 1, 8, 9))
-      bfrag = UOp.stack(*(vval(key.valid(key < valid_kv_len), dim_base) for key in keys))
-      val = UOp.wmma(afrag, bfrag, val, *WMMA_ARG)
-    o_vals.append(val)
-  updates = [acc.store(val) for acc, val in zip(o_acc, o_vals)] + [row_max[r].store(new_max[r]) for r in range(2)] + \
+    rescaled.append(o_acc[n].store(UOp.stack(*(prev[i].load() * alphas[i // 2] for i in range(4)))))
+  rescale = UOp.group(*rescaled)
+  # O += P.V over a RANGE of 16-key steps: A = P (rows x 16 keys) from two adjacent S tiles, B = V (16 keys x 8 dims) per output n-tile
+  t = UOp.range(BLOCK_N // WMMA_K, 102, AxisType.REDUCE)
+  afrag = UOp.stack(*(p_reg[2 * t + tt, i].load().cast(dtypes.float16) for tt in (0, 1) for i in range(4)))
+  keys = tuple(key_base + t * WMMA_K + 2 * lane_lo + dk for dk in (0, 1, 8, 9))
+  keys_ok = tuple(key.valid(key < valid_kv_len) for key in keys)
+  o_stores = []
+  for n in range(o_tiles):
+    bfrag = UOp.stack(*(vval(key, dbase + n * WMMA_N) for key in keys_ok))
+    o_stores.append(o_acc[n].store(UOp.wmma(afrag, bfrag, o_acc[n].after(rescale, t), *WMMA_ARG)))
+  o_done = UOp.group(*o_stores).end(t)
+  updates = [o_done] + [row_max[r].store(new_max[r]) for r in range(2)] + \
     [row_sum[r].store(prev_sum[r].load() * alphas[r] + lane_sums[r]) for r in range(2)]
   update = UOp.group(*updates).end(offset)
   o_acc, row_max, row_sum = tuple(acc.after(update) for acc in o_acc), row_max.after(update), row_sum.after(update)

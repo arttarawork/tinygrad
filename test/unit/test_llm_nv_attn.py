@@ -1,7 +1,7 @@
 """T4.107a: NV split-KV decode attention (kernels/nv_attn.py) -- the kernel graph builds for the real geometry and renders on sm_86
 with its 32 lanes as one warp, the merge and the in-kernel dequant convention agree with a plain-tensor reference on CPU, and the
 NV_CUSTOM_ATTN gate leaves every other path untouched. Kernel numerics on the card: extra/nv_attn_validate_real.py."""
-import math, re, unittest
+import math, pickle, re, unittest
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, Context
 from tinygrad.uop.ops import Ops, KernelInfo
@@ -237,6 +237,10 @@ class TestPrefillWMMAKernel(unittest.TestCase):
         self.assertIn("int lidx0 = threadIdx.x; /* 4 */", src)
         self.assertIn("int lidx1 = threadIdx.y; /* 8 */", src)
         self.assertIn("start_pos", src)
+        # the compile worker pool pickles the lowered PROGRAM back to the parent: the fully unrolled first cut overflowed the C stack
+        # there (2026-09-16 card run); the RANGE-looped kernel must pickle at the default limits, on the main thread
+        self.assertLess(len(pickle.dumps(prg)), 2_000_000)
+        self.assertLess(len(src), 150_000)
 
   def test_routing_and_fallback(self):
     # graph-level: the flag picks the wmma kernel (16-row tiles) for a head_dim the fragments cover; a head_dim that is not a multiple
