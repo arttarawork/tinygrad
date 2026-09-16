@@ -461,7 +461,7 @@ class Handler(HTTPRequestHandler):
           # boundary generate()/speculative_generate() themselves just set) -- park it for a later session.
           # T4.96: `boundary` (this request didn't extend the live cache) pins it; a tool-loop step's snapshot is second tier.
           # a tool-loop step = the request ends with a tool result; user turns (cold or extending the live cache) always store.
-          tool_step = bool(messages) and messages[-1].get("role") == "tool"
+          tool_step = messages is not None and len(messages) > 0 and messages[-1].get("role") == "tool"
           if self.server.state_cache_mb > 0 and (STATE_CACHE_TOOL_SNAPSHOTS or not tool_step):
             t_snap = time.perf_counter()
             self.server.store_snapshot(ids, vision is not None, boundary=boundary)
