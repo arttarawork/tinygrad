@@ -1117,6 +1117,23 @@ class TestPrefixSnapshot(unittest.TestCase):
   def _content(self, chunks):
     return "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
 
+  def test_request_without_a_system_prompt_has_no_prefix_and_never_renders_an_empty_list(self):
+    # 09-16 regression: the first message IS the user message -> prefix = messages[:0] = [] -> the real template raises
+    # "No messages provided." (jinja raise_exception) -> every system-less request died with a closed connection.
+    import tinygrad.llm.serve as srv_mod
+    from tinygrad.llm.serve import Handler
+    msgs = [{"role": "user", "content": "hello there, no system prompt at all"}]
+    def render(messages, add_gen):
+      if not messages: raise RuntimeError("No messages provided.")
+      return self._render(messages, add_gen)
+    ids = [ord(c) for c in render(msgs, True)]
+    srv = self._server()
+    h = Handler.__new__(Handler)
+    h.server = srv
+    with patch.object(srv_mod, "PREFIX_SNAPSHOT_MIN", 1), patch.object(srv_mod, "stderr_log", lambda *a, **k: None):
+      list(h.run_model(ids, "m", messages=msgs, render=render))   # must not raise
+    self.assertEqual(srv.model.prefill_calls, [])                   # nothing to pin: no prefix
+
   def test_second_session_resumes_at_the_shared_prefix_with_cold_identical_output(self):
     import tinygrad.llm.serve as srv_mod
     from tinygrad.llm.serve import Handler

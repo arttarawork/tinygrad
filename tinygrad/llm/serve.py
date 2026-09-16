@@ -387,7 +387,10 @@ class Handler(HTTPRequestHandler):
     if (boundary and cache_start_pos == 0 and self.server.state_cache_mb > 0 and vision is None
         and not (self.server.mtp and model.mtp_head is not None) and messages is not None and render is not None):
       first_user = next((i for i, m in enumerate(messages) if m.get("role") == "user"), None)
-      if first_user is not None:
+      # 09-16: `first_user == 0` (no system prompt) is an EMPTY prefix -- the chat template raises "No messages provided" on
+      # an empty list, which killed every system-less request since T4.111 went live (Hermes/dsh always send one; a bare
+      # curl did not).
+      if first_user:
         prefix_ids = tok.encode(render(messages[:first_user], False))
         k = len(prefix_ids)
         if k >= PREFIX_SNAPSHOT_MIN and ids[:k] == prefix_ids and tuple(prefix_ids) not in self.server.snapshots:
