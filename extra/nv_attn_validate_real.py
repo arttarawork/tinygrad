@@ -5,7 +5,8 @@ Two passes of the same script, one per attention path, then a compare -- the dec
   DEV=NV KV_INT4=1 NV_CUSTOM_QUANT=1 GDN_NV_FUSED_DECODE=1 KQUANT_STAGE=0 NV_CUSTOM_ATTN=0 PYTHONPATH=. python extra/nv_attn_validate_real.py run \
     --model /Users/artur/models/qwen3.8-27b-q4/Qwen3.8-27B-Q4_0.gguf --max-context 65536 --chunk-size 128 --fill 2048,20480,61440 --out generic.npz
   ... NV_CUSTOM_ATTN=1 ... --out custom.npz
-  PYTHONPATH=. python extra/nv_attn_validate_real.py compare generic.npz custom.npz
+  ... NV_CUSTOM_ATTN=1 ... run --wmma ... --out wmma.npz          # T4.113: the tensor-core prefill kernel (NV_ATTN_WMMA=1 for this process)
+  PYTHONPATH=. python extra/nv_attn_validate_real.py compare generic.npz custom.npz wmma.npz   # A vs each of the others
 Per fill size N: the cache is filled with N seeded random tokens (chunked prefill through Transformer.__call__ with bound Variables,
 exactly generate()'s decode graphs), then `--steps` greedy decode steps are timed (ms/step, first step excluded: it captures the JIT)
 and the first step's argmax + top-2 logit gap are recorded. `compare` prints per N: ms/step for both, the speedup, whether the argmax
@@ -19,9 +20,11 @@ import argparse, time
 import numpy as np
 from tinygrad import Tensor, UOp
 from tinygrad.llm.model import Transformer
+from tinygrad.llm.kernels.nv_attn import NV_ATTN_WMMA, NV_CUSTOM_ATTN
 from extra.flip_rate import reset_recurrent_state, _spec_step, _top1_and_gap
 
 def run(args:argparse.Namespace) -> None:
+  if args.wmma: NV_ATTN_WMMA.value, NV_CUSTOM_ATTN.value = 1, 1  # before the model builds any kernel (the jit keys on nothing else)
   model, _ = Transformer.from_gguf(args.model, args.max_context, device_map=args.device_map)
   dev = model.blk[0].device
   fills = [int(n) for n in args.fill.split(",")]
@@ -71,15 +74,18 @@ def run(args:argparse.Namespace) -> None:
   print(f"wrote {args.out}")
 
 def compare(args:argparse.Namespace) -> None:
-  a, b = np.load(args.a), np.load(args.b)
-  for label, keys in (("decode ms/step", [k for k in a.files if not k.startswith("p")]),
-                      ("prefill ms/chunk", [k for k in a.files if k.startswith("p")])):
-    if not keys: continue
-    print(f"{label:>16} {'A':>10} {'B':>10} {'speedup':>8}  argmax  gap A / gap B")
-    for key in sorted(keys, key=lambda k: int(k.lstrip("p"))):
-      ma, mb = a[key], b[key]
-      agree = 'same' if int(ma[2]) == int(mb[2]) else 'DIFF'
-      print(f"{int(key.lstrip('p')):16d} {ma[0]:10.1f} {mb[0]:10.1f} {ma[0] / mb[0]:8.2f}x  {agree:5s}  {ma[3]:.4f} / {mb[3]:.4f}")
+  a = np.load(args.a)
+  for path in args.others:
+    b = np.load(path)
+    print(f"== {args.a} (A) vs {path} (B)")
+    for label, keys in (("decode ms/step", [k for k in a.files if not k.startswith("p")]),
+                        ("prefill ms/chunk", [k for k in a.files if k.startswith("p")])):
+      if not keys: continue
+      print(f"{label:>16} {'A':>10} {'B':>10} {'speedup':>8}  argmax  gap A / gap B")
+      for key in sorted(keys, key=lambda k: int(k.lstrip("p"))):
+        ma, mb = a[key], b[key]
+        agree = 'same' if int(ma[2]) == int(mb[2]) else 'DIFF'
+        print(f"{int(key.lstrip('p')):16d} {ma[0]:10.1f} {mb[0]:10.1f} {ma[0] / mb[0]:8.2f}x  {agree:5s}  {ma[3]:.4f} / {mb[3]:.4f}")
 
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -94,9 +100,10 @@ def main() -> None:
   r.add_argument("--prefill-steps", type=int, default=3, help="T4.107b: prefill chunks per fill (the first captures the jit, untimed)")
   r.add_argument("--device-map", default=None)
   r.add_argument("--out", required=True)
+  r.add_argument("--wmma", action="store_true", help="T4.113: NV_ATTN_WMMA=1 (+NV_CUSTOM_ATTN=1) for this run")
   c = sub.add_parser("compare")
   c.add_argument("a")
-  c.add_argument("b")
+  c.add_argument("others", nargs="+")
   args = parser.parse_args()
   (run if args.cmd == "run" else compare)(args)
 
