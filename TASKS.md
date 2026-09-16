@@ -522,6 +522,7 @@ flowchart LR
 ```
 
 ## Status log
+- **2026-09-16 15:00 closing sprint:** RUNBOOK.md + healthcheck.sh + daily-maintenance LaunchAgent + Ornith LaunchAgent + deploy_start wrapper + Ornith 64k + PR script (open_pr_t4111.sh). Maple 0/20 twice (out); K2 with card settings running. HANDOFF_2026-09-13 §5e.
 - **2026-09-16 07:45 T4.115 addenda (LocalLLaMA thread):** K2-Horizon-3.7B 5/20 resolved on the fork with half the runs cut by the 4096 cap → 8192-cap rerun in progress; Maple 0/20 (loops on tool calls, never submits); Ling instant+recommended 2/20. Ornith-1.5-9B Q5_K_M stays the worker. Disk: 09-16 00:48 full → VM read-only → recovered (`vm_recover.sh`); 123 GB of models deleted incl. the 35B fallback (Artur). HANDOFF_2026-09-13 §5d.
 - **2026-09-15 21:00 T4.115 closed, memory window done:** Ling with recommended sampling 2/20 (sampling was not the limiter); colima 6 GiB + Firecrawl api capped + `STATE_CACHE_TOOL_SNAPSHOTS=0` live → Mac 28 GB used / 7.9 GB free / swap 0.6 GB (was 35 / 0.3 / 4.3). Ornith-1.5-9B Q5_K_M on :8082 at 305/21 tok/s, 7.5 GB. HANDOFF_2026-09-13 §5d.
 - **2026-09-15 15:10 T4.115 evaluated:** Ornith-1.0-9B 12/20 resolved (12/12 submitted patches pass), Ling 1/20 (greedy; rerun with recommended sampling in progress, same shape so far), Nemotron cut (4B 4 patches, 9B slow + 1/3). KL quant test on tinygrad source: Q5_K_M 96.1 % top-1 vs Q8_0, Q4_K_M 93.4 % → Ornith-1.5-9B Q5_K_M standing on :8082. HANDOFF_2026-09-13 §5d.
