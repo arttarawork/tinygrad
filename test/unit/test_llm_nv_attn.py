@@ -1,7 +1,7 @@
 """T4.107a: NV split-KV decode attention (kernels/nv_attn.py) -- the kernel graph builds for the real geometry and renders on sm_86
 with its 32 lanes as one warp, the merge and the in-kernel dequant convention agree with a plain-tensor reference on CPU, and the
 NV_CUSTOM_ATTN gate leaves every other path untouched. Kernel numerics on the card: extra/nv_attn_validate_real.py."""
-import math, re, unittest
+import math, pickle, re, unittest
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, Context
 from tinygrad.uop.ops import Ops, KernelInfo
@@ -196,6 +196,71 @@ class TestPrefillKernel(unittest.TestCase):
     nodes = list(out.uop.toposort())
     self.assertEqual(sum(u.op is Ops.CALL for u in nodes), 1)                     # exactly one custom kernel call
     self.assertEqual([u.shape for u in nodes if u.op is Ops.PAD], [(1, Hq, 8, Dh)])  # q padded to 2 tiles of 4 rows
+
+def _wmma_sink(dtype, N:int, valid, q_start, M:int=32, d_split:int=1):
+  kv, scale = _cache(dtype, N)
+  chunks = min(nv_attn.PREFILL_CHUNKS, N // BLOCK_N)
+  srcs = [Tensor.empty(B, H, M, chunks, D, dtype=dtypes.float32).uop, Tensor.empty(B, H, M, chunks, 2, dtype=dtypes.float32).uop,
+          Tensor.empty(B, H, M, D, dtype=dtypes.float16).uop, kv.uop] + ([scale.uop] if scale is not None else [])
+  params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate(srcs))
+  return nv_attn._prefill_wmma_kernel(*params, valid_kv_len=valid, q_start=q_start, max_kv_len=N, d_split=d_split)
+
+class TestPrefillWMMAKernel(unittest.TestCase):
+  """T4.113: the tensor-core prefill kernel builds and renders for the model's geometry; NV_ATTN_WMMA routes to it; the numerics are
+  card-only (extra/nv_attn_validate_real.py --wmma) -- the CUDA renderer is the only one that emits mma.sync."""
+  def test_graph_builds_for_every_cache_dtype(self):
+    sp = UOp.variable("start_pos", 0, 4095 - 32)
+    for dtype in (dtypes.uint8, dtypes.int8, dtypes.float16):
+      for d_split in (1, 2):
+        for valid, q_start in ((32, 0), (4095, 4063), (sp + 32, sp)):
+          with self.subTest(dtype=dtype, d_split=d_split, valid=str(valid)):
+            sink = _wmma_sink(dtype, 4096, valid, q_start, d_split=d_split)
+            self.assertIs(sink.op, Ops.SINK)
+            nodes = list(sink.toposort())
+            self.assertTrue(any(u.op is Ops.WMMA for u in nodes))
+            self.assertTrue(any(u.op is Ops.CUSTOM and "__shfl_xor_sync(0xffffffff, {0}, 1)" in u.arg[0] for u in nodes))  # the row shuffles
+
+  def test_render_uses_mma_and_pins_the_lane_split(self):
+    # the fragment map assumes nv_gemm's (4, 8) lane split (hardware lane = 4*lane_hi + lane_lo) -- pinned the same way as test_llm_nv_gemm
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    sp = UOp.variable("start_pos", 0, 4095 - 32)
+    for dtype in (dtypes.uint8, dtypes.int8, dtypes.float16):
+      with self.subTest(dtype=dtype):
+        prg = to_program(_wmma_sink(dtype, 4096, sp + 32, sp), renderer)
+        src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+        self.assertIn("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32", src)
+        self.assertIn("__shfl_xor_sync(0xffffffff", src)
+        self.assertIn("int lidx0 = threadIdx.x; /* 4 */", src)
+        self.assertIn("int lidx1 = threadIdx.y; /* 8 */", src)
+        self.assertIn("start_pos", src)
+        # the compile worker pool pickles the lowered PROGRAM back to the parent: the fully unrolled first cut overflowed the C stack
+        # there (2026-09-16 card run); the RANGE-looped kernel must pickle at the default limits, on the main thread
+        self.assertLess(len(pickle.dumps(prg)), 2_000_000)
+        self.assertLess(len(src), 150_000)
+
+  def test_routing_and_fallback(self):
+    # graph-level: the flag picks the wmma kernel (16-row tiles) for a head_dim the fragments cover; a head_dim that is not a multiple
+    # of 16 keeps the T4.107b kernel even with the flag on; the flag off changes nothing
+    def kernel_names(Dh:int, wmma:int, lanes:int=nv_attn.WARP_SIZE):
+      Hq, KVH, N = 4, 2, 256
+      kv = Tensor.zeros(2, 1, KVH, N, Dh, dtype=dtypes.float16)
+      q = Tensor.ones(1, Hq, 6, Dh, dtype=dtypes.float16)
+      with Context(NV_ATTN_WMMA=wmma):
+        out = nv_attn.nv_prefill_attention(q, kv, None, 106, 100, lanes=lanes)
+      nodes = list(out.uop.toposort())
+      names = [u.arg.name for u in nodes if u.op is Ops.SINK and isinstance(u.arg, KernelInfo)]
+      pads = [u.shape for u in nodes if u.op is Ops.PAD]
+      return names, pads
+    names, pads = kernel_names(64, 1)
+    self.assertEqual(names, ["flash_prefill_wmma_nv"])
+    self.assertEqual(pads, [(1, 4, 16, 64)])                                  # 6 rows padded to one 16-row tile
+    self.assertEqual(kernel_names(64, 0)[0], ["flash_prefill_partial_nv"])   # off: unchanged
+    # head_dim 8: no 16-wide k-step -> the T4.107b kernel even with the flag on (its warp form needs 32 | head_dim, so the one-lane CPU form)
+    self.assertEqual(kernel_names(8, 1, lanes=1)[0], ["flash_prefill_partial_nv"])
 
 def _dequant_reference_np(kv:Tensor, scale:Tensor|None, Dh:int) -> np.ndarray:
   if kv.dtype == dtypes.uint8:

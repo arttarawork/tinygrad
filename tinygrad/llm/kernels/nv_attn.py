@@ -28,15 +28,19 @@ from typing import cast
 from tinygrad import Tensor, UOp
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import ContextVar
-from tinygrad.uop.ops import AxisType, KernelInfo, resolve
+from tinygrad.uop.ops import AxisType, KernelInfo, Ops, resolve
 from tinygrad.llm.kernels.amd import _unbind
 from tinygrad.llm.kernels.nv import warp_reduce, _nv_device_ok
 
 NV_CUSTOM_ATTN = ContextVar("NV_CUSTOM_ATTN", 0)
 NV_ATTN_QROWS = ContextVar("NV_ATTN_QROWS", 1)  # T4.107b: query rows per prefill block (register budget vs K/V re-reads; tune on the card)
+NV_ATTN_WMMA = ContextVar("NV_ATTN_WMMA", 0)  # T4.113: the tensor-core prefill kernel below (0 = the T4.107b warp-shuffle kernel)
+NV_ATTN_WMMA_DSPLIT = ContextVar("NV_ATTN_WMMA_DSPLIT", 1)  # T4.113: head_dim halves per block (2 = half the O registers, QK^T twice); card knob
 WARP_SIZE, LOG2E = 32, math.log2(math.e)
 BLOCK_N, MAX_CHUNKS, KEY_GROUP = 128, 256, 4  # keys per chunk; partial slots per (batch, q head); keys per loop step (one rescale per group)
 PREFILL_CHUNKS, MAX_PREFILL_ROWS, SENTINEL = 64, 64, -1e30  # prefill: slots per (batch, q head, row); widest chunk handled; finite "no key yet" max
+WMMA_M, WMMA_N, WMMA_K = 16, 8, 16  # mma.sync.aligned.m16n8k16 fp16 in / fp32 out (nv_gemm.py's fragment map)
+WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)
 
 def nv_decode_attention_ok(device:str|tuple[str, ...]|None, head_dim:int, cache_kv:Tensor) -> bool:
   """The decode kernel covers this layer: NV (sm_70+), a head_dim each lane can own a contiguous run of (32 | head_dim; 64 | head_dim
@@ -195,20 +199,156 @@ def _prefill_partial_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp,
   ends = (lane, block) if lane is not None else (block,)
   return UOp.group(*stores).end(*ends).sink(arg=KernelInfo(name="flash_prefill_partial_nv", opts_to_apply=()))
 
+# ******** T4.113: prefill chunks on the tensor cores ********
+
+def _shfl_xor(val:UOp, offset:int, maximum:bool=False) -> UOp:
+  """Butterfly step over hardware lanes L ^ offset (warp_reduce's CUSTOM, one offset). With the (4, 8) lane split of _wmma fragments
+  (hardware L = 4*lane_hi + lane_lo) offsets 1 and 2 combine the four lanes that share a fragment row."""
+  other = UOp(Ops.CUSTOM, src=(val,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
+  return val.maximum(other) if maximum else val + other
+
+@functools.cache
+def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, valid_kv_len:int|UOp, q_start:int|UOp, max_kv_len:int,
+                         d_split:int=1) -> UOp:
+  """_prefill_partial_kernel's contract (same partial/stats layout, same q_start/valid_kv_len masks, same chunk slots) with the
+  arithmetic on mma.sync.aligned.m16n8k16: one warp per (batch, QUERY head, 16-row tile, head_dim part) x chunk slot. Per 128-key
+  chunk: S = Q.K^T as 16 n-tiles of 8 keys (Q fp16 A fragments, K dequantised straight into fp16 B fragments), the online softmax per
+  row in fp32 (chunk max/sum over the 4 lanes of a fragment row by two xor shuffles), then O += P.V with P cast to fp16 as the A
+  operand -- the C layout of two adjacent S tiles IS the A layout of a 16-key k-step (nv_gemm.py's fragment map: rows lane_hi/+8,
+  cols 2*lane_lo/+1 and +8/+9), so P never leaves the registers. d_split > 1 gives each block a D/d_split slice of the output
+  (O accumulators / d_split at the price of computing S d_split times). The k-steps of S and the key-steps of P.V are RANGE loops
+  (static register files, ~85 KB of CUDA): fully unrolled, the lowered program could not be pickled back from the compile worker pool
+  (C-stack overflow, 2026-09-16). Renders only on the CUDA renderer (no CPU form)."""
+  valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start)
+  sc = scale[0] if scale else None
+  _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
+  _, H, M, D = cast(tuple[int, int, int, int], q.shape)
+  G, chunks, DC = H // H_KV, cast(int, out.shape[3]), D // d_split
+  assert M % WMMA_M == 0 and H % H_KV == 0 and D % WMMA_K == 0 and DC * d_split == D and DC % WMMA_N == 0 and max_kv_len == N \
+    and N % BLOCK_N == 0 and BLOCK_N % WMMA_K == 0
+  tiles, k_steps, s_tiles, o_tiles = M // WMMA_M, D // WMMA_K, BLOCK_N // WMMA_N, DC // WMMA_N
+  valid_chunks = (valid_kv_len + BLOCK_N - 1) // BLOCK_N
+  group_count = min(valid_chunks, chunks) if isinstance(valid_chunks, int) else valid_chunks.minimum(chunks)
+  block = UOp.range(B * H * tiles * d_split * group_count, 0, AxisType.GLOBAL)
+  block_rest, block_n = block // group_count, block % group_count
+  block_rest, dpart = block_rest // d_split, block_rest % d_split
+  bh, tile = block_rest // tiles, block_rest % tiles
+  b, q_head = bh // H, bh % H
+  kv_head, dbase = q_head // G, dpart * DC
+  lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
+  lane_hi, lane_lo = lane % 8, lane // 8  # nv_gemm._wmma_layout_nv's split: lane_hi = fragment row/col (0-7), lane_lo = k/n sub-index (0-3)
+  rows = (tile * WMMA_M + lane_hi, tile * WMMA_M + lane_hi + 8)  # this lane's two fragment rows
+  o_acc = tuple(_reg((4,), 10 + n, 0, block) for n in range(o_tiles))  # this block's O fragments, one (4,) register file per n-tile
+  row_max, row_sum = _reg((2,), 1, SENTINEL, block), _reg((2,), 2, 0, block)
+  steps = (valid_chunks + group_count - 1) // group_count
+  offset = UOp.range(steps, 100, AxisType.REDUCE)
+  key_base = (block_n + offset * group_count) * BLOCK_N
+  def kval(kv:int, key:UOp, d:UOp|int) -> UOp: return kv_value(cache_kv, sc, kv, b, kv_head, key, cast(UOp, d)).cast(dtypes.float16)
+  def vval(key:UOp, dim_base:UOp|int) -> UOp:
+    """V[key][dim_base + lane_hi] as fp16 -- the B fragment's n index is lane_hi, so the int4 nibble select must not put a div/mod of
+    the lane into an index (that re-splits the lane range, nv_gemm._byte's lesson): byte = dim_base/2 + (lane_hi >> 1), nibble by
+    (lane_hi & 1); the scale block of dim_base + lane_hi is dim_base's (dim_base is a multiple of 8, blocks are 32 wide)."""
+    if cache_kv.dtype == dtypes.uint8:
+      assert sc is not None
+      blk = cast(int, cache_kv.shape[-1]) * 2 // cast(int, sc.shape[-1])
+      byte = cache_kv[1, b, kv_head, key, dim_base // 2 + (lane_hi >> 1)].load().cast(dtypes.uint32)
+      nibble = (byte >> ((lane_hi & 1).cast(dtypes.uint32) * 4)) & 0xF
+      return ((nibble.cast(dtypes.float) - 8.0) * sc[1, b, kv_head, key, dim_base // blk].load().float()).cast(dtypes.float16)
+    if cache_kv.dtype == dtypes.int8:
+      assert sc is not None
+      blk = cast(int, cache_kv.shape[-1]) // cast(int, sc.shape[-1])
+      v = cache_kv[1, b, kv_head, key, dim_base + lane_hi].load().float() * sc[1, b, kv_head, key, dim_base // blk].load().float()
+      return v.cast(dtypes.float16)
+    return cache_kv[1, b, kv_head, key, dim_base + lane_hi].load().cast(dtypes.float16)
+  # S = Q.K^T: A = Q (rows x head_dim), B = K^T (head_dim x keys). The k-steps are a RANGE (not unrolled): the 16 n-tile accumulators
+  # stay static register files while the linear program stays short -- fully unrolled (512 mma + ~4k loads per chunk) the lowered
+  # PROGRAM UOp was too deep to pickle across the compile worker pool (C-stack overflow in the worker; 2026-09-16 card run).
+  s_acc = tuple(_reg((4,), 50 + j, 0, offset) for j in range(s_tiles))  # zeroed per chunk
+  ks = UOp.range(k_steps, 101, AxisType.REDUCE)
+  k0 = ks * WMMA_K + 2 * lane_lo
+  afrag = UOp.stack(*(q[b, q_head, row, k0 + dk].load().cast(dtypes.float16) for row in rows for dk in (0, 1)),
+                    *(q[b, q_head, row, k0 + 8 + dk].load().cast(dtypes.float16) for row in rows for dk in (0, 1)))
+  s_stores = []
+  for j in range(s_tiles):
+    key = key_base + j * WMMA_N + lane_hi
+    key_ok = key.valid(key < valid_kv_len)
+    bfrag = UOp.stack(kval(0, key_ok, k0), kval(0, key_ok, k0 + 1), kval(0, key_ok, k0 + 8), kval(0, key_ok, k0 + 9))
+    s_stores.append(s_acc[j].store(UOp.wmma(afrag, bfrag, s_acc[j].after(ks), *WMMA_ARG)))
+  s_done = UOp.group(*s_stores).end(ks)
+  s_vals = [acc.after(s_done) for acc in s_acc]
+  # masked scores (this lane: rows[0] at c0/c1, rows[1] at c2/c3; keys 2*lane_lo, +1 of each 8-key tile), chunk max per row
+  scale_log2 = LOG2E / math.sqrt(D)
+  scores, oks = [], []
+  for j, sv in enumerate(s_vals):
+    for i in range(4):
+      key, row = key_base + j * WMMA_N + 2 * lane_lo + (i % 2), rows[i // 2]
+      ok = (key < valid_kv_len) & (key <= q_start + row)
+      oks.append(ok)
+      scores.append(ok.where(sv[i].load() * scale_log2, UOp.const(SENTINEL, dtypes.float)))
+  prev_max, prev_sum = row_max.after(offset), row_sum.after(offset)
+  new_max, alphas, ps = [], [], []
+  for r in range(2):
+    m = functools.reduce(lambda a, s: a.maximum(s), [s for idx, s in enumerate(scores) if idx % 4 // 2 == r], UOp.const(SENTINEL, dtypes.float))
+    m = _shfl_xor(_shfl_xor(m, 1, maximum=True), 2, maximum=True)
+    nm = prev_max[r].load().maximum(m)
+    new_max.append(nm)
+    alphas.append((prev_max[r].load() - nm).exp2())  # scores already carry log2(e): the running max is in the exp2 domain
+  for idx, (s, ok) in enumerate(zip(scores, oks)):
+    ps.append(ok.where((s - new_max[idx % 4 // 2]).exp2(), UOp.const(0, dtypes.float)))
+  lane_sums = [functools.reduce(lambda a, p: a + p, [p for idx, p in enumerate(ps) if idx % 4 // 2 == r], UOp.const(0, dtypes.float))
+               for r in range(2)]
+  # P parked in a (16 tiles x 4) register file so the key-step RANGE below can index it; O rescaled by alpha once per chunk
+  p_reg = UOp.placeholder((s_tiles, 4), dtypes.float, slot=90, addrspace=AddrSpace.REG).after(offset)
+  p_ready = UOp.group(*(p_reg[j, i].store(ps[j * 4 + i]) for j in range(s_tiles) for i in range(4)))
+  p_reg = p_reg.after(p_ready)
+  rescaled = []
+  for n in range(o_tiles):
+    prev = o_acc[n].after(offset)
+    rescaled.append(o_acc[n].store(UOp.stack(*(prev[i].load() * alphas[i // 2] for i in range(4)))))
+  rescale = UOp.group(*rescaled)
+  # O += P.V over a RANGE of 16-key steps: A = P (rows x 16 keys) from two adjacent S tiles, B = V (16 keys x 8 dims) per output n-tile
+  t = UOp.range(BLOCK_N // WMMA_K, 102, AxisType.REDUCE)
+  afrag = UOp.stack(*(p_reg[2 * t + tt, i].load().cast(dtypes.float16) for tt in (0, 1) for i in range(4)))
+  keys = tuple(key_base + t * WMMA_K + 2 * lane_lo + dk for dk in (0, 1, 8, 9))
+  keys_ok = tuple(key.valid(key < valid_kv_len) for key in keys)
+  o_stores = []
+  for n in range(o_tiles):
+    bfrag = UOp.stack(*(vval(key, dbase + n * WMMA_N) for key in keys_ok))
+    o_stores.append(o_acc[n].store(UOp.wmma(afrag, bfrag, o_acc[n].after(rescale, t), *WMMA_ARG)))
+  o_done = UOp.group(*o_stores).end(t)
+  updates = [o_done] + [row_max[r].store(new_max[r]) for r in range(2)] + \
+    [row_sum[r].store(prev_sum[r].load() * alphas[r] + lane_sums[r]) for r in range(2)]
+  update = UOp.group(*updates).end(offset)
+  o_acc, row_max, row_sum = tuple(acc.after(update) for acc in o_acc), row_max.after(update), row_sum.after(update)
+  sums = [_shfl_xor(_shfl_xor(row_sum[r].load(), 1), 2) for r in range(2)]  # the four lanes of a row hold partial sums
+  stores = []
+  for n, acc in enumerate(o_acc):
+    d0 = dbase + n * WMMA_N + 2 * lane_lo
+    stores += [out[b, q_head, rows[0], block_n, d0].store(acc[0].load()), out[b, q_head, rows[0], block_n, d0 + 1].store(acc[1].load()),
+               out[b, q_head, rows[1], block_n, d0].store(acc[2].load()), out[b, q_head, rows[1], block_n, d0 + 1].store(acc[3].load())]
+  stats_head = q_head.valid(lane_lo.eq(0) & dpart.eq(0)) if d_split > 1 else q_head.valid(lane_lo.eq(0))
+  stores += [stats[b, stats_head, rows[r], block_n, 0].store(row_max[r].load()) for r in range(2)]
+  stores += [stats[b, stats_head, rows[r], block_n, 1].store(sums[r]) for r in range(2)]
+  return UOp.group(*stores).end(lane, block).sink(arg=KernelInfo(name="flash_prefill_wmma_nv", opts_to_apply=()))
+
 def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, valid_kv_len:int|UOp, q_start:int|UOp,
                          lanes:int=WARP_SIZE) -> Tensor:
   """q (B,H,T,D) for a prefill chunk whose keys are already stored (valid_kv_len = q_start + T); row r attends keys <= q_start + r.
   T may be a bound Variable: the queries are padded to the chunk's static width (padded rows attend every valid key and are
-  sliced off), exactly amd.py's flash_attention. Returns (B,H,T,D) float32. `lanes` is only for the CPU test (lanes=1)."""
+  sliced off), exactly amd.py's flash_attention. Returns (B,H,T,D) float32. `lanes` is only for the CPU test (lanes=1).
+  NV_ATTN_WMMA=1 (T4.113) takes the tensor-core kernel when head_dim allows it (16-row tiles); otherwise the T4.107b kernel."""
   B, H, T, D = q.shape
-  q_rows = NV_ATTN_QROWS.value
+  d_split = NV_ATTN_WMMA_DSPLIT.value
+  wmma = bool(NV_ATTN_WMMA.value) and lanes == WARP_SIZE and cast(int, D) % WMMA_K == 0 and cast(int, D) % (WMMA_N * d_split) == 0
+  q_rows = WMMA_M if wmma else NV_ATTN_QROWS.value
   T_pad = -(-q.max_shape[2] // q_rows) * q_rows
   if resolve(T != T_pad): q = q.pad_to((B, H, T_pad, D))
   N = cast(int, cache_kv.shape[3])
   chunks = min(PREFILL_CHUNKS, N // BLOCK_N)
   partial = Tensor.empty(B, H, T_pad, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, T_pad, chunks, 2, dtype="float32", device=q.device)
-  fxn = functools.partial(_prefill_partial_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, q_rows=q_rows, lanes=lanes)
+  if wmma: fxn = functools.partial(_prefill_wmma_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, d_split=d_split)
+  else: fxn = functools.partial(_prefill_partial_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, q_rows=q_rows, lanes=lanes)
   srcs = (partial, stats, q.contiguous(), cache_kv) + ((cache_kv_scale,) if cache_kv_scale is not None else ())
   partial, stats = Tensor.custom_kernel(*srcs, fxn=fxn)[:2]
   out = _merge_partials(partial, stats, valid_kv_len)
