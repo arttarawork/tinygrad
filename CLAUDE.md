@@ -29,7 +29,7 @@ HANDOFF §2) cite `integration/phase1b` (`b37c792c6`). Re-verify file:line refs 
   KFD iface only — never the AM/PCI driver path there; it unbinds amdgpu and kills the display.
 
 ## Conventions
-- Branch `task/T<id>-<slug>` off fork `master` = **`43ac66739`** (the PR #43 merge, 2026-09-10 — master is content-identical to the serving tree `integration/t6` 4c6b6a954: everything through T4.92/T4.95-97 and the T6.x chain is on master; earlier bases 2d38cada5 (#26, 09-01) and older apply only to their era's branches. PR #44 merged 09-12 (11101713b); integration/t6 is master + T4.106 (477f299ea) + T4.107a (aa46d6244) as of 09-12 23:41 — the next PR bundles those with T4.107b/T4.94 when they land.)
+- Branch `task/T<id>-<slug>` off fork `master` = **`018532163`** (the PR #46 merge, 2026-09-16: master == integration/t6 — T4.111/T4.113/T4.116 + AGENTS.md; earlier base `43ac66739` = the PR #43 merge, 2026-09-10 — master is content-identical to the serving tree `integration/t6` 4c6b6a954: everything through T4.92/T4.95-97 and the T6.x chain is on master; earlier bases 2d38cada5 (#26, 09-01) and older apply only to their era's branches. PR #44 merged 09-12 (11101713b); integration/t6 is master + T4.106 (477f299ea) + T4.107a (aa46d6244) as of 09-12 23:41 — the next PR bundles those with T4.107b/T4.94 when they land.)
   `integration/phase1b`
   RETIRED; dock trees = master or a descendant — plus `task/T4.40c-halt-verify` once hardware-verified. There is no local `master`, and **`origin/*` tracking refs are STALE by construction** (SSH `origin`
   is interactive-only; agents fetch/push via the explicit HTTPS URL `https://github.com/arttarawork/tinygrad.git`,

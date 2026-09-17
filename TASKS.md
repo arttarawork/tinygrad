@@ -1,6 +1,6 @@
 # TASKS.md — agent handoff for the Ampere-over-Thunderbolt effort
 
-> **RESUME HERE (2026-09-13 10:40):** read `HANDOFF_2026-09-13.md` — the dock is disconnected on purpose; reconnect procedure there. Standing = Q4_0 @262144 with both attention kernels; master == integration/t6 (PR #45). Open: T4.113 (waiting), T4.93b (needs Artur's prompts), T4.94b (parked), BEAM refresh, chat-harness choice.
+> **RESUME HERE (2026-09-16 19:10):** read `HANDOFF_2026-09-13.md` §5d/§5e (the 09-15/16 sprint) then §0–§4. Standing = Q4_0 @262144, `NV_ATTN_WMMA=1` (T4.113), `STATE_CACHE_TOOL_SNAPSHOTS=0`, Hermes compaction at 131072; Ornith-1.5-9B Q5_K_M on :8082 (LaunchAgent), Ling on demand. master == integration/t6 (PR #46, 018532163). Ops: `~/Documents/tinygrad-bench-data/RUNBOOK.md`, `healthcheck.sh`. Open: T4.93b (needs Artur's prompts), T4.94b (parked), BEAM refresh, WMMA levers (`NV_ATTN_WMMA_DSPLIT=2`, per-kv-head variant), the held macOS 15.8 update.
 >
 > **Next arc (drafted 2026-09-09, done by 09-13):** T4.91 `reasoning_effort` passthrough (every think:on request has run at the template default xhigh) → T4.92 model-card sampler defaults + presence penalty → T4.93 the 27B on the 3090 ALONE at 4-bit (measure first) → T4.94 MTP on that build. Entries at the end of the T4 section. **2026-09-10: all of the above is on master (43ac66739 == integration/t6). T4.93 measured and parked (K-quant 5.4 / Q4_0 6.9 tok/s: the generated gemv kernels cap every quant). NOW: T4.98 (hand-written NV quantized gemv, 6 subtasks, agents running), T4.99 host snapshots, T4.93b quality gate. Hermes/server deliberately DOWN for the experiments (Artur 09-10: \"Don't hesitate to stop it\").**
 
@@ -522,6 +522,7 @@ flowchart LR
 ```
 
 ## Status log
+- **2026-09-16 19:10 PR #46 merged:** master = integration/t6 = 018532163 (T4.111 + fix, T4.113, T4.116, AGENTS.md). Closing sprint complete; see HANDOFF §5e.
 - **2026-09-16 18:00 T4.113 live-bound:** tensor-core prefill attention validated (+31 % at 61k, +14 % at 20k, argmax identical, gate 12/1152) → merged, flag standing, restart in the idle window. Speculative decoding for Ornith = net loss on Metal (recorded). K2 final 3/20. HANDOFF_2026-09-13 §5e.
 - **2026-09-16 15:00 closing sprint:** RUNBOOK.md + healthcheck.sh + daily-maintenance LaunchAgent + Ornith LaunchAgent + deploy_start wrapper + Ornith 64k + PR script (open_pr_t4111.sh). Maple 0/20 twice (out); K2 with card settings running. HANDOFF_2026-09-13 §5e.
 - **2026-09-16 07:45 T4.115 addenda (LocalLLaMA thread):** K2-Horizon-3.7B 5/20 resolved on the fork with half the runs cut by the 4096 cap → 8192-cap rerun in progress; Maple 0/20 (loops on tool calls, never submits); Ling instant+recommended 2/20. Ornith-1.5-9B Q5_K_M stays the worker. Disk: 09-16 00:48 full → VM read-only → recovered (`vm_recover.sh`); 123 GB of models deleted incl. the 35B fallback (Artur). HANDOFF_2026-09-13 §5d.
