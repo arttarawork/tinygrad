@@ -522,6 +522,7 @@ flowchart LR
 ```
 
 ## Status log
+- **2026-09-24 upstream survey:** 495 upstream commits since the 08-26 merge-base; hcq2 runtime rewrite + the macOS TinyGPU transport removed from upstream's runtime (parked in extra/hcq1) → no rebase, nothing to cherry-pick (upstream LLM kernels are AMD-only; our formats/KV fix already present). Rebase trigger: the macOS remote returning to hcq2. HANDOFF_2026-09-17 §3 item 6.
 - **2026-09-16 19:10 PR #46 merged:** master = integration/t6 = 018532163 (T4.111 + fix, T4.113, T4.116, AGENTS.md). Closing sprint complete; see HANDOFF §5e.
 - **2026-09-16 18:00 T4.113 live-bound:** tensor-core prefill attention validated (+31 % at 61k, +14 % at 20k, argmax identical, gate 12/1152) → merged, flag standing, restart in the idle window. Speculative decoding for Ornith = net loss on Metal (recorded). K2 final 3/20. HANDOFF_2026-09-13 §5e.
 - **2026-09-16 15:00 closing sprint:** RUNBOOK.md + healthcheck.sh + daily-maintenance LaunchAgent + Ornith LaunchAgent + deploy_start wrapper + Ornith 64k + PR script (open_pr_t4111.sh). Maple 0/20 twice (out); K2 with card settings running. HANDOFF_2026-09-13 §5e.
