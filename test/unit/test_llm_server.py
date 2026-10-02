@@ -1030,6 +1030,30 @@ class TestBoundarySnapshot(unittest.TestCase):
     srv.store_snapshot([7, 8], boundary=True)            # E: a new boundary evicts anything older, including A
     self.assertEqual(list(srv.snapshots), [(7, 8)])
 
+  def test_supersede_keeps_one_snapshot_per_conversation(self):
+    # T4.117: two coworkers alternating on one server -- each conversation's newer snapshot replaces its older ones (and
+    # inherits their pin), the shared T4.111 prefix snapshot survives, and the other conversation is untouched.
+    import collections
+    from types import SimpleNamespace
+    import tinygrad.llm.serve as srv_mod
+    from tinygrad.llm.serve import LLMServer
+    srv = LLMServer.__new__(LLMServer)
+    srv.snapshots, srv.state_cache_mb = collections.OrderedDict(), 64
+    class Snap(dict): pass
+    srv.model = SimpleNamespace(snapshot_state=lambda: Snap(blocks=[{"recurrent_state": Tensor.zeros(1024)}]))
+    with patch.object(srv_mod, "STATE_CACHE_SUPERSEDE", 1):
+      srv.store_snapshot([1, 2], boundary=True, prefix=True)       # P: the shared system prompt
+      srv.store_snapshot([1, 2, 3, 4], boundary=True)              # A: coworker A's user turn (pinned)
+      srv.store_snapshot([1, 2, 7, 8], boundary=True)              # B: coworker B's user turn
+      srv.store_snapshot([1, 2, 3, 4, 5, 6], boundary=False)       # A's tool step: replaces A, inherits its pin
+      self.assertEqual(list(srv.snapshots), [(1, 2), (1, 2, 7, 8), (1, 2, 3, 4, 5, 6)])
+      self.assertTrue(srv.snapshots[(1, 2, 3, 4, 5, 6)]["boundary"])
+      self.assertTrue(srv.snapshots[(1, 2)]["prefix"])
+      srv.store_snapshot([1, 2, 7, 8, 9], boundary=False)          # B's tool step: replaces only B
+      self.assertEqual(list(srv.snapshots), [(1, 2), (1, 2, 3, 4, 5, 6), (1, 2, 7, 8, 9)])
+    srv.store_snapshot([1, 2, 7, 8, 9, 10], boundary=False)        # knob off: the T4.96 rule, nothing superseded
+    self.assertIn((1, 2, 7, 8, 9), srv.snapshots)
+
   def test_reference_to_restored_snapshot_is_released_before_next_store(self):
     # T4.96: run_model's own `snap := find_snapshot(ids)` walrus is a generator-frame local -- generator frames
     # don't drop locals across yields, so it used to live for the whole request. A snapshot restored early in a

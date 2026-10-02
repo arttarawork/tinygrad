@@ -24,6 +24,12 @@ STATE_CACHE_MB = getenv("STATE_CACHE_MB", 2048)
 # 2026-09-15 (Artur): tool-loop snapshots only serve a retry of the identical prompt; Hermes's skill authoring keeps what a loop learned.
 # 0 = a request whose last message is a tool result stores no snapshot; user turns and the prefix snapshot are unaffected.
 STATE_CACHE_TOOL_SNAPSHOTS = getenv("STATE_CACHE_TOOL_SNAPSHOTS", 1)
+# T4.117 (2026-10-01, time-shared coworkers): a newer snapshot of the SAME conversation -- its ids extend an older snapshot's key --
+# makes the older one dead weight (every later lookup prefers the longer match), so drop it and let the new one inherit its pin.
+# Keeps the cache at ~one snapshot per live conversation, so two agents alternating on one server both resume near their ends.
+# T4.111 prefix snapshots are shared by every session of a client and are never superseded. Cost: a retry from an EARLIER
+# point of a conversation falls back to its prefix snapshot. 0 = the T4.96 two-tier behavior unchanged.
+STATE_CACHE_SUPERSEDE = getenv("STATE_CACHE_SUPERSEDE", 0)
 # T4.111: minimum length (tokens) of a request's FIXED PREFIX -- everything before its first user message --
 # worth its own pinned state-cache snapshot (see Handler.run_model). A short prefix isn't worth a whole extra
 # snapshot slot under LLMServer.store_snapshot's own MB cap; a real system prompt + tool schemas is 9k-13k.
@@ -395,7 +401,7 @@ class Handler(HTTPRequestHandler):
         k = len(prefix_ids)
         if k >= PREFIX_SNAPSHOT_MIN and ids[:k] == prefix_ids and tuple(prefix_ids) not in self.server.snapshots:
           model.prefill_only(prefix_ids)
-          self.server.store_snapshot(prefix_ids, boundary=True)
+          self.server.store_snapshot(prefix_ids, boundary=True, prefix=True)
           cache_start_pos = model.get_start_pos(ids)
           prefix_len = k
     # T5.4: " img:{images}/{visual tokens}" after the in: field, only when this request actually carries images.
@@ -645,7 +651,7 @@ class LLMServer(TCPServerWithReuse):
     self.snapshots.move_to_end(best_key)
     return self.snapshots[best_key]
 
-  def store_snapshot(self, ids:list[int], one_shot:bool=False, boundary:bool=True) -> None:
+  def store_snapshot(self, ids:list[int], one_shot:bool=False, boundary:bool=True, prefix:bool=False) -> None:
     """Snapshot self.model's current state -- assumed to have just finished prefilling exactly `ids` (see
     Handler.run_model) -- under key tuple(ids), LRU-evicting the oldest entries to stay under state_cache_mb
     (always keeping at least the just-stored entry, even if it alone exceeds the cap).
@@ -673,6 +679,10 @@ class LLMServer(TCPServerWithReuse):
       if (est := snapshot_nbytes_for(next(iter(self.snapshots.values())), len(ids))) > cap:
         stderr_log(f"{colored(f'state cache: skip {len(ids)}-token snapshot (~{est>>20} MB > cap)', 'yellow')}  {colored('--', 'BLACK')}  ")
         return
+      if STATE_CACHE_SUPERSEDE and (old := [k for k, v in self.snapshots.items() if not v.get("prefix") and len(k) < len(key) and key[:len(k)] == k]):
+        boundary = boundary or any(self.snapshots[k].get("boundary", True) for k in old)   # inherit the pin it replaces
+        for k in old: self.snapshots.pop(k)
+        _free_state_cache_lru()  # T4.106
       total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
       # LRU-first, but only what this store may displace: a tool-loop snapshot never evicts a pinned boundary one (T4.96)
       evicted = False
@@ -690,7 +700,7 @@ class LLMServer(TCPServerWithReuse):
       _free_state_cache_lru()  # T4.106: same as above -- every dropped snapshot's buffers must actually be freed
       stderr_log(f"{colored(f'state cache: snapshot dropped ({str(e)[:50]}), cache cleared', 'yellow')}  {colored('--', 'BLACK')}  ")
       return
-    snap["boundary"] = boundary
+    snap["boundary"], snap["prefix"] = boundary, prefix
     self.snapshots[key] = snap
     total = sum(snapshot_nbytes(v) for v in self.snapshots.values())
     evicted = False
