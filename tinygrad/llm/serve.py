@@ -509,7 +509,11 @@ class Handler(HTTPRequestHandler):
         yield chunk({"tool_calls":tool_calls})
         if finish_reason == "stop": finish_reason = "tool_calls"
       completed = True
-      if record is not None: self.server.last = (*record, out)  # what the model state now holds, for splice_ids on the next turn
+      if record is not None:
+        self.server.last = (*record, out)  # what the model state now holds, for splice_ids on the next turn
+        if (turns := getattr(self.server, "turns", None)) is not None:  # T4.118: one record per conversation, newest kept
+          for t in [t for t in turns if record[0].startswith(t[0])]: turns.remove(t)
+          turns.append(self.server.last)
       yield {"choices": [{"index":0, "delta":{},"finish_reason":finish_reason}], **tmpl}
       if include_usage:
         yield {"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(out),
@@ -563,8 +567,8 @@ class Handler(HTTPRequestHandler):
         embed_list = [enc(Tensor(patches, device=enc.device), grid) for _, patches, grid in loaded]
         vision_input = VisionInput(spans, Tensor.cat(*embed_list, dim=0).realize())
       else:
-        ids = (splice_ids(self.server.last, rendered, body["messages"], render, self.server.tok) if self.server.last else None) \
-          or self.server.tok.encode(rendered)
+        turns = getattr(self.server, "turns", None) or ([self.server.last] if self.server.last else [])
+        ids = splice_from_turns(turns, rendered, body["messages"], render, self.server.tok) or self.server.tok.encode(rendered)
         record = (rendered, ids, len(body["messages"]))
       think = (f"think:{kwargs.get('reasoning_effort', 'xhigh') if kwargs['enable_thinking'] else 'off'}  {colored('--', 'BLACK')}  "
                if "enable_thinking" in kwargs else "")
@@ -616,6 +620,18 @@ class Handler(HTTPRequestHandler):
 # decode step (that's the whole point of LRU=1), and flushing it there would force reallocation and cost real
 # tok/s -- exactly the throughput hit the blunter global LRU=0 mitigation already causes. When STATE_CACHE_DEVICE
 # is unset, snapshot buffers stay on each block's own live device (T4.99) and this is a no-op -- out of scope here.
+
+SPLICE_TURNS = getenv("SPLICE_TURNS", 8)
+
+def splice_from_turns(turns, rendered:str, messages:list[dict], render:typing.Callable[[list[dict], bool], str],
+                      tok:SimpleTokenizer) -> list[int]|None:
+  """T4.118: splice against EVERY remembered conversation's last turn, longest first -- agents time-sharing the server interleave,
+  so this conversation's record is often not the most recent one. Without it the returning agent's history re-encodes plainly,
+  no longer extends its own (spliced) state-cache snapshot, and resumes far back (2026-10-02: a 20k-token re-read, 4 min)."""
+  for last in sorted(turns, key=lambda r: len(r[0]), reverse=True):
+    if rendered.startswith(last[0]) and (ids := splice_ids(last, rendered, messages, render, tok)) is not None: return ids
+  return None
+
 def _free_state_cache_lru() -> None:
   if STATE_CACHE_DEVICE and isinstance(alloc := Device[STATE_CACHE_DEVICE].allocator, LRUAllocator): alloc.free_cache()
 
@@ -625,6 +641,7 @@ class LLMServer(TCPServerWithReuse):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
     self.mtp, self.spec_k = mtp, spec_k  # T4.65: --mtp/SPEC_TOKENS -- see Handler.run_model's use_spec
     self.last: tuple[str, list[int], int, list[int]]|None = None  # (rendered prompt, ids, message count, generated ids) of the last completed request
+    self.turns: collections.deque = collections.deque(maxlen=SPLICE_TURNS)  # T4.118: last turn of each recent conversation
     # T4.67: cross-session state cache -- self.last above only ever remembers ONE (the most recent) sequence;
     # this keyed, MB-capped, LRU dict lets a later request reuse ANY previously-snapshotted sequence whose
     # tokens it exactly extends, not just the immediately preceding one. Default 0 = off (byte-identical to

@@ -427,6 +427,16 @@ class TestSpliceIds(unittest.TestCase):
   def test_no_assistant_turn_falls_back(self):
     self.assertIsNone(self._splice(self.hist + [{"role":"user","content":"more"}]))
 
+  def test_splice_finds_this_conversations_turn_after_another_agent_ran(self):
+    # T4.118: agent A's turn, then agent B's (now the most recent record) -- A's follow-up must still splice against A's record.
+    from tinygrad.llm.serve import splice_from_turns
+    other_hist = [{"role":"system","content":"be brief"}, {"role":"user","content":"a different task"}]
+    other = (self.render(other_hist, True), self.tok.encode(self.render(other_hist, True)), len(other_hist), self.tok.encode("done"))
+    msgs = self.hist + [{"role":"assistant","content":"ok   then"}, {"role":"user","content":"more"}]
+    ids = splice_from_turns([self.last, other], self.render(msgs, True), msgs, self.render, self.tok)
+    self.assertEqual(ids[:len(self.prev_ids)+len(self.gen)], self.prev_ids + self.gen)
+    self.assertIsNone(splice_from_turns([other], self.render(msgs, True), msgs, self.render, self.tok))  # only B's record: plain encode
+
 class TestLMStudioShim(unittest.TestCase):
   # T4.80: LM Studio's native probe endpoints (Hermes's /reasoning command) + reasoning_effort -> enable_thinking
 
