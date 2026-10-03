@@ -636,6 +636,7 @@ def _free_state_cache_lru() -> None:
   if STATE_CACHE_DEVICE and isinstance(alloc := Device[STATE_CACHE_DEVICE].allocator, LRUAllocator): alloc.free_cache()
 
 class LLMServer(TCPServerWithReuse):
+  request_queue_size = 128  # T4.119: socketserver's 5 overflowed while one long request ran -> macOS dropped new connects after 7.8 s
   def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer, template:typing.Any,
                mtp:bool=False, spec_k:int=SPEC_TOKENS, state_cache_mb:int=0, vision:VisionEncoder|None=None):
     self.model, self.model_name, self.tok, self.template = model, model_name, tok, template
