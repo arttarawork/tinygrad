@@ -5,7 +5,7 @@ from pathlib import Path
 import tarfile
 import gdown
 from tqdm import tqdm
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, tar_members
 
 def gdrive_download(url:str, path:str):
   if not os.path.exists(path): gdown.download(url, path)
@@ -14,12 +14,12 @@ def wikipedia_uncompress_and_extract(file:str, path:str, small:bool=False):
   if not os.path.exists(os.path.join(path, "results4")):
     print("Uncompressing and extracting file...")
     with tarfile.open(file, 'r:gz') as tar:
-      tar.extractall(path=path)
+      tar.extractall(path=path, members=tar_members(tar, path), filter="data")
       os.remove(file)
       if small:
-        for member in tar.getmembers(): tar.extract(path=path, member=member)
+        for member in tar_members(tar, path): tar.extract(path=path, member=member, filter="data")
       else:
-        for member in tqdm(iterable=tar.getmembers(), total=len(tar.getmembers())): tar.extract(path=path, member=member)
+        for member in tqdm(iterable=(ms:=tar_members(tar, path)), total=len(ms)): tar.extract(path=path, member=member, filter="data")
 
 def verify_checksum(folder_path:str, checksum_path:str):
   print("Verifying checksums...")

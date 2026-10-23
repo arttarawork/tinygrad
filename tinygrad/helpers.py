@@ -463,6 +463,30 @@ def _ensure_downloads_dir() -> pathlib.Path:
     return downloads_dir
   return pathlib.Path(cache_dir) / "downloads"
 
+def tar_members(tf, dest:str) -> list:
+  # tarfile's own filters have had link-based bypasses (CVE-2026-7774 for "data", CVE-2026-114583 for "tar"), so archives we didn't
+  # create are checked here as well: plain files/dirs/links only, nothing outside dest, nothing written or linked through an earlier link
+  import unicodedata, posixpath
+  links:set[str] = set()
+  def key(n:str) -> str: return unicodedata.normalize("NFC", n).casefold()  # APFS is case- and normalization-insensitive
+  def walk(path:str, exact:bool) -> str:  # resolve "." and ".." one component at a time, refusing to step through a link
+    out:list[str] = []
+    comps = [c for c in path.split("/") if c not in ("", ".")]
+    for i, c in enumerate(comps):
+      if c != "..": out.append(c)
+      elif out: out.pop()
+      else: raise ValueError(f"tar path escapes {dest}: {path!r}")
+      if c != ".." and (exact or i < len(comps)-1) and key("/".join(out)) in links: raise ValueError(f"tar path goes through a link: {path!r}")
+    return "/".join(out)
+  for m in tf.getmembers():
+    if not (m.isfile() or m.isdir() or m.issym() or m.islnk()) or m.name.startswith("/") or not (name:=walk(m.name, exact=True)):
+      raise ValueError(f"unsafe tar member {m.name!r}")
+    if m.issym() or m.islnk():
+      if m.linkname.startswith("/"): raise ValueError(f"absolute tar link {m.name!r} -> {m.linkname!r}")
+      walk(posixpath.join(posixpath.dirname(name), m.linkname) if m.issym() else m.linkname, exact=False)
+      links.add(key(name))
+  return tf.getmembers()
+
 def fetch(url:str, name:pathlib.Path|str|None=None, subdir:str|None=None, gunzip:bool=False, allow_caching=not getenv("DISABLE_HTTP_CACHE"),
           headers:dict[str, str]={}, sha256:str|None=None, extract:bool=False) -> pathlib.Path:
   import urllib.request
@@ -495,7 +519,7 @@ def fetch(url:str, name:pathlib.Path|str|None=None, subdir:str|None=None, gunzip
       import tarfile
       tmpdir = tempfile.mkdtemp(dir=fp.parent)
       try:
-        with tarfile.open(fp) as t: t.extractall(tmpdir, filter="data")
+        with tarfile.open(fp) as t: t.extractall(tmpdir, members=tar_members(t, tmpdir), filter="data")
         try: os.rename(tmpdir, extract_dir)  # rename is atomic, so concurrent fetches can't see a partial extraction
         except OSError:
           if not extract_dir.is_dir(): raise

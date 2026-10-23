@@ -1,5 +1,5 @@
 # Python version of https://gist.github.com/antoinebrl/7d00d5cb6c95ef194c737392ef7e476a
-from tinygrad.helpers import fetch
+from tinygrad.helpers import fetch, tar_members
 from pathlib import Path
 from tqdm import tqdm
 import tarfile, os
@@ -7,9 +7,9 @@ import tarfile, os
 def imagenet_extract(file, path, small=False):
   with tarfile.open(name=file) as tar:
     if small: # Show progressbar only for big files
-      for member in tar.getmembers(): tar.extract(path=path, member=member)
+      for member in tar_members(tar, path): tar.extract(path=path, member=member, filter="data")
     else:
-      for member in tqdm(iterable=tar.getmembers(), total=len(tar.getmembers())): tar.extract(path=path, member=member)
+      for member in tqdm(iterable=(ms:=tar_members(tar, path)), total=len(ms)): tar.extract(path=path, member=member, filter="data")
     tar.close()
 
 def imagenet_prepare_val():

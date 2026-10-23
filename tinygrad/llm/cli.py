@@ -209,7 +209,7 @@ def main():
     # SIGTERM is the documented stop: make it a normal exit so atexit -> Device.finalize() (the GSP unload on NV) runs;
     # python's default disposition would skip it
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    LLMServer(('', args.serve), model, model_name, tok, template, mtp=args.mtp,
+    LLMServer(('127.0.0.1', args.serve), model, model_name, tok, template, mtp=args.mtp,
               state_cache_mb=STATE_CACHE_MB if args.state_cache else 0, vision=enc).serve_forever()
 
   # do benchmark

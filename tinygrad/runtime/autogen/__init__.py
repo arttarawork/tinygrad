@@ -1,5 +1,5 @@
 import glob, importlib, os, pathlib, subprocess
-from tinygrad.helpers import fetch, flatten, system, getenv
+from tinygrad.helpers import fetch, flatten, system, getenv, tar_members
 
 root = (here:=pathlib.Path(__file__).parent).parents[2]
 nv_src = {"nv_570": "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/81fe4fb417c8ac3b9bdcc1d56827d116743892a5.tar.gz",
@@ -37,7 +37,7 @@ def load(name, files, **kwargs):
         if 'tar' in src:
           # dangerous for arbitrary urls!
           with tarfile.open(fetch(src, gunzip=src.endswith("gz"))) as tf:
-            tf.extractall(srcpath)
+            tf.extractall(srcpath, members=tar_members(tf, srcpath), filter="data")
             if not isinstance(srcs, list): srcpath += tf.getnames()[0] # if we just have a single tarball, make this the root
         else: fetch(src, name=srcpath + src.split('/')[-1])
       files, kwargs['args'] = [str(f).format(srcpath) for f in files], [a.format(srcpath) for a in kwargs.get('args', [])]
