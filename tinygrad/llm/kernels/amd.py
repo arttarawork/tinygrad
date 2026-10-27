@@ -121,9 +121,9 @@ class Linear(nn.Linear):
       if self.ggml_type is None and not (nv_supported and nv_dense.nv_dense_eligible(self)):
         # neither a supported ggml quant format nor a small-enough dense layer for the NV gemv (T4.98h) -- never
         # true again for this layer instance (shape/dtype are fixed for its lifetime), so stop re-probing every
-        # call. When it IS gemv-eligible, leave nv_supported alone: a >4-token prefill call must not permanently
-        # disable the 1-token decode calls that follow it -- nv_f16_gemv (below) re-checks the token count itself,
-        # every call, and returns None (falls through) rather than guess when it doesn't cover this call's shape
+        # call. When it IS gemv-eligible, leave nv_supported alone: nv_dense covers every token count (T4.122b),
+        # concrete or symbolic, so this probe no longer varies call to call the way it used to when nv_f16_gemv
+        # bailed out above 4 tokens -- it still returns None (falls through) when the weight copy isn't ready yet
         self.use_custom_quant = amd_supported = nv_supported = False
     if self.ggml_type in (Q4_K, Q5_K, Q6_K, IQ4_XS) and amd_supported:
       if isinstance(x.numel(), int): return q8_linear(self, x)
@@ -136,8 +136,9 @@ class Linear(nn.Linear):
     # nv_gemm.py covers the prefill side of the same two byte-view formats (Q8_0/Q4_0, tokens > 4) with the tensor cores
     # (T4.98f); same None-means-fall-through contract, NV_WMMA=0 keeps the generic matmul for A/B
     if nv_supported and self.ggml_type is not None and (nv_out := nv_gemm.nv_wmma_linear(self, x)) is not None: return nv_out
-    # nv_dense.py covers the same decode-only range for a non-quantized (plain dense) small Linear layer, e.g.
-    # GatedDeltaNet's ssm_alpha/ssm_beta head projections (T4.98h) -- same None-means-fall-through contract
+    # nv_dense.py covers decode AND prefill (T4.122b: any token count, including a symbolic chunk width) for a
+    # non-quantized (plain dense) small Linear layer, e.g. GatedDeltaNet's ssm_alpha/ssm_beta head projections
+    # (T4.98h) -- same None-means-fall-through contract
     if nv_supported and self.ggml_type is None and (nv_out := nv_dense.nv_f16_gemv(self, x)) is not None: return nv_out
     if (dequant_weight := self.dequant_weight) is None: return super().__call__(x)
     # self.weight is the packed view once ggml_type is set -- swap the pre-quantization dequant graph back in for
