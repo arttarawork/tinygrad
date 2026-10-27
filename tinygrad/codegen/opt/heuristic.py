@@ -192,12 +192,26 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       k.apply_opt(Opt(OptOps.NOLOCALS))
     else:
       # prioritize making expand axes local
+      # T4.122a: a symbolic-size axis (e.g. a prefill chunk's merged `toks*17408` range) has src[0].op != CONST,
+      # but still carries a concrete factor (17408) that shift_to can split on via .divides() -- the same test
+      # this file already uses for symbolic axes elsewhere (MV's reduce axis above, TC's upcast candidates).
+      # Gate on const_factor() > 1 instead of requiring a bare CONST so these single-axis elementwise prefill
+      # kernels (SiLU, residual adds, cache-offset copies) stop launching 1 thread/block; concrete CONST axes
+      # (const_factor() == their own value) are unaffected.
       local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
-                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK) if k.rngs[axis].src[0].op is Ops.CONST]
+                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK) \
+                              if k.rngs[axis].src[0].op is Ops.CONST or k.rngs[axis].src[0].const_factor() > 1]
       to_local: list[tuple[int, int]] = []
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
-        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        # a merged symbolic axis has no sibling axis left to contribute a second LOCAL split (unlike a
+        # concrete multi-axis kernel, where axis0 maxes at 32 and relies on OTHER axes to reach 128), so it
+        # gets first crack at the full 128 budget in one split; concrete (CONST) axes keep their exact old
+        # candidate list so already-tuned concrete kernels render identically.
+        is_const = k.rngs[axis].src[0].op is Ops.CONST
+        candidates = ([32] * (axis == 0) + [16,8,4,3,2]) if is_const else [128,64,32,16,8,4,3,2]
+        local_sz: int|None = next((x for x in candidates
+                                    if k.rngs[axis].src[0].divides(x) is not None and local_size * x <= 128), None)
         if local_sz is not None: to_local.append((axis, local_sz))
       deleted_shape = 0
       for axis, local_sz in sorted(to_local[:3]):
