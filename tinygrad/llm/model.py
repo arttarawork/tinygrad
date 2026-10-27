@@ -911,8 +911,13 @@ class GatedDeltaNetBlock(FFNBlock):
     # qkv conv, conv_state is reset when starting from position 0
     conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | qkv rows | zero-pad].
-    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
-    win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels, device=x.device).uop
+    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp).
+    # T4.123b: when T is concrete and equals T_pad (decode, or any non-symbolic call), the two stores below
+    # write every row ((conv_kernel-1) + T == (conv_kernel-1) + T_pad) -- skip the zero-fill, it's dead weight.
+    # Symbolic prefill chunks can have T < T_pad (the remainder chunk), so the padded rows must stay zero.
+    win_fully_written = not symbolic and T == T_pad
+    win_ctor = Tensor.empty if win_fully_written else Tensor.zeros
+    win = win_ctor(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels, device=x.device).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
     win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
     conv_window = Tensor(win)
