@@ -385,7 +385,7 @@ class TestQuantizeOncePerActivation(unittest.TestCase):
     from tinygrad.llm.kernels.nv_quant import _q8_quantize_cached
     info = _q8_quantize_cached.cache_info()
     self.assertIsNotNone(info.maxsize)
-    self.assertGreater(cast(int, info.maxsize), 300)  # comfortably above one decode trace's ~257 distinct activations
+    self.assertLessEqual(cast(int, info.maxsize), 64)  # sharing is between back-to-back calls; a big bound pins old graphs
 
 class TestDispatch(unittest.TestCase):
   """With NV_CUSTOM_QUANT unset (default 0), or set on a non-NV device, Linear must never construct a custom

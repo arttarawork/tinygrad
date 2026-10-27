@@ -96,12 +96,11 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
 # x.uop as a literal src (the kernel genuinely reads x's buffer), so the cache would hold a live strong path back
 # to its own key (cache -> value -> kernel -> x.uop) -- a cycle rooted in a module-global, which neither simple
 # refcounting nor a weakref (e.g. WeakKeyDictionary) can break, since the dict is itself always reachable. The
-# fix is a HARD BOUND, not weakness: `lru_cache(maxsize=...)` evicts the oldest entries once the cache overflows,
-# which is the only thing that actually limits retention for a cache shaped this way. One decode-step trace needs
-# at most ~257 distinct entries live at once (T4.123 profile: 401 quantizes, 144 of them duplicates); 4096 covers
-# several concurrent JIT families' worth of decode traces with room to spare while still being a fixed ceiling --
-# old families' entries age out under new ones instead of growing forever over a long server run.
-@functools.lru_cache(maxsize=4096)
+# fix is a HARD BOUND: `lru_cache(maxsize=...)` evicts the oldest entries once the cache overflows. The Linears that share
+# an input are called back to back (q/k/v, gate/up, attn_gate..attn_qkv), so a handful of entries gets every share; a
+# big bound would pin up to that many old activation graphs (and the buffers an eager/capture run realized for them) on a
+# card that runs within ~1 GB of full at 262k context.
+@functools.lru_cache(maxsize=16)
 def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int) -> tuple[UOp, UOp]:
   x = Tensor(x_uop)
   groups = in_features//Q8_GROUP_SIZE
