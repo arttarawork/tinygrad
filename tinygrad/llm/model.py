@@ -880,7 +880,7 @@ class GatedDeltaNetBlock(FFNBlock):
     if hasattr(self, "ssm_g_a") or self.ssm_norm.weight is None or not nv_decode_kernel_supported(self.ssm_a.device): return
     if self.head_k_dim % 32 or self.head_v_dim % 8 or self.head_v_dim > 256 or self.conv_channels % 32: return  # 32-lane rows, <= 1024 threads
     self.nv_decode_weights = cast(tuple[Tensor, Tensor, Tensor, Tensor], tuple(t.float().contiguous().realize() for t in
-      (self.ssm_conv1d["weight"], cast(Tensor, self.ssm_norm.weight), self.ssm_dt["bias"], self.ssm_a)))
+      (self.ssm_conv1d["weight"], self.ssm_norm.weight, self.ssm_dt["bias"], self.ssm_a)))
 
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
     # rope: unused, GDN has no positions (T5.3); kept so FFNBlock.__call__ can pass it positionally to every block type.
