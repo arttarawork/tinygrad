@@ -89,12 +89,30 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
   stores = (q[token, group, lane.valid(lane < 8)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+# T4.123a: several Linears in one forward step quantize the SAME activation (FFN gate+up, GDN attn_gate/attn_qkv,
+# attention q/k/v all read one norm output) -- q8_quantize used to run the quantize kernel once per Linear even
+# though the result is identical. Share it, keyed on x.uop (the live graph node for this call's activation).
+# A plain `functools.cache` (unbounded) was rejected: a cache VALUE here is a (q, scale) pair whose CALL node has
+# x.uop as a literal src (the kernel genuinely reads x's buffer), so the cache would hold a live strong path back
+# to its own key (cache -> value -> kernel -> x.uop) -- a cycle rooted in a module-global, which neither simple
+# refcounting nor a weakref (e.g. WeakKeyDictionary) can break, since the dict is itself always reachable. The
+# fix is a HARD BOUND, not weakness: `lru_cache(maxsize=...)` evicts the oldest entries once the cache overflows,
+# which is the only thing that actually limits retention for a cache shaped this way. One decode-step trace needs
+# at most ~257 distinct entries live at once (T4.123 profile: 401 quantizes, 144 of them duplicates); 4096 covers
+# several concurrent JIT families' worth of decode traces with room to spare while still being a fixed ceiling --
+# old families' entries age out under new ones instead of growing forever over a long server run.
+@functools.lru_cache(maxsize=4096)
+def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int) -> tuple[UOp, UOp]:
+  x = Tensor(x_uop)
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
-  return q, scale
+  return q.uop, scale.uop
+
+def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  q_uop, scale_uop = _q8_quantize_cached(x.uop, tokens, in_features)
+  return Tensor(q_uop), Tensor(scale_uop)
 
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int) -> UOp:

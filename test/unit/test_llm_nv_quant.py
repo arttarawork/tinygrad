@@ -7,14 +7,16 @@ against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what gro
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
 import unittest
+from typing import cast
 import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
-from tinygrad.uop.ops import Ops
+from tinygrad.uop.ops import Ops, KernelInfo
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import (
   Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, IQ4_WORDS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES)
 from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
+  nv_q8_linear, q8_quantize,
 )
 
 KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
@@ -313,6 +315,77 @@ class TestKernelGraphAndRender(unittest.TestCase):
           self.assertIn("__shfl_xor_sync(0xffffffff", src)
           self.assertNotIn("amdgcn", src)
           if ggml_type in (IQ4_XS, IQ4_NL): self.assertIn("__byte_perm", src)
+
+class TestQuantizeOncePerActivation(unittest.TestCase):
+  """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
+  attn_gate/attn_qkv, attention q/k/v) -- q8_quantize must run once per distinct INPUT UOP, shared by every
+  consumer, not once per Linear. Built directly through nv_q8_linear (no NV device opened; CPU weight buffers,
+  same pattern TestDispatch uses below) since Linear.__call__'s own NV gate needs real hardware -- the sharing
+  logic under test lives entirely inside nv_quant.py's q8_quantize, one layer below that gate."""
+  IN_FEATURES = 128
+
+  @staticmethod
+  def _q4_0_linear(out_features:int, seed:int, in_features:int=IN_FEATURES) -> Linear:
+    rng = np.random.default_rng(seed)
+    blocks = in_features // 32
+    packed = rng.integers(0, 256, 18 * blocks * out_features, dtype=np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, in_features * out_features, Q4_0).reshape(out_features, in_features)
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    return linear
+
+  @staticmethod
+  def _quantize_calls(*outputs:Tensor) -> list[UOp]:
+    sink = UOp.sink(*[o.uop for o in outputs])
+    return [u for u in sink.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.SINK
+            and isinstance(u.src[0].arg, KernelInfo) and u.src[0].arg.name == "q8_quantize_nv"]
+
+  def test_gdn_and_ffn_sharing_groups_quantize_once_each(self):
+    # the three real sharing groups from the design doc, in one combined graph: ffn gate+up (one norm output),
+    # gdn attn_gate+attn_qkv (one norm output), attention q+k+v (one norm output) -- 7 Linears, 3 distinct inputs
+    x_ffn, x_gdn, x_attn = (Tensor.randn(1, self.IN_FEATURES) for _ in range(3))
+    outs = [
+      nv_q8_linear(self._q4_0_linear(256, 0), x_ffn),   # ffn_gate
+      nv_q8_linear(self._q4_0_linear(256, 1), x_ffn),   # ffn_up
+      nv_q8_linear(self._q4_0_linear(192, 2), x_gdn),   # attn_gate
+      nv_q8_linear(self._q4_0_linear(192, 3), x_gdn),   # attn_qkv
+      nv_q8_linear(self._q4_0_linear(64, 4), x_attn),   # q
+      nv_q8_linear(self._q4_0_linear(64, 5), x_attn),   # k
+      nv_q8_linear(self._q4_0_linear(64, 6), x_attn),   # v
+    ]
+    calls = self._quantize_calls(*outs)
+    self.assertEqual(len(calls), 3, "one q8_quantize_nv per distinct activation, not one per Linear (7)")
+    # and the gemv kernels themselves are untouched: still one linear_q4_0_nv CALL per Linear
+    gemv_calls = [u for u in UOp.sink(*[o.uop for o in outs]).toposort()
+                  if u.op is Ops.CALL and u.src[0].op is Ops.SINK and isinstance(u.src[0].arg, KernelInfo)
+                  and u.src[0].arg.name == "linear_q4_0_nv"]
+    self.assertEqual(len(gemv_calls), 7)
+
+  def test_distinct_activations_still_quantize_separately(self):
+    # same shape, different Tensors -- no over-merging just because the content/shape happens to match
+    x1, x2 = Tensor.randn(1, self.IN_FEATURES), Tensor.randn(1, self.IN_FEATURES)
+    outs = [nv_q8_linear(self._q4_0_linear(32, 0), x1), nv_q8_linear(self._q4_0_linear(32, 1), x2)]
+    self.assertEqual(len(self._quantize_calls(*outs)), 2)
+
+  def test_q8_quantize_returns_the_same_tensors_for_the_same_input_uop(self):
+    x = Tensor.randn(1, self.IN_FEATURES)
+    q1, s1 = q8_quantize(x, tokens=1, in_features=self.IN_FEATURES)
+    q2, s2 = q8_quantize(x, tokens=1, in_features=self.IN_FEATURES)
+    self.assertIs(q1.uop, q2.uop)
+    self.assertIs(s1.uop, s2.uop)
+
+  def test_q8_quantize_cache_is_bounded_not_unbounded(self):
+    # the memo must not be a plain (unbounded) functools.cache -- a cache entry's value (q, scale) has x.uop as
+    # a literal CALL src (the kernel reads x's buffer), so the entry holds a strong path back to its own key;
+    # neither refcounting nor a weakref dict can ever free that on their own (verified separately: a
+    # WeakKeyDictionary whose value references its own key back never collects, since the dict itself is a
+    # reachable root). A finite lru_cache maxsize is what actually bounds retention across many JIT families.
+    from tinygrad.llm.kernels.nv_quant import _q8_quantize_cached
+    info = _q8_quantize_cached.cache_info()
+    self.assertIsNotNone(info.maxsize)
+    self.assertGreater(cast(int, info.maxsize), 300)  # comfortably above one decode trace's ~257 distinct activations
 
 class TestDispatch(unittest.TestCase):
   """With NV_CUSTOM_QUANT unset (default 0), or set on a non-NV device, Linear must never construct a custom
