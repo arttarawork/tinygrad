@@ -8,6 +8,7 @@ itself can't run here. Numeric hardware parity (does the compiled kernel produce
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
 import unittest
 from typing import cast
+from unittest import mock
 import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
 from tinygrad.uop.ops import Ops, KernelInfo
@@ -18,6 +19,8 @@ from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
   nv_q8_linear, q8_quantize,
 )
+from tinygrad.llm.model import FFNBlock, TransformerConfig
+from test.helpers import check_schedule
 
 KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 
@@ -540,5 +543,88 @@ class TestSetQuantizedIdentifiesFormat(unittest.TestCase):
     original = linear.weight
     linear.set_quantized(linear.weight)
     self.assertIs(linear.dequant_weight, original)
+
+class TestFFNActivationFusion(unittest.TestCase):
+  """T4.123c (decode fusion design, P3): FFNBlock._feed_forward's dense branch (model.py) drops the
+  `.contiguous()` between silu(gate) and the up-multiply ONLY when T==1 (concrete) and both ffn_gate/ffn_up
+  dispatch through nv_q8_linear (NV custom-quant decode gemv) -- there the activation's two inputs are
+  already per-kernel outputs nv_q8_linear produced, so the contiguous only forces a second launch the
+  scheduler would otherwise fuse. No GPU is opened here (CPU only); the NV dispatch gate is exercised by
+  monkeypatching model.nv_quant_supported, the same idiom TestDispatch above and test_llm_nv_dense.py use."""
+  DIM = 32  # one Q4_0 block wide
+
+  @staticmethod
+  def _q4_0_linear(in_features:int, out_features:int, seed:int) -> Linear:
+    rng = np.random.default_rng(seed)
+    blocks_per_row = in_features // 32
+    packed = rng.integers(0, 256, 18 * blocks_per_row * out_features, dtype=np.uint8).reshape(out_features * blocks_per_row, 18)
+    packed[:, 0:2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)  # finite d (random bytes can decode to inf/nan)
+    raw = Tensor(np.pad(packed.reshape(-1), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, in_features * out_features, Q4_0).reshape(out_features, in_features)
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    assert linear.ggml_type == Q4_0
+    return linear
+
+  def _ffn_block(self) -> FFNBlock:
+    config = TransformerConfig(num_blocks=1, dim=self.DIM, hidden_dim=self.DIM, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
+                                vocab_size=8, head_dim=self.DIM, rope_theta=10000.0, rope_dim=self.DIM, v_head_dim=self.DIM)
+    block = FFNBlock(config)
+    block.ffn_gate = self._q4_0_linear(self.DIM, self.DIM, seed=0)
+    block.ffn_up = self._q4_0_linear(self.DIM, self.DIM, seed=1)
+    block.ffn_down = self._q4_0_linear(self.DIM, self.DIM, seed=2)
+    return block
+
+  def _old_formula(self, block:FFNBlock, x:Tensor) -> Tensor:
+    # the pre-T4.123c dense branch, verbatim -- the baseline every "unchanged" assertion below compares against
+    return block.ffn_down(block.ffn_gate(x).silu().contiguous() * block.ffn_up(x))
+
+  def test_nv_decode_drops_to_one_activation_kernel(self):
+    block, x = self._ffn_block(), Tensor.randn(1, 1, self.DIM)
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      # pre-realize x (to_prerealize) so its own rand-generation kernels don't pollute the FFN kernel count
+      check_schedule(self._old_formula(block, x), 3, to_prerealize=[x])  # silu+contiguous, up-multiply, down sum
+      check_schedule(block._feed_forward(x), 2, to_prerealize=[x])       # one fewer: silu*up fused into the next kernel
+
+  def test_nv_decode_numerics_match_the_old_formula(self):
+    block, x = self._ffn_block(), Tensor.randn(1, 1, self.DIM)
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      fused, old = block._feed_forward(x), self._old_formula(block, x)
+    np.testing.assert_allclose(fused.numpy(), old.numpy(), rtol=1e-5, atol=1e-6)
+
+  def test_generic_graph_and_numerics_are_byte_identical(self):
+    # no NV mock: nv_quant_supported("CPU"/whatever this process's device is) is really False, so _feed_forward
+    # must take the exact same contiguous path as before this task, for every T shape it can see (decode T==1,
+    # a concrete prefill-sized T, and a symbolic chunk-width T) -- UOp hash-consing makes `is` a structural proof.
+    block = self._ffn_block()
+    for x in (Tensor.randn(1, 1, self.DIM), Tensor.randn(1, 7, self.DIM),
+              Tensor.randn(1, 8, self.DIM)[:, :UOp.variable("toks", 1, 8).bind(1), :]):
+      with self.subTest(shape=x.shape):
+        self.assertIs(block._feed_forward(x).uop, self._old_formula(block, x).uop)
+    x = Tensor.randn(1, 1, self.DIM)
+    np.testing.assert_allclose(block._feed_forward(x).numpy(), self._old_formula(block, x).numpy(), rtol=1e-5, atol=1e-6)
+
+  def test_mixed_ggml_type_keeps_the_contiguous_path(self):
+    # the condition requires BOTH gate and up to be NV_QUANT_TYPES formats -- a plain (unquantized) gate must
+    # not trip the fast path even with the NV gate open and up on a covered format
+    block = self._ffn_block()
+    plain_gate = Linear(self.DIM, self.DIM, bias=False)
+    nn.state.load_state_dict(plain_gate, {"weight": Tensor.randn(self.DIM, self.DIM)}, verbose=False, realize=False)
+    block.ffn_gate = plain_gate
+    self.assertIsNone(block.ffn_gate.ggml_type)
+    x = Tensor.randn(1, 1, self.DIM)
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      self.assertIs(block._feed_forward(x).uop, self._old_formula(block, x).uop)
+
+  def test_t_greater_than_one_keeps_the_contiguous_path_even_with_the_nv_gate_open(self):
+    # T4.123c is decode-only (T==1 concrete) -- nv_q8_linear itself covers tokens<=4, but this fusion must not
+    # take the fast path for a 1<T<=4 concrete call or a symbolic chunk bound at 1 (neither is T==1 concrete)
+    block = self._ffn_block()
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      x4 = Tensor.randn(1, 4, self.DIM)
+      self.assertIs(block._feed_forward(x4).uop, self._old_formula(block, x4).uop)
+      xsym = Tensor.randn(1, 8, self.DIM)[:, :UOp.variable("toks", 1, 8).bind(1), :]
+      self.assertIs(block._feed_forward(xsym).uop, self._old_formula(block, xsym).uop)
 
 if __name__ == "__main__": unittest.main()
