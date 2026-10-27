@@ -9,6 +9,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported
+from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -523,6 +524,15 @@ class FFNBlock:
         h_d = g_lin(xd).silu().contiguous() * u_lin(xd)
         partials.append(d_lin(h_d).to(primary))
       return functools.reduce(lambda a, b: a + b, partials)
+    # T4.123c: on the NV custom-quant decode path (T==1, concrete) the gate/up outputs already come out of
+    # nv_q8_linear's own partial-sum kernel (kernels/nv_quant.py), so the .contiguous() below only forces a
+    # SECOND launch (SiLU*up) instead of letting the scheduler fuse it into the one that follows -- 64 extra
+    # launches/step on the 27B (T4.123 profile, P3). Every other path (generic dequant+matmul, AMD, prefill,
+    # symbolic T) keeps the contiguous: this task must not change their kernels or numerics.
+    T = x.shape[1]
+    if (isinstance(T, int) and T == 1 and nv_quant_supported(self.ffn_gate.weight.device)
+        and self.ffn_gate.ggml_type in NV_QUANT_TYPES and self.ffn_up.ggml_type in NV_QUANT_TYPES):
+      return self.ffn_down(self.ffn_gate(x).silu() * self.ffn_up(x))
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
