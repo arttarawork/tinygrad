@@ -1,4 +1,4 @@
-"""T4.98h: NV decode-only fp16 gemv for small DENSE (non-ggml-quantized) Linear layers -- e.g. GatedDeltaNet's
+"""T4.98h: NV fp16 gemv for small DENSE (non-ggml-quantized) Linear layers -- e.g. GatedDeltaNet's
 ssm_alpha/ssm_beta head projections ((5120->48) in Qwen3.8-27B, bias=False). A PROFILE=1 decode trace
 (2026-09-10) showed these running as a generic reduce kernel (r_48_320_4_4) at 0.249ms/call, 96 calls/token =
 24ms/token (16% of decode) for 0.5MB of fp16 weight (~2GB/s). Mirrors upstream's _amd_f16_gemv_kernel/f16_gemv
@@ -7,9 +7,20 @@ ssm_alpha/ssm_beta head projections ((5120->48) in Qwen3.8-27B, bias=False). A P
 added after the kernel (like nv_quant.py's nv_q8_linear) instead of threaded into it -- ssm_alpha/beta are
 bias=False so this is unexercised, but it keeps both NV decode kernels' calling convention the same.
 
+T4.122b: the same gemv also covers PREFILL chunks (tokens > 4, including a symbolic chunk-width token count) --
+a PROFILE dump (2026-10-27) showed these same two Linear layers compiling to a generic tensor-core kernel at
+prefill (`r_32_2_2_2_2_3_320_2`, global_size (1,1,1): ONE thread block doing the whole 32x5120 @ 5120x96
+product) at 535us/call, 96 calls/chunk = 51ms of a 205ms chunk. The one-warp-per-(token,output row) layout below
+needs no change to cover this: it was always launched with `tokens*out_features` blocks (48 blocks already at
+tokens=1), so a wider or symbolic `tokens` just launches more of the same tiny block -- unlike nv_gemm.py's WMMA
+path, there's no cross-token work to tile/amortize here, every (token, output row) pair is independent. A
+symbolic token count is padded to the chunk bound (`x.max_shape`) and the output sliced back down, exactly as
+nv_gemm.py's `nv_wmma_linear` does for its own symbolic prefill chunks -- safe here too because padding adds
+whole extra *rows* (one warp's full gemv over zeros, never a partial one), never touches a valid row's math.
+
 Dispatch lives in amd.py's Linear.__call__, behind the existing NV_CUSTOM_QUANT gate (no second env var) -- see
-nv_dense_eligible's docstring for why the shape/dtype check is split out from the token-count check nv_f16_gemv
-does internally: they feed two different decisions in Linear.__call__."""
+nv_dense_eligible's docstring for why the shape/dtype check is split out from the (now token-count-independent)
+checks nv_f16_gemv does internally: they feed two different decisions in Linear.__call__."""
 from __future__ import annotations
 import functools
 from typing import cast
@@ -75,14 +86,18 @@ def prepare_dense_weights(model) -> int:
   return n
 
 def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
-  """Decode-only (tokens<=4, like nv_quant.py's nv_q8_linear) fp16 gemv for a small dense Linear layer. Returns
-  None when it doesn't cover this call (not shape-eligible, bigger batch, or a symbolic token count) so
+  """Decode AND prefill fp16 gemv for a small dense Linear layer: one warp per (token, output row), unchanged
+  from T4.98h for every call shape. A concrete tokens<=4 call takes exactly the path/kernel/launch it always
+  did (nothing below depends on a token-count cap, that cap used to be the whole gate). A symbolic token count
+  (prefill's bound `toks` Variable) is padded to the chunk bound the same way nv_gemm.py's `nv_wmma_linear`
+  pads for its own symbolic prefill chunks: run the kernel at the padded concrete token count, then shrink the
+  output back down to x's real (possibly still-symbolic) token count (T4.122b). Returns None only when it
+  doesn't cover this call at all (not shape/dtype-eligible, or the weight copy isn't ready yet) so
   Linear.__call__ (amd.py) falls back to the generic matmul."""
   if not nv_dense_eligible(layer): return None
   numel = x.numel()
-  if not isinstance(numel, int): return None  # symbolic token count: no padded path ported (matches nv_quant.py)
-  tokens = numel // layer.in_features
-  if tokens > 4: return None  # decode-only
+  symbolic = not isinstance(numel, int)
+  tokens = x.max_shape[-2] if symbolic else numel // layer.in_features
   out_dtype = least_upper_dtype(x.dtype, layer.weight.dtype)  # matches nn.Linear's own x.dot(weight) promotion
   if layer.dense_weight is None:
     # the first call of a served model happens inside a @function context (ALLOW_DEVICE_USAGE=0) under JIT capture:
@@ -92,9 +107,11 @@ def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
     if not ALLOW_DEVICE_USAGE.value or capturing: return None
     layer.dense_weight = _fp16_copy(layer)
   weight = layer.dense_weight
-  xh = x.contiguous() if x.dtype == dtypes.float16 else x.cast(dtypes.float16).contiguous()
+  x_pad = x.pad_to(x.max_shape) if symbolic else x  # concrete shape from here on (mirrors nv_gemm.py's nv_wmma_linear)
+  xh = x_pad.contiguous() if x_pad.dtype == dtypes.float16 else x_pad.cast(dtypes.float16).contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=out_dtype, device=x.device)
   fxn = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
   result = Tensor.custom_kernel(out, weight.reshape(-1), xh.reshape(tokens, layer.in_features), fxn=fxn)[0]
-  result = result.reshape(*x.shape[:-1], layer.out_features)
+  result = result.reshape(*x_pad.shape[:-1], layer.out_features)
+  if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], layer.out_features)))
   return result if layer.bias is None else result + layer.bias

@@ -39,11 +39,28 @@ def _numpy_gemv(w:np.ndarray, x:np.ndarray, in_features:int) -> np.ndarray:
 class TestLaneAccumulationMath(unittest.TestCase):
   def test_matches_reference_matmul(self):
     rng = np.random.default_rng(0)
-    for in_features, out_features, tokens in ((5120, 48, 1), (5120, 48, 4), (128, 8, 3), (256, 16, 1)):
+    # T4.122b: 7/31/32 are prefill-shaped (chunk width up to 32) -- the same kernel now covers them, not just decode's 1/4
+    for in_features, out_features, tokens in ((5120, 48, 1), (5120, 48, 4), (5120, 48, 7), (5120, 48, 31), (5120, 48, 32),
+                                               (128, 8, 3), (256, 16, 1)):
       with self.subTest(in_features=in_features, out_features=out_features, tokens=tokens):
         w = rng.standard_normal((out_features, in_features)).astype(np.float32)
         x = rng.standard_normal((tokens, in_features)).astype(np.float32)
         np.testing.assert_allclose(_numpy_gemv(w, x, in_features), x @ w.T, rtol=1e-3, atol=1e-3)
+
+  def test_padding_rows_does_not_perturb_real_rows(self):
+    """nv_f16_gemv's symbolic-token path (T4.122b) pads the activation with zero rows up to the chunk bound and
+    shrinks the OUTPUT back down afterward, mirroring nv_gemm.py's nv_wmma_linear. That's only safe because this
+    kernel's (token, output row) pairs are independent -- a zero-padded token row's warp never feeds another
+    token's reduction (unlike e.g. the fused recurrent scan kernels, where a padded step's state must be a no-op
+    by construction). Verify the padded rows the kernel never meant to produce don't change the real ones."""
+    rng = np.random.default_rng(1)
+    in_features, out_features, real_tokens, chunk = 5120, 48, 7, 32
+    w = rng.standard_normal((out_features, in_features)).astype(np.float32)
+    x = rng.standard_normal((real_tokens, in_features)).astype(np.float32)
+    x_padded = np.zeros((chunk, in_features), dtype=np.float32)
+    x_padded[:real_tokens] = x
+    np.testing.assert_allclose(_numpy_gemv(w, x_padded, in_features)[:real_tokens], _numpy_gemv(w, x, in_features),
+                                rtol=1e-3, atol=1e-3)
 
 # ******** kernel graph construction + sm_86 render/compile ********
 
@@ -60,8 +77,9 @@ class TestKernelGraphAndRender(unittest.TestCase):
     return _nv_f16_gemv_kernel(out, w, x, in_features=in_features, out_features=out_features, tokens=tokens)
 
   def test_graph_builds_for_qwen_shape_and_others(self):
+    # 1/4 = decode; 7/31/32 = prefill-shaped (up to the 32-token chunk width), T4.122b
     for in_features, out_features in self.SHAPES:
-      for tokens in (1, 4):
+      for tokens in (1, 4, 7, 31, 32):
         with self.subTest(in_features=in_features, out_features=out_features, tokens=tokens):
           sink = self._build(in_features, out_features, tokens)
           self.assertEqual(sink.op, Ops.SINK)
@@ -87,6 +105,26 @@ class TestKernelGraphAndRender(unittest.TestCase):
         src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
         self.assertIn("__shfl_xor_sync(0xffffffff", src)
         self.assertNotIn("amdgcn", src)
+
+  def test_launch_config_decode_unchanged_prefill_launches_enough_blocks(self):
+    """T4.122b done-when #4: decode (tokens<=4) must render with the exact launch config it always had -- one
+    32-thread warp per (token, output row), nothing about the kernel itself changed, only nv_f16_gemv's dispatch
+    around it. Also pins done-when #1 (>=48 blocks) for the real Qwen shape at every token count up to the
+    32-wide chunk: blocks = tokens*out_features, so even tokens=1 alone already clears 48."""
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    in_features, out_features = 5120, 48
+    for tokens in (1, 4, 7, 31, 32):
+      with self.subTest(tokens=tokens):
+        sink = self._build(in_features, out_features, tokens)
+        prg = to_program(sink, renderer)
+        self.assertEqual(prg.arg.global_size, (out_features, tokens, 1))
+        self.assertEqual(prg.arg.local_size, (WARP_SIZE, 1, 1))  # one warp per block, unchanged since T4.98h
+        blocks = prg.arg.global_size[0] * prg.arg.global_size[1] * prg.arg.global_size[2]
+        self.assertGreaterEqual(blocks, 48)
 
 # ******** nv_dense_eligible: the shape/dtype gate ********
 
@@ -154,15 +192,28 @@ class TestNvF16Gemv(unittest.TestCase):
                               verbose=False, realize=False)
     return linear
 
-  def test_returns_none_for_more_than_4_tokens(self):
+  def test_covers_prefill_token_counts(self):
+    # T4.122b: tokens>4 (concrete, prefill-shaped) is no longer a bail-out -- the same kernel just launches
+    # tokens*OUT_FEATURES blocks instead of returning None for the generic matmul to handle
     linear = self._linear()
-    self.assertIsNone(nv_f16_gemv(linear, Tensor.randn(5, self.IN_FEATURES, dtype=dtypes.float16)))
+    for tokens in (5, 7, 31, 32):
+      with self.subTest(tokens=tokens):
+        out = nv_f16_gemv(linear, Tensor.randn(tokens, self.IN_FEATURES, dtype=dtypes.float16))
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, (tokens, self.OUT_FEATURES))
 
-  def test_returns_none_for_symbolic_token_count(self):
+  def test_covers_symbolic_token_count(self):
+    # T4.122b: a symbolic chunk-width token count (prefill's bound `toks` Variable) is padded to the bound
+    # internally (x.max_shape) and the output shrunk back to x's own (still-symbolic) token dim -- also not a
+    # bail-out. Checked at the bound itself (32) and below it, mirroring the real 1..32-token chunk Variable.
     linear = self._linear()
-    data = np.random.default_rng(0).standard_normal((4, self.IN_FEATURES)).astype(np.float16)
-    sym = Tensor(data).contiguous()[:UOp.variable("tokens", 1, 4).bind(2)]
-    self.assertIsNone(nv_f16_gemv(linear, sym))
+    for bound, tokens in ((4, 2), (32, 1), (32, 7), (32, 31), (32, 32)):
+      with self.subTest(bound=bound, tokens=tokens):
+        data = np.random.default_rng(0).standard_normal((bound, self.IN_FEATURES)).astype(np.float16)
+        sym = Tensor(data).contiguous()[:UOp.variable("toks", 1, bound).bind(tokens)]
+        out = nv_f16_gemv(linear, sym)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, (sym.shape[0], self.OUT_FEATURES))  # same symbolic token dim x came in with
 
   def test_returns_none_when_not_shape_eligible(self):
     linear = Linear(5121, 8, bias=False)  # in_features not a multiple of 128
@@ -222,11 +273,17 @@ class TestDispatch(unittest.TestCase):
   def test_use_custom_quant_survives_a_bigger_than_decode_call(self):
     # a >4-token prefill-shaped call for a gemv-eligible dense layer must NOT permanently disable
     # use_custom_quant -- otherwise every later 1-token decode call for the same layer instance would
-    # silently fall back to the generic matmul for the rest of the process's life (T4.98h)
+    # silently fall back to the generic matmul for the rest of the process's life (T4.98h). T4.122b: nv_f16_gemv
+    # no longer returns None for tokens=8 (it's dispatch-eligible now), so it's mocked here too -- real NV
+    # kernels (warp_reduce's __shfl_xor_sync) can't actually execute through the CPU device these tests run on;
+    # nv_quant_supported is mocked to True purely to exercise the amd.py dispatch gate without a real NV device.
     linear = self._dense_linear()
     with Context(NV_CUSTOM_QUANT=1), mock.patch.object(nv_quant, "nv_quant_supported", return_value=True):
-      big = linear(Tensor.randn(8, self.IN_FEATURES, dtype=dtypes.float16))  # tokens=8>4: nv_f16_gemv returns None internally
-      self.assertTrue(np.isfinite(big.numpy()).all())
+      sentinel_big = Tensor.zeros(8, self.OUT_FEATURES)
+      with mock.patch.object(nv_dense, "nv_f16_gemv", return_value=sentinel_big) as mock_gemv:
+        big = linear(Tensor.randn(8, self.IN_FEATURES, dtype=dtypes.float16))  # tokens=8>4: now dispatch-covered, not a bail-out
+      mock_gemv.assert_called_once()
+      self.assertIs(big, sentinel_big)
       self.assertTrue(linear.use_custom_quant)  # must not have been permanently disabled by the big call
       sentinel = Tensor.zeros(1, self.OUT_FEATURES)
       with mock.patch.object(nv_dense, "nv_f16_gemv", return_value=sentinel) as mock_gemv:
