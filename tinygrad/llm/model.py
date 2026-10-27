@@ -8,7 +8,8 @@ if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays nump
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
-from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported
+from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
+  gdn_decode as nv_gdn_decode
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
@@ -852,6 +853,7 @@ class MLATransformerBlock(FFNBlock):
         yarn_beta_slow=self.config.yarn_beta_slow, yarn_attn_factor=self.config.yarn_attn_factor)
 
 class GatedDeltaNetBlock(FFNBlock):
+  nv_decode_weights: tuple[Tensor, Tensor, Tensor, Tensor]|None = None  # T4.123f+g, set by prepare_nv_decode
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
@@ -870,6 +872,15 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_dt = {"bias": Tensor.zeros(ssm.inner_size if ssm.kda else self.num_v_heads)}
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
+
+  def prepare_nv_decode(self) -> None:
+    """T4.123f+g: realized fp32 copies of the four small weights kernels/nv.py's gdn_decode reads -- made once at load (from_gguf), never
+    inside a JIT capture: the loaded tensors are lazy GGUF byte views a custom kernel would re-copy on every step. Leaves
+    nv_decode_weights None (decode keeps the generic graph + fused scan) off the gate or outside the kernels' geometry."""
+    if hasattr(self, "ssm_g_a") or not nv_decode_kernel_supported(self.ssm_a.device): return
+    if self.head_k_dim % 32 or self.head_v_dim % 8 or self.head_v_dim > 256 or self.conv_channels % 32: return  # 32-lane rows, <= 1024 threads
+    self.nv_decode_weights = cast(tuple[Tensor, Tensor, Tensor, Tensor], tuple(t.float().contiguous().realize() for t in
+      (self.ssm_conv1d["weight"], self.ssm_norm.weight, self.ssm_dt["bias"], self.ssm_a)))
 
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
     # rope: unused, GDN has no positions (T5.3); kept so FFNBlock.__call__ can pass it positionally to every block type.
@@ -908,6 +919,15 @@ class GatedDeltaNetBlock(FFNBlock):
     is_kda = hasattr(self, "ssm_g_a")
     symbolic = isinstance(T, UOp)
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
+
+    # T4.123f+g: a decode token on the card is two kernels from the four projections (conv + conv_state shift, then norms/beta/alpha/
+    # scan/ssm_norm/gate) instead of 13 small generic kernels around the fused scan -- kernels/nv.py's gdn_decode. Same gate as the
+    # fused decode scan below; prefill (symbolic or T > 1) never comes here.
+    if not symbolic and T == 1 and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
+      x = x.half()
+      z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), self.ssm_beta(x), self.ssm_alpha(x), self.conv_state, self.recurrent_state,
+                        *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps)
+      return self.ssm_out(z)
 
     # input processing
     x = x.half()
@@ -1714,6 +1734,8 @@ class Transformer:
       model.realize_placement()
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights  # local: mirrors amd.py's import discipline
     prepare_dense_weights(model)  # T4.98h: the fp16 head copies must exist before the first (@function, JIT-captured) call
+    for blk in model.blk:
+      if isinstance(blk, GatedDeltaNetBlock): blk.prepare_nv_decode()  # T4.123f+g: same reason
     return model, kv
 
   def warmup(self, vision:bool=False):

@@ -1,19 +1,27 @@
 """T6.2: the NV fused Gated-DeltaNet prefill scan (tinygrad/llm/kernels/nv.py).
 T4.98g adds: the SAME kernel also serves the T_pad==1 DECODE step (readout+state-update only -- conv1d stays
 the separate, unchanged code it always was outside this kernel), behind its own GDN_NV_FUSED_DECODE gate.
+T4.123f+g replaces that decode step (when GatedDeltaNetBlock.prepare_nv_decode ran) by nv.gdn_decode's two kernels; their CPU
+form (lanes=1) runs here against numpy and against the generic block graph, plus the decode/prefill kernel-count checks.
 
 Runs on CPU: gate/import checks and an sm_86 render + nvrtc compile of the kernel at the 35B's real geometry (skips when
 the nvrtc lane -- docker on macOS -- is unavailable). The numerics tests need real NV hardware: mock-NV reports sm_35, so
 the gate is closed there and they skip. Hardware round: DEV=NV PYTHONPATH=. python -m pytest test/unit/test_llm_nv_scan.py"""
-import unittest
+import contextlib, functools, math, re, unittest
+from unittest import mock
 import numpy as np
-from tinygrad import Tensor, Device, Context, UOp, dtypes
+from tinygrad import Tensor, Device, Context, UOp, TinyJit, dtypes, nn
 from tinygrad.device import CompileError
 from tinygrad.helpers import DEV
-from tinygrad.uop.ops import Ops
+from tinygrad.uop.ops import Ops, KernelInfo
+from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.kernels.amd import Linear, Q4_0, kernel_var
 from tinygrad.llm.kernels.nv import (
   nv_custom_kernels_supported, nv_decode_kernel_supported, GDN_NV_FUSED_DECODE, gated_delta_prefill, _gated_delta_prefill_kernel,
+  _gdn_conv_decode_kernel, _gdn_decode_kernel, _split_k_partials, gdn_decode,
 )
+from tinygrad.llm.kernels.nv_quant import nv_q8_linear
+from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig
 
 GEOMETRIES = {"27b": (48, 128, 128), "35b": (32, 128, 128)}  # (v-heads, head_k_dim, head_v_dim): Qwen3.8-27B / Qwen3.6-35B-A3B
 CHUNK = 32
@@ -209,6 +217,263 @@ class TestNVFusedScanParity(unittest.TestCase):
         with Context(GDN_NV_FUSED=0, GDN_NV_FUSED_DECODE=0): out_loop = run_attention(block_loop, step, 8)
         np.testing.assert_allclose(out_fused, out_loop, rtol=1e-3, atol=1e-4)
         for got, want in zip(snapshot(block_fused), snapshot(block_loop)): np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-4)
+
+  def test_two_kernel_decode_matches_loop(self):
+    # T4.123f+g hardware round: the same check through nv.gdn_decode (prepare_nv_decode under the gate), 4 decode steps then a
+    # restart at start_pos 0 -- z is fp16 before ssm_out, hence the looser output tolerance
+    from test.unit.test_gdn_scan_parity import GEOMETRIES as BLOCK_GEOMETRIES, DIM, make_block, run_attention, snapshot
+    for name, ssm in BLOCK_GEOMETRIES.items():
+      with self.subTest(geometry=name):
+        steps = (Tensor.randn(1, 5, DIM) * 0.1).realize()
+        block_fused, block_loop = make_block(ssm), make_block(ssm)
+        with Context(GDN_NV_FUSED=0, GDN_NV_FUSED_DECODE=1): block_fused.prepare_nv_decode()
+        self.assertIsNotNone(block_fused.nv_decode_weights)
+        for t, pos in enumerate((0, 1, 2, 3, 0)):
+          with Context(GDN_NV_FUSED=0, GDN_NV_FUSED_DECODE=1): out_fused = run_attention(block_fused, steps[:, t:t+1], pos)
+          with Context(GDN_NV_FUSED=0, GDN_NV_FUSED_DECODE=0): out_loop = run_attention(block_loop, steps[:, t:t+1], pos)
+          np.testing.assert_allclose(out_fused, out_loop, rtol=1e-2, atol=1e-3)
+          for got, want in zip(snapshot(block_fused), snapshot(block_loop)): np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-4)
+
+# ******** T4.123f+g: the GDN decode step in two kernels (nv.gdn_decode) -- CPU form (lanes=1) + sm_86 render ********
+
+TINY = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=4, inner_size=32*4)  # 2 k-heads -> 4 v-heads of 32
+TINY_DIM = 8
+
+def tiny_block(seed:int=0, dim:int=TINY_DIM) -> GatedDeltaNetBlock:
+  config = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=dim*2, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=32, head_dim=dim,
+                             rope_theta=10000.0, rope_dim=dim, v_head_dim=dim, max_context=64, ssm_layers=(True,), ssm=TINY)
+  block = GatedDeltaNetBlock(config, TINY)
+  Tensor.manual_seed(seed)
+  params = nn.state.get_parameters(block)
+  for p in params: p.replace(Tensor.randn(*p.shape) * 0.3)
+  Tensor.realize(*params)  # pin the weights now (test_gdn_scan_parity.make_block's RNG-counter note)
+  return block
+
+def decode_gate(): return mock.patch("tinygrad.llm.model.nv_decode_kernel_supported", return_value=True)
+
+def kernel_names(t:Tensor) -> list[str]:
+  """the schedule's kernels: custom kernels by name, generic ones (the default KernelInfo name until codegen) as '?'"""
+  linear, _ = t.linear_with_vars()
+  return [u.src[0].arg.name if isinstance(u.src[0].arg, KernelInfo) and u.src[0].arg.name != KernelInfo().name else "?" for u in linear.src]
+
+def _copy_kernel(out:UOp, src:UOp) -> UOp:
+  i = UOp.range(math.prod(out.shape), 0)
+  return out.flatten()[i].store(src.flatten()[i].load()).end(i).sink(arg=KernelInfo(name="copy", opts_to_apply=()))
+
+def linear_output(partials:np.ndarray) -> Tensor:
+  """(B,F,P) split-K partials as nv_q8_linear hands them out: a kernel output summed lazily, (B,1,F)"""
+  out = Tensor.custom_kernel(Tensor.empty(*partials.shape), Tensor(partials).realize(), fxn=_copy_kernel)[0]
+  return out.sum(-1).reshape(partials.shape[0], 1, partials.shape[1])
+
+def decode_reference(qkv, gate, beta, alpha, conv_state, state, conv_w, norm_w, dt_bias, ssm_a, start_pos, k_heads, qk_eps=1e-6, norm_eps=1e-5):
+  """numpy ground truth of one GatedDeltaNet decode token from the projections (model.py _attention at T=1, the per-token loop's
+  algebra): returns z (B,1,H*V) before ssm_out, the new conv_state and the new recurrent state."""
+  B, H, V, K = state.shape
+  if start_pos == 0: conv_state, state = np.zeros_like(conv_state), np.zeros_like(state)
+  window = np.concatenate([conv_state.astype(np.float32), qkv.sum(-1)[:, None]], axis=1)  # (B, taps, C)
+  conv = (window * conv_w.T[None]).sum(1)
+  conv = conv / (1 + np.exp(-conv))
+  q_dim = k_heads*K
+  q, k = conv[:, :q_dim].reshape(B, k_heads, K), conv[:, q_dim:2*q_dim].reshape(B, k_heads, K)
+  q = q / np.maximum(np.linalg.norm(q, axis=-1, keepdims=True), qk_eps) * K**-0.5
+  k = k / np.maximum(np.linalg.norm(k, axis=-1, keepdims=True), qk_eps)
+  q, k = np.tile(q, (1, H//k_heads, 1)), np.tile(k, (1, H//k_heads, 1))  # .repeat(): v-head h reads k-head h % k_heads
+  v = conv[:, 2*q_dim:].reshape(B, H, V)
+  b, a = 1/(1 + np.exp(-beta)), np.exp(np.logaddexp(alpha + dt_bias, 0) * ssm_a)
+  decayed = state * a[..., None, None]
+  delta = (v - (decayed * k[:, :, None]).sum(-1)) * b[..., None]
+  new_state = decayed + delta[..., None] * k[:, :, None]
+  core = (new_state * q[:, :, None]).sum(-1)
+  g = gate.sum(-1).reshape(B, H, V)
+  z = core / np.sqrt((core**2).mean(-1, keepdims=True) + norm_eps) * norm_w * g / (1 + np.exp(-g))
+  return z.reshape(B, 1, H*V), window[:, 1:], new_state
+
+class TestGDNDecodeKernelSource(unittest.TestCase):
+  def test_renders_and_compiles_for_sm86(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    sp = kernel_var(UOp.variable("start_pos", 0, 262143))
+    for name, (heads, key_dim, value_dim) in GEOMETRIES.items():
+      k_heads, parts = 16, 5
+      channels = 2*k_heads*key_dim + heads*value_dim
+      def ph(shape, dtype, slot): return UOp.placeholder(shape, dtype, slot=slot)
+      conv = _gdn_conv_decode_kernel(ph((1, channels), dtypes.float32, 0), ph((1, 3, channels), dtypes.float16, 1),
+                                     ph((1, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), sp, start_pos=sp)
+      step = _gdn_decode_kernel(ph((1, heads*value_dim), dtypes.float16, 0), ph((1, heads, value_dim, key_dim), dtypes.float32, 1),
+        ph((1, channels), dtypes.float32, 2), ph((1, heads), dtypes.float16, 3), ph((1, heads), dtypes.float16, 4), ph((heads,), dtypes.float32, 5),
+        ph((heads,), dtypes.float32, 6), ph((1, heads*value_dim, parts), dtypes.float32, 7), ph((value_dim,), dtypes.float32, 8), sp,
+        start_pos=sp, k_heads=k_heads, qk_eps=1e-6, norm_eps=1e-6)
+      for sink, kname, threads in ((conv, "gdn_conv_decode_nv", [32]), (step, "gdn_decode_nv", [32, value_dim//8])):
+        with self.subTest(geometry=name, kernel=kname):
+          try: prg = to_program(sink, renderer)
+          except CompileError: raise
+          except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+          self.assertIn(kname, src)
+          # the lane must be threadIdx.x (stride 1 over the state's key columns) for __shfl_xor_sync to reduce one row
+          self.assertEqual([int(n) for n in re.findall(r"threadIdx\.[xyz]; /\* (\d+) \*/", src)], threads)
+          if kname == "gdn_decode_nv":
+            self.assertIn("__shfl_xor_sync(0xffffffff", src)
+            self.assertIn("__syncthreads()", src)  # the rms block reduction
+          self.assertTrue(next(u.arg for u in prg.src if u.op is Ops.BINARY).startswith(b"\x7fELF"))
+
+class TestGDNDecodeMatchesNumpy(unittest.TestCase):
+  """nv.gdn_decode's two kernels in their CPU form (lanes=1: the same graphs minus shuffles and shared memory) against
+  decode_reference, from split-K partials (P=3 qkv, P=2 gate) and a nonzero incoming conv/recurrent state."""
+  def test_matches_reference(self):
+    B, Hk, H, K, V = 1, 2, 4, 32, 32
+    C = 2*Hk*K + H*V
+    rng = np.random.default_rng(0)
+    def f32(*s, scale=1.0): return (rng.standard_normal(s) * scale).astype(np.float32)
+    qkv, gate, beta, alpha = f32(B, C, 3, scale=0.5), f32(B, H*V, 2), f32(B, 1, H), f32(B, 1, H)
+    conv0, state0 = f32(B, 3, C).astype(np.float16), f32(B, H, V, K, scale=0.3)
+    conv_w, norm_w, dt_bias, ssm_a = f32(C, 4, scale=0.5), f32(V), f32(H), -np.abs(f32(H))
+    for pos in (5, 0):
+      with self.subTest(start_pos=pos):
+        conv_state, state = Tensor(conv0).contiguous().realize(), Tensor(state0).contiguous().realize()
+        z = gdn_decode(linear_output(qkv), linear_output(gate), Tensor(beta), Tensor(alpha), conv_state, state, Tensor(conv_w), Tensor(norm_w),
+                       Tensor(dt_bias), Tensor(ssm_a), UOp.variable("start_pos", 0, 63).bind(pos), k_heads=Hk, qk_eps=1e-6, norm_eps=1e-5)
+        want_z, want_conv, want_state = decode_reference(qkv, gate, beta[:, 0], alpha[:, 0], conv0, state0, conv_w, norm_w, dt_bias, ssm_a, pos, Hk)
+        self.assertEqual(z.dtype, dtypes.float16)
+        np.testing.assert_allclose(z.numpy().astype(np.float32), want_z, rtol=5e-3, atol=1e-3)
+        np.testing.assert_allclose(conv_state.numpy().astype(np.float32), want_conv.astype(np.float16).astype(np.float32), rtol=0, atol=0)
+        np.testing.assert_allclose(state.numpy(), want_state, rtol=1e-5, atol=1e-6)
+
+class TestGDNDecodeBlock(unittest.TestCase):
+  """GatedDeltaNetBlock._attention at T=1 through nv.gdn_decode (gate mocked open, CPU form) against the generic graph: output and
+  both states after every step, over decode steps and a restart at start_pos 0 with a nonzero resident state."""
+  def test_matches_generic_path(self):
+    fused, generic = tiny_block(), tiny_block()
+    with decode_gate(): fused.prepare_nv_decode()
+    self.assertIsNotNone(fused.nv_decode_weights)
+    xs = (Tensor.randn(1, 6, TINY_DIM)).realize()
+    for t, pos in enumerate((0, 1, 2, 3, 0, 1)):
+      with self.subTest(step=t, start_pos=pos):
+        for block in (fused, generic): block._init_state(xs)
+        want = generic._attention(generic.attn_norm(xs[:, t:t+1]), pos).numpy()
+        with decode_gate(): got = fused._attention(fused.attn_norm(xs[:, t:t+1]), pos).numpy()
+        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-5)
+        np.testing.assert_allclose(fused.conv_state.numpy(), generic.conv_state.numpy(), rtol=0, atol=0)
+        np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-5, atol=1e-7)
+
+  def test_matches_generic_path_through_function_and_jit(self):
+    # the served path: GatedDeltaNetBlock.__call__ is a precompiled @function inside a TinyJit. A precompiled function drops arguments
+    # no kernel references, so start_pos must reach the gdn kernels as a CALL src (an earlier AFTER-only binding ran unbound here).
+    # Each side's output is realized exactly once: realizing a function's output twice re-runs its in-place state updates.
+    blocks = {name: tiny_block() for name in ("fused", "generic", "jit_fused", "jit_generic")}
+    for name in ("fused", "jit_fused"):
+      with decode_gate(): blocks[name].prepare_nv_decode()
+    jits = {name: TinyJit(functools.partial(lambda b, x, sp: b(x, sp).contiguous().realize(), blocks[name])) for name in ("jit_fused", "jit_generic")}
+    xs, var = Tensor.randn(1, 6, TINY_DIM).realize(), UOp.variable("start_pos", 0, 63)
+    for t, pos in enumerate((0, 1, 2, 3, 0, 1)):  # step 1 is the JIT capture, 2+ replays, 4 restarts with a nonzero resident state
+      x, got = xs[:, t:t+1].contiguous().realize(), {}
+      for name, block in blocks.items():
+        with decode_gate() if "fused" in name else contextlib.nullcontext():
+          out = jits[name](x, var.bind(pos)) if name in jits else block(x, var.bind(pos))
+          got[name] = (out.numpy(), block.conv_state.numpy(), block.recurrent_state.numpy())
+      for fused, generic in (("fused", "generic"), ("jit_fused", "jit_generic")):
+        with self.subTest(step=t, pair=fused):
+          np.testing.assert_allclose(got[fused][0], got[generic][0], rtol=1e-3, atol=1e-5)
+          np.testing.assert_allclose(got[fused][1], got[generic][1], rtol=0, atol=0)
+          np.testing.assert_allclose(got[fused][2], got[generic][2], rtol=1e-5, atol=1e-7)
+
+class TestGDNDecodeGraph(unittest.TestCase):
+  @staticmethod
+  def _q4_0(in_features:int, out_features:int, seed:int) -> Linear:
+    rng = np.random.default_rng(seed)
+    packed = rng.integers(0, 256, 18 * (in_features//32) * out_features, dtype=np.uint8).reshape(-1, 18)
+    packed[:, 0:2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)  # finite d
+    raw = Tensor(np.pad(packed.reshape(-1), (4, 0))).contiguous().realize()[4:]
+    linear = Linear(in_features, out_features, bias=False)
+    nn.state.load_state_dict(linear, {"weight": ggml_data_to_tensor(raw, in_features*out_features, Q4_0).reshape(out_features, in_features)},
+                             verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    return linear
+
+  def _card_like_block(self) -> GatedDeltaNetBlock:
+    # the served layout in miniature: attn_qkv/attn_gate/ssm_out on the Q4_0 dp4a gemv (split-K partials), ssm_alpha/ssm_beta on the f16 gemv
+    block = tiny_block(dim=128)
+    block.attn_qkv, block.attn_gate, block.ssm_out = self._q4_0(128, block.conv_channels, 0), self._q4_0(128, 128, 1), self._q4_0(128, 128, 2)
+    return block
+
+  def _decode_kernels(self, prepared:bool) -> list[str]:
+    block, x = self._card_like_block(), Tensor.randn(1, 1, 128).realize()
+    block._init_state(x)
+    Tensor.realize(block.conv_state, block.recurrent_state)
+    with decode_gate(), mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True):
+      if prepared: block.prepare_nv_decode()
+      return kernel_names(block._attention(x, 3))
+
+  def test_decode_generic_kernels_gone(self):
+    # NV decode graph of one block (no device opened: Linear's NV gate and the GDN decode gate mocked): before, 15 generic kernels and the
+    # fused scan; after, the two gdn kernels and 2 generic ones -- x.half() and nv_f16_gemv's contiguous copy of it, both inputs of the
+    # projections. attn_qkv's and attn_gate's split-K partial sums are folded into the gdn kernels (_split_k_partials).
+    before, after = self._decode_kernels(False), self._decode_kernels(True)
+    custom = ["q8_quantize_nv", "linear_f16_gemv_nv", "linear_f16_gemv_nv", "linear_q4_0_nv", "linear_q4_0_nv", "q8_quantize_nv", "linear_q4_0_nv"]
+    self.assertEqual([n for n in before if n not in ("?", "gated_delta_prefill_nv")], custom)
+    self.assertEqual((before.count("?"), before.count("gated_delta_prefill_nv")), (15, 1))
+    self.assertEqual([n for n in after if n != "?"], custom[:5] + ["gdn_conv_decode_nv", "gdn_decode_nv"] + custom[5:])
+    self.assertEqual(after.count("?"), 2)
+
+  def test_split_k_partials(self):
+    linear, x = self._q4_0(128, 96, 0), Tensor.randn(1, 1, 128)
+    partials = _split_k_partials(nv_q8_linear(linear, x))
+    self.assertIs(partials.uop.op, Ops.AFTER)
+    self.assertEqual(partials.shape, (1, 96, 1))  # in_features 128 -> one 1024-wide split-K chunk
+    generic = Tensor.randn(1, 1, 96) * 2  # anything else: (B,F,1), realized by the scheduler
+    self.assertEqual(_split_k_partials(generic).shape, (1, 96, 1))
+    self.assertIsNot(_split_k_partials(generic).uop.op, Ops.AFTER)
+
+  @staticmethod
+  def _kernel_asts(prepared:bool, gate_open:bool, x:Tensor, start_pos) -> list[UOp]:
+    """the scheduled kernels' ASTs of one _attention call on a fresh block (scheduling remaps the state tensors, so one block per graph)"""
+    block = tiny_block()
+    block._init_state(x)
+    Tensor.realize(block.conv_state, block.recurrent_state)
+    if prepared:
+      with decode_gate(): block.prepare_nv_decode()
+      assert block.nv_decode_weights is not None
+    with (decode_gate() if gate_open else contextlib.nullcontext()):
+      linear, _ = block._attention(x, start_pos).linear_with_vars()
+    return [u.src[0] for u in linear.src]
+
+  def assert_same_kernels(self, a:list[UOp], b:list[UOp]):
+    self.assertEqual(len(a), len(b))
+    for x, y in zip(a, b): self.assertIs(x, y)  # hash-consed ASTs: `is` = the identical kernel
+
+  def test_prefill_graph_unchanged(self):
+    # the decode branch needs a concrete T == 1: a symbolic prefill chunk and a concrete T > 1 schedule exactly the kernels they did
+    # with nothing prepared, gate open
+    x = Tensor.randn(1, 8, TINY_DIM).realize()
+    chunk, sp = x[:, :UOp.variable("toks", 1, 8).bind(5)], UOp.variable("start_pos", 0, 63).bind(16)
+    for inp, pos in ((chunk, sp), (x[:, :4], 16)):
+      with self.subTest(T=str(inp.shape[1])):
+        self.assert_same_kernels(self._kernel_asts(False, True, inp, pos), self._kernel_asts(True, True, inp, pos))
+
+  def test_gate_closed_keeps_the_generic_decode_graph(self):
+    # GDN_NV_FUSED_DECODE closed (the default) at call time: prepared weights change nothing
+    x = Tensor.randn(1, 1, TINY_DIM).realize()
+    self.assert_same_kernels(self._kernel_asts(False, False, x, 3), self._kernel_asts(True, False, x, 3))
+
+  def test_prepare_only_under_the_gate_and_geometry(self):
+    block = tiny_block()
+    block.prepare_nv_decode()  # gate closed: CPU, GDN_NV_FUSED_DECODE=0
+    self.assertIsNone(block.nv_decode_weights)
+    odd = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=4, inner_size=12*4)  # head_v_dim 12: not a multiple of 8
+    config = TransformerConfig(num_blocks=1, dim=8, hidden_dim=16, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=32, head_dim=8,
+                               rope_theta=10000.0, rope_dim=8, v_head_dim=8, max_context=64, ssm_layers=(True,), ssm=odd)
+    with decode_gate():
+      for blk in (GatedDeltaNetBlock(config, odd), GatedDeltaNetBlock(config, SSMConfig(4, 32, 2, 4, 32*4, kda=True))):
+        blk.prepare_nv_decode()
+        self.assertIsNone(blk.nv_decode_weights)
+      block.prepare_nv_decode()
+    self.assertEqual([tuple(w.shape) for w in cast_weights(block)], [(block.conv_channels, 4), (32,), (4,), (4,)])
+
+def cast_weights(block:GatedDeltaNetBlock) -> tuple[Tensor, ...]:
+  assert block.nv_decode_weights is not None
+  return block.nv_decode_weights
 
 if __name__ == "__main__":
   unittest.main()

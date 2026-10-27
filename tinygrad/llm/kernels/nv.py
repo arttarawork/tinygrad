@@ -104,3 +104,123 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
   assert start_pos.uop.is_bound_var
   call = _gated_delta_prefill_kernel(*params, kernel_var(start_pos.uop.src[0])).call(*contig)
   return Tensor(contig[0].after(call))
+
+# ******** T4.123f+g: the whole GatedDeltaNet decode step (T == 1) in two launches ********
+# The generic decode graph ran 13 small kernels (~6 us each regardless of size) around the fused scan: the attn_qkv partial sum, the
+# conv window in and out of conv_state, conv+SiLU for v and -- recomputed per consumer -- for q/k, their l2 norms, the repeated q/k,
+# kq, beta, alpha, ssm_norm's rms and the gated output. Here: two kernels, behind the same GDN_NV_FUSED_DECODE gate.
+#  1. _gdn_conv_decode_kernel: one thread per conv channel -- sums attn_qkv's split-K partials, runs the taps + SiLU into conv_out and
+#     shifts conv_state in place. Every conv_state element is read and written by one thread only, so the shift is race-free.
+#     It cannot live in the scan kernel: a k-head's q/k channels feed every v-head mapped to it (3 blocks at 27B geometry), and one
+#     block overwriting conv_state rows that the others still read needs a grid-wide barrier.
+#  2. _gdn_decode_kernel: one block per (batch, v-head) = value_dim/row_tile warps x row_tile value rows (the old scan's lane map), so
+#     the block owns the whole head. Each warp l2-normalizes its k-head's q/k from conv_out (three warp_reduces over the same 2x128
+#     floats in every warp -- L1 hits), forms kq, beta, alpha, runs the gated-delta update of its rows, then ssm_norm's rms over the head
+#     is a block reduction (one shared float per warp, one barrier), times the norm weight and SiLU(attn_gate, its split-K partials
+#     summed in-kernel), stored fp16 for ssm_out. Row tile 8, not the old scan's 4: 4 means 1024-thread blocks, whose 64-register cap
+#     spills 24 B/thread (ptxas sm_86); 8 = 512 threads at 27B geometry, 128 registers, no stack frame, the same state bytes in
+#     flight per SM. 48 such blocks on 48 of the 82 SMs instead of 1536 one-warp blocks: the 6.3 MB state read+write is 131 KB per
+#     busy SM, far below one SM's load rate, so the scan part should stay DRAM-bound (~7 us) -- the card profile decides.
+# lanes=1 is the CPU form of both (one lane owns the whole head, no shuffles, no shared memory) for the CPU tests, as in nv_attn.py.
+
+def _lane(lanes:int, axis:int) -> UOp: return UOp.range(lanes, axis, AxisType.LOCAL) if lanes > 1 else UOp.const(0, dtypes.weakint)
+
+def _added(xs) -> UOp: return functools.reduce(lambda a, b: a + b, xs)  # left to right, the order the generic graph sums in
+
+@functools.cache
+def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, _bound:UOp, start_pos:UOp, lanes:int=32) -> UOp:
+  """conv_out (B,C) fp32 = SiLU(sum_i weight[c,i] * window[i]) with window = [conv_state rows (zero at start_pos 0) | sum_p qkv[b,c,p]];
+  conv_state (B,taps-1,C) <- window[1:] in place."""
+  batch, history, channels = conv_state.shape
+  parts = qkv.shape[-1]
+  assert all(isinstance(s, int) for s in (batch, history, channels, parts)) and channels % lanes == 0 and weight.shape == (channels, history+1)
+  batch, history, channels, parts = cast(tuple[int, int, int, int], (batch, history, channels, parts))
+  block, lane = UOp.range(batch*channels//lanes, 0), _lane(lanes, 1)
+  b, c = block // (channels//lanes), (block % (channels//lanes))*lanes + lane
+  initial = start_pos.eq(0)
+  window = [initial.where(0, conv_state[b, i, c].load().float()) for i in range(history)] + [_added(qkv[b, c, p].load() for p in range(parts))]
+  out = conv_out[b, c].store(_added(x*weight[c, i].load() for i,x in enumerate(window)).silu())
+  # the old rows all feed `out`, so storing the shifted window through conv_state.after(out) orders every load before every store
+  shifts = [conv_state.after(out)[b, i, c].store(window[i+1].cast(conv_state.dtype)) for i in range(history)]
+  ends = tuple(r for r in (lane, block) if r.op is Ops.RANGE)
+  return UOp.group(out, *shifts).end(*ends).sink(arg=KernelInfo(name="gdn_conv_decode_nv", opts_to_apply=()))
+
+@functools.cache
+def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta:UOp, alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, _bound:UOp,
+                       start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float, lanes:int=32, row_tile:int=8) -> UOp:
+  """model.py's decode graph from conv_out on, per (b, v-head h): q/k = conv_out's k-head h % k_heads l2-normalized (q * key_dim^-0.5),
+  v = conv_out's v channels, beta = sigmoid(beta) in its own dtype, alpha = exp(softplus(alpha + dt_bias) * ssm_a), the fused scan's
+  one-token step on state (B,H,V,K) in place (zeroed at start_pos 0), then z (B,H*V) = rmsnorm(core) * norm_weight * SiLU(sum_p gate)."""
+  batch, heads, value_dim, key_dim = state.shape
+  parts = gate.shape[-1]
+  assert all(isinstance(s, int) for s in (batch, heads, value_dim, key_dim, parts)) and heads % k_heads == 0
+  batch, heads, value_dim, key_dim, parts = cast(tuple[int, int, int, int, int], (batch, heads, value_dim, key_dim, parts))
+  assert key_dim % lanes == 0 and value_dim % row_tile == 0 and value_dim // row_tile <= 32
+  waves, q_dim = value_dim // row_tile if lanes > 1 else 1, k_heads*key_dim
+  beta, alpha = beta.reshape(batch, heads), alpha.reshape(batch, heads)
+  bh, lane = UOp.range(batch*heads, 0), _lane(lanes, 1)
+  wave = UOp.range(waves, 2, AxisType.LOCAL) if waves > 1 else UOp.const(0, dtypes.weakint)
+  b, h = bh // heads, bh % heads
+  k_head = h % k_heads  # model.py .repeat()s the k-heads along the head axis: v-head h reads k-head h % k_heads
+  cols = tuple(lane + i*lanes for i in range(key_dim//lanes))
+  rows = tuple(wave*(value_dim//waves) + i for i in range(value_dim//waves))
+  def dot(xs, ys) -> UOp:
+    s = sum((x*y for x,y in zip(xs, ys)), UOp.const(0, dtypes.float32))
+    return warp_reduce(s, full_wave=True) if lanes > 1 else s
+  def l2(xs:tuple[UOp, ...]) -> tuple[UOp, ...]:  # Tensor.normalize: x / max(||x||_2, eps)
+    den = dot(xs, xs).sqrt().maximum(qk_eps)
+    return tuple(x / den for x in xs)
+  q = tuple(x * key_dim**-0.5 for x in l2(tuple(conv_out[b, k_head*key_dim + c].load() for c in cols)))
+  k = l2(tuple(conv_out[b, q_dim + k_head*key_dim + c].load() for c in cols))
+  kq, initial = dot(q, k), start_pos.eq(0)
+  bv = beta[b, h].load().sigmoid().float()
+  av = ((alpha[b, h].load().float() + dt_bias[h].load()).softplus() * ssm_a[h].load()).exp()
+  outs, stores = [], []
+  for row in rows:  # _gated_delta_prefill_kernel's step at tokens == 1
+    previous = tuple(initial.where(0, state[b, h, row, c].load().float()) for c in cols)
+    delta = (conv_out[b, 2*q_dim + h*value_dim + row].load() - dot(previous, k)*av) * bv
+    stores += [state[b, h, row, c].store((x*av + delta*y).cast(state.dtype)) for x,y,c in zip(previous, k, cols)]
+    outs.append(dot(previous, q)*av + delta*kq)
+  squares = _added(o*o for o in outs)  # this warp's rows (warp_reduce leaves every lane the same sums)
+  if waves > 1:
+    partial = UOp.placeholder((waves,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL)
+    partial = partial.after(partial[wave.valid(lane.eq(0))].store(squares).barrier())
+    squares = _added(partial[w].load() for w in range(waves))
+  inv = (squares * (1/value_dim) + norm_eps).rsqrt()  # nn.RMSNorm: x * (mean(x^2) + eps).rsqrt(), then * weight
+  for row,o in zip(rows, outs):
+    gated = o*inv*norm_weight[row].load() * _added(gate[b, h*value_dim + row, p].load() for p in range(parts)).silu()
+    stores.append(z[b, (h*value_dim + row).valid(lane.eq(0))].store(gated.cast(z.dtype)))
+  return UOp.group(*stores).end(*(r for r in (wave, lane, bh) if r.op is Ops.RANGE)).sink(arg=KernelInfo(name="gdn_decode_nv", opts_to_apply=()))
+
+def _split_k_partials(t:Tensor) -> Tensor:
+  """t (B,1,F) as (B,F,P): nv_q8_linear returns its split-K partials summed lazily (`Tensor(out.after(call)).sum(-1).reshape(...)`), so
+  handing a kernel the partials folds that sum's own launch into it. Matched structurally -- the rebuilt sum IS t.uop (hash-consing)
+  -- so any other producer (a generic matmul, a biased Linear) comes back as (B,F,1) and is realized as usual."""
+  u = t.uop
+  for _ in range(6):
+    if u.op is Ops.AFTER and len(u.shape) == 3 and Tensor(u).sum(-1).reshape(t.shape).uop is t.uop: return Tensor(u)
+    if not u.src: break
+    u = u.src[0]
+  return t.reshape(t.shape[0], t.shape[-1], 1)
+
+def gdn_decode(qkv:Tensor, out_gate:Tensor, beta:Tensor, alpha:Tensor, conv_state:Tensor, state:Tensor, conv_weight:Tensor, norm_weight:Tensor,
+               dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float) -> Tensor:
+  """One GatedDeltaNet decode token (T == 1) from the projections: qkv = attn_qkv(x), out_gate = attn_gate(x), beta = ssm_beta(x),
+  alpha = ssm_alpha(x) (all (B,1,F)). Updates conv_state and state in place; returns z (B,1,H*V) fp16, ssm_out's input.
+  The four weights must be realized buffers (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be re-copied every step."""
+  batch, heads, value_dim, _ = state.shape
+  channels, device = conv_state.shape[2], conv_state.device
+  lanes = 32 if isinstance(device, str) and device.split(":")[0] == "NV" else 1  # off NV only the CPU tests get here
+  assert start_pos.is_bound_var
+  # the kernels read start_pos as a PARAM by name (kernel_var); the bound variable itself rides along as an extra CALL src (`_bound`,
+  # never loaded) so the schedule binds it -- a precompiled @function drops arguments no kernel references, and the generic graph
+  # this replaces got the binding from its conv-window kernel
+  var, bound = kernel_var(start_pos.src[0]), Tensor(start_pos)
+  conv_out = Tensor.empty(batch, channels, dtype=dtypes.float32, device=device)
+  conv_out = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, bound,
+                                  fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes))[0]
+  z = Tensor.empty(batch, heads*value_dim, dtype=dtypes.float16, device=device)
+  z = Tensor.custom_kernel(z, state, conv_out, beta.reshape(batch, heads), alpha.reshape(batch, heads), dt_bias, ssm_a,
+                           _split_k_partials(out_gate), norm_weight, bound, fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads,
+                           qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes))[0]
+  return z.reshape(batch, 1, heads*value_dim)
