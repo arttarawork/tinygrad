@@ -1,6 +1,7 @@
 """T4.98f/T4.98j: NV WMMA (mma.sync m16n8k16) prefill gemm for Q8_0/Q4_0/Q4_1/IQ4_NL and the K-quants -- graph builds
 for the real shapes, the sm_86 render pins the lane-range split the fragment mapping relies on, and the dispatch gates.
-Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py)."""
+Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py). T4.126's int8 (IMMA, m16n8k32) Q4_0 kernel is different:
+the PYTHON emulator models that mma, so its fragment map, staging and epilogue are executed there bit-exact vs numpy."""
 import functools, sys, unittest
 from math import prod
 import numpy as np
@@ -337,5 +338,47 @@ class TestImmaDispatch(unittest.TestCase):
     lin = _quantized_linear(Q4_0, 256, 1024)  # 32 groups
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32):
       self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
+
+def _emulated_lane_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+  # warp_reduce's xor butterfly for q8_quantize_nv's one-warp lane range, each __shfl_xor_sync swapped for a shared exchange
+  # (the PYTHON emulator has no CUDA intrinsics and runs the block in lockstep) -- test_llm_nv_norm's _emulated_warp_reduce
+  assert full_wave
+  lane = next(u for u in val.toposort() if u.op is Ops.RANGE and u.arg[-1] is AxisType.LOCAL)
+  for off in (16, 8, 4, 2, 1):
+    buf = UOp.placeholder((32,), dtypes.float32, slot=60 + off, addrspace=AddrSpace.LOCAL)
+    other = buf.after(buf[lane].store(val))[lane + off - (lane // off) % 2 * (2 * off)].load()
+    val = val.maximum(other) if maximum else val + other
+  return val
+
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestImmaEndToEndOnEmulator(unittest.TestCase):
+  """T4.126: Linear.set_quantized's real Q4_0 views -> nv_wmma_linear with NV_IMMA=1 -> q8_quantize + the IMMA kernel, all executed
+  on the PYTHON emulator (gate forced open, warp shuffle emulated). Bit-exact vs the numpy reference fed the quantizer's own
+  output, and close to the fp32 matmul of the dequantized weights (q8 activations are the only approximation)."""
+  def test_q4_0_linear(self):
+    from unittest import mock
+    from tinygrad import nn, Context
+    from tinygrad.llm.gguf import ggml_data_to_tensor
+    from tinygrad.llm.kernels import nv_quant
+    from tinygrad.llm.kernels.amd import Linear
+    tokens, out_features, in_features = 32, 64, 128
+    rng = np.random.default_rng(7)
+    blocks = _q4_0_blocks(rng, out_features, in_features // 32)
+    raw = Tensor(np.pad(blocks.reshape(-1), (4, 0)), device="PYTHON").contiguous().realize()[4:]
+    lin = Linear(in_features, out_features, bias=False)
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, Q4_0).reshape(out_features, in_features)
+    nn.state.load_state_dict(lin, {"weight": decoded}, verbose=False, realize=False)
+    lin.set_quantized(lin.weight)
+    x_np = rng.standard_normal((1, tokens, in_features)).astype(np.float32)
+    x = Tensor(x_np, device="PYTHON")
+    with mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__), Context(NV_IMMA=1, NV_IMMA_WARPS=2):
+      out = nv_gemm.nv_wmma_linear(lin, x)
+      self.assertIn("linear_q4_0_imma_nv", _kernels(out))
+      xq, xd = (t.numpy() for t in nv_quant.q8_quantize(x, tokens, in_features))  # the very tensors the dispatch used (T4.123a cache)
+      res = out.numpy()
+    np.testing.assert_array_equal(res[0], _np_imma_reference(blocks, xq, xd))
+    # q8 activation error only: max 0.033 here on outputs of mean magnitude 1.2 (a wiring slip would be O(1))
+    np.testing.assert_allclose(res[0], x_np[0] @ decoded.numpy().T, rtol=0, atol=0.05)
 
 if __name__ == "__main__": unittest.main()
