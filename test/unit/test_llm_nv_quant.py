@@ -289,7 +289,7 @@ class TestKernelGraphAndRender(unittest.TestCase):
     if ggml_type == Q6_K: return (total // 2,), dtypes.uint16  # T4.125a: likewise for Q6_K
     return (total,), dtypes.uint8
 
-  def _build(self, ggml_type:int, out_features:int):
+  def _build(self, ggml_type:int, out_features:int, rows_per_warp:int=1):
     in_features, tokens = self.IN_FEATURES, 1
     group_count, chunks = in_features // 32, (in_features//32 + 31)//32
     raw_shape, raw_dtype = self._raw_shape(ggml_type, out_features, in_features)
@@ -300,7 +300,22 @@ class TestKernelGraphAndRender(unittest.TestCase):
     # T4.98k: IQ3_XXS/IQ3_S need the codebook as a 5th input, built the way nv_q8_linear does (a placeholder of the
     # right uint32 length) -- every other format leaves grid at its default None
     grid = UOp.placeholder((IQ_GRID_SIZES[ggml_type],), dtypes.uint32, slot=4) if ggml_type in IQ_GRID_SIZES else None
-    return _quant_decode_kernel(out, raw, xq, xd, grid, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
+    return _quant_decode_kernel(out, raw, xq, xd, grid, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
+                                 rows_per_warp=rows_per_warp)
+
+  def _render(self, sink:UOp) -> str:
+    # T4.125d: shared render-to-source helper for the rows-per-warp tests below (same skip-on-unreachable-nvrtc
+    # idiom test_renders_and_compiles_for_sm86 uses, factored out since three tests now need it)
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    from tinygrad.device import CompileError
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    try: prg = to_program(sink, renderer)
+    except CompileError: raise
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    return next(u.arg for u in prg.src if u.op is Ops.SOURCE)
 
   def test_graph_builds_for_every_format_and_shape(self):
     for ggml_type in NV_QUANT_TYPES:
@@ -337,6 +352,27 @@ class TestKernelGraphAndRender(unittest.TestCase):
             self.assertIsNotNone(decl, f"couldn't find the weight buffer's declared type in {ggml_type}'s source")
             self.assertEqual(cast(re.Match, decl).group(1), "unsigned short")
             self.assertNotRegex(src, r"unsigned char \w+ = \(\*\(data1_", f"{ggml_type} still loads bytes from the weight buffer")
+
+  def test_rows_per_warp_builds_and_renders_for_every_r(self):
+    # T4.125d: R in {1 (default knob fallback), 2 (NV_GEMV_ROWS default), 4} must build and render for every
+    # format at both model-like shapes -- the dp4a dot survives regardless of how many rows one warp now produces.
+    for ggml_type in NV_QUANT_TYPES:
+      for out_features in self.SHAPES:
+        for rows_per_warp in (1, 2, 4):
+          with self.subTest(ggml_type=ggml_type, out_features=out_features, rows_per_warp=rows_per_warp):
+            sink = self._build(ggml_type, out_features, rows_per_warp=rows_per_warp)
+            self.assertEqual(sink.op, Ops.SINK)
+            self.assertIn("__dp4a", self._render(sink))
+
+  def test_out_features_mod_rows_per_warp_falls_back_to_r1(self):
+    # T4.125d: out_features % R != 0 must render EXACTLY R=1's kernel -- _decode_linear's fallback, not a crash
+    # or a silently-wrong row count.
+    out_features = self.SHAPES[0] + 1  # 12289: not a multiple of 2 or 4
+    for ggml_type in NV_QUANT_TYPES:
+      with self.subTest(ggml_type=ggml_type):
+        r1 = self._build(ggml_type, out_features, rows_per_warp=1)
+        r4 = self._build(ggml_type, out_features, rows_per_warp=4)
+        self.assertEqual(self._render(r1), self._render(r4))
 
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
