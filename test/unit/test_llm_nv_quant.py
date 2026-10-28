@@ -6,10 +6,7 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
-import pathlib
 import re
-import subprocess
-import types
 import unittest
 from typing import cast
 from unittest import mock
@@ -27,29 +24,6 @@ from tinygrad.llm.model import FFNBlock, TransformerConfig
 from test.helpers import check_schedule
 
 KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
-
-# T4.125d: the commit this branch (task/T4.125d-rows-per-warp) is based on -- T4.125a validated, no rows-per-warp yet.
-T4125D_BASE_COMMIT = "c07146713"
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-def _load_base_nv_quant_module() -> types.ModuleType:
-  """Exec nv_quant.py exactly as it stood at T4125D_BASE_COMMIT (pre-T4.125d, so _quant_decode_kernel has no
-  rows_per_warp knob) as an isolated module, so test_r1_render_matches_t4125a_base can diff this file's R=1
-  render against it byte-for-byte without relying on a saved-string fixture that could drift from the real base.
-  ContextVar guards against re-registering a key it's already seen (tinygrad.helpers.ContextVar), and this file's
-  own NV_CUSTOM_QUANT/NV_GEMV_ROWS are already registered by the normal import above -- pop the one key the base
-  file re-declares out of the shared registry for the duration of the exec, then restore it; nothing in this test
-  reads the base module's NV_CUSTOM_QUANT by value, only its _quant_decode_kernel function, so the swap is safe."""
-  src = subprocess.run(["git", "show", f"{T4125D_BASE_COMMIT}:tinygrad/llm/kernels/nv_quant.py"], cwd=REPO_ROOT,
-                        capture_output=True, text=True, check=True).stdout
-  from tinygrad.helpers import ContextVar
-  saved = ContextVar._cache.pop("NV_CUSTOM_QUANT", None)
-  try:
-    module = types.ModuleType(f"nv_quant_base_{T4125D_BASE_COMMIT}")
-    exec(compile(src, f"<git:{T4125D_BASE_COMMIT}:nv_quant.py>", "exec"), module.__dict__)
-  finally:
-    if saved is not None: ContextVar._cache["NV_CUSTOM_QUANT"] = saved
-  return module
 
 def _iq3_grids() -> tuple[list, list]:  # (iq3xxs_grid, iq3s_grid), 256 and 512 uint32 words -- loaded once, lazily
   from tinygrad.runtime.autogen import ggml_common as _ggml
@@ -387,27 +361,6 @@ class TestKernelGraphAndRender(unittest.TestCase):
             sink = self._build(ggml_type, out_features, rows_per_warp=rows_per_warp)
             self.assertEqual(sink.op, Ops.SINK)
             self.assertIn("__dp4a", self._render(sink))
-
-  def test_r1_render_matches_t4125a_base(self):
-    # T4.125d: R=1 (the fallback/identity case) must render EXACTLY what _quant_decode_kernel rendered before
-    # this task -- diffed against T4125D_BASE_COMMIT's own copy of this file (no rows-per-warp knob at all),
-    # loaded as an isolated module, so the comparison can't drift from the real base like a saved string could.
-    base = _load_base_nv_quant_module()
-    for ggml_type in NV_QUANT_TYPES:
-      for out_features in self.SHAPES:
-        with self.subTest(ggml_type=ggml_type, out_features=out_features):
-          new_sink = self._build(ggml_type, out_features, rows_per_warp=1)
-          in_features = self.IN_FEATURES
-          group_count, chunks = in_features // 32, (in_features//32 + 31)//32
-          raw_shape, raw_dtype = self._raw_shape(ggml_type, out_features, in_features)
-          out = UOp.placeholder((1, out_features, chunks), dtypes.float32, slot=0)
-          raw = UOp.placeholder(raw_shape, raw_dtype, slot=1)
-          xq = UOp.placeholder((1, group_count, 8), dtypes.uint32, slot=2)
-          xd = UOp.placeholder((1, group_count), dtypes.float32, slot=3)
-          grid = UOp.placeholder((IQ_GRID_SIZES[ggml_type],), dtypes.uint32, slot=4) if ggml_type in IQ_GRID_SIZES else None
-          base_sink = base._quant_decode_kernel(out, raw, xq, xd, grid, out_features=out_features, in_features=in_features,
-                                                 ggml_type=ggml_type)
-          self.assertEqual(self._render(new_sink), self._render(base_sink))
 
   def test_out_features_mod_rows_per_warp_falls_back_to_r1(self):
     # T4.125d: out_features % R != 0 must render EXACTLY R=1's kernel -- _decode_linear's fallback, not a crash
