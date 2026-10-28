@@ -6,20 +6,24 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
+import itertools
 import re
+import sys
 import unittest
 from typing import cast
 from unittest import mock
 import contextlib
 import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
-from tinygrad.uop.ops import Ops, KernelInfo
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import AxisType, Ops, KernelInfo
 from tinygrad.llm.gguf import ggml_data_to_tensor
+from tinygrad.llm.kernels import nv_quant
 from tinygrad.llm.kernels.amd import (
-  Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, IQ4_WORDS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES)
+  Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, IQ4_WORDS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES, Q8_GROUP_SIZE)
 from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
-  nv_q8_linear, q8_quantize, split_k_partials,
+  nv_q8_linear, q8_quantize, split_k_partials, _ffn_act_q8_kernel, ffn_act_q8,
 )
 from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, nv_fused_norm
 from test.helpers import check_schedule
@@ -373,6 +377,83 @@ class TestKernelGraphAndRender(unittest.TestCase):
         r1 = self._build(ggml_type, out_features, rows_per_warp=1)
         r4 = self._build(ggml_type, out_features, rows_per_warp=4)
         self.assertEqual(self._render(r1), self._render(r4))
+
+# T4.127a: an emulated single-warp reduce for _ffn_act_q8_kernel's PYTHON-emulator execution test below -- simpler
+# than test_llm_nv_norm.py's _emulated_warp_reduce (add_rmsnorm_q8's multi-warp blocks need a `warp*32+lane` tid to
+# find a shuffle partner across warps): this kernel's 32-wide AxisType.LOCAL lane range IS the whole block (no
+# separate AxisType.WARP range), so the partner is just `lane`'s own xor-butterfly index into one shared buffer.
+_emu_slot = itertools.count(200)
+def _emulated_warp_reduce_one_warp(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+  assert full_wave
+  lane = next(u for u in val.toposort() if u.op is Ops.RANGE and u.arg[-1] is AxisType.LOCAL)
+  for off in (16, 8, 4, 2, 1):
+    buf = UOp.placeholder((32,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
+    partner = lane + off - (lane // off) % 2 * (2 * off)  # lane ^ off for a power-of-two off (CHECK_OOB-friendly form)
+    other = buf.after(buf[lane].store(val))[partner].load()
+    val = val.maximum(other) if maximum else val + other
+  return val
+
+class TestFFNActQ8Kernel(unittest.TestCase):
+  """T4.127a: _ffn_act_q8_kernel (nv_quant.py) -- the fused SiLU(gate)*up + q8-quantize decode kernel. Render+
+  compile for sm_86 like TestKernelGraphAndRender above, plus real execution on tinygrad's PYTHON emulator (the
+  idiom test_llm_nv_norm.py's TestKernelRunsOnPythonEmulator uses for add_rmsnorm_q8) since this kernel's layout
+  -- one plain 32-wide AxisType.LOCAL lane range per (token, group), same as _q8_quantize_kernel -- is simple
+  enough for _emulated_warp_reduce_one_warp above to stand in for the real __shfl_xor_sync."""
+  TOKENS, HIDDEN, C = 1, 2048, 2
+
+  @staticmethod
+  def np_ffn_act_q8(gate_partials:np.ndarray, up_partials:np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """gate_partials/up_partials (tokens, hidden, C): act = silu(sum_c gate) * sum_c up, then _q8_pack's exact
+    formula (test_llm_amd.py's q8_quantize reference: scale=max(abs)/127 clamped 1e-8, q=clip(rint(x/scale)))."""
+    tokens, hidden, _ = gate_partials.shape
+    gate_sum, up_sum = gate_partials.sum(-1), up_partials.sum(-1)
+    act = (gate_sum / (1 + np.exp(-gate_sum))) * up_sum  # silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    groups = hidden // Q8_GROUP_SIZE
+    g = act.reshape(tokens, groups, Q8_GROUP_SIZE)
+    scale = np.maximum(np.max(np.abs(g), axis=-1) / 127, 1e-8)
+    q = np.clip(np.rint(g / scale[..., None]), -127, 127).astype(np.int8)
+    return q, scale
+
+  def _build(self, tokens:int|None=None, hidden:int|None=None, C:int|None=None) -> UOp:
+    tokens, hidden, C = tokens or self.TOKENS, hidden or self.HIDDEN, self.C if C is None else C
+    groups = hidden // Q8_GROUP_SIZE
+    params = [UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=0), UOp.placeholder((tokens, groups), dtypes.float32, slot=1),
+              UOp.placeholder((tokens, hidden, C), dtypes.float32, slot=2), UOp.placeholder((tokens, hidden, C), dtypes.float32, slot=3)]
+    return _ffn_act_q8_kernel(*params, tokens=tokens, hidden_dim=hidden, C=C)
+
+  def test_graph_builds_for_every_shape(self):
+    for hidden in (self.HIDDEN, 17408):  # 17408: the standing Qwen3.8-27B FFN hidden width
+      for C in (1, 2, 5):
+        with self.subTest(hidden=hidden, C=C):
+          self.assertEqual(self._build(hidden=hidden, C=C).op, Ops.SINK)
+
+  def test_renders_and_compiles_for_sm86(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    from tinygrad.device import CompileError
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    try: prg = to_program(self._build(hidden=17408, C=17), renderer)
+    except CompileError: raise
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+    self.assertIn("__shfl_xor_sync(0xffffffff", src)
+    self.assertNotIn("amdgcn", src)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+ -- unused here, kept for parity with test_llm_nv_norm.py")
+  def test_runs_on_python_emulator(self):
+    tokens, hidden, C = 1, 64, 3
+    rng = np.random.default_rng(hidden + C)
+    gate_p = rng.standard_normal((tokens, hidden, C)).astype(np.float32)
+    up_p = rng.standard_normal((tokens, hidden, C)).astype(np.float32)
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce_one_warp), \
+         mock.patch.object(nv_quant, "_ffn_act_q8_kernel", nv_quant._ffn_act_q8_kernel.__wrapped__):  # bypass the cache
+      q, scale = ffn_act_q8(Tensor(gate_p, device="PYTHON"), Tensor(up_p, device="PYTHON"), tokens, hidden)
+      q_np, scale_np = q.numpy(), scale.numpy()
+    ref_q, ref_scale = self.np_ffn_act_q8(gate_p, up_p)
+    np.testing.assert_allclose(scale_np, ref_scale, rtol=1e-6)
+    np.testing.assert_array_equal(q_np.view(np.int8).reshape(ref_q.shape), ref_q)
 
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
@@ -779,16 +860,19 @@ class TestFFNNormSiteFusion(unittest.TestCase):
          mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True):
       old_names, old_reduces = _kernel_names_and_reduces(self._old_formula(block, x, attn_out))
       new_names, new_reduces = _kernel_names_and_reduces(block._ffn_output(x, attn_out))
-    # old: ffn_norm's RMSNorm reduce, one shared q8_quantize_nv for gate+up (T4.123a) + one for down, 3 gemvs
+    # old: ffn_norm's RMSNorm reduce, one shared q8_quantize_nv for gate+up (T4.123a); ffn_down's own quantize is
+    # now fused into ffn_act_q8_nv in BOTH formulas (T4.127a lives in _feed_forward, shared code), 3 gemvs
     self.assertEqual(old_reduces, 1)
-    self.assertEqual(old_names.count("q8_quantize_nv"), 2)
+    self.assertEqual(old_names.count("q8_quantize_nv"), 1)
+    self.assertEqual(old_names.count("ffn_act_q8_nv"), 1)
     self.assertEqual(old_names.count("add_rmsnorm_q8_nv"), 0)
     self.assertEqual(old_names.count("linear_q4_0_nv"), 3)
     # new: the reduce and the gate+up quantize are both gone, replaced by ONE add_rmsnorm_q8_nv; down's own
-    # quantize (a different activation, gate*up's product -- never fused by this task) is untouched
+    # quantize is T4.127a's fused kernel, same as the old formula above (an orthogonal fusion, same effect here)
     self.assertEqual(new_reduces, 0)
-    self.assertEqual(new_names.count("q8_quantize_nv"), 1)
+    self.assertEqual(new_names.count("q8_quantize_nv"), 0)
     self.assertEqual(new_names.count("add_rmsnorm_q8_nv"), 1)
+    self.assertEqual(new_names.count("ffn_act_q8_nv"), 1)
     self.assertEqual(new_names.count("linear_q4_0_nv"), 3)
 
   def test_fused_wiring_matches_the_old_formula_within_float_tolerance(self):
@@ -963,6 +1047,7 @@ class TestDecodeStepCensus(unittest.TestCase):
       census = _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
     print(f"\n{type(b).__name__} decode step: {len(census)} kernels", sorted(census))
     self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
+    self.assertEqual(census.count("ffn_act_q8_nv"), 1, "T4.127a: ffn_down's input (SiLU(gate)*up + its quantize) is one kernel")
     conversions = [k for k in census if (ins := k.partition(" <- ")[2]).startswith("unsigned char[") and "," not in ins]
     self.assertEqual(conversions, [], "no per-step norm-weight conversion (a kernel reading only a GGUF byte view)")
     self.assertNotIn(f"reduce float[{D}] <- float[{2*D}]", census, "the projection's partials are summed inside the ffn_norm kernel")
@@ -979,7 +1064,10 @@ class TestDecodeStepCensus(unittest.TestCase):
     b.ssm_norm.weight = self._gguf_f32(W // 8, 12)
     census = self._step(b)
     self.assertNotIn(f"elementwise half[{D}] <- half[{D}]", census, "the f16 gemvs read the fused fp16 output in place")
-    self.assertEqual(census.count("q8_quantize_nv"), 2, "attn_qkv/attn_gate's quantize is the fused kernel's; left: ssm_out's, ffn_down's")
+    # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only ssm_out's q8_quantize_nv remains
+    self.assertEqual(census.count("q8_quantize_nv"), 1, "attn_qkv/attn_gate's is the fused kernel's; ffn_down's is ffn_act_q8_nv's")
+    # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs -- are now the one combined gemv (dim 256 is 128-aligned)
+    self.assertEqual(census.count("linear_f16_gemv_nv"), 1, "ssm_beta/ssm_alpha's two gemvs are now the combined one")
 
   def test_attention_decode_step(self):
     D, W = self.DIM, self.WIDE
@@ -990,7 +1078,8 @@ class TestDecodeStepCensus(unittest.TestCase):
     b.attn_q_norm.weight, b.attn_k_norm.weight = self._gguf_f32(128, 12), self._gguf_f32(128, 13)
     census = self._step(b)
     self.assertNotIn(f"reduce float[1] <- float[{D}]", census, "attn_norm's sum of squares runs inside add_rmsnorm_q8")
-    self.assertEqual(census.count("q8_quantize_nv"), 2, "q/k/v's quantize is the fused kernel's; left: attn_output's and ffn_down's")
+    # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only attn_output's q8_quantize_nv remains
+    self.assertEqual(census.count("q8_quantize_nv"), 1, "q/k/v's quantize is the fused kernel's; ffn_down's is ffn_act_q8_nv's; left: attn_output's")
 
   def test_output_norm_feeds_the_head_directly(self):
     head, norm = self._q4_0(self.DIM, 64, 7), nn.RMSNorm(self.DIM, 1e-5)

@@ -301,6 +301,45 @@ def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|No
   results = srcs[0].custom_kernel(*srcs[1:], fxn=fxn)
   return results[0], results[1], results[2], (results[-1] if want_fp16 else None)
 
+# ******** T4.127a: FFN activation (SiLU(gate)*up) + q8-quantize decode kernel -- fuses FFNBlock._feed_forward's
+# T4.123c combine step with the q8_quantize_nv that follows it (ffn_down's input) into one kernel, reading the
+# gate/up gemvs' own un-summed split-K partials (split_k_partials below) instead of a materialized activation
+# buffer. Same warp-per-32-group layout/packing as _q8_quantize_kernel (via _q8_pack), wired into model.py's
+# _feed_forward by register_fused_q8 -- the exact pattern nv_fused_norm/_ffn_output already use. ********
+
+@functools.cache
+def _ffn_act_q8_kernel(q:UOp, scale:UOp, gate:UOp, up:UOp, *, tokens:int, hidden_dim:int, C:int) -> UOp:
+  """act = silu(sum_c gate[c]) * sum_c up[c], per element, then _q8_quantize_kernel's exact pack -- gate/up are
+  nv_q8_linear's un-summed split-K partials (tokens, hidden_dim, C), summed in index order (matching the generic
+  reduce this replaces); SiLU as Tensor.silu lowers it (x * sigmoid(x), tinygrad/mixin/elementwise.py)."""
+  groups = hidden_dim // Q8_GROUP_SIZE
+  token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token, group = token_group // groups, token_group % groups
+  gate, up = gate.reshape(tokens, groups, 32, C), up.reshape(tokens, groups, 32, C)
+  def act(e:UOp) -> UOp:
+    gate_sum = sum((gate[token, group, e, c].float() for c in range(C)), UOp.const(0, dtypes.float32))
+    up_sum = sum((up[token, group, e, c].float() for c in range(C)), UOp.const(0, dtypes.float32))
+    return gate_sum.silu() * up_sum
+  group_scale = (warp_reduce(act(lane).abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
+  word_lane = lane.minimum(7)
+  xs = tuple(act(word_lane*4+i) for i in range(4))
+  stores = (q[token, group, lane.valid(lane < 8)].store(_q8_pack(xs, group_scale)),
+            scale[token, group.valid(lane.eq(0))].store(group_scale))
+  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="ffn_act_q8_nv", opts_to_apply=()))
+
+def ffn_act_q8(gate_partials:Tensor, up_partials:Tensor, tokens:int, hidden_dim:int) -> tuple[Tensor, Tensor]:
+  """Thin wrapper (T4.127a) around _ffn_act_q8_kernel -- see FFNBlock._feed_forward's NV decode branch (model.py).
+  Returns (q, scale) in the same (tokens, groups, 8) uint32 / (tokens, groups) float32 shape q8_quantize/
+  add_rmsnorm_q8 produce, ready for register_fused_q8."""
+  C = cast(int, gate_partials.shape[-1])
+  groups = hidden_dim // Q8_GROUP_SIZE
+  dev = gate_partials.device
+  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=dev)
+  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=dev)
+  fxn = functools.partial(_ffn_act_q8_kernel, tokens=tokens, hidden_dim=hidden_dim, C=C)
+  q, scale = Tensor.custom_kernel(q, scale, gate_partials, up_partials, fxn=fxn)[:2]
+  return q, scale
+
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
                           rows_per_warp:int=1) -> UOp:

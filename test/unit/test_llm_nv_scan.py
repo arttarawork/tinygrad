@@ -301,9 +301,11 @@ class TestGDNDecodeKernelSource(unittest.TestCase):
       def ph(shape, dtype, slot): return UOp.placeholder(shape, dtype, slot=slot)
       conv = _gdn_conv_decode_kernel(ph((1, channels), dtypes.float32, 0), ph((1, 3, channels), dtypes.float16, 1),
                                      ph((1, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), sp, start_pos=sp)
+      # T4.127b: beta_alpha is ONE (1, 2*heads) buffer now (beta at [:heads], alpha at [heads:]), replacing the two
+      # separate (1, heads) placeholders -- every later slot shifts down by one.
       step = _gdn_decode_kernel(ph((1, heads*value_dim), dtypes.float16, 0), ph((1, heads, value_dim, key_dim), dtypes.float32, 1),
-        ph((1, channels), dtypes.float32, 2), ph((1, heads), dtypes.float16, 3), ph((1, heads), dtypes.float16, 4), ph((heads,), dtypes.float32, 5),
-        ph((heads,), dtypes.float32, 6), ph((1, heads*value_dim, parts), dtypes.float32, 7), ph((value_dim,), dtypes.float32, 8), sp,
+        ph((1, channels), dtypes.float32, 2), ph((1, 2*heads), dtypes.float16, 3), ph((heads,), dtypes.float32, 4),
+        ph((heads,), dtypes.float32, 5), ph((1, heads*value_dim, parts), dtypes.float32, 6), ph((value_dim,), dtypes.float32, 7), sp,
         start_pos=sp, k_heads=k_heads, qk_eps=1e-6, norm_eps=1e-6)
       for sink, kname, threads in ((conv, "gdn_conv_decode_nv", [32]), (step, "gdn_decode_nv", [32, value_dim//8])):
         with self.subTest(geometry=name, kernel=kname):
@@ -328,12 +330,13 @@ class TestGDNDecodeMatchesNumpy(unittest.TestCase):
     rng = np.random.default_rng(0)
     def f32(*s, scale=1.0): return (rng.standard_normal(s) * scale).astype(np.float32)
     qkv, gate, beta, alpha = f32(B, C, 3, scale=0.5), f32(B, H*V, 2), f32(B, 1, H), f32(B, 1, H)
+    beta_alpha = np.concatenate([beta, alpha], axis=-1)  # T4.127b: gdn_decode's ONE combined (B,1,2*heads) input
     conv0, state0 = f32(B, 3, C).astype(np.float16), f32(B, H, V, K, scale=0.3)
     conv_w, norm_w, dt_bias, ssm_a = f32(C, 4, scale=0.5), f32(V), f32(H), -np.abs(f32(H))
     for pos in (5, 0):
       with self.subTest(start_pos=pos):
         conv_state, state = Tensor(conv0).contiguous().realize(), Tensor(state0).contiguous().realize()
-        z = gdn_decode(linear_output(qkv), linear_output(gate), Tensor(beta), Tensor(alpha), conv_state, state, Tensor(conv_w), Tensor(norm_w),
+        z = gdn_decode(linear_output(qkv), linear_output(gate), Tensor(beta_alpha), conv_state, state, Tensor(conv_w), Tensor(norm_w),
                        Tensor(dt_bias), Tensor(ssm_a), UOp.variable("start_pos", 0, 63).bind(pos), k_heads=Hk, qk_eps=1e-6, norm_eps=1e-5)
         want_z, want_conv, want_state = decode_reference(qkv, gate, beta[:, 0], alpha[:, 0], conv0, state0, conv_w, norm_w, dt_bias, ssm_a, pos, Hk)
         self.assertEqual(z.dtype, dtypes.float16)
@@ -414,7 +417,9 @@ class TestGDNDecodeGraph(unittest.TestCase):
     custom = ["q8_quantize_nv", "linear_f16_gemv_nv", "linear_f16_gemv_nv", "linear_q4_0_nv", "linear_q4_0_nv", "q8_quantize_nv", "linear_q4_0_nv"]
     self.assertEqual([n for n in before if n not in ("?", "gated_delta_prefill_nv")], custom)
     self.assertEqual((before.count("?"), before.count("gated_delta_prefill_nv")), (15, 1))
-    self.assertEqual([n for n in after if n != "?"], custom[:5] + ["gdn_conv_decode_nv", "gdn_decode_nv"] + custom[5:])
+    # T4.127b: ssm_beta/ssm_alpha's two linear_f16_gemv_nv calls (before) become one (the combined gemv) after prepare_nv_decode
+    fused_custom = ["q8_quantize_nv", "linear_f16_gemv_nv", "linear_q4_0_nv", "linear_q4_0_nv", "q8_quantize_nv", "linear_q4_0_nv"]
+    self.assertEqual([n for n in after if n != "?"], fused_custom[:4] + ["gdn_conv_decode_nv", "gdn_decode_nv"] + fused_custom[4:])
     self.assertEqual(after.count("?"), 2)
 
   def test_split_k_partials(self):
