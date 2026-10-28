@@ -2,6 +2,7 @@
 for the real shapes, the sm_86 render pins the lane-range split the fragment mapping relies on, and the dispatch gates.
 Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py)."""
 import functools, sys, unittest
+from math import prod
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
@@ -154,7 +155,7 @@ def _np_imma_reference(blocks:np.ndarray, xq:np.ndarray, xd:np.ndarray) -> np.nd
     acc = ((c[:, :, grp] * dw[None, :, grp]).astype(np.float64) * xd[:, None, grp] + acc).astype(np.float32)
   return acc
 
-def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4):
+def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=2):
   groups = in_features // 32
   params = [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((out_features*groups*9,), dtypes.uint16, slot=1),
             UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)]
@@ -179,6 +180,25 @@ class TestImmaKernel(unittest.TestCase):
         self.assertEqual(tuple(prg.arg.global_size[:2]), (2, out_features // 64))  # token blocks fastest: they share weights in L2
         self.assertIn("__syncthreads();", src)
         self.assertIn("__shared__", src)
+
+  def test_every_knob_value_renders_and_compiles(self):
+    # each knob value the card sweep would try, one factor at a time around the defaults, at gate/up (in 5120) and down (in 17408)
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    default = (64, 4, 2, 2)
+    variants = [default] + [default[:i] + (v,) + default[i+1:] for i, vals in enumerate(((16, 32, 128), (1, 2, 8), (1, 4), (0, 1, 4, 8)))
+                            for v in vals]
+    for out_features, in_features in ((17408, 5120), (5120, 17408)):
+      for token_tile, warps, out_tiles, stage in variants:
+        with self.subTest(out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage):
+          prg = to_program(_imma_sink(128, out_features, in_features, token_tile, warps, out_tiles, stage), renderer)
+          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+          self.assertIn(f"__launch_bounds__({32*warps})", src)
+          self.assertEqual(src.count("__syncthreads();"), 2 if stage else 0)
+          self.assertEqual(prod(prg.arg.global_size), 128 // token_tile * out_features // (8*warps*out_tiles))  # a size-1 axis drops out
 
   def test_numpy_reference_matches_ggml_dequant(self):
     # the reference's integer form == gguf.py's own Q4_0 dequant times the dequantized activations (up to fp32 rounding)
@@ -243,5 +263,79 @@ class TestGates(unittest.TestCase):
     # divide 64, so it falls through to 32, same as the uncapped default would for tokens=32).
     self.assertEqual([nv_gemm._token_tile_for(64, knob=k) for k in (16, 32, 64, 128)], [16, 32, 64, 32])
     self.assertEqual([nv_gemm._output_tiles_for(o) for o in (8, 16, 32, 48)], [1, 1, 4, 1])
+
+def _quantized_linear(ggml_type:int, out_features:int, in_features:int):
+  # a Linear holding real packed ggml blocks, set_quantized the way gguf loading does (byte view at a 4-aligned offset)
+  from tinygrad import nn
+  from tinygrad.llm.gguf import ggml_data_to_tensor
+  from tinygrad.llm.kernels.amd import Linear
+  weights, block_bytes = BLOCK[ggml_type]
+  rng = np.random.default_rng(ggml_type)
+  packed = rng.integers(0, 256, out_features * in_features // weights * block_bytes, dtype=np.uint8).reshape(-1, block_bytes)
+  packed[:, :2] = np.full((len(packed), 1), 0.01, np.float16).view(np.uint8)  # finite f16 scales
+  raw = Tensor(np.pad(packed.reshape(-1), (4, 0))).contiguous().realize()[4:]
+  lin = Linear(in_features, out_features, bias=False)
+  nn.state.load_state_dict(lin, {"weight": ggml_data_to_tensor(raw, out_features * in_features, ggml_type).reshape(out_features, in_features)},
+                           verbose=False, realize=False)
+  lin.set_quantized(lin.weight)
+  assert lin.ggml_type == ggml_type
+  return lin
+
+def _kernels(t:Tensor) -> dict[str, UOp]:
+  return {k.arg.name: k for u in t.uop.toposort() if u.op is Ops.CALL and (k := u.src[0]).op is Ops.SINK and isinstance(k.arg, KernelInfo)}
+
+class TestImmaDispatch(unittest.TestCase):
+  """T4.126: nv_wmma_linear with the sm_80 gate forced open (graph build only, nothing realized): NV_IMMA=0 builds exactly the
+  fp16 WMMA kernel (the very UOp _wmma_kernel builds, so the same render), NV_IMMA=1 swaps in q8_quantize + the IMMA kernel
+  for Q4_0 only and reads its knobs at call time."""
+  def setUp(self):
+    from unittest import mock
+    patcher = mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True)
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def test_imma_off_is_the_fp16_kernel(self):
+    from tinygrad import Context
+    lin, x = _quantized_linear(Q4_0, 256, 128), Tensor.empty(1, 64, 128, dtype=dtypes.float32)
+    for ctx in ({}, {"NV_IMMA": 0}):
+      with Context(**ctx):
+        kernels = _kernels(nv_gemm.nv_wmma_linear(lin, x))
+      self.assertEqual(set(kernels), {"linear_q4_0_wmma_nv"})
+      self.assertIs(kernels["linear_q4_0_wmma_nv"], _sink(Q4_0, 64, 256, 128))
+
+  def test_imma_on_takes_q4_0_only(self):
+    from tinygrad import Context
+    x = Tensor.empty(1, 64, 128, dtype=dtypes.float32)
+    with Context(NV_IMMA=1):
+      kernels = _kernels(out := nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 256, 128), x))
+      self.assertEqual(set(kernels), {"q8_quantize_nv", "linear_q4_0_imma_nv"})
+      self.assertEqual(out.shape, (1, 64, 256))
+      self.assertIs(kernels["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128))  # the knob defaults: tile 64, 4 warps, 2 tiles, stage 2
+      for ggml_type in (Q8_0, Q4_1, IQ4_NL):  # every other format keeps its fp16 WMMA kernel
+        self.assertNotIn("linear_q4_0_imma_nv", _kernels(nv_gemm.nv_wmma_linear(_quantized_linear(ggml_type, 256, 128), x)))
+      self.assertEqual(set(_kernels(nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 72, 128), x))), {"linear_q4_0_wmma_nv"})  # 72 % 64
+
+  def test_knobs_reach_the_kernel(self):
+    from tinygrad import Context
+    lin, x = _quantized_linear(Q4_0, 256, 128), Tensor.empty(1, 64, 128, dtype=dtypes.float32)
+    with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=32, NV_IMMA_WARPS=2, NV_IMMA_OUT_TILES=4, NV_IMMA_STAGE=0):
+      self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128, 32, 2, 4, 0))
+    with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=3):  # tile: largest power of two dividing 64; stage: gcd with 4 groups
+      self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128, 64, 4, 2, 1))
+
+  def test_symbolic_chunk_pads_and_shrinks(self):
+    from tinygrad import Context, UOp as U
+    lin = _quantized_linear(Q4_0, 256, 128)
+    x = Tensor.empty(1, 64, 128, dtype=dtypes.float32)[:, :U.variable("T", 1, 64).bind(48)]
+    with Context(NV_IMMA=1):
+      out = nv_gemm.nv_wmma_linear(lin, x)
+    self.assertEqual(out.shape[-1], 256)
+    self.assertIn("linear_q4_0_imma_nv", _kernels(out))
+
+  def test_geometry_shrinks_stage_to_fit_shared_memory(self):
+    from tinygrad import Context
+    lin = _quantized_linear(Q4_0, 256, 1024)  # 32 groups
+    with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32):
+      self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
 
 if __name__ == "__main__": unittest.main()

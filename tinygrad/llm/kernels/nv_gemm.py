@@ -43,7 +43,7 @@ the same logical N axis -- that is how the ISA actually wires it (cross-checked 
 "simplify" this to reuse one variable for both, that would silently transpose/scramble the output.
 """
 from __future__ import annotations
-import functools
+import functools, math
 from typing import cast, Callable
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
@@ -53,9 +53,18 @@ from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok, iq_grid
+from tinygrad.llm.kernels.nv_quant import q8_quantize
 
 NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the generic prefill matmul (A/B lever for the bench)
 NV_WMMA_TOKEN_TILE = ContextVar("NV_WMMA_TOKEN_TILE", 64)  # T4.124c: card knob -- more/fewer token-tile warps per block (PB.3)
+# T4.126: Q4_0 prefill on the int8 tensor cores (q8 activations, decode's quantizer) instead of the fp16 WMMA kernel. Off by
+# default: the activations change from fp16 to q8 per 32-group, a numerics change the card's flip-rate gate decides. The four
+# shape knobs are card-sweepable and, like NV_WMMA_TOKEN_TILE, read only in nv_wmma_linear (never in the cached builder):
+NV_IMMA = ContextVar("NV_IMMA", 0)
+NV_IMMA_TOKEN_TILE = ContextVar("NV_IMMA_TOKEN_TILE", 64)  # tokens per block (largest power of two <= knob dividing the chunk)
+NV_IMMA_WARPS = ContextVar("NV_IMMA_WARPS", 4)            # warps per block, sharing one staged activation tile
+NV_IMMA_OUT_TILES = ContextVar("NV_IMMA_OUT_TILES", 2)    # 8-output n-tiles per warp (each A fragment feeds this many mmas)
+NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 2)            # 32-groups per shared-memory stage (barrier pair); 0 = no staging
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -380,13 +389,14 @@ def _i8x4(word:UOp) -> tuple[UOp, ...]:
   # them back into the mma's .b32 operand through the fragment struct; nvcc folds the round trip (see _q4_0_linear_imma_nv)
   return tuple((word >> (8*i)).cast(dtypes.int8) for i in range(4))
 
-def _i2f_exact(c:UOp) -> UOp:
-  # T4.126: int32 -> fp32 for |c| < 2**22 by the magic-number trick: (c + 0x4B400000) reinterpreted is 1.5*2**23 + c exactly,
-  # and subtracting 1.5*2**23 is exact (Sterbenz). Same bits as cvt.rn.f32.s32, but an IADD + FADD instead of an I2F, which
-  # sm_86 issues at 16/clk/SM (vs 64 IADD, 128 FADD) -- four conversions per lane per mma would otherwise cap the kernel at
-  # half the int8 tensor rate. A Q4_0 x q8 group dot is |c| <= 32*8*127 = 32512. The codegen's pm_wmma_add then folds the
-  # +0x4B400000 into the mma's C operand (WMMA(a,b,0)+k -> WMMA(a,b,k)), so the tensor core does the add: one FADD per element.
-  return (c + 0x4B400000).bitcast(dtypes.float32) - 12582912.0
+def _int_times_half(c:UOp, d:UOp) -> UOp:
+  # T4.126: float(c) * d for an int32 c with |c| < 2**22 and an fp16-valued fp32 d, as ONE fused multiply-add and no I2F
+  # (sm_86 issues I2F at 16/clk/SM vs 128 for FFMA -- four conversions per lane per mma would cap the kernel at half the
+  # int8 tensor rate). f = bitcast(c + 0x4B400000) is 1.5*2**23 + c exactly; 1.5*2**23 * d is exact in fp32 (2 + 11
+  # significant bits), so fma(f, d, -1.5*2**23*d) rounds the exact c*d once: the same bits as cvt.rn.f32.s32 then FMUL. A
+  # Q4_0 x q8 group dot is |c| <= 32*8*127 = 32512. The codegen's pm_wmma_add folds the +0x4B400000 into the mma's C operand
+  # (WMMA(a,b,0)+k -> WMMA(a,b,k)): the tensor core does the integer add.
+  return (c + 0x4B400000).bitcast(dtypes.float32) * d + d * -12582912.0
 
 @functools.cache
 def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, in_features:int, token_tile:int, warps:int,
@@ -478,10 +488,9 @@ def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, 
       dw = tuple(_half(raw[((n0 + 2*t + j)*groups + group)*9]) for j in (0, 1))
       dws = UOp.stack(*(dw[i % 2] for i in range(4)))  # C's n index: 2t for c0/c2, 2t+1 for c1/c3
       for mt, afrag in enumerate(afrags):
-        c = _i2f_exact(UOp.wmma(afrag, bfrag, zero, *IMMA_ARG))
-        # (c * d_w) * xd, written in the order the C renderer emits it (it strips a same-op child's parens, so c*(d_w*xd)
-        # would still compile as (c*d_w)*xd and the card would round differently from this graph on the emulator)
-        running[o][mt] = running[o][mt] + c * dws * xss[mt]
+        # acc += (c * d_w) * xd: two FFMAs per element. Not c*(d_w*xd): the C renderer strips a same-op child's parens, so the
+        # card would compile it as (c*d_w)*xd anyway and round differently from this graph on the emulator
+        running[o][mt] = running[o][mt] + _int_times_half(UOp.wmma(afrag, bfrag, zero, *IMMA_ARG), dws) * xss[mt]
   update = UOp.group(*(acc.store(value) for row, values in zip(accs, running) for acc, value in zip(row, values))).end(step)
   stores = []
   for n0, row in zip(n0s, accs):
@@ -503,6 +512,19 @@ def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:in
   layout = _wmma_layout_nv(out, out_features, token_tile, _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, dequant4, name)
 
+def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
+  # T4.126: the IMMA kernel's shape arguments from the NV_IMMA_* knobs, or None (-> the fp16 WMMA kernel) when NV_IMMA is off,
+  # the layer isn't Q4_0, or out_features doesn't split into whole blocks. tokens % 16 == 0 and in_features % 32 == 0 hold here.
+  warps, out_tiles = NV_IMMA_WARPS.value, NV_IMMA_OUT_TILES.value
+  if not NV_IMMA.value or layer.ggml_type != Q4_0 or layer.packed_u16 is None or layer.out_features % (WMMA_N*out_tiles*warps): return None
+  token_tile = WMMA_M
+  while token_tile*2 <= NV_IMMA_TOKEN_TILE.value and tokens % (token_tile*2) == 0: token_tile *= 2
+  groups = layer.in_features // Q8_GROUP_SIZE
+  stage = NV_IMMA_STAGE.value and math.gcd(NV_IMMA_STAGE.value, groups)  # must divide the groups; 0 = off
+  # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
+  while stage > 1 and token_tile*((8*stage + 4) + (stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
+  return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage}
+
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to
   `x.max_shape` the way amd.py's q8_linear pads for a symbolic chunk size). Returns None when it doesn't cover this
@@ -518,6 +540,16 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   if tokens <= 4 or tokens % WMMA_M != 0: return None  # tokens<=4: nv_quant.py's decode gemv covers it
   if not _nv_wmma_ok(x.device): return None
   x_pad = x.pad_to(x.max_shape) if symbolic else x  # concrete shape from here on
+  if (imma := _imma_geometry(layer, cast(int, tokens))) is not None:
+    # T4.126: q8 activations (shared across the Linears reading one x, nv_quant's T4.123a cache) x the u16 weight view
+    xq, xd = q8_quantize(x_pad, cast(int, tokens), in_features)
+    out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
+    all_srcs = (out, cast(Tensor, layer.packed_u16).uop.buf_uop, xq.uop, xd.uop)
+    params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
+    kernel = _q4_0_linear_imma_nv(*params, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
+    result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)
+    if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], out_features)))
+    return result if layer.bias is None else result + layer.bias
   xh = x_pad.cast(dtypes.float16).contiguous().reshape(tokens, in_features)
   raw = (layer.packed_bytes if layer.packed_bytes is not None else layer.weight).uop.buf_uop  # always the byte view, see _byte
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
