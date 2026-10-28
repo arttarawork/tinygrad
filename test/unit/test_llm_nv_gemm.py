@@ -1,7 +1,7 @@
 """T4.98f/T4.98j: NV WMMA (mma.sync m16n8k16) prefill gemm for Q8_0/Q4_0/Q4_1/IQ4_NL and the K-quants -- graph builds
 for the real shapes, the sm_86 render pins the lane-range split the fragment mapping relies on, and the dispatch gates.
 Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py)."""
-import sys, unittest
+import functools, sys, unittest
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
@@ -124,6 +124,85 @@ class TestImmaRenderer(unittest.TestCase):
     out = Tensor.empty(16, 8, dtype=dtypes.int32, device="PYTHON")
     res = out.custom_kernel(Tensor(a, device="PYTHON"), Tensor(b, device="PYTHON"), fxn=_imma_probe)[0].numpy()
     np.testing.assert_array_equal(res, a.astype(np.int32) @ b.astype(np.int32).T)
+
+# ******** T4.126: the IMMA Q4_0 kernel -- numpy reference of the exact quantized math, executed on the PYTHON emulator ********
+
+def _q4_0_blocks(rng, out_features:int, groups:int) -> np.ndarray:
+  # random Q4_0 blocks (out, groups, 18 bytes): f16 d then 16 qs bytes (any byte is a valid pair of nibbles)
+  blocks = rng.integers(0, 256, (out_features, groups, 18), dtype=np.uint8)
+  blocks[..., :2] = rng.uniform(-0.05, 0.05, (out_features, groups)).astype(np.float16)[..., None].view(np.uint8)
+  return blocks
+
+def _q8(rng, tokens:int, in_features:int) -> tuple[np.ndarray, np.ndarray]:
+  # q8_quantize_nv's exact formula (scale = max|x|/127 clamped at 1e-8, q = clip(rint(x/scale))), packed 4 int8 per uint32
+  x = rng.standard_normal((tokens, in_features // 32, 32)).astype(np.float32)
+  xd = np.maximum(np.abs(x).max(-1) / np.float32(127), np.float32(1e-8)).astype(np.float32)
+  q = np.clip(np.rint(x / xd[..., None]), -127, 127).astype(np.int8)
+  return q.view(np.uint32), xd
+
+def _np_imma_reference(blocks:np.ndarray, xq:np.ndarray, xd:np.ndarray) -> np.ndarray:
+  # the kernel's math: int32 dot per (token, output, group) of q8 x (nibble-8), then acc = fma(float(c) * d_w, xd, acc) in fp32,
+  # group by group in order (the kernel's REDUCE loop). Fused like the card's FFMA (nvcc contracts a*b+c by default) and the
+  # PYTHON renderer's MULACC: the fp32 product of two fp32 values is exact in fp64, so one rounding after the add
+  q = xq.view(np.int8).astype(np.int64)                                                    # (tokens, groups, 32)
+  qs = blocks[..., 2:]
+  w = np.concatenate([qs & 0xF, qs >> 4], axis=-1).astype(np.int64) - 8                    # (out, groups, 32)
+  c = np.einsum("tgk,ogk->tog", q, w).astype(np.float32)
+  dw = blocks[..., :2].copy().view(np.float16)[..., 0].astype(np.float32)                 # (out, groups)
+  acc = np.zeros(c.shape[:2], np.float32)
+  for grp in range(c.shape[2]):
+    acc = ((c[:, :, grp] * dw[None, :, grp]).astype(np.float64) * xd[:, None, grp] + acc).astype(np.float32)
+  return acc
+
+def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2):
+  groups = in_features // 32
+  params = [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((out_features*groups*9,), dtypes.uint16, slot=1),
+            UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)]
+  return nv_gemm._q4_0_linear_imma_nv.__wrapped__(*params, out_features=out_features, in_features=in_features, token_tile=token_tile,
+                                                  warps=warps, out_tiles=out_tiles)
+
+class TestImmaKernel(unittest.TestCase):
+  def test_renders_and_compiles_for_sm86_at_model_shapes(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    # Qwen3.8-27B's Q4_0 prefill linears at the standing 128-token chunk: attn/ssm out, ffn gate/up, GDN qkv, ffn down
+    for out_features, in_features in ((5120, 5120), (17408, 5120), (10240, 5120), (5120, 17408)):
+      with self.subTest(out=out_features, inp=in_features):
+        prg = to_program(_imma_sink(128, out_features, in_features), renderer)
+        src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+        self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
+        self.assertIn("int lidx0 = threadIdx.x; /* 32 */", src)  # the WARP range is the hardware lane, unsplit
+        self.assertIn("int lidx1 = threadIdx.y; /* 4 */", src)   # the warps
+        self.assertEqual(tuple(prg.arg.global_size[:2]), (out_features // 64, 2))
+
+  def test_numpy_reference_matches_ggml_dequant(self):
+    # the reference's integer form == gguf.py's own Q4_0 dequant times the dequantized activations (up to fp32 rounding)
+    from tinygrad.llm.gguf import ggml_data_to_tensor
+    rng = np.random.default_rng(1)
+    tokens, out_features, in_features = 4, 8, 128
+    blocks = _q4_0_blocks(rng, out_features, in_features // 32)
+    xq, xd = _q8(rng, tokens, in_features)
+    w = ggml_data_to_tensor(Tensor(blocks.reshape(-1)), out_features * in_features, Q4_0).reshape(out_features, in_features).numpy()
+    x = (xq.view(np.int8).astype(np.float32) * xd[..., None]).reshape(tokens, in_features)
+    np.testing.assert_allclose(_np_imma_reference(blocks, xq, xd), x @ w.T, rtol=1e-4, atol=1e-4)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_kernel_runs_on_python_emulator(self):
+    # the kernel itself executed lane by lane (every fragment index, the WARP/LOCAL thread mapping, the epilogue scales) on
+    # the PYTHON emulator, whose m16n8k32 model is the PTX ISA's; out_features spans several output blocks and warps
+    for tokens, out_features, in_features, token_tile, warps, out_tiles in ((32, 64, 64, 32, 2, 2), (32, 32, 96, 16, 1, 4)):
+      with self.subTest(tokens=tokens, out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles):
+        rng = np.random.default_rng(tokens + out_features)
+        blocks, (xq, xd) = _q4_0_blocks(rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
+        fxn = functools.partial(nv_gemm._q4_0_linear_imma_nv.__wrapped__, out_features=out_features, in_features=in_features,
+                                token_tile=token_tile, warps=warps, out_tiles=out_tiles)
+        out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device="PYTHON")
+        srcs = [Tensor(a, device="PYTHON") for a in (blocks.reshape(-1).view(np.uint16), xq, xd)]
+        res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
+        np.testing.assert_array_equal(res, _np_imma_reference(blocks, xq, xd))  # same fp32 op order: bit-exact
 
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):

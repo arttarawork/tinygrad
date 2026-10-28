@@ -373,6 +373,91 @@ def _token_tile_for(tokens:int, knob:int=64) -> int:
   return WMMA_M
 def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA_N*4) == 0 else 1
 
+# ******** T4.126: int8 tensor-core (IMMA) Q4_0 prefill gemm -- q8 activations x (nibble-8) weights ********
+
+def _i8x4(word:UOp) -> tuple[UOp, ...]:
+  # the 4 signed bytes of a uint32, little-endian (element 4j+i of a packed fragment register is byte i). The renderer packs
+  # them back into the mma's .b32 operand through the fragment struct; nvcc folds the round trip (see _q4_0_linear_imma_nv)
+  return tuple((word >> (8*i)).cast(dtypes.int8) for i in range(4))
+
+def _i2f_exact(c:UOp) -> UOp:
+  # T4.126: int32 -> fp32 for |c| < 2**22 by the magic-number trick: (c + 0x4B400000) reinterpreted is 1.5*2**23 + c exactly,
+  # and subtracting 1.5*2**23 is exact (Sterbenz). Same bits as cvt.rn.f32.s32, but an IADD + FADD instead of an I2F, which
+  # sm_86 issues at 16/clk/SM (vs 64 IADD, 128 FADD) -- four conversions per lane per mma would otherwise cap the kernel at
+  # half the int8 tensor rate. A Q4_0 x q8 group dot is |c| <= 32*8*127 = 32512. The codegen's pm_wmma_add then folds the
+  # +0x4B400000 into the mma's C operand (WMMA(a,b,0)+k -> WMMA(a,b,k)), so the tensor core does the add: one FADD per element.
+  return (c + 0x4B400000).bitcast(dtypes.float32) - 12582912.0
+
+@functools.cache
+def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, in_features:int, token_tile:int, warps:int,
+                         out_tiles:int) -> UOp:
+  """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
+  (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
+  acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
+  Q4_0 weight's uint16 view (amd.py packed_u16; 9 u16 per 18-byte block: d, then qs[0:16]), xq/xd = nv_quant.q8_quantize's
+  (tokens, groups, 8) uint32 words (4 int8 per word, element 4w+i = byte i) and (tokens, groups) fp32 scales.
+
+  Layout: grid (tokens/token_tile, out_features/(8*out_tiles*warps)), block = `warps` warps x 32 lanes. lane is its own
+  AxisType.WARP range (never split by the lowerer, mark_range_mod skips WARP: renders as threadIdx.x, 32) and warp an
+  AxisType.LOCAL range (threadIdx.y), so the hardware lane IS `lane` -- no lane%8/lane//8 trick needed here (_wmma_layout_nv).
+  Each warp owns out_tiles n-tiles and every m-tile of the token tile: B is decoded once per (n-tile, group) and reused over
+  the m-tiles, A once per (m-tile, group) and reused over the n-tiles.
+
+  Fragment map for m16n8k32 .s8 (g = lane//4 in [0,8), t = lane%4; k relative to the 32-wide group). Derived like T4.98f:
+  a forced-TC fp8 matmul (16x64 @ 64x8, codegen/opt/tc.py's cuda_81632_f8 = the same m16n8k32 8-bit fragment shape),
+  Opt(OptOps.TC, 0, (-1,0,1)), rendered for sm_89 via CUDARenderer(DEV.target("NV", arch="sm_89")): lidx0 = threadIdx.x (32),
+  g = lidx0>>2, t = lidx0&3; A loaded as four 4-byte runs A[g][4t..], A[g+8][4t..], A[g][16+4t..], A[g+8][16+4t..] (in that
+  register order), B as B[4t..4t+3][g] then B[16+4t..16+4t+3][g], C stored as C[g][2t..2t+1] and C[g+8][2t..2t+1]. Agrees with
+  the PTX ISA's m16n8k32 8-bit layout (groupID/threadID_in_group) and with ops_python's (8,16,32) emulator model, which
+  test_llm_nv_gemm's _imma_probe runs against numpy:
+
+           A (MxK = tokens x k)            B (KxN = k x outputs)          C/D (MxN) int32
+    a0 = A[g,   4t..4t+3]              b0 = B[4t..4t+3,    g]         c0 = C[g,   2t]   c1 = C[g,   2t+1]
+    a1 = A[g+8, 4t..4t+3]              b1 = B[16+4t..+3,   g]         c2 = C[g+8, 2t]   c3 = C[g+8, 2t+1]
+    a2 = A[g,   16+4t..16+4t+3]
+    a3 = A[g+8, 16+4t..16+4t+3]        (byte i of a register = the i-th k of its run)
+
+  So a0..a3 are xq words t, t, t+4, t+4 of tokens g, g+8, g, g+8 -- the quantizer's packing IS the fragment, no unpack. b0/b1
+  come from ONE 32-bit qs word: Q4_0 elements 0-15 are the low nibbles of qs[0:16] and 16-31 the high nibbles of the same
+  bytes (gguf.py), so qs[4t..4t+3]'s low nibbles are b0 and its high nibbles b1; nibble-8 per byte is (n + 0x78) ^ 0x80 (no
+  carry: n + 0x78 <= 0x87). C's n index (2t, 2t+1) is a different lane split than B's (g) -- the d_w the epilogue needs are
+  the blocks of outputs 2t and 2t+1, not the block this lane decoded."""
+  groups = in_features // Q8_GROUP_SIZE
+  token_block = UOp.range(out.shape[0] // token_tile, 0)
+  output_block = UOp.range(out_features // (WMMA_N*out_tiles*warps), 1)
+  warp, lane = UOp.range(warps, 2, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  g, t = lane // 4, lane % 4
+  n0s = tuple(((output_block*warps + warp)*out_tiles + o)*WMMA_N for o in range(out_tiles))
+  m0s = tuple(token_block*token_tile + mt*WMMA_M for mt in range(token_tile // WMMA_M))
+  accs = [[UOp.placeholder((4,), dtypes.float32, slot=o*len(m0s)+mt, addrspace=AddrSpace.REG) for mt in range(len(m0s))]
+          for o in range(out_tiles)]
+  accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
+  zero = UOp.const((0,)*4, dtypes.int32)
+  group = UOp.range(groups, 3, AxisType.REDUCE)
+  afrags = tuple(UOp.stack(*(b for r in range(4) for b in _i8x4(xq[m0 + g + 8*(r % 2), group, t + 4*(r // 2)]))) for m0 in m0s)
+  xds = tuple((xd[m0 + g, group], xd[m0 + g + 8, group]) for m0 in m0s)
+  updates = []
+  for o, n0 in enumerate(n0s):
+    base16 = ((n0 + g)*groups + group)*9
+    qs = raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16)
+    bfrag = UOp.stack(*(b for nib in (qs & 0x0F0F0F0F, (qs >> 4) & 0x0F0F0F0F) for b in _i8x4((nib + 0x78787878) ^ 0x80808080)))
+    dw = tuple(_half(raw[((n0 + 2*t + j)*groups + group)*9]) for j in (0, 1))
+    dws = UOp.stack(*(dw[i % 2] for i in range(4)))  # C's n index: 2t for c0/c2, 2t+1 for c1/c3
+    for mt, afrag in enumerate(afrags):
+      c = _i2f_exact(UOp.wmma(afrag, bfrag, zero, *IMMA_ARG))
+      # (c * d_w) * xd, written in the order the C renderer emits it (it strips a same-op child's parens, so c*(d_w*xd) would
+      # still compile as (c*d_w)*xd and the card would round differently from this graph on the emulator)
+      acc = accs[o][mt]
+      updates.append(acc.store(acc.after(group) + c * dws * UOp.stack(*(xds[mt][i // 2] for i in range(4)))))
+  update = UOp.group(*updates).end(group)
+  stores = []
+  for n0, row in zip(n0s, accs):
+    for m0, acc in zip(m0s, row):
+      c0, c1, c2, c3 = (acc.after(update)[i].load() for i in range(4))
+      stores += [out[m0 + g, n0 + 2*t].store(c0), out[m0 + g, n0 + 2*t + 1].store(c1),
+                 out[m0 + g + 8, n0 + 2*t].store(c2), out[m0 + g + 8, n0 + 2*t + 1].store(c3)]
+  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name="linear_q4_0_imma_nv", opts_to_apply=()))
+
 @functools.cache
 def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
                   token_tile:int) -> UOp:
