@@ -79,6 +79,9 @@ class Linear(nn.Linear):
                                       # to a real float matmul on the rest, without losing the packed view below
   packed_bytes:Tensor|None = None  # T4.98j: a uint8 view of the packed weight when self.weight is a uint32 word view (the WMMA
                                    # gemm decodes bytes; a word view's byte extraction (b//4, b%4) re-splits its lane range)
+  packed_u16:Tensor|None = None  # T4.125a: a uint16 view of the packed weight for Q4_0/IQ4_NL/Q6_K (2-byte-aligned, 18/18/210-byte
+                                  # blocks) -- nv_quant.py's decode gemv reads it instead of self.weight's byte view to halve its
+                                  # load-instruction count; None for every other format
   dense_weight:Tensor|None = None  # T4.98h: cached realized-fp16 copy of a non-quantized dense weight (nv_dense.py's
                                     # gemv) -- cast+.contiguous() is real work, cached so it runs once, not every decode step
   def __init__(self, in_features:int, out_features:int, bias=True):
@@ -111,6 +114,10 @@ class Linear(nn.Linear):
     buffer, nbytes = cast(Buffer, raw.buf_uop.buffer), raw.max_numel() * raw.dtype.itemsize
     self.weight = Tensor(UOp.from_buffer(buffer.view(nbytes // packed_dtype.itemsize, packed_dtype, raw_offset)))
     self.packed_bytes = Tensor(UOp.from_buffer(buffer.view(nbytes, dtypes.uint8, raw_offset))) if packed_dtype != dtypes.uint8 else None
+    # T4.125a: a uint16 view of the same buffer (no copy) for the three formats whose decode gemv (nv_quant.py)
+    # halves its load-instruction count with 16-bit instead of 8-bit loads. raw_offset % 4 == 0 is already
+    # asserted above, so % 2 == 0 (all this view needs) holds too; every block width here (18, 18, 210) is even.
+    self.packed_u16 = Tensor(UOp.from_buffer(buffer.view(nbytes // 2, dtypes.uint16, raw_offset))) if self.ggml_type in (Q4_0, IQ4_NL, Q6_K) else None
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels import nv_quant, nv_dense, nv_gemm  # local: both import Linear/QUANT_SIZES etc. from here --
                                                           # a module-level import there of this module would cycle (T4.98c)

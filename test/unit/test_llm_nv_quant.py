@@ -6,9 +6,11 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
+import re
 import unittest
 from typing import cast
 from unittest import mock
+import contextlib
 import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
 from tinygrad.uop.ops import Ops, KernelInfo
@@ -17,10 +19,11 @@ from tinygrad.llm.kernels.amd import (
   Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, IQ4_WORDS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES)
 from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
-  nv_q8_linear, q8_quantize,
+  nv_q8_linear, q8_quantize, split_k_partials,
 )
-from tinygrad.llm.model import FFNBlock, TransformerConfig
+from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, nv_fused_norm
 from test.helpers import check_schedule
+from test.unit.test_llm_nv_norm import np_add_rmsnorm_q8
 
 KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 
@@ -268,18 +271,25 @@ class TestKernelGraphAndRender(unittest.TestCase):
   SHAPES = (12288, 17408)
   IN_FEATURES = 5120
 
+  U16_VIEW_TYPES = (Q4_0, IQ4_NL, Q6_K)  # T4.125a
+
   @staticmethod
   def _raw_shape(ggml_type:int, out_features:int, in_features:int) -> tuple[tuple[int, ...], object]:
     if ggml_type in (Q4_0, Q8_0, Q4_1, IQ4_NL):
       blocks = in_features // 32
       nbytes = {Q8_0: 34, Q4_1: 20}.get(ggml_type, 18)  # Q4_0 and IQ4_NL are both 18
-      return (out_features*blocks*nbytes,), dtypes.uint8
+      total = out_features*blocks*nbytes
+      # T4.125a: nv_q8_linear now passes the uint16 view (set_quantized's packed_u16) for Q4_0/IQ4_NL
+      if ggml_type in (Q4_0, IQ4_NL): return (total // 2,), dtypes.uint16
+      return (total,), dtypes.uint8
     blocks = in_features // 256
     words = {Q4_K: Q4_WORDS, Q5_K: Q5_WORDS, IQ4_XS: IQ4_WORDS}.get(ggml_type)
     if words is not None: return (out_features*blocks*words,), dtypes.uint32
-    return (out_features*blocks*QUANT_SIZES[ggml_type],), dtypes.uint8  # Q6_K/Q3_K/IQ3_XXS/IQ3_S
+    total = out_features*blocks*QUANT_SIZES[ggml_type]  # Q6_K/Q3_K/IQ3_XXS/IQ3_S
+    if ggml_type == Q6_K: return (total // 2,), dtypes.uint16  # T4.125a: likewise for Q6_K
+    return (total,), dtypes.uint8
 
-  def _build(self, ggml_type:int, out_features:int):
+  def _build(self, ggml_type:int, out_features:int, rows_per_warp:int=1):
     in_features, tokens = self.IN_FEATURES, 1
     group_count, chunks = in_features // 32, (in_features//32 + 31)//32
     raw_shape, raw_dtype = self._raw_shape(ggml_type, out_features, in_features)
@@ -290,7 +300,22 @@ class TestKernelGraphAndRender(unittest.TestCase):
     # T4.98k: IQ3_XXS/IQ3_S need the codebook as a 5th input, built the way nv_q8_linear does (a placeholder of the
     # right uint32 length) -- every other format leaves grid at its default None
     grid = UOp.placeholder((IQ_GRID_SIZES[ggml_type],), dtypes.uint32, slot=4) if ggml_type in IQ_GRID_SIZES else None
-    return _quant_decode_kernel(out, raw, xq, xd, grid, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
+    return _quant_decode_kernel(out, raw, xq, xd, grid, out_features=out_features, in_features=in_features, ggml_type=ggml_type,
+                                 rows_per_warp=rows_per_warp)
+
+  def _render(self, sink:UOp) -> str:
+    # T4.125d: shared render-to-source helper for the rows-per-warp tests below (same skip-on-unreachable-nvrtc
+    # idiom test_renders_and_compiles_for_sm86 uses, factored out since three tests now need it)
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    from tinygrad.device import CompileError
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    try: prg = to_program(sink, renderer)
+    except CompileError: raise
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    return next(u.arg for u in prg.src if u.op is Ops.SOURCE)
 
   def test_graph_builds_for_every_format_and_shape(self):
     for ggml_type in NV_QUANT_TYPES:
@@ -318,6 +343,36 @@ class TestKernelGraphAndRender(unittest.TestCase):
           self.assertIn("__shfl_xor_sync(0xffffffff", src)
           self.assertNotIn("amdgcn", src)
           if ggml_type in (IQ4_XS, IQ4_NL): self.assertIn("__byte_perm", src)
+          if ggml_type in self.U16_VIEW_TYPES:
+            # T4.125a: the weight buffer (slot 1 -> "data1_<n>") must be a uint16 pointer, with no byte-sized
+            # load left from it -- Q6_K's int8-packing casts still render "unsigned char" elsewhere in the
+            # source (unrelated register casts, not loads), so this checks the load pattern specifically
+            # rather than the substring's mere presence.
+            decl = re.search(r"(unsigned \w+)\*\s*data1_\d+", src)
+            self.assertIsNotNone(decl, f"couldn't find the weight buffer's declared type in {ggml_type}'s source")
+            self.assertEqual(cast(re.Match, decl).group(1), "unsigned short")
+            self.assertNotRegex(src, r"unsigned char \w+ = \(\*\(data1_", f"{ggml_type} still loads bytes from the weight buffer")
+
+  def test_rows_per_warp_builds_and_renders_for_every_r(self):
+    # T4.125d: R in {1 (the fallback), 2, 4 (NV_GEMV_ROWS default)} must build and render for every
+    # format at both model-like shapes -- the dp4a dot survives regardless of how many rows one warp now produces.
+    for ggml_type in NV_QUANT_TYPES:
+      for out_features in self.SHAPES:
+        for rows_per_warp in (1, 2, 4):
+          with self.subTest(ggml_type=ggml_type, out_features=out_features, rows_per_warp=rows_per_warp):
+            sink = self._build(ggml_type, out_features, rows_per_warp=rows_per_warp)
+            self.assertEqual(sink.op, Ops.SINK)
+            self.assertIn("__dp4a", self._render(sink))
+
+  def test_out_features_mod_rows_per_warp_falls_back_to_r1(self):
+    # T4.125d: out_features % R != 0 must render EXACTLY R=1's kernel -- _decode_linear's fallback, not a crash
+    # or a silently-wrong row count.
+    out_features = self.SHAPES[0] + 1  # 12289: not a multiple of 2 or 4
+    for ggml_type in NV_QUANT_TYPES:
+      with self.subTest(ggml_type=ggml_type):
+        r1 = self._build(ggml_type, out_features, rows_per_warp=1)
+        r4 = self._build(ggml_type, out_features, rows_per_warp=4)
+        self.assertEqual(self._render(r1), self._render(r4))
 
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
@@ -544,6 +599,37 @@ class TestSetQuantizedIdentifiesFormat(unittest.TestCase):
     linear.set_quantized(linear.weight)
     self.assertIs(linear.dequant_weight, original)
 
+class TestPackedU16View(unittest.TestCase):
+  """T4.125a: set_quantized also stores a uint16 view of the packed buffer for Q4_0/IQ4_NL/Q6_K (the three
+  2-byte-aligned-but-not-4-byte-aligned formats nv_quant.py's decode gemv reads through it); every other
+  format's packed_u16 stays None, and the view shares the byte view's buffer -- no copy."""
+  def _linear_for(self, ggml_type:int, n:int, row_bytes:int) -> Linear:
+    rng = np.random.default_rng(0)
+    packed = rng.integers(0, 256, row_bytes, dtype=np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, n, ggml_type).reshape(1, n)
+    linear = Linear(n, 1, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    return linear
+
+  def test_u16_view_present_and_shares_the_byte_view_s_buffer(self):
+    for ggml_type, n, row_bytes in ((Q4_0, 32, 18), (IQ4_NL, 32, 18), (Q6_K, 256, 210)):
+      with self.subTest(ggml_type=ggml_type):
+        linear = self._linear_for(ggml_type, n, row_bytes)
+        self.assertIsNotNone(linear.packed_u16)
+        u16 = cast(Tensor, linear.packed_u16)
+        self.assertEqual(u16.dtype, dtypes.uint16)
+        self.assertEqual(u16.nbytes(), row_bytes)  # same bytes, just read as half as many elements
+        # no copy: both views are Buffer.view()s of the SAME base allocation
+        self.assertIs(u16.uop.buf_uop.buffer.base, linear.weight.uop.buf_uop.buffer.base)
+
+  def test_u16_view_none_for_every_other_format(self):
+    for ggml_type, n, row_bytes in ((Q8_0, 32, 34), (Q4_1, 32, 20), (Q4_K, 256, 144)):
+      with self.subTest(ggml_type=ggml_type):
+        linear = self._linear_for(ggml_type, n, row_bytes)
+        self.assertIsNone(linear.packed_u16)
+
 class TestFFNActivationFusion(unittest.TestCase):
   """T4.123c (decode fusion design, P3): FFNBlock._feed_forward's dense branch (model.py) drops the
   `.contiguous()` between silu(gate) and the up-multiply ONLY when T==1 (concrete) and both ffn_gate/ffn_up
@@ -626,5 +712,324 @@ class TestFFNActivationFusion(unittest.TestCase):
       self.assertIs(block._feed_forward(x4).uop, self._old_formula(block, x4).uop)
       xsym = Tensor.randn(1, 8, self.DIM)[:, :UOp.variable("toks", 1, 8).bind(1), :]
       self.assertIs(block._feed_forward(xsym).uop, self._old_formula(block, xsym).uop)
+
+def _kernel_names_and_reduces(t:Tensor) -> tuple[list[str], int]:
+  """Every custom-kernel CALL name in t's unscheduled graph, plus a count of plain Ops.REDUCE nodes (nn.RMSNorm's
+  .mean(-1) is the only thing in this file's graphs that produces one -- none of nv_quant.py's/nv.py's own
+  kernels use Ops.REDUCE, they all reduce via warp_reduce's shuffle tree -- so this is a clean proxy for "a
+  generic RMSNorm sum-of-squares survived"). check_schedule can't be used here: add_rmsnorm_q8's kernel uses
+  AxisType.LOCAL/WARP + AddrSpace.LOCAL, which .linear_with_vars() (and so check_schedule) can't push through
+  the scheduler's early rewrite passes on CPU/NULL at all (see test_llm_nv_norm.py's module docstring) -- this
+  reads the raw, unscheduled UOp graph directly instead (same idiom TestQuantizeOncePerActivation._quantize_calls
+  uses), which is exactly what nv_q8_linear/add_rmsnorm_q8's custom kernels already are (pre-built Ops.CALL nodes,
+  not something the scheduler groups later)."""
+  nodes = list(UOp.sink(t.uop).toposort())
+  names = [u.src[0].arg.name for u in nodes if u.op is Ops.CALL and u.src[0].op is Ops.SINK and isinstance(u.src[0].arg, KernelInfo)]
+  return names, sum(1 for u in nodes if u.op is Ops.REDUCE)
+
+class TestFFNNormSiteFusion(unittest.TestCase):
+  """T4.123e (decode fusion design, P4 wiring half): FFNBlock._ffn_output (model.py), used by both FFNBlock/
+  TransformerBlock's shared __call__ and GatedDeltaNetBlock's own one, fuses the ffn_norm site's residual-add +
+  RMSNorm + quantize into one add_rmsnorm_q8 kernel on the NV decode path (concrete T==1, dense FFN, both
+  ffn_gate/ffn_up already NV-quantized -- the same gate T4.123c's SiLU fusion uses). No GPU is opened here
+  (CPU/NULL only): the NV dispatch gate is exercised by monkeypatching nv_quant_supported at BOTH call sites
+  that check it -- model.py's own (controls _ffn_output's and _feed_forward's T4.123c gates) and
+  kernels/nv_quant.py's (amd.py's Linear.__call__ reads THIS one to decide whether to actually dispatch through
+  nv_q8_linear at all) -- mocking only the first one (TestFFNActivationFusion's own idiom) leaves Linear.__call__
+  on the generic dequant+matmul path, which never quantizes anything and so can't exercise this fusion."""
+  DIM = 256  # must be a multiple of 256 (add_rmsnorm_q8's default threads) -- _ffn_output's own guard
+
+  @staticmethod
+  def _q4_0_linear(dim:int, seed:int) -> Linear:
+    rng = np.random.default_rng(seed)
+    blocks = dim // 32
+    packed = rng.integers(0, 256, 18 * blocks * dim, dtype=np.uint8).reshape(dim * blocks, 18)
+    packed[:, 0:2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)  # finite d
+    raw = Tensor(np.pad(packed.reshape(-1), (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, dim * dim, Q4_0).reshape(dim, dim)
+    linear = Linear(dim, dim, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    assert linear.ggml_type == Q4_0
+    return linear
+
+  def _ffn_block(self) -> FFNBlock:
+    config = TransformerConfig(num_blocks=1, dim=self.DIM, hidden_dim=self.DIM, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
+                                vocab_size=8, head_dim=self.DIM, rope_theta=10000.0, rope_dim=self.DIM, v_head_dim=self.DIM)
+    block = FFNBlock(config)
+    block.ffn_gate, block.ffn_up, block.ffn_down = (self._q4_0_linear(self.DIM, s) for s in (0, 1, 2))
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True): block.prepare_nv_norms()  # T4.125b: from_gguf's load-time step
+    return block
+
+  @staticmethod
+  def _old_formula(block:FFNBlock, x:Tensor, attn_out:Tensor) -> Tensor:
+    # the pre-T4.123e two-step form, verbatim -- every "fused drops exactly this" / "unchanged" claim below is
+    # against this baseline
+    h = x + attn_out
+    return h + block._feed_forward(block.ffn_norm(h))
+
+  def _inputs(self, T:int=1) -> tuple[Tensor, Tensor]:
+    with Context(DEBUG=0):  # pre-realize: keep the randn RNG graph out of the kernel-count toposorts below
+      return Tensor.randn(1, T, self.DIM).contiguous().realize(), Tensor.randn(1, T, self.DIM).contiguous().realize()
+
+  def test_fused_drops_the_reduce_and_shares_one_fewer_quantize(self):
+    block = self._ffn_block()
+    x, attn_out = self._inputs()
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True), \
+         mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True):
+      old_names, old_reduces = _kernel_names_and_reduces(self._old_formula(block, x, attn_out))
+      new_names, new_reduces = _kernel_names_and_reduces(block._ffn_output(x, attn_out))
+    # old: ffn_norm's RMSNorm reduce, one shared q8_quantize_nv for gate+up (T4.123a) + one for down, 3 gemvs
+    self.assertEqual(old_reduces, 1)
+    self.assertEqual(old_names.count("q8_quantize_nv"), 2)
+    self.assertEqual(old_names.count("add_rmsnorm_q8_nv"), 0)
+    self.assertEqual(old_names.count("linear_q4_0_nv"), 3)
+    # new: the reduce and the gate+up quantize are both gone, replaced by ONE add_rmsnorm_q8_nv; down's own
+    # quantize (a different activation, gate*up's product -- never fused by this task) is untouched
+    self.assertEqual(new_reduces, 0)
+    self.assertEqual(new_names.count("q8_quantize_nv"), 1)
+    self.assertEqual(new_names.count("add_rmsnorm_q8_nv"), 1)
+    self.assertEqual(new_names.count("linear_q4_0_nv"), 3)
+
+  def test_fused_wiring_matches_the_old_formula_within_float_tolerance(self):
+    # add_rmsnorm_q8's own kernel can't execute on CPU (AxisType.LOCAL/WARP -- test_llm_nv_norm.py's module
+    # docstring), so this checks the WIRING: _ffn_output passes (residual=x, partials=attn_out reshaped to one
+    # C=1 "split", weight=ffn_norm.weight, eps=ffn_norm.eps) into add_rmsnorm_q8 -- np_add_rmsnorm_q8 (already
+    # proven in test_llm_nv_norm.py to match the kernel's own math bit-for-bit modulo reduction order) applied to
+    # those EXACT inputs must agree with the real tinygrad-executed old formula's x+attn_out -> ffn_norm, which
+    # needs no NV kernel and so can genuinely run here. Tolerance 1e-5 rtol / 1e-6 atol: the same bound
+    # test_llm_nv_norm.py's own numpy-vs-kernel-formula tests use, sized for fp64-internal-mean-vs-fp32 rounding
+    # (measured here: 2.4e-7 max abs diff on the normed value, 0 on the residual sum).
+    block = self._ffn_block()
+    x, attn_out = self._inputs()
+    h_real = x + attn_out
+    normed_real = block.ffn_norm(h_real)
+    new_residual_np, _, _, normed_np = np_add_rmsnorm_q8(
+      x.reshape(1, self.DIM).numpy(), attn_out.reshape(1, self.DIM, 1).numpy(), block.ffn_norm.weight.numpy(), block.config.norm_eps)
+    np.testing.assert_allclose(new_residual_np.reshape(h_real.shape), h_real.numpy(), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(normed_np.reshape(normed_real.shape), normed_real.numpy(), rtol=1e-5, atol=1e-6)
+
+  def test_no_gate_is_byte_identical(self):
+    # NV_CUSTOM_QUANT unset (default 0): nv_quant_supported is really False everywhere, no mocking at all --
+    # _ffn_output must take the exact pre-T4.123e two-step path
+    block = self._ffn_block()
+    x, attn_out = self._inputs()
+    self.assertIs(block._ffn_output(x, attn_out).uop, self._old_formula(block, x, attn_out).uop)
+
+  def test_t_greater_than_one_is_byte_identical_even_with_the_gate_open(self):
+    # decode-only (T==1 concrete); mocking only model.py's own nv_quant_supported (not kernels/nv_quant.py's)
+    # keeps Linear.__call__ on the generic path, so `is` identity is meaningful here (a real nv_q8_linear
+    # dispatch allocates a fresh output buffer every call, which breaks hash-cons `is` regardless of this task --
+    # TestFFNActivationFusion's own T>1 test uses the same one-sided mock for the same reason)
+    block = self._ffn_block()
+    x4, attn_out4 = self._inputs(T=4)
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      self.assertIs(block._ffn_output(x4, attn_out4).uop, self._old_formula(block, x4, attn_out4).uop)
+
+  def test_moe_and_tp_blocks_keep_the_old_path(self):
+    # the dense-only guard (hasattr ffn_gate_exps/ffn_gate_tp) must close even with the NV gate open and T==1 --
+    # block.ffn_gate_exps's mere presence (no full MoE setup behind it) is enough to prove the guard closed:
+    # both _ffn_output and the old formula fall into FFNBlock._feed_forward's (untouched) MoE branch and fail
+    # identically past it (ffn_gate_inp missing) -- had _ffn_output's fused branch been taken instead, it would
+    # have failed earlier, inside add_rmsnorm_q8's own shape asserts, not inside _feed_forward's MoE code.
+    block = self._ffn_block()
+    block.ffn_gate_exps = object()  # presence alone is enough to trip the guard; never actually reached
+    x, attn_out = self._inputs()
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      with self.assertRaises(AttributeError) as new_err: block._ffn_output(x, attn_out)
+      with self.assertRaises(AttributeError) as old_err: self._old_formula(block, x, attn_out)
+    self.assertEqual(str(new_err.exception), str(old_err.exception))
+    self.assertIn("ffn_gate_inp", str(new_err.exception))
+
+class TestGDNAttnNormSiteFusion(unittest.TestCase):
+  """T4.123e: GatedDeltaNetBlock._normed_for_attention (model.py) fuses attn_norm's RMSNorm into add_rmsnorm_q8
+  on the NV decode path, feeding _attention its want_fp16 output directly -- _attention's own `x = x.half()`
+  (its first operation in every branch, fast nv_gdn_decode path and the generic per-token loop alike) becomes a
+  true no-op on an already-float16 Tensor (tinygrad/mixin/dtype.py: cast returns self when the dtype already
+  matches), so _attention itself needs no change at all (this task's GDN restriction)."""
+  DIM = 256
+
+  def _gdn_block(self) -> GatedDeltaNetBlock:
+    config = TransformerConfig(num_blocks=1, dim=self.DIM, hidden_dim=self.DIM, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
+                                vocab_size=8, head_dim=self.DIM, rope_theta=10000.0, rope_dim=self.DIM, v_head_dim=self.DIM)
+    ssm = SSMConfig(conv_kernel=4, state_size=16, group_count=1, time_step_rank=2, inner_size=32)
+    block = GatedDeltaNetBlock(config, ssm)
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True): block.prepare_nv_norms()  # T4.125b: from_gguf's load-time step
+    return block
+
+  def test_fused_output_is_fp16_with_no_reduce_and_half_is_a_true_noop(self):
+    block = self._gdn_block()
+    with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      fused = block._normed_for_attention(x)
+      names, reduces = _kernel_names_and_reduces(fused)
+    self.assertEqual(reduces, 0)
+    self.assertEqual(names.count("add_rmsnorm_q8_nv"), 1)
+    self.assertEqual(fused.dtype, dtypes.float16)
+    self.assertIs(fused.half().uop, fused.uop, "_attention's own x.half() must be a true no-op on this")
+
+  def test_unfused_has_a_reduce_and_is_float32(self):
+    block = self._gdn_block()
+    with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
+    unfused = block.attn_norm(x)
+    _, reduces = _kernel_names_and_reduces(unfused)
+    self.assertEqual(reduces, 1)
+    self.assertEqual(unfused.dtype, dtypes.float32)
+
+  def test_fused_wiring_matches_the_old_formula_within_float_tolerance(self):
+    # same reasoning as TestFFNNormSiteFusion's numerics test: add_rmsnorm_q8 can't execute on CPU, so this
+    # checks that the inputs _normed_for_attention wires in (residual=x, no partials, weight=attn_norm.weight,
+    # want_fp16=True) reproduce the old attn_norm(x).half() value through np_add_rmsnorm_q8's reference formula.
+    block = self._gdn_block()
+    with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
+    old_fp16 = block.attn_norm(x).half().numpy()
+    _, _, _, normed_np = np_add_rmsnorm_q8(x.reshape(1, self.DIM).numpy(), None, block.attn_norm.weight.numpy(), block.config.norm_eps)
+    new_fp16 = normed_np.astype(np.float16).astype(np.float32).reshape(old_fp16.shape)
+    np.testing.assert_allclose(new_fp16, old_fp16, rtol=1e-3, atol=1e-3)  # fp16 rounding, not fp32 -- a coarser bound
+
+  def test_no_gate_is_byte_identical(self):
+    block = self._gdn_block()
+    with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
+    self.assertIs(block._normed_for_attention(x).uop, block.attn_norm(x).uop)
+
+  def test_t_greater_than_one_is_byte_identical_even_with_the_gate_open(self):
+    block = self._gdn_block()
+    with Context(DEBUG=0): x4 = Tensor.randn(1, 4, self.DIM).contiguous().realize()
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
+      self.assertIs(block._normed_for_attention(x4).uop, block.attn_norm(x4).uop)
+
+def _decode_census(t:Tensor) -> list[str]:
+  """T4.125b: every kernel the scheduler launches to realize t (really scheduled via linear_with_vars, never executed): a custom
+  kernel by its own name, a generic one as 'reduce|elementwise <out dtype>[numel] <- <in dtypes>[numel],...'."""
+  lin, _ = t.linear_with_vars()
+  census = []
+  for call in (u for u in lin.src if u.op is Ops.CALL):
+    ast = call.src[0]
+    if isinstance(ast.arg, KernelInfo) and ast.arg.opts_to_apply == ():
+      census.append(ast.arg.name)
+      continue
+    bufs = [f"{b.dtype.name}[{b.max_numel()}]" for b in call.src[1:] if b.dtype.name != "int"]  # skip bound Variables
+    census.append(f"{'reduce' if any(u.op is Ops.REDUCE for u in ast.toposort()) else 'elementwise'} {bufs[0]} <- {','.join(bufs[1:])}")
+  return census
+
+@contextlib.contextmanager
+def _nv_gates_open():
+  # every NV gate the decode fast paths check, opened on CPU (graphs are built and scheduled, never run)
+  with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True), \
+       mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True), \
+       mock.patch("tinygrad.llm.model.nv_decode_kernel_supported", return_value=True), \
+       mock.patch("tinygrad.llm.model.nv_decode_attention_ok", return_value=True):
+    yield
+
+class TestDecodeStepCensus(unittest.TestCase):
+  """T4.125b: the kernels of ONE block's decode step (attn_norm site -> attention/GDN -> output projection -> ffn_norm site -> FFN ->
+  block output) on a tiny mocked-NV config, scheduled on CPU -- a GatedDeltaNetBlock and a TransformerBlock (qwen35's two kinds).
+  Widths are chosen so the split-K gemvs really split (ssm_out/attn_output and ffn_down read 2048 inputs -> C=2 partials, as the
+  27B's 6144/17408 give C=6/17) and the norm weights are lazy GGUF views like from_gguf's (F32 bytes, then .cast(float16)) -- the
+  two things the 10-28 card profile showed costing kernels."""
+  DIM, WIDE = 256, 2048
+
+  @staticmethod
+  def _q4_0(in_features:int, out_features:int, seed:int) -> Linear:
+    rng = np.random.default_rng(seed)
+    packed = rng.integers(0, 256, 18 * (in_features // 32) * out_features, dtype=np.uint8).reshape(-1, 18)
+    packed[:, 0:2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)  # finite d
+    raw = Tensor(np.pad(packed.reshape(-1), (4, 0))).contiguous().realize()[4:]
+    linear = Linear(in_features, out_features, bias=False)
+    decoded = ggml_data_to_tensor(raw, in_features * out_features, Q4_0).reshape(out_features, in_features)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    return linear
+
+  @staticmethod
+  def _gguf_f32(n:int, seed:int) -> Tensor:
+    w = np.random.default_rng(seed).standard_normal(n).astype(np.float32)
+    return ggml_data_to_tensor(Tensor(w.view(np.uint8)).realize(), n, 0).cast(dtypes.float16)
+
+  def _step(self, b:FFNBlock) -> list[str]:
+    from tinygrad.llm.kernels.nv_dense import prepare_dense_weights
+    D, W = self.DIM, self.WIDE
+    b.ffn_gate, b.ffn_up, b.ffn_down = self._q4_0(D, W, 3), self._q4_0(D, W, 4), self._q4_0(W, D, 5)
+    b.attn_norm.weight, b.ffn_norm.weight = self._gguf_f32(D, 10), self._gguf_f32(D, 11)
+    with _nv_gates_open():
+      prepare_dense_weights(b)  # from_gguf's load-time steps, in its order
+      b.prepare_nv_norms()
+      if isinstance(b, GatedDeltaNetBlock): b.prepare_nv_decode()
+      with Context(DEBUG=0):
+        x = Tensor.randn(1, 1, D).contiguous().realize()
+        b._init_state(x)
+        Tensor.realize(*[t for t in (getattr(b, n, None) for n in ("conv_state", "recurrent_state", "cache_kv", "freqs_cis")) if t is not None])
+      # the blocks' _run body (spec=False), without the @function wrapper
+      census = _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
+    print(f"\n{type(b).__name__} decode step: {len(census)} kernels", sorted(census))
+    self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
+    conversions = [k for k in census if (ins := k.partition(" <- ")[2]).startswith("unsigned char[") and "," not in ins]
+    self.assertEqual(conversions, [], "no per-step norm-weight conversion (a kernel reading only a GGUF byte view)")
+    self.assertNotIn(f"reduce float[{D}] <- float[{2*D}]", census, "the projection's partials are summed inside the ffn_norm kernel")
+    return census
+
+  def test_gdn_decode_step(self):
+    D, W = self.DIM, self.WIDE
+    config = TransformerConfig(num_blocks=1, dim=D, hidden_dim=W, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=D,
+                               rope_theta=10000.0, rope_dim=D, v_head_dim=D, max_context=64)
+    b = GatedDeltaNetBlock(config, SSMConfig(conv_kernel=4, state_size=32, group_count=1, time_step_rank=8, inner_size=W))
+    b.attn_qkv, b.attn_gate, b.ssm_out = self._q4_0(D, b.conv_channels, 0), self._q4_0(D, W, 1), self._q4_0(W, D, 2)
+    for i, lin in enumerate((b.ssm_beta, b.ssm_alpha)):
+      nn.state.load_state_dict(lin, {"weight": self._gguf_f32(8 * D, 6 + i).reshape(8, D)}, verbose=False, realize=False)
+    b.ssm_norm.weight = self._gguf_f32(W // 8, 12)
+    census = self._step(b)
+    self.assertNotIn(f"elementwise half[{D}] <- half[{D}]", census, "the f16 gemvs read the fused fp16 output in place")
+    self.assertEqual(census.count("q8_quantize_nv"), 2, "attn_qkv/attn_gate's quantize is the fused kernel's; left: ssm_out's, ffn_down's")
+
+  def test_attention_decode_step(self):
+    D, W = self.DIM, self.WIDE
+    config = TransformerConfig(num_blocks=1, dim=D, hidden_dim=W, n_heads=16, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=128,
+                               rope_theta=10000.0, rope_dim=64, v_head_dim=128, max_context=128, qk_norm=128, attn_output_gate=True)
+    b = TransformerBlock(config)
+    b.attn_q, b.attn_k, b.attn_v, b.attn_output = self._q4_0(D, 4096, 0), self._q4_0(D, 128, 1), self._q4_0(D, 128, 2), self._q4_0(W, D, 6)
+    b.attn_q_norm.weight, b.attn_k_norm.weight = self._gguf_f32(128, 12), self._gguf_f32(128, 13)
+    census = self._step(b)
+    self.assertNotIn(f"reduce float[1] <- float[{D}]", census, "attn_norm's sum of squares runs inside add_rmsnorm_q8")
+    self.assertEqual(census.count("q8_quantize_nv"), 2, "q/k/v's quantize is the fused kernel's; left: attn_output's and ffn_down's")
+
+  def test_output_norm_feeds_the_head_directly(self):
+    head, norm = self._q4_0(self.DIM, 64, 7), nn.RMSNorm(self.DIM, 1e-5)
+    norm.weight = self._gguf_f32(self.DIM, 14)
+    with _nv_gates_open():
+      weight = norm.weight.float().contiguous().realize()  # from_gguf's nv_output_norm_weight
+      with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
+      self.assertEqual(len(_decode_census(head(norm(x)))), 4, "sum of squares, apply, q8_quantize_nv, the gemv")
+      self.assertEqual(sorted(_decode_census(head(nv_fused_norm(norm, weight, x, head)))), ["add_rmsnorm_q8_nv", "linear_q4_0_nv"])
+
+  def test_nv_fused_norm_off_the_decode_path_is_plain_norm(self):
+    head, norm = self._q4_0(self.DIM, 64, 8), nn.RMSNorm(self.DIM, 1e-5)
+    weight = norm.weight.float().contiguous().realize()
+    x1, x4 = Tensor.randn(1, 1, self.DIM), Tensor.randn(1, 4, self.DIM)
+    self.assertIs(nv_fused_norm(norm, weight, x1, head).uop, norm(x1).uop, "NV gate closed")
+    plain = Linear(self.DIM, 64, bias=False)
+    with _nv_gates_open():
+      self.assertIs(nv_fused_norm(norm, weight, x4, head).uop, norm(x4).uop, "T > 1")
+      self.assertIs(nv_fused_norm(norm, None, x1, head).uop, norm(x1).uop, "weight not prepared at load")
+      self.assertIs(nv_fused_norm(norm, weight, x1, plain).uop, norm(x1).uop, "a consumer that isn't NV-quantized")
+
+class TestSplitKPartials(unittest.TestCase):
+  """T4.125b: nv_q8_linear's summed result maps back to its kernel's un-summed split-K partials (split_k_partials), which
+  _ffn_output hands to add_rmsnorm_q8 so the summing reduce is never scheduled."""
+  def test_partials_are_exactly_what_the_result_sums(self):
+    linear = TestDecodeStepCensus._q4_0(2048, 64, 0)
+    out = nv_q8_linear(linear, Tensor.randn(1, 1, 2048))
+    assert out is not None
+    partials = split_k_partials(out)
+    assert partials is not None
+    self.assertEqual(partials.shape, (1, 64, 2))  # 2048 inputs = two 1024-wide chunks
+    self.assertIs(partials.sum(-1).reshape(out.shape).uop, out.uop, "hash-consing: the result IS the sum of these partials")
+
+  def test_anything_else_has_none(self):
+    self.assertIsNone(split_k_partials(Tensor.randn(1, 1, 64)))
+    linear = TestDecodeStepCensus._q4_0(2048, 64, 1)
+    linear.bias = Tensor.randn(64)
+    out = nv_q8_linear(linear, Tensor.randn(1, 1, 2048))
+    assert out is not None
+    self.assertIsNone(split_k_partials(out), "a bias is added after the sum: those partials don't sum to the result")
 
 if __name__ == "__main__": unittest.main()

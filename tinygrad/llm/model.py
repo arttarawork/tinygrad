@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode
-from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES
+from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -435,8 +435,22 @@ class TransformerConfig:
   # override that never needed to reach FFNBlock.__init__ at all).
   tp: tuple[tuple[str, float], ...] = ()
 
+def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Linear) -> Tensor:
+  """norm(x) -- T4.125b: on the NV decode path (concrete T==1, `weight` = norm's fp32 copy prepared at load, every consumer an
+  NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
+  register_fused_q8 hands that quantize the kernel's (q, scale), so the RMSNorm graph returned here is never read -- _ffn_output's
+  trick at the attention blocks' attn_norm (q/k/v) and at output_norm (the head). Anything else: plain norm(x), byte-identical."""
+  T, dim = x.shape[1], x.shape[-1]
+  if not (isinstance(T, int) and T == 1 and isinstance(dim, int) and dim % 256 == 0 and weight is not None
+          and nv_quant_supported(weight.device) and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
+  tokens = T * cast(int, x.shape[0])
+  _, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), weight, norm.eps)
+  register_fused_q8(normed := norm(x), tokens, dim, q, scale)
+  return normed
+
 class FFNBlock:
   freqs_cis: Tensor  # set by the attention/MLA subclasses' _init_state (GDN blocks never touch it)
+  nv_norm_weights: tuple[Tensor, Tensor]|None = None  # T4.125b: (attn_norm, ffn_norm) fp32 copies, set by prepare_nv_norms
   def __init__(self, config:TransformerConfig):
     self.config = config
 
@@ -546,6 +560,47 @@ class FFNBlock:
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
+  def _ffn_output(self, x:Tensor, attn_out:Tensor) -> Tensor:
+    """x + attn_out -> ffn_norm -> _feed_forward -- the shared extraction point every __call__/_run uses (T4.123e,
+    design doc section 3, P4): on the NV decode path (concrete T==1, dense FFN, both ffn_gate/ffn_up already
+    NV-quantized -- the same gate test_llm_nv_quant.py's T4.123c fusion uses below) the residual-add (x+attn_out)
+    and ffn_norm's RMSNorm+quantize collapse into ONE add_rmsnorm_q8 kernel instead of ~4 separate ones (a
+    generic residual-sum, RMSNorm's sum-of-squares + apply, q8_quantize_nv). The kernel sums however many partials it's
+    given: T4.125b passes the producing gemv's real split-K partials (nv_quant.py's split_k_partials, so attn_out's own
+    summing reduce is never scheduled), else attn_out.reshape(...,1) as a one-wide "split" (T4.123e's form).
+    `self.ffn_norm(h)` below is called completely normally afterwards
+    (building nn.RMSNorm's ordinary lazy graph, the exact Tensor _feed_forward keeps using) but it is NEVER
+    actually scheduled: register_fused_q8 (kernels/nv_quant.py) makes the q8_quantize call inside
+    ffn_gate/ffn_up's nv_q8_linear (shared between the two since T4.123a) return the kernel's own (q, scale)
+    instead of re-deriving them, so the RMSNorm graph's only readers never read its VALUE -- dead code, never
+    lowered. Every other path (MoE, tensor-parallel FFN, symbolic T, non-NV, ggml_type not yet probed or not
+    NV-quantized, norm weights not prepared by prepare_nv_norms) keeps the original two-step byte-identical form."""
+    T, dim = x.shape[1], self.config.dim
+    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
+        and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
+        and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
+      tokens = T * cast(int, x.shape[0])
+      # T4.125b: the producing gemv's own split-K partials (ssm_out/attn_output via nv_q8_linear), summed in-kernel -- attn_out's
+      # summing reduce is then never read; anything else (a generic Linear) still folds in as one C=1 "split"
+      partials = split_k_partials(attn_out)
+      new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[1], self.ffn_norm.eps,
+                                                   partials=attn_out.reshape(tokens, dim, 1) if partials is None else partials)
+      h = new_residual.reshape(x.shape)
+      normed = self.ffn_norm(h)
+      register_fused_q8(normed, tokens, dim, q, scale)
+      return h + self._feed_forward(normed)
+    h = x + attn_out
+    return h + self._feed_forward(self.ffn_norm(h))
+
+  def prepare_nv_norms(self) -> None:
+    """T4.125b: realized fp32 copies of the RMSNorm weights add_rmsnorm_q8 reads on the NV decode path -- made once at load
+    (from_gguf), never inside a JIT capture (prepare_nv_decode's idiom). The loaded weights are lazy GGUF views (F32 bytes, then
+    from_gguf's blanket .cast(float16)) the fused kernel re-converted on EVERY decode step (one E_40_32_4 per site, 10-28 profile).
+    .float() folds that cast chain back to the file's fp32 values -- the numbers nn.RMSNorm's generic path multiplies by. Leaves
+    nv_norm_weights None (both sites keep the generic graph) off the NV gate."""
+    if self.attn_norm.weight is None or self.ffn_norm.weight is None or not nv_quant_supported(self.attn_norm.weight.device): return
+    self.nv_norm_weights = (self.attn_norm.weight.float().contiguous().realize(), self.ffn_norm.weight.float().contiguous().realize())
+
   @property
   def device(self) -> str|tuple[str, ...]|None:
     assert self.attn_norm.weight is not None
@@ -560,6 +615,7 @@ class FFNBlock:
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor: raise NotImplementedError
+  def _normed_for_attention(self, x:Tensor) -> Tensor: return self.attn_norm(x)  # T4.125b: TransformerBlock/GatedDeltaNetBlock fuse it
 
   def _rope_freqs(self, rope:int|UOp|Tensor, T:int|UOp) -> Tensor:
     # T5.3: `rope` is either this chunk's first ROPE position (an int/Variable: a slice of the table -- every text request, and decode
@@ -574,8 +630,7 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor):
-      h =     x + self._attention(self.attn_norm(x), start_pos, rope)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      return self._ffn_output(x, self._attention(self._normed_for_attention(x), start_pos, rope)).contiguous()
     return _run(x, start_pos, rope)
 
 # --- attention-override hook (T1.8) -----------------------------------------------------------
@@ -658,6 +713,9 @@ class TransformerBlock(FFNBlock):
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=config.attn_out_bias)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
+
+  def _normed_for_attention(self, x:Tensor) -> Tensor:  # T4.125b: q/k/v are q8 consumers -- see nv_fused_norm
+    return nv_fused_norm(self.attn_norm, None if self.nv_norm_weights is None else self.nv_norm_weights[0], x, self.attn_q, self.attn_k, self.attn_v)
 
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
     if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
@@ -882,6 +940,29 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
+  def _normed_for_attention(self, x:Tensor) -> Tensor:
+    """attn_norm(x), fused with its own quantize-equivalent at the NV decode path (T4.123e) -- see FFNBlock's
+    _ffn_output docstring for the general idea. GDN's own _attention calls `x = x.half()` as its very first
+    operation UNCONDITIONALLY, in every branch (the fast nv_gdn_decode path and the generic per-token-loop
+    path alike) -- every attn_norm consumer here (attn_qkv/attn_gate/ssm_beta/ssm_alpha, or ssm_g_a/ssm_f_a for
+    kda) reads that fp16 copy, not an int8-quantized one (T4.98h's nv_dense f16 gemv, not nv_q8_linear). So
+    add_rmsnorm_q8's want_fp16 output IS exactly the value _attention's `x.half()` would have produced, and
+    Tensor.cast is a true no-op when the dtype already matches (tinygrad/mixin/dtype.py: `return self if
+    self.dtype == dt else ...`) -- feeding _attention this already-fp16 Tensor in place of attn_norm(x) makes
+    its internal `.half()` a no-op, so _attention needs no change at all (this task's GDN restriction).
+    T4.125b: attn_qkv/attn_gate ARE q8 consumers (Q4_0 on the 27B: nv_q8_linear quantized this fp16 copy again, one
+    q8_quantize_nv per GDN block per step) -- register_fused_q8 hands them the kernel's own (q, scale), quantized from
+    the fp32 normed value instead of its fp16 rounding (a small numerics change); ssm_beta/ssm_alpha keep the fp16 copy."""
+    T, dim = x.shape[1], self.config.dim
+    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.nv_norm_weights is not None
+        and nv_quant_supported(self.nv_norm_weights[0].device)):
+      tokens = T * cast(int, x.shape[0])
+      _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
+      assert fp16_out is not None
+      register_fused_q8(normed := fp16_out.reshape(x.shape), tokens, dim, q, scale)
+      return normed
+    return self.attn_norm(x)
+
   def prepare_nv_decode(self) -> None:
     """T4.123f+g: realized fp32 copies of the four small weights kernels/nv.py's gdn_decode reads -- made once at load (from_gguf), never
     inside a JIT capture: the loaded tensors are lazy GGUF byte views a custom kernel would re-copy on every step. Leaves
@@ -1070,12 +1151,11 @@ class GatedDeltaNetBlock(FFNBlock):
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp) -> Tensor|tuple[Tensor, Tensor, Tensor]:
       if not spec:
-        h = x + cast(Tensor, self._attention(self.attn_norm(x), start_pos))
-        return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+        attn_out = cast(Tensor, self._attention(self._normed_for_attention(x), start_pos))
+        return self._ffn_output(x, attn_out).contiguous()
       attn_out, state_track, conv_window = cast(tuple[Tensor, Tensor, Tensor],
-                                                  self._attention(self.attn_norm(x), start_pos, capture=True))
-      h = x + attn_out
-      out = (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+                                                  self._attention(self._normed_for_attention(x), start_pos, capture=True))
+      out = self._ffn_output(x, attn_out).contiguous()
       return out, state_track, conv_window
     return _run(x, start_pos)
 
@@ -1382,11 +1462,13 @@ def sample_logits(logits:Tensor, temperature:Tensor, min_p:float=0.0) -> Tensor:
   """One sampled token id per row of `logits` (B, vocab) -> (B, 1). Gumbel-max: argmax(logits/temp - log(-log(u))) is a sample
   from softmax(logits/temp). min_p > 0 first drops every token whose probability is below min_p x the top token's (the tail
   that makes a 0.6-temperature sample emit garbage); there is no sort here (the tensor library has none), so this is the
-  sort-free stand-in for top-k/top-p. The top token always survives, so the masked argmax is always defined."""
+  sort-free stand-in for top-k/top-p. The top token always survives, so the masked argmax is always defined.
+  T4.125c: `probs >= probs.max() * min_p` is the same test as `scaled >= scaled.max() + log(min_p)` (softmax is monotone
+  in scaled and its normalizer cancels out of the ratio), so the mask is computed directly on `scaled` -- no exp/sum/divide
+  over the whole vocab."""
   scaled = logits / temperature.maximum(1e-12)
   if min_p > 0:
-    probs = scaled.softmax(-1)
-    scaled = (probs >= probs.max(-1, keepdim=True) * min_p).where(scaled, float("-inf"))
+    scaled = (scaled >= scaled.max(-1, keepdim=True) + math.log(min_p)).where(scaled, float("-inf"))
   return (scaled - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
 # T4.99: the device snapshot_state's clones are parked on. "" (default) leaves them on the live buffers' own
@@ -1425,6 +1507,7 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.mtp_head: MTPHead|None = None  # set by from_gguf when MTP=1 and the GGUF has a nextn block (T4.63)
+    self.nv_output_norm_weight: Tensor|None = None  # T4.125b: output_norm's fp32 copy for nv_fused_norm, set by from_gguf
     self.max_context = config.max_context
     # set by the device_map branch below; None means "no device_map", the fast/no-op path for realize_placement()
     self._placed_devices: frozenset[str]|None = None
@@ -1521,7 +1604,7 @@ class Transformer:
       # too. Callers that only ever wanted the last position (the prefill tail) slice `[:, -1:]` themselves.
       return self.output(self.output_norm(x)), x.contiguous()  # (B,T,vocab) logits, (B,T,D) hidden
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    logits = self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x[:, -1:], self.output))[:, -1, :]  # T4.125b
     # T4.92: presence penalty -- self.penalty_mask is a (1,vocab) 0/1 buffer, reset in place at the start of generate() and
     # updated in its eager decode loop (never inside this jit'd graph -- see generate()'s own comment); a plain READ here is
     # exactly like reading cache_kv, no AFTER-chaining needed. presence_penalty is a Tensor (not a python float), same reason
@@ -1744,7 +1827,11 @@ class Transformer:
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights  # local: mirrors amd.py's import discipline
     prepare_dense_weights(model)  # T4.98h: the fp16 head copies must exist before the first (@function, JIT-captured) call
     for blk in model.blk:
+      blk.prepare_nv_norms()  # T4.125b: same reason
       if isinstance(blk, GatedDeltaNetBlock): blk.prepare_nv_decode()  # T4.123f+g: same reason
+    if model.mtp_head is not None: model.mtp_head.block.prepare_nv_norms()
+    if model.output_norm.weight is not None and nv_quant_supported(model.output_norm.weight.device):
+      model.nv_output_norm_weight = model.output_norm.weight.float().contiguous().realize()  # T4.125b: as prepare_nv_norms
     return model, kv
 
   def warmup(self, vision:bool=False):

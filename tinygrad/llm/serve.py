@@ -473,6 +473,10 @@ class Handler(HTTPRequestHandler):
             self.server.store_snapshot(ids, vision is not None, boundary=boundary)
             # 09-13: the store sits between the first token and its delivery -- log it when it is not negligible
             if (t_snap := time.perf_counter() - t_snap) > 0.5: stderr_log(f"snap:{t_snap:5.1f}s  {colored('--', 'BLACK')}  ")
+          # T4.125c: the gen-rate window starts here, AFTER the snapshot store above, not at the `pt` set in the
+          # prefill log line (which must stay where it is -- that's where prefill ends today) -- the logged `gen:`
+          # tok/s used to include the ~0.7s snapshot store as if it were decode time.
+          pt = time.perf_counter()
         if tok.is_end(next_id): break
         out.append(next_id)
         hit = None
