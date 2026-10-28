@@ -6,6 +6,7 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
+import re
 import unittest
 from typing import cast
 from unittest import mock
@@ -268,16 +269,23 @@ class TestKernelGraphAndRender(unittest.TestCase):
   SHAPES = (12288, 17408)
   IN_FEATURES = 5120
 
+  U16_VIEW_TYPES = (Q4_0, IQ4_NL, Q6_K)  # T4.125a
+
   @staticmethod
   def _raw_shape(ggml_type:int, out_features:int, in_features:int) -> tuple[tuple[int, ...], object]:
     if ggml_type in (Q4_0, Q8_0, Q4_1, IQ4_NL):
       blocks = in_features // 32
       nbytes = {Q8_0: 34, Q4_1: 20}.get(ggml_type, 18)  # Q4_0 and IQ4_NL are both 18
-      return (out_features*blocks*nbytes,), dtypes.uint8
+      total = out_features*blocks*nbytes
+      # T4.125a: nv_q8_linear now passes the uint16 view (set_quantized's packed_u16) for Q4_0/IQ4_NL
+      if ggml_type in (Q4_0, IQ4_NL): return (total // 2,), dtypes.uint16
+      return (total,), dtypes.uint8
     blocks = in_features // 256
     words = {Q4_K: Q4_WORDS, Q5_K: Q5_WORDS, IQ4_XS: IQ4_WORDS}.get(ggml_type)
     if words is not None: return (out_features*blocks*words,), dtypes.uint32
-    return (out_features*blocks*QUANT_SIZES[ggml_type],), dtypes.uint8  # Q6_K/Q3_K/IQ3_XXS/IQ3_S
+    total = out_features*blocks*QUANT_SIZES[ggml_type]  # Q6_K/Q3_K/IQ3_XXS/IQ3_S
+    if ggml_type == Q6_K: return (total // 2,), dtypes.uint16  # T4.125a: likewise for Q6_K
+    return (total,), dtypes.uint8
 
   def _build(self, ggml_type:int, out_features:int):
     in_features, tokens = self.IN_FEATURES, 1
@@ -318,6 +326,15 @@ class TestKernelGraphAndRender(unittest.TestCase):
           self.assertIn("__shfl_xor_sync(0xffffffff", src)
           self.assertNotIn("amdgcn", src)
           if ggml_type in (IQ4_XS, IQ4_NL): self.assertIn("__byte_perm", src)
+          if ggml_type in self.U16_VIEW_TYPES:
+            # T4.125a: the weight buffer (slot 1 -> "data1_<n>") must be a uint16 pointer, with no byte-sized
+            # load left from it -- Q6_K's int8-packing casts still render "unsigned char" elsewhere in the
+            # source (unrelated register casts, not loads), so this checks the load pattern specifically
+            # rather than the substring's mere presence.
+            decl = re.search(r"(unsigned \w+)\*\s*data1_\d+", src)
+            self.assertIsNotNone(decl, f"couldn't find the weight buffer's declared type in {ggml_type}'s source")
+            self.assertEqual(cast(re.Match, decl).group(1), "unsigned short")
+            self.assertNotRegex(src, r"unsigned char \w+ = \(\*\(data1_", f"{ggml_type} still loads bytes from the weight buffer")
 
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
@@ -543,6 +560,37 @@ class TestSetQuantizedIdentifiesFormat(unittest.TestCase):
     original = linear.weight
     linear.set_quantized(linear.weight)
     self.assertIs(linear.dequant_weight, original)
+
+class TestPackedU16View(unittest.TestCase):
+  """T4.125a: set_quantized also stores a uint16 view of the packed buffer for Q4_0/IQ4_NL/Q6_K (the three
+  2-byte-aligned-but-not-4-byte-aligned formats nv_quant.py's decode gemv reads through it); every other
+  format's packed_u16 stays None, and the view shares the byte view's buffer -- no copy."""
+  def _linear_for(self, ggml_type:int, n:int, row_bytes:int) -> Linear:
+    rng = np.random.default_rng(0)
+    packed = rng.integers(0, 256, row_bytes, dtype=np.uint8)
+    raw = Tensor(np.pad(packed, (4, 0))).contiguous().realize()[4:]
+    decoded = ggml_data_to_tensor(raw, n, ggml_type).reshape(1, n)
+    linear = Linear(n, 1, bias=False)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    return linear
+
+  def test_u16_view_present_and_shares_the_byte_view_s_buffer(self):
+    for ggml_type, n, row_bytes in ((Q4_0, 32, 18), (IQ4_NL, 32, 18), (Q6_K, 256, 210)):
+      with self.subTest(ggml_type=ggml_type):
+        linear = self._linear_for(ggml_type, n, row_bytes)
+        self.assertIsNotNone(linear.packed_u16)
+        u16 = cast(Tensor, linear.packed_u16)
+        self.assertEqual(u16.dtype, dtypes.uint16)
+        self.assertEqual(u16.nbytes(), row_bytes)  # same bytes, just read as half as many elements
+        # no copy: both views are Buffer.view()s of the SAME base allocation
+        self.assertIs(u16.uop.buf_uop.buffer.base, linear.weight.uop.buf_uop.buffer.base)
+
+  def test_u16_view_none_for_every_other_format(self):
+    for ggml_type, n, row_bytes in ((Q8_0, 32, 34), (Q4_1, 32, 20), (Q4_K, 256, 144)):
+      with self.subTest(ggml_type=ggml_type):
+        linear = self._linear_for(ggml_type, n, row_bytes)
+        self.assertIsNone(linear.packed_u16)
 
 class TestFFNActivationFusion(unittest.TestCase):
   """T4.123c (decode fusion design, P3): FFNBlock._feed_forward's dense branch (model.py) drops the
