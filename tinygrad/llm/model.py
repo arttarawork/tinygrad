@@ -24,12 +24,21 @@ import traceback
 # 64 falls off a cliff even on METAL (28 tok/s). Set GDN_CHUNK explicitly to override either way.
 # T4.68: 64 is explicit-only (never auto-selected above); CPU scan-parity now covers both geometries (test_gdn_scan_parity.py).
 GDN_CHUNK = ContextVar("GDN_CHUNK", 0)
+# T4.124a: serving prefill width -- the default (32) reproduces every pre-T4.124a chunk_size/gdn_chunk_for call byte-identically
+# (min(32, MAX_PREFILL_ROWS=64) == 32). Raise it (e.g. 64/128/256) only on devices whose fused NV scan and prefill-attention
+# kernel (nv_attn.py, gated on MAX_PREFILL_ROWS below) both stay linear in chunk width; gdn_chunk_for below gates that.
+# generate()/prefill_only() fall back to this whenever their own caller doesn't pass an explicit chunk_size.
+PREFILL_CHUNK = ContextVar("PREFILL_CHUNK", 32)
 # T5.5: prefill chunk width for IMAGE prompts. The image-prompt jit family is a second capture whose planned arena is the attention
 # score pipeline (2 x (B,H,T,Tk_max) fp32 after T5.6) -- it scales with the chunk width, and on the pooled qwen3.6-35B @192k every
 # extra prefill family costs ~0.78 GB of the 3090's headroom at width 32. 16 halves that for the few hundred visual tokens of a request.
 VISION_CHUNK = ContextVar("VISION_CHUNK", 16)
 def gdn_chunk_for(device:str|tuple[str, ...]|None) -> int:
   if GDN_CHUNK.value > 0: return GDN_CHUNK.value
+  # T4.124a: the fused NV scan has no width cliff (kernels/nv.py), and nv_attn.py's prefill-attention kernel handles up to
+  # MAX_PREFILL_ROWS rows regardless of M -- cap PREFILL_CHUNK there so a wider request never silently falls off the NV
+  # attention kernel onto the generic path (which OOMs at long context, see nv_attn.py / model.py's _nv_attn).
+  if nv_custom_kernels_supported(device): return min(PREFILL_CHUNK.value, MAX_PREFILL_ROWS)
   dev = (device[0] if isinstance(device, tuple) else device) or Device.DEFAULT
   return 32 if dev.split(":")[0] in ("METAL", "NV", "CUDA") else 1
 
@@ -1887,7 +1896,7 @@ class Transformer:
   # key. T4.67's find_snapshot already resumes from ANY stored snapshot that's an exact token prefix of a request's
   # ids -- this just gives it one to find before any session-specific request ever completes, so a brand-new session
   # sharing only the prefix skips straight to prefilling its own tail instead of re-prefilling the whole thing cold.
-  def prefill_only(self, tokens:list[int], chunk_size:int=32) -> None:
+  def prefill_only(self, tokens:list[int], chunk_size:int|None=None) -> None:
     """Leaves this model exactly where generate() would leave it mid-response to `tokens` as the whole prompt:
     self._cached_tokens == list(tokens), so get_start_pos(tokens + more) == len(tokens) and a following
     generate(tokens + more) is TOKEN-IDENTICAL to a cold generate(tokens + more) -- same chunked prefill loop, same
@@ -1908,9 +1917,11 @@ class Transformer:
     next(it, None)
     it.close()
 
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0, drain_every:int=1, vision:VisionInput|None=None,
+  def generate(self, tokens:list[int], chunk_size:int|None=None, temperature:float=0.0, drain_every:int=1, vision:VisionInput|None=None,
                presence_penalty:float=0.0):
-    """vision (T5.3): the prompt's images -- see VisionInput. None (every pre-T5.3 caller) is the byte-identical text path.
+    """chunk_size (T4.124a): None (the default, every pre-T4.124a caller) resolves to PREFILL_CHUNK.value (itself 32 by default) --
+    byte-identical to the old chunk_size=32 default. Pass an explicit width to override PREFILL_CHUNK for one call.
+    vision (T5.3): the prompt's images -- see VisionInput. None (every pre-T5.3 caller) is the byte-identical text path.
     drain_every: batch this many decode steps between host round-trips (T2.5 sync amortization) instead of
     syncing every sampled token. drain_every=1 (default) is byte-identical to the pre-T2.5 behavior -- every
     generate()-caller and test that assumes one .item()/next() per decode step keeps working unchanged. Pass
@@ -1920,6 +1931,7 @@ class Transformer:
     existed -- no buffer allocated, no extra op anywhere. >0 subtracts `presence_penalty` from the logit of every token id
     already emitted BY THIS generate() CALL (never the prompt, never a previous call -- see self.penalty_mask's reset below
     and forward()'s own comment for the read side) before the greedy/sampled decision, every step."""
+    chunk_size = chunk_size or PREFILL_CHUNK.value
     # T4.6: a prompt that already fills (or overflows) max_context has zero room to generate into. Without this,
     # `while virtual_len < self.max_context` below never runs and this silently yields nothing (len==max_context),
     # or the `t = Tensor(...).reshape(1, self.max_context)` a few lines down throws an opaque shape-mismatch
