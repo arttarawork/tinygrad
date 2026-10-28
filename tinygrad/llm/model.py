@@ -437,6 +437,7 @@ class TransformerConfig:
 
 class FFNBlock:
   freqs_cis: Tensor  # set by the attention/MLA subclasses' _init_state (GDN blocks never touch it)
+  nv_norm_weights: tuple[Tensor, Tensor]|None = None  # T4.125b: (attn_norm, ffn_norm) fp32 copies, set by prepare_nv_norms
   def __init__(self, config:TransformerConfig):
     self.config = config
 
@@ -560,13 +561,13 @@ class FFNBlock:
     ffn_gate/ffn_up's nv_q8_linear (shared between the two since T4.123a) return the kernel's own (q, scale)
     instead of re-deriving them, so the RMSNorm graph's only readers never read its VALUE -- dead code, never
     lowered. Every other path (MoE, tensor-parallel FFN, symbolic T, non-NV, ggml_type not yet probed or not
-    NV-quantized, no RMSNorm weight) keeps the original two-step byte-identical form."""
+    NV-quantized, norm weights not prepared by prepare_nv_norms) keeps the original two-step byte-identical form."""
     T, dim = x.shape[1], self.config.dim
     if (isinstance(T, int) and T == 1 and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
         and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
-        and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.ffn_norm.weight is not None):
+        and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
       tokens = T * x.shape[0]
-      new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), cast(Tensor, self.ffn_norm.weight), self.ffn_norm.eps,
+      new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[1], self.ffn_norm.eps,
                                                    partials=attn_out.reshape(tokens, dim, 1))
       h = new_residual.reshape(x.shape)
       normed = self.ffn_norm(h)
@@ -574,6 +575,15 @@ class FFNBlock:
       return h + self._feed_forward(normed)
     h = x + attn_out
     return h + self._feed_forward(self.ffn_norm(h))
+
+  def prepare_nv_norms(self) -> None:
+    """T4.125b: realized fp32 copies of the RMSNorm weights add_rmsnorm_q8 reads on the NV decode path -- made once at load
+    (from_gguf), never inside a JIT capture (prepare_nv_decode's idiom). The loaded weights are lazy GGUF views (F32 bytes, then
+    from_gguf's blanket .cast(float16)) the fused kernel re-converted on EVERY decode step (one E_40_32_4 per site, 10-28 profile).
+    .float() folds that cast chain back to the file's fp32 values -- the numbers nn.RMSNorm's generic path multiplies by. Leaves
+    nv_norm_weights None (both sites keep the generic graph) off the NV gate."""
+    if self.attn_norm.weight is None or self.ffn_norm.weight is None or not nv_quant_supported(self.attn_norm.weight.device): return
+    self.nv_norm_weights = (self.attn_norm.weight.float().contiguous().realize(), self.ffn_norm.weight.float().contiguous().realize())
 
   @property
   def device(self) -> str|tuple[str, ...]|None:
@@ -923,9 +933,9 @@ class GatedDeltaNetBlock(FFNBlock):
     scale int8 outputs the kernel also computes are unused here (GDN's fast-decode Linears never quantize) --
     wasted ALU, not a wasted launch: still one kernel, same as everywhere else this helper runs."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.attn_norm.weight is not None
-        and nv_quant_supported(self.attn_norm.weight.device)):
-      _, _, _, fp16_out = add_rmsnorm_q8(x.reshape(T * x.shape[0], dim), cast(Tensor, self.attn_norm.weight), self.attn_norm.eps, want_fp16=True)
+    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.nv_norm_weights is not None
+        and nv_quant_supported(self.nv_norm_weights[0].device)):
+      _, _, _, fp16_out = add_rmsnorm_q8(x.reshape(T * x.shape[0], dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
       assert fp16_out is not None
       return fp16_out.reshape(x.shape)
     return self.attn_norm(x)
@@ -1791,7 +1801,9 @@ class Transformer:
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights  # local: mirrors amd.py's import discipline
     prepare_dense_weights(model)  # T4.98h: the fp16 head copies must exist before the first (@function, JIT-captured) call
     for blk in model.blk:
+      blk.prepare_nv_norms()  # T4.125b: same reason
       if isinstance(blk, GatedDeltaNetBlock): blk.prepare_nv_decode()  # T4.123f+g: same reason
+    if model.mtp_head is not None: model.mtp_head.block.prepare_nv_norms()
     return model, kv
 
   def warmup(self, vision:bool=False):

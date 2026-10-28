@@ -673,6 +673,7 @@ class TestFFNNormSiteFusion(unittest.TestCase):
                                 vocab_size=8, head_dim=self.DIM, rope_theta=10000.0, rope_dim=self.DIM, v_head_dim=self.DIM)
     block = FFNBlock(config)
     block.ffn_gate, block.ffn_up, block.ffn_down = (self._q4_0_linear(self.DIM, s) for s in (0, 1, 2))
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True): block.prepare_nv_norms()  # T4.125b: from_gguf's load-time step
     return block
 
   @staticmethod
@@ -767,7 +768,9 @@ class TestGDNAttnNormSiteFusion(unittest.TestCase):
     config = TransformerConfig(num_blocks=1, dim=self.DIM, hidden_dim=self.DIM, n_heads=1, n_kv_heads=1, norm_eps=1e-5,
                                 vocab_size=8, head_dim=self.DIM, rope_theta=10000.0, rope_dim=self.DIM, v_head_dim=self.DIM)
     ssm = SSMConfig(conv_kernel=4, state_size=16, group_count=1, time_step_rank=2, inner_size=32)
-    return GatedDeltaNetBlock(config, ssm)
+    block = GatedDeltaNetBlock(config, ssm)
+    with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True): block.prepare_nv_norms()  # T4.125b: from_gguf's load-time step
+    return block
 
   def test_fused_output_is_fp16_with_no_reduce_and_half_is_a_true_noop(self):
     block = self._gdn_block()
@@ -809,5 +812,73 @@ class TestGDNAttnNormSiteFusion(unittest.TestCase):
     with Context(DEBUG=0): x4 = Tensor.randn(1, 4, self.DIM).contiguous().realize()
     with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
       self.assertIs(block._normed_for_attention(x4).uop, block.attn_norm(x4).uop)
+
+def _decode_census(t:Tensor) -> list[str]:
+  """T4.125b: every kernel the scheduler launches to realize t (really scheduled via linear_with_vars, never executed): a custom
+  kernel by its own name, a generic one as 'reduce|elementwise <out dtype>[numel] <- <in dtypes>[numel],...'."""
+  lin, _ = t.linear_with_vars()
+  census = []
+  for call in (u for u in lin.src if u.op is Ops.CALL):
+    ast = call.src[0]
+    if isinstance(ast.arg, KernelInfo) and ast.arg.opts_to_apply == ():
+      census.append(ast.arg.name)
+      continue
+    bufs = [f"{b.dtype.name}[{b.max_numel()}]" for b in call.src[1:] if b.dtype.name != "int"]  # skip bound Variables
+    census.append(f"{'reduce' if any(u.op is Ops.REDUCE for u in ast.toposort()) else 'elementwise'} {bufs[0]} <- {','.join(bufs[1:])}")
+  return census
+
+class TestDecodeStepCensus(unittest.TestCase):
+  """T4.125b: the kernels of ONE GatedDeltaNetBlock decode step (attn_norm site -> nv_gdn_decode -> ssm_out -> ffn_norm site -> FFN ->
+  block output) on a tiny mocked-NV config, scheduled on CPU. Widths are chosen so the split-K gemvs really split (ssm_out and
+  ffn_down read 2048 inputs -> C=2 partials, as the 27B's 6144/17408 give C=6/17) and the norm weights are lazy GGUF views like
+  from_gguf's (F32 bytes, then .cast(float16)) -- the two things the 10-28 card profile showed costing kernels."""
+  DIM, WIDE = 256, 2048
+
+  @staticmethod
+  def _q4_0(in_features:int, out_features:int, seed:int) -> Linear:
+    rng = np.random.default_rng(seed)
+    packed = rng.integers(0, 256, 18 * (in_features // 32) * out_features, dtype=np.uint8).reshape(-1, 18)
+    packed[:, 0:2] = np.frombuffer(np.float16(0.01).tobytes(), dtype=np.uint8)  # finite d
+    raw = Tensor(np.pad(packed.reshape(-1), (4, 0))).contiguous().realize()[4:]
+    linear = Linear(in_features, out_features, bias=False)
+    decoded = ggml_data_to_tensor(raw, in_features * out_features, Q4_0).reshape(out_features, in_features)
+    nn.state.load_state_dict(linear, {"weight": decoded}, verbose=False, realize=False)
+    linear.set_quantized(linear.weight)
+    return linear
+
+  @staticmethod
+  def _gguf_f32(n:int, seed:int) -> Tensor:
+    w = np.random.default_rng(seed).standard_normal(n).astype(np.float32)
+    return ggml_data_to_tensor(Tensor(w.view(np.uint8)).realize(), n, 0).cast(dtypes.float16)
+
+  def _gdn_step(self) -> list[str]:
+    from tinygrad.llm.kernels.nv_dense import prepare_dense_weights
+    D, W = self.DIM, self.WIDE
+    config = TransformerConfig(num_blocks=1, dim=D, hidden_dim=W, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=D,
+                               rope_theta=10000.0, rope_dim=D, v_head_dim=D, max_context=64)
+    b = GatedDeltaNetBlock(config, SSMConfig(conv_kernel=4, state_size=32, group_count=1, time_step_rank=8, inner_size=W))
+    b.attn_qkv, b.attn_gate, b.ssm_out = self._q4_0(D, b.conv_channels, 0), self._q4_0(D, W, 1), self._q4_0(W, D, 2)
+    b.ffn_gate, b.ffn_up, b.ffn_down = self._q4_0(D, W, 3), self._q4_0(D, W, 4), self._q4_0(W, D, 5)
+    for i, lin in enumerate((b.ssm_beta, b.ssm_alpha)):
+      nn.state.load_state_dict(lin, {"weight": self._gguf_f32(8 * D, 6 + i).reshape(8, D)}, verbose=False, realize=False)
+    b.attn_norm.weight, b.ffn_norm.weight, b.ssm_norm.weight = self._gguf_f32(D, 10), self._gguf_f32(D, 11), self._gguf_f32(W // 8, 12)
+    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True), \
+         mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True), \
+         mock.patch("tinygrad.llm.model.nv_decode_kernel_supported", return_value=True):
+      prepare_dense_weights(b)  # from_gguf's load-time steps, in its order
+      b.prepare_nv_norms()
+      b.prepare_nv_decode()
+      with Context(DEBUG=0):
+        x = Tensor.randn(1, 1, D).contiguous().realize()
+        b._init_state(x)
+        Tensor.realize(b.conv_state, b.recurrent_state)
+      # GatedDeltaNetBlock.__call__'s _run body (spec=False), without the @function wrapper
+      return _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
+
+  def test_gdn_decode_step(self):
+    census = self._gdn_step()
+    print("\nGDN decode step census:", len(census), "kernels", sorted(census))
+    self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
+    self.assertEqual([k for k in census if "unsigned char" in k], [], "no per-step norm-weight conversion (prepare_nv_norms)")
 
 if __name__ == "__main__": unittest.main()
