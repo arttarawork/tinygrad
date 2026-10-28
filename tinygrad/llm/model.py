@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode
-from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials
+from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -556,7 +556,18 @@ class FFNBlock:
     T = x.shape[1]
     if (isinstance(T, int) and T == 1 and nv_quant_supported(self.ffn_gate.weight.device)
         and self.ffn_gate.ggml_type in NV_QUANT_TYPES and self.ffn_up.ggml_type in NV_QUANT_TYPES):
-      return self.ffn_down(self.ffn_gate(x).silu() * self.ffn_up(x))
+      gate, up = self.ffn_gate(x), self.ffn_up(x)
+      # T4.127a: when ffn_down will actually read it through nv_q8_linear (same build-only-if-consumed guard
+      # nv_fused_norm/_ffn_output use) and both gemvs' real split-K partials are there (T4.125b -- always true
+      # here, ffn_gate/up are bias=False, checked defensively like _ffn_output's own split_k_partials lookup),
+      # fuse SiLU(gate)*up with ffn_down's q8-quantize into one kernel instead of a generic combine + q8_quantize_nv.
+      gate_partials, up_partials = split_k_partials(gate), split_k_partials(up)
+      if self.ffn_down.ggml_type in NV_QUANT_TYPES and gate_partials is not None and up_partials is not None:
+        tokens, hidden = T * cast(int, x.shape[0]), self.ffn_gate.out_features
+        q, scale = ffn_act_q8(gate_partials, up_partials, tokens, hidden)
+        register_fused_q8(act := gate.silu() * up, tokens, hidden, q, scale)
+        return self.ffn_down(act)
+      return self.ffn_down(gate.silu() * up)
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
