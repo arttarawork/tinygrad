@@ -38,7 +38,7 @@ NV_ATTN_WMMA = ContextVar("NV_ATTN_WMMA", 0)  # T4.113: the tensor-core prefill 
 NV_ATTN_WMMA_DSPLIT = ContextVar("NV_ATTN_WMMA_DSPLIT", 1)  # T4.113: head_dim halves per block (2 = half the O registers, QK^T twice); card knob
 WARP_SIZE, LOG2E = 32, math.log2(math.e)
 BLOCK_N, MAX_CHUNKS, KEY_GROUP = 128, 256, 4  # keys per chunk; partial slots per (batch, q head); keys per loop step (one rescale per group)
-PREFILL_CHUNKS, MAX_PREFILL_ROWS, SENTINEL = 64, 64, -1e30  # prefill: slots per (batch, q head, row); widest chunk handled; finite "no key yet" max
+PREFILL_CHUNKS, MAX_PREFILL_ROWS, SENTINEL = 64, 256, -1e30  # prefill: slots at T_pad<=32; widest chunk handled (T4.124b); finite "no key yet" max
 WMMA_M, WMMA_N, WMMA_K = 16, 8, 16  # mma.sync.aligned.m16n8k16 fp16 in / fp32 out (nv_gemm.py's fragment map)
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)
 
@@ -344,7 +344,10 @@ def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, 
   T_pad = -(-q.max_shape[2] // q_rows) * q_rows
   if resolve(T != T_pad): q = q.pad_to((B, H, T_pad, D))
   N = cast(int, cache_kv.shape[3])
-  chunks = min(PREFILL_CHUNKS, N // BLOCK_N)
+  # T4.124b: slots scale down as T_pad widens (64 at T_pad<=32, byte-identical to before; 32/16/8 at 64/128/256) so the partial
+  # buffer stays ~48 MiB at every width instead of growing with T_pad -- see nv_prefill_attention's own docstring and the design
+  # doc's section 3.3. The kernels need no change: _prefill_partial_kernel/_prefill_wmma_kernel read `chunks` back off out.shape[3].
+  chunks = min(PREFILL_CHUNKS * 32 // max(cast(int, T_pad), 32), N // BLOCK_N)
   partial = Tensor.empty(B, H, T_pad, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, T_pad, chunks, 2, dtype="float32", device=q.device)
   if wmma: fxn = functools.partial(_prefill_wmma_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, d_split=d_split)
