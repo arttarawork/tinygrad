@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode
-from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES
+from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -546,6 +546,35 @@ class FFNBlock:
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 
+  def _ffn_output(self, x:Tensor, attn_out:Tensor) -> Tensor:
+    """x + attn_out -> ffn_norm -> _feed_forward -- the shared extraction point every __call__/_run uses (T4.123e,
+    design doc section 3, P4): on the NV decode path (concrete T==1, dense FFN, both ffn_gate/ffn_up already
+    NV-quantized -- the same gate test_llm_nv_quant.py's T4.123c fusion uses below) the residual-add (x+attn_out)
+    and ffn_norm's RMSNorm+quantize collapse into ONE add_rmsnorm_q8 kernel instead of ~4 separate ones (a
+    generic residual-sum, RMSNorm's sum-of-squares + apply, q8_quantize_nv). `partials=attn_out.reshape(...,1)`
+    folds the plain residual-add in as a one-wide "split": the kernel sums however many partials it's given, and
+    one IS the whole value, so there is no need to reach into _attention/_feed_forward to get real split-K
+    partials (out of scope here, see HANDOFF). `self.ffn_norm(h)` below is called completely normally afterwards
+    (building nn.RMSNorm's ordinary lazy graph, the exact Tensor _feed_forward keeps using) but it is NEVER
+    actually scheduled: register_fused_q8 (kernels/nv_quant.py) makes the q8_quantize call inside
+    ffn_gate/ffn_up's nv_q8_linear (shared between the two since T4.123a) return the kernel's own (q, scale)
+    instead of re-deriving them, so the RMSNorm graph's only readers never read its VALUE -- dead code, never
+    lowered. Every other path (MoE, tensor-parallel FFN, symbolic T, non-NV, ggml_type not yet probed or not
+    NV-quantized, no RMSNorm weight) keeps the original two-step byte-identical form."""
+    T, dim = x.shape[1], self.config.dim
+    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
+        and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
+        and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.ffn_norm.weight is not None):
+      tokens = T * x.shape[0]
+      new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), cast(Tensor, self.ffn_norm.weight), self.ffn_norm.eps,
+                                                   partials=attn_out.reshape(tokens, dim, 1))
+      h = new_residual.reshape(x.shape)
+      normed = self.ffn_norm(h)
+      register_fused_q8(normed, tokens, dim, q, scale)
+      return h + self._feed_forward(normed)
+    h = x + attn_out
+    return h + self._feed_forward(self.ffn_norm(h))
+
   @property
   def device(self) -> str|tuple[str, ...]|None:
     assert self.attn_norm.weight is not None
@@ -574,8 +603,7 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor):
-      h =     x + self._attention(self.attn_norm(x), start_pos, rope)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      return self._ffn_output(x, self._attention(self.attn_norm(x), start_pos, rope)).contiguous()
     return _run(x, start_pos, rope)
 
 # --- attention-override hook (T1.8) -----------------------------------------------------------
@@ -882,6 +910,26 @@ class GatedDeltaNetBlock(FFNBlock):
     self.ssm_a = Tensor.zeros(self.num_v_heads, 1) if ssm.kda else Tensor.zeros(self.num_v_heads)
     self.ssm_norm, self.ssm_out = nn.RMSNorm(self.head_v_dim, config.norm_eps), Linear(ssm.inner_size, config.dim, bias=False)
 
+  def _normed_for_attention(self, x:Tensor) -> Tensor:
+    """attn_norm(x), fused with its own quantize-equivalent at the NV decode path (T4.123e) -- see FFNBlock's
+    _ffn_output docstring for the general idea. GDN's own _attention calls `x = x.half()` as its very first
+    operation UNCONDITIONALLY, in every branch (the fast nv_gdn_decode path and the generic per-token-loop
+    path alike) -- every attn_norm consumer here (attn_qkv/attn_gate/ssm_beta/ssm_alpha, or ssm_g_a/ssm_f_a for
+    kda) reads that fp16 copy, not an int8-quantized one (T4.98h's nv_dense f16 gemv, not nv_q8_linear). So
+    add_rmsnorm_q8's want_fp16 output IS exactly the value _attention's `x.half()` would have produced, and
+    Tensor.cast is a true no-op when the dtype already matches (tinygrad/mixin/dtype.py: `return self if
+    self.dtype == dt else ...`) -- feeding _attention this already-fp16 Tensor in place of attn_norm(x) makes
+    its internal `.half()` a no-op, so _attention needs no change at all (this task's GDN restriction). The q/
+    scale int8 outputs the kernel also computes are unused here (GDN's fast-decode Linears never quantize) --
+    wasted ALU, not a wasted launch: still one kernel, same as everywhere else this helper runs."""
+    T, dim = x.shape[1], self.config.dim
+    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.attn_norm.weight is not None
+        and nv_quant_supported(self.attn_norm.weight.device)):
+      _, _, _, fp16_out = add_rmsnorm_q8(x.reshape(T * x.shape[0], dim), cast(Tensor, self.attn_norm.weight), self.attn_norm.eps, want_fp16=True)
+      assert fp16_out is not None
+      return fp16_out.reshape(x.shape)
+    return self.attn_norm(x)
+
   def prepare_nv_decode(self) -> None:
     """T4.123f+g: realized fp32 copies of the four small weights kernels/nv.py's gdn_decode reads -- made once at load (from_gguf), never
     inside a JIT capture: the loaded tensors are lazy GGUF byte views a custom kernel would re-copy on every step. Leaves
@@ -1070,12 +1118,11 @@ class GatedDeltaNetBlock(FFNBlock):
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp) -> Tensor|tuple[Tensor, Tensor, Tensor]:
       if not spec:
-        h = x + cast(Tensor, self._attention(self.attn_norm(x), start_pos))
-        return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+        attn_out = cast(Tensor, self._attention(self._normed_for_attention(x), start_pos))
+        return self._ffn_output(x, attn_out).contiguous()
       attn_out, state_track, conv_window = cast(tuple[Tensor, Tensor, Tensor],
-                                                  self._attention(self.attn_norm(x), start_pos, capture=True))
-      h = x + attn_out
-      out = (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+                                                  self._attention(self._normed_for_attention(x), start_pos, capture=True))
+      out = self._ffn_output(x, attn_out).contiguous()
       return out, state_track, conv_window
     return _run(x, start_pos)
 
