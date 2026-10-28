@@ -6,7 +6,7 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
-import unittest
+import contextlib, re, unittest
 from typing import cast
 from unittest import mock
 import numpy as np
@@ -19,7 +19,7 @@ from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
   nv_q8_linear, q8_quantize, split_k_partials,
 )
-from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerConfig
+from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, nv_fused_norm
 from test.helpers import check_schedule
 from test.unit.test_llm_nv_norm import np_add_rmsnorm_q8
 
@@ -827,11 +827,21 @@ def _decode_census(t:Tensor) -> list[str]:
     census.append(f"{'reduce' if any(u.op is Ops.REDUCE for u in ast.toposort()) else 'elementwise'} {bufs[0]} <- {','.join(bufs[1:])}")
   return census
 
+@contextlib.contextmanager
+def _nv_gates_open():
+  # every NV gate the decode fast paths check, opened on CPU (graphs are built and scheduled, never run)
+  with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True), \
+       mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True), \
+       mock.patch("tinygrad.llm.model.nv_decode_kernel_supported", return_value=True), \
+       mock.patch("tinygrad.llm.model.nv_decode_attention_ok", return_value=True):
+    yield
+
 class TestDecodeStepCensus(unittest.TestCase):
-  """T4.125b: the kernels of ONE GatedDeltaNetBlock decode step (attn_norm site -> nv_gdn_decode -> ssm_out -> ffn_norm site -> FFN ->
-  block output) on a tiny mocked-NV config, scheduled on CPU. Widths are chosen so the split-K gemvs really split (ssm_out and
-  ffn_down read 2048 inputs -> C=2 partials, as the 27B's 6144/17408 give C=6/17) and the norm weights are lazy GGUF views like
-  from_gguf's (F32 bytes, then .cast(float16)) -- the two things the 10-28 card profile showed costing kernels."""
+  """T4.125b: the kernels of ONE block's decode step (attn_norm site -> attention/GDN -> output projection -> ffn_norm site -> FFN ->
+  block output) on a tiny mocked-NV config, scheduled on CPU -- a GatedDeltaNetBlock and a TransformerBlock (qwen35's two kinds).
+  Widths are chosen so the split-K gemvs really split (ssm_out/attn_output and ffn_down read 2048 inputs -> C=2 partials, as the
+  27B's 6144/17408 give C=6/17) and the norm weights are lazy GGUF views like from_gguf's (F32 bytes, then .cast(float16)) -- the
+  two things the 10-28 card profile showed costing kernels."""
   DIM, WIDE = 256, 2048
 
   @staticmethod
@@ -851,37 +861,69 @@ class TestDecodeStepCensus(unittest.TestCase):
     w = np.random.default_rng(seed).standard_normal(n).astype(np.float32)
     return ggml_data_to_tensor(Tensor(w.view(np.uint8)).realize(), n, 0).cast(dtypes.float16)
 
-  def _gdn_step(self) -> list[str]:
+  def _step(self, b:FFNBlock) -> list[str]:
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights
+    D, W = self.DIM, self.WIDE
+    b.ffn_gate, b.ffn_up, b.ffn_down = self._q4_0(D, W, 3), self._q4_0(D, W, 4), self._q4_0(W, D, 5)
+    b.attn_norm.weight, b.ffn_norm.weight = self._gguf_f32(D, 10), self._gguf_f32(D, 11)
+    with _nv_gates_open():
+      prepare_dense_weights(b)  # from_gguf's load-time steps, in its order
+      b.prepare_nv_norms()
+      if isinstance(b, GatedDeltaNetBlock): b.prepare_nv_decode()
+      with Context(DEBUG=0):
+        x = Tensor.randn(1, 1, D).contiguous().realize()
+        b._init_state(x)
+        Tensor.realize(*[t for t in (getattr(b, n, None) for n in ("conv_state", "recurrent_state", "cache_kv", "freqs_cis")) if t is not None])
+      # the blocks' _run body (spec=False), without the @function wrapper
+      census = _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
+    print(f"\n{type(b).__name__} decode step: {len(census)} kernels", sorted(census))
+    self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
+    self.assertEqual([k for k in census if re.search(r"<- unsigned char\[\d+\]$", k)], [], "no per-step norm-weight conversion")
+    self.assertNotIn(f"reduce float[{D}] <- float[{2*D}]", census, "the projection's partials are summed inside the ffn_norm kernel")
+    return census
+
+  def test_gdn_decode_step(self):
     D, W = self.DIM, self.WIDE
     config = TransformerConfig(num_blocks=1, dim=D, hidden_dim=W, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=D,
                                rope_theta=10000.0, rope_dim=D, v_head_dim=D, max_context=64)
     b = GatedDeltaNetBlock(config, SSMConfig(conv_kernel=4, state_size=32, group_count=1, time_step_rank=8, inner_size=W))
     b.attn_qkv, b.attn_gate, b.ssm_out = self._q4_0(D, b.conv_channels, 0), self._q4_0(D, W, 1), self._q4_0(W, D, 2)
-    b.ffn_gate, b.ffn_up, b.ffn_down = self._q4_0(D, W, 3), self._q4_0(D, W, 4), self._q4_0(W, D, 5)
     for i, lin in enumerate((b.ssm_beta, b.ssm_alpha)):
       nn.state.load_state_dict(lin, {"weight": self._gguf_f32(8 * D, 6 + i).reshape(8, D)}, verbose=False, realize=False)
-    b.attn_norm.weight, b.ffn_norm.weight, b.ssm_norm.weight = self._gguf_f32(D, 10), self._gguf_f32(D, 11), self._gguf_f32(W // 8, 12)
-    with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True), \
-         mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True), \
-         mock.patch("tinygrad.llm.model.nv_decode_kernel_supported", return_value=True):
-      prepare_dense_weights(b)  # from_gguf's load-time steps, in its order
-      b.prepare_nv_norms()
-      b.prepare_nv_decode()
-      with Context(DEBUG=0):
-        x = Tensor.randn(1, 1, D).contiguous().realize()
-        b._init_state(x)
-        Tensor.realize(b.conv_state, b.recurrent_state)
-      # GatedDeltaNetBlock.__call__'s _run body (spec=False), without the @function wrapper
-      return _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
+    b.ssm_norm.weight = self._gguf_f32(W // 8, 12)
+    census = self._step(b)
+    self.assertNotIn(f"elementwise half[{D}] <- half[{D}]", census, "the f16 gemvs read the fused fp16 output in place")
 
-  def test_gdn_decode_step(self):
-    census = self._gdn_step()
-    print("\nGDN decode step census:", len(census), "kernels", sorted(census))
-    self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
-    self.assertEqual([k for k in census if "unsigned char" in k], [], "no per-step norm-weight conversion (prepare_nv_norms)")
-    self.assertNotIn(f"elementwise half[{self.DIM}] <- half[{self.DIM}]", census, "the f16 gemvs read the fused fp16 output in place")
-    self.assertNotIn(f"reduce float[{self.DIM}] <- float[{2*self.DIM}]", census, "ssm_out's partials are summed inside the ffn_norm kernel")
+  def test_attention_decode_step(self):
+    D, W = self.DIM, self.WIDE
+    config = TransformerConfig(num_blocks=1, dim=D, hidden_dim=W, n_heads=16, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=128,
+                               rope_theta=10000.0, rope_dim=64, v_head_dim=128, max_context=128, qk_norm=128, attn_output_gate=True)
+    b = TransformerBlock(config)
+    b.attn_q, b.attn_k, b.attn_v, b.attn_output = self._q4_0(D, 4096, 0), self._q4_0(D, 128, 1), self._q4_0(D, 128, 2), self._q4_0(W, D, 6)
+    b.attn_q_norm.weight, b.attn_k_norm.weight = self._gguf_f32(128, 12), self._gguf_f32(128, 13)
+    census = self._step(b)
+    self.assertNotIn(f"reduce float[1] <- float[{D}]", census, "attn_norm's sum of squares runs inside add_rmsnorm_q8")
+    self.assertEqual(census.count("q8_quantize_nv"), 2, "q/k/v's quantize is the fused kernel's; left: attn_output's and ffn_down's")
+
+  def test_output_norm_feeds_the_head_directly(self):
+    head, norm = self._q4_0(self.DIM, 64, 7), nn.RMSNorm(self.DIM, 1e-5)
+    norm.weight = self._gguf_f32(self.DIM, 14)
+    with _nv_gates_open():
+      weight = norm.weight.float().contiguous().realize()  # from_gguf's nv_output_norm_weight
+      with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
+      self.assertEqual(len(_decode_census(head(norm(x)))), 4, "sum of squares, apply, q8_quantize_nv, the gemv")
+      self.assertEqual(sorted(_decode_census(head(nv_fused_norm(norm, weight, x, head)))), ["add_rmsnorm_q8_nv", "linear_q4_0_nv"])
+
+  def test_nv_fused_norm_off_the_decode_path_is_plain_norm(self):
+    head, norm = self._q4_0(self.DIM, 64, 8), nn.RMSNorm(self.DIM, 1e-5)
+    weight = norm.weight.float().contiguous().realize()
+    x1, x4 = Tensor.randn(1, 1, self.DIM), Tensor.randn(1, 4, self.DIM)
+    self.assertIs(nv_fused_norm(norm, weight, x1, head).uop, norm(x1).uop, "NV gate closed")
+    plain = Linear(self.DIM, 64, bias=False)
+    with _nv_gates_open():
+      self.assertIs(nv_fused_norm(norm, weight, x4, head).uop, norm(x4).uop, "T > 1")
+      self.assertIs(nv_fused_norm(norm, None, x1, head).uop, norm(x1).uop, "weight not prepared at load")
+      self.assertIs(nv_fused_norm(norm, weight, x1, plain).uop, norm(x1).uop, "a consumer that isn't NV-quantized")
 
 class TestSplitKPartials(unittest.TestCase):
   """T4.125b: nv_q8_linear's summed result maps back to its kernel's un-summed split-K partials (split_k_partials), which

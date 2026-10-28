@@ -435,6 +435,19 @@ class TransformerConfig:
   # override that never needed to reach FFNBlock.__init__ at all).
   tp: tuple[tuple[str, float], ...] = ()
 
+def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Linear) -> Tensor:
+  """norm(x) -- T4.125b: on the NV decode path (concrete T==1, `weight` = norm's fp32 copy prepared at load, every consumer an
+  NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
+  register_fused_q8 hands that quantize the kernel's (q, scale), so the RMSNorm graph returned here is never read -- _ffn_output's
+  trick at the attention blocks' attn_norm (q/k/v) and at output_norm (the head). Anything else: plain norm(x), byte-identical."""
+  T, dim = x.shape[1], x.shape[-1]
+  if not (isinstance(T, int) and T == 1 and isinstance(dim, int) and dim % 256 == 0 and weight is not None
+          and nv_quant_supported(weight.device) and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
+  tokens = T * x.shape[0]
+  _, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), weight, norm.eps)
+  register_fused_q8(normed := norm(x), tokens, dim, q, scale)
+  return normed
+
 class FFNBlock:
   freqs_cis: Tensor  # set by the attention/MLA subclasses' _init_state (GDN blocks never touch it)
   nv_norm_weights: tuple[Tensor, Tensor]|None = None  # T4.125b: (attn_norm, ffn_norm) fp32 copies, set by prepare_nv_norms
@@ -602,6 +615,7 @@ class FFNBlock:
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor: raise NotImplementedError
+  def _normed_for_attention(self, x:Tensor) -> Tensor: return self.attn_norm(x)  # T4.125b: TransformerBlock/GatedDeltaNetBlock fuse it
 
   def _rope_freqs(self, rope:int|UOp|Tensor, T:int|UOp) -> Tensor:
     # T5.3: `rope` is either this chunk's first ROPE position (an int/Variable: a slice of the table -- every text request, and decode
@@ -616,7 +630,7 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor):
-      return self._ffn_output(x, self._attention(self.attn_norm(x), start_pos, rope)).contiguous()
+      return self._ffn_output(x, self._attention(self._normed_for_attention(x), start_pos, rope)).contiguous()
     return _run(x, start_pos, rope)
 
 # --- attention-override hook (T1.8) -----------------------------------------------------------
@@ -699,6 +713,9 @@ class TransformerBlock(FFNBlock):
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=config.attn_out_bias)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
+
+  def _normed_for_attention(self, x:Tensor) -> Tensor:  # T4.125b: q/k/v are q8 consumers -- see nv_fused_norm
+    return nv_fused_norm(self.attn_norm, None if self.nv_norm_weights is None else self.nv_norm_weights[0], x, self.attn_q, self.attn_k, self.attn_v)
 
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
     if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
@@ -1485,6 +1502,7 @@ class Transformer:
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.mtp_head: MTPHead|None = None  # set by from_gguf when MTP=1 and the GGUF has a nextn block (T4.63)
+    self.nv_output_norm_weight: Tensor|None = None  # T4.125b: output_norm's fp32 copy for nv_fused_norm, set by from_gguf
     self.max_context = config.max_context
     # set by the device_map branch below; None means "no device_map", the fast/no-op path for realize_placement()
     self._placed_devices: frozenset[str]|None = None
@@ -1581,7 +1599,7 @@ class Transformer:
       # too. Callers that only ever wanted the last position (the prefill tail) slice `[:, -1:]` themselves.
       return self.output(self.output_norm(x)), x.contiguous()  # (B,T,vocab) logits, (B,T,D) hidden
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    logits = self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x[:, -1:], self.output))[:, -1, :]  # T4.125b
     # T4.92: presence penalty -- self.penalty_mask is a (1,vocab) 0/1 buffer, reset in place at the start of generate() and
     # updated in its eager decode loop (never inside this jit'd graph -- see generate()'s own comment); a plain READ here is
     # exactly like reading cache_kv, no AFTER-chaining needed. presence_penalty is a Tensor (not a python float), same reason
@@ -1807,6 +1825,8 @@ class Transformer:
       blk.prepare_nv_norms()  # T4.125b: same reason
       if isinstance(blk, GatedDeltaNetBlock): blk.prepare_nv_decode()  # T4.123f+g: same reason
     if model.mtp_head is not None: model.mtp_head.block.prepare_nv_norms()
+    if model.output_norm.weight is not None and nv_quant_supported(model.output_norm.weight.device):
+      model.nv_output_norm_weight = model.output_norm.weight.float().contiguous().realize()  # T4.125b: as prepare_nv_norms
     return model, kv
 
   def warmup(self, vision:bool=False):
