@@ -449,10 +449,12 @@ class CUDARenderer(CStyleLanguage):
     if any(dt in dtypes.fp8s for dt, _ in used_dtypes): prefix.append("#include <cuda_fp8.h>")
     if any(dt == dtypes.half for dt, _ in used_dtypes): prefix.append("#include <cuda_fp16.h>")
     if any(dt == dtypes.bfloat16 for dt, _ in used_dtypes): prefix.append("#include <cuda_bf16.h>")
+    # T4.126: int8 x8/x16 are the m16n8k32 .s8 B/A fragments (no CUDA builtin vector type has 8 or 16 chars)
     prefix += [self.render_vector_prefix(dt, count) for dt, count in used_dtypes if (count in (4,8) and dt in {dtypes.half, dtypes.bfloat16})
-      or (count in (2,4,8,16) and dt in dtypes.fp8s)]
-    dt_map_in = { dtypes.float: "tf32", dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2" }
-    dt_map_out = { dtypes.float: "f32", dtypes.half: "f16" }
+      or (count in (2,4,8,16) and dt in dtypes.fp8s) or (count in (8,16) and dt == dtypes.int8)]
+    dt_map_in = { dtypes.float: "tf32", dtypes.half: "f16", dtypes.bfloat16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2",
+                  dtypes.int8: "s8" }  # T4.126: int8 in / int32 accumulate = mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32
+    dt_map_out = { dtypes.float: "f32", dtypes.half: "f16", dtypes.int32: "s32" }
     for name, (N, M, K), dtype_in, dtype_out, _, _, upcast_sizes in wmma_args(uops):
       wmma_dtypes = [self._render_dtype(dtype, size, AddrSpace.REG) for dtype, size in zip([dtype_in, dtype_in, dtype_out], upcast_sizes)]
       n_operands = [size*dtype.itemsize//4 for dtype, size in zip([dtype_in, dtype_in, dtype_out], upcast_sizes)] # 4 => CUDA reg size in bytes

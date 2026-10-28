@@ -1,9 +1,11 @@
 """T4.98f/T4.98j: NV WMMA (mma.sync m16n8k16) prefill gemm for Q8_0/Q4_0/Q4_1/IQ4_NL and the K-quants -- graph builds
 for the real shapes, the sm_86 render pins the lane-range split the fragment mapping relies on, and the dispatch gates.
 Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py)."""
-import unittest
+import sys, unittest
+import numpy as np
 from tinygrad import Tensor, UOp, dtypes
-from tinygrad.uop.ops import Ops
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import Ops, AxisType, KernelInfo
 from tinygrad.llm.kernels import nv_gemm
 from tinygrad.llm.kernels.amd import Q8_0, Q4_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES
 from tinygrad.llm.kernels.nv_quant import NV_CUSTOM_QUANT  # importing nv_quant registers the ContextVar the dispatch test sets
@@ -86,6 +88,42 @@ class TestKernelGraphAndRender(unittest.TestCase):
       for tokens, _o, _i in _shapes(ggml_type):
         fixed_rule = 64 if tokens % 64 == 0 else 32 if tokens % 32 == 0 else nv_gemm.WMMA_M
         self.assertEqual(nv_gemm._token_tile_for(tokens), fixed_rule, (ggml_type, tokens))
+
+def _imma_probe(out:UOp, a:UOp, b:UOp) -> UOp:
+  # T4.126: ONE m16n8k32 int8 mma, one warp, the fragments loaded straight from A (16x32 int8, row-major) and B (8x32 int8 =
+  # N rows of K, the weight layout) through nv_gemm's documented fragment map -- so running it on the PYTHON emulator (which
+  # models the PTX ISA's m16n8k32 layout) against numpy's A @ B.T checks the map, and rendering it checks the .s8 renderer
+  lane = UOp.range(32, -1, AxisType.WARP)
+  g, t = lane // 4, lane % 4
+  afrag = UOp.stack(*(a[g + 8*(r % 2), 16*(r // 2) + 4*t + i] for r in range(4) for i in range(4)))
+  bfrag = UOp.stack(*(b[g, 16*r + 4*t + i] for r in range(2) for i in range(4)))
+  acc = UOp.placeholder((4,), dtypes.int32, slot=0, addrspace=AddrSpace.REG)
+  acc = acc.after(acc.store(UOp.wmma(afrag, bfrag, UOp.const((0,)*4, dtypes.int32), *nv_gemm.IMMA_ARG)))
+  stores = [out[g + 8*(i // 2), 2*t + i % 2].store(acc[i].load()) for i in range(4)]
+  return UOp.group(*stores).end(lane).sink(arg=KernelInfo(name="imma_probe", opts_to_apply=()))
+
+class TestImmaRenderer(unittest.TestCase):
+  def test_int8_mma_renders_and_compiles_for_sm86(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    params = [UOp.placeholder((16, 8), dtypes.int32, slot=0), UOp.placeholder((16, 32), dtypes.int8, slot=1),
+              UOp.placeholder((8, 32), dtypes.int8, slot=2)]
+    src = next(u.arg for u in to_program(_imma_probe(*params), renderer).src if u.op is Ops.SOURCE)
+    self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
+    self.assertIn('"{%0, %1, %2, %3}, {%4, %5, %6, %7},"', src)  # C = 4 regs, A = 16 int8 = 4 regs
+    self.assertIn('"{%8, %9}, {%0, %1, %2, %3};"', src)          # B = 8 int8 = 2 regs
+    self.assertIn("struct __align__(16) signed_char16", src)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_fragment_map_on_python_emulator(self):
+    rng = np.random.default_rng(0)
+    a, b = rng.integers(-128, 128, (16, 32), dtype=np.int8), rng.integers(-128, 128, (8, 32), dtype=np.int8)
+    out = Tensor.empty(16, 8, dtype=dtypes.int32, device="PYTHON")
+    res = out.custom_kernel(Tensor(a, device="PYTHON"), Tensor(b, device="PYTHON"), fxn=_imma_probe)[0].numpy()
+    np.testing.assert_array_equal(res, a.astype(np.int32) @ b.astype(np.int32).T)
 
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):

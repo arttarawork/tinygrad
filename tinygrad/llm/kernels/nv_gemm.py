@@ -59,6 +59,10 @@ NV_WMMA_TOKEN_TILE = ContextVar("NV_WMMA_TOKEN_TILE", 64)  # T4.124c: card knob 
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
+# T4.126: mma.sync.aligned.m16n8k32 s8 x s8 -> s32 (one 32-wide Q4_0/q8 group per K). The CUDA renderer ignores the device
+# string; the PYTHON emulator keys its NVIDIA fragment model on "CUDA", which lets the IMMA kernel run there unchanged.
+IMMA_K = 32
+IMMA_ARG = ((WMMA_N, WMMA_M, IMMA_K), 'CUDA', WARP_SIZE)
 
 @functools.cache
 def _nv_wmma_ok(device:str|tuple[str, ...]|None) -> bool:
