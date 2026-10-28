@@ -166,7 +166,7 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
   optional tensors (nv_quant.py's other kernels only ever have one optional src, e.g. _quant_decode_kernel's
   IQ3 grid, which a trailing `=None` kwarg handles fine -- two would collide positionally).
 
-  One block (AxisType.GLOBAL) per token, `threads` (>=256, a multiple of 32 dividing dim) threads per block.
+  One block (AxisType.GLOBAL) per token, `threads` (a multiple of 32 dividing dim, <= 1024) threads per block.
   Phase 1: every thread computes `per_thread` (=dim/threads) strided elements of residual+sum(partials),
   writes them to the new_residual output AND stages them in a block-shared buffer (AddrSpace.LOCAL) -- the
   LOCAL store is what makes the codegen pipeline's add_raw_barrier pass (tinygrad/codegen/__init__.py) insert
@@ -209,7 +209,7 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
   wsum_buf = UOp.placeholder((warps,), dtypes.float32, slot=51, addrspace=AddrSpace.LOCAL)
 
   # phase 1: residual add (+ optional partial sums), staged into val_buf for phase 2's re-read. Unrolled over
-  # per_thread (a compile-time int, 20 at the standing dim=5120/threads=256) the same way _q8_quantize_kernel
+  # per_thread (a compile-time int, 5 at the standing dim=5120/threads=1024) the same way _q8_quantize_kernel
   # unrolls its 4-wide word pack -- no RANGE/REG machinery needed since each thread's per_thread elements are
   # independent (no loop-carried state).
   vals, writes = [], []
@@ -245,13 +245,16 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
   return UOp.group(*stores).end(lane, warp, tok).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
 
 def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|None=None, want_fp16:bool=False,
-                    threads:int=256) -> tuple[Tensor, Tensor, Tensor, Tensor|None]:
+                    threads:int|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor|None]:
   """Thin wrapper (T4.123d) around _add_rmsnorm_q8_kernel: residual (tokens,dim) fp32, optional partials
   (tokens,dim,C) fp32 (the previous projection's un-summed split-K partials -- summed in-kernel), weight (dim,)
   the RMSNorm weight. Returns (new_residual, q, scale, fp16_copy_or_None); q/scale are nv_q8_linear-ready
-  (same (tokens,groups,8) uint32 / (tokens,groups) float32 shape _q8_quantize_cached produces). NOT called from
-  model.py yet -- T4.123e wires this into FFNBlock/GatedDeltaNetBlock._run's decode path."""
+  (same (tokens,groups,8) uint32 / (tokens,groups) float32 shape _q8_quantize_cached produces). Wired into
+  FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention's decode path by T4.123e."""
   tokens, dim = cast(tuple[int, int], residual.shape)
+  # T4.125b: default = the widest block (<= 1024 threads): 1024 at dim=5120, i.e. 5 elements per thread and 5 q8 groups per warp
+  # instead of 256 threads' 20 each -- the 256-thread kernel was latency-bound (12.7 us per launch on the card, 10-28 profile)
+  if threads is None: threads = next((t for t in range(1024, 31, -32) if dim % t == 0), 32)
   assert threads % 32 == 0 and dim % threads == 0, f"threads={threads} must be a multiple of 32 dividing dim={dim}"
   groups = dim // Q8_GROUP_SIZE
   C = 0 if partials is None else cast(int, partials.shape[-1])

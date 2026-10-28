@@ -12,12 +12,16 @@ which CPU's renderer doesn't support at all (attn_kernel.py's own docstring: "a 
 ... has no threadgroup/shared-memory model"), so unlike the single-warp kernels in those two files this one
 can never be realized on CPU even for a toy shape -- math parity is checked with a NumPy transcription of the
 intended add -> RMSNorm -> q8 pipeline instead (same idea as test_llm_nv_dense.py's _numpy_gemv), using
-test_llm_amd.py's own q8_quantize reference formula (scale=max(abs)/127 clamped 1e-8, q=clip(rint(x/scale)))."""
-import unittest
+test_llm_amd.py's own q8_quantize reference formula (scale=max(abs)/127 clamped 1e-8, q=clip(rint(x/scale))).
+T4.125b adds TestKernelRunsOnPythonEmulator: the kernel itself executed on tinygrad's PYTHON emulator device (which does
+model a threadgroup), with only the warp shuffle swapped for an equivalent shared-memory exchange."""
+import itertools, sys, unittest
+from unittest import mock
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, Ops
+from tinygrad.llm.kernels import nv_quant
 from tinygrad.llm.kernels.amd import Q8_GROUP_SIZE
 from tinygrad.llm.kernels.nv_quant import _add_rmsnorm_q8_kernel, _q8_pack, add_rmsnorm_q8
 
@@ -148,18 +152,18 @@ class TestKernelGraphAndRender(unittest.TestCase):
     from tinygrad.device import CompileError
     try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
     except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
-    for C in (0, 6):
-      for want_fp16 in (False, True):
-        with self.subTest(C=C, want_fp16=want_fp16):
-          sink = self._build(C=C, want_fp16=want_fp16)
-          try: prg = to_program(sink, renderer)
-          except CompileError: raise
-          except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
-          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
-          self.assertIn("__shfl_xor_sync(0xffffffff", src)   # warp_reduce (both the sq and the max-abs reduce)
-          self.assertIn("__syncthreads()", src)               # the whole point: add_raw_barrier fired on val_buf/wsum_buf
-          self.assertIn("__shared__", src)
-          self.assertNotIn("amdgcn", src)
+    for C, want_fp16, threads in itertools.product((0, 6), (False, True), (256, 1024)):  # T4.125b: 1024 = the default at dim 5120
+      with self.subTest(C=C, want_fp16=want_fp16, threads=threads):
+        sink = self._build(C=C, want_fp16=want_fp16, threads=threads)
+        try: prg = to_program(sink, renderer)
+        except CompileError: raise
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+        self.assertIn(f"__launch_bounds__({threads})", src)
+        self.assertIn("__shfl_xor_sync(0xffffffff", src)   # warp_reduce (both the sq and the max-abs reduce)
+        self.assertIn("__syncthreads()", src)               # the whole point: add_raw_barrier fired on val_buf/wsum_buf
+        self.assertIn("__shared__", src)
+        self.assertNotIn("amdgcn", src)
 
 class TestQ8Pack(unittest.TestCase):
   """_q8_pack is a 1:1 lift of _q8_quantize_kernel's word-packing formula. Its round+clip+cast-to-int8 stage
@@ -236,5 +240,56 @@ class TestWrapperBuildsExpectedShapes(unittest.TestCase):
     weight = Tensor.empty(self.DIM, dtype=dtypes.float32)
     with self.assertRaises(AssertionError):
       add_rmsnorm_q8(residual, weight, eps=1e-6, threads=384)
+
+  def test_default_threads_is_the_widest_block(self):
+    # T4.125b: <= 1024 threads, a multiple of 32 dividing dim -- 1024 at the standing 5120 (the 256 default was latency-bound)
+    for dim, threads in ((5120, 1024), (256, 256), (2560, 640)):
+      with self.subTest(dim=dim):
+        new_residual = add_rmsnorm_q8(Tensor.empty(1, dim, dtype=dtypes.float32), Tensor.empty(dim, dtype=dtypes.float32), eps=1e-6)[0]
+        warps = [u.src[0].arg for u in new_residual.uop.toposort() if u.op is Ops.CALL for u in u.src[0].toposort()
+                 if u.op is Ops.RANGE and u.arg[-1] is AxisType.LOCAL]
+        self.assertEqual(warps, [threads // 32])
+
+_emu_slot = itertools.count(60)
+def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+  """warp_reduce's xor butterfly with each __shfl_xor_sync(v, off) replaced by a block-shared exchange: thread tid writes v at [tid]
+  and reads [tid ^ off] -- the same partner a 32-lane xor shuffle reads, since tid = warp*32 + lane. The PYTHON emulator runs the
+  whole block in lockstep (barriers are no-ops), so the store is always seen."""
+  assert full_wave
+  rngs = {u.arg[-1]: u for u in val.toposort() if u.op is Ops.RANGE}
+  lane, warp = rngs[AxisType.WARP], rngs[AxisType.LOCAL]
+  tid = warp * 32 + lane
+  for off in (16, 8, 4, 2, 1):
+    buf = UOp.placeholder((warp.src[0].arg * 32,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
+    partner = tid + off - (tid // off) % 2 * (2 * off)  # tid ^ off for a power-of-two off, spelled so CHECK_OOB's z3 can bound it
+    other = buf.after(buf[tid].store(val))[partner].load()
+    val = val.maximum(other) if maximum else val + other
+  return val
+
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestKernelRunsOnPythonEmulator(unittest.TestCase):
+  """T4.125b: the kernel itself EXECUTED (not a transcription), on tinygrad's PYTHON emulator device -- every thread mapping,
+  both phases, the barrier-ordered shared buffers, the q8 packing -- with only the warp shuffle swapped for an equivalent shared
+  exchange (_emulated_warp_reduce; the emulator has no CUDA intrinsics). Compared against np_add_rmsnorm_q8. The standing shape:
+  dim 5120 at the default 1024 threads with C=6 split-K partials (ssm_out/attn_output), plus the old 256-thread layout."""
+  def _check(self, tokens:int, dim:int, C:int, threads:int|None, want_fp16:bool):
+    rng = np.random.default_rng(dim + C)
+    residual, weight = rng.standard_normal((tokens, dim)).astype(np.float32), rng.standard_normal(dim).astype(np.float32)
+    partials = rng.standard_normal((tokens, dim, C)).astype(np.float32) if C else None
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce), \
+         mock.patch.object(nv_quant, "_add_rmsnorm_q8_kernel", nv_quant._add_rmsnorm_q8_kernel.__wrapped__):  # bypass the cache
+      outs = add_rmsnorm_q8(Tensor(residual, device="PYTHON"), Tensor(weight, device="PYTHON"), 1e-6, want_fp16=want_fp16, threads=threads,
+                            partials=None if partials is None else Tensor(partials, device="PYTHON"))
+      new_residual, q, scale = (t.numpy() for t in outs[:3])
+      fp16 = None if outs[3] is None else outs[3].numpy()
+    ref_residual, ref_q, ref_scale, ref_normed = np_add_rmsnorm_q8(residual, partials, weight, 1e-6)
+    # partials summed left to right, then the residual: the same order numpy's 6-element sum + add uses -> exact
+    np.testing.assert_array_equal(new_residual, ref_residual)
+    np.testing.assert_allclose(scale, ref_scale, rtol=1e-6)
+    np.testing.assert_array_equal(q.view(np.int8).reshape(ref_q.shape), ref_q)
+    if want_fp16: np.testing.assert_allclose(fp16, ref_normed.astype(np.float16), rtol=1e-3, atol=1e-3)
+
+  def test_standing_shape_1024_threads_with_partials(self): self._check(2, 5120, 6, None, True)
+  def test_256_threads_without_partials(self): self._check(1, 256, 0, 256, False)
 
 if __name__ == "__main__": unittest.main()
