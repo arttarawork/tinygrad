@@ -1382,11 +1382,13 @@ def sample_logits(logits:Tensor, temperature:Tensor, min_p:float=0.0) -> Tensor:
   """One sampled token id per row of `logits` (B, vocab) -> (B, 1). Gumbel-max: argmax(logits/temp - log(-log(u))) is a sample
   from softmax(logits/temp). min_p > 0 first drops every token whose probability is below min_p x the top token's (the tail
   that makes a 0.6-temperature sample emit garbage); there is no sort here (the tensor library has none), so this is the
-  sort-free stand-in for top-k/top-p. The top token always survives, so the masked argmax is always defined."""
+  sort-free stand-in for top-k/top-p. The top token always survives, so the masked argmax is always defined.
+  T4.125c: `probs >= probs.max() * min_p` is the same test as `scaled >= scaled.max() + log(min_p)` (softmax is monotone
+  in scaled and its normalizer cancels out of the ratio), so the mask is computed directly on `scaled` -- no exp/sum/divide
+  over the whole vocab."""
   scaled = logits / temperature.maximum(1e-12)
   if min_p > 0:
-    probs = scaled.softmax(-1)
-    scaled = (probs >= probs.max(-1, keepdim=True) * min_p).where(scaled, float("-inf"))
+    scaled = (scaled >= scaled.max(-1, keepdim=True) + math.log(min_p)).where(scaled, float("-inf"))
   return (scaled - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
 # T4.99: the device snapshot_state's clones are parked on. "" (default) leaves them on the live buffers' own
