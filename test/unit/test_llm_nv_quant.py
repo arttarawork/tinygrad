@@ -893,6 +893,7 @@ class TestDecodeStepCensus(unittest.TestCase):
     b.ssm_norm.weight = self._gguf_f32(W // 8, 12)
     census = self._step(b)
     self.assertNotIn(f"elementwise half[{D}] <- half[{D}]", census, "the f16 gemvs read the fused fp16 output in place")
+    self.assertEqual(census.count("q8_quantize_nv"), 2, "attn_qkv/attn_gate's quantize is the fused kernel's; left: ssm_out's, ffn_down's")
 
   def test_attention_decode_step(self):
     D, W = self.DIM, self.WIDE

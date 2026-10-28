@@ -949,15 +949,18 @@ class GatedDeltaNetBlock(FFNBlock):
     add_rmsnorm_q8's want_fp16 output IS exactly the value _attention's `x.half()` would have produced, and
     Tensor.cast is a true no-op when the dtype already matches (tinygrad/mixin/dtype.py: `return self if
     self.dtype == dt else ...`) -- feeding _attention this already-fp16 Tensor in place of attn_norm(x) makes
-    its internal `.half()` a no-op, so _attention needs no change at all (this task's GDN restriction). The q/
-    scale int8 outputs the kernel also computes are unused here (GDN's fast-decode Linears never quantize) --
-    wasted ALU, not a wasted launch: still one kernel, same as everywhere else this helper runs."""
+    its internal `.half()` a no-op, so _attention needs no change at all (this task's GDN restriction).
+    T4.125b: attn_qkv/attn_gate ARE q8 consumers (Q4_0 on the 27B: nv_q8_linear quantized this fp16 copy again, one
+    q8_quantize_nv per GDN block per step) -- register_fused_q8 hands them the kernel's own (q, scale), quantized from
+    the fp32 normed value instead of its fp16 rounding (a small numerics change); ssm_beta/ssm_alpha keep the fp16 copy."""
     T, dim = x.shape[1], self.config.dim
     if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.nv_norm_weights is not None
         and nv_quant_supported(self.nv_norm_weights[0].device)):
-      _, _, _, fp16_out = add_rmsnorm_q8(x.reshape(T * x.shape[0], dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
+      tokens = T * x.shape[0]
+      _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
       assert fp16_out is not None
-      return fp16_out.reshape(x.shape)
+      register_fused_q8(normed := fp16_out.reshape(x.shape), tokens, dim, q, scale)
+      return normed
     return self.attn_norm(x)
 
   def prepare_nv_decode(self) -> None:
