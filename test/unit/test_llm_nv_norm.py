@@ -1,6 +1,7 @@
 """T4.123d: the fused residual-add + RMSNorm + q8-quantize decode kernel (tinygrad/llm/kernels/nv_quant.py's
-_add_rmsnorm_q8_kernel / add_rmsnorm_q8), design doc section 3 (P4 kernel half). NOT wired into model.py yet
-(T4.123e) -- this file only covers the kernel itself.
+_add_rmsnorm_q8_kernel / add_rmsnorm_q8), design doc section 3 (P4 kernel half). This file only covers the
+kernel itself; the model.py wiring (T4.123e: FFNBlock._ffn_output, GatedDeltaNetBlock._normed_for_attention,
+nv_quant.py's register_fused_q8) is tested in test_llm_nv_quant.py instead.
 
 Everything here runs WITHOUT a GPU (no DEV=NV, no Device["NV"] opened), mirroring test_llm_nv_quant.py's and
 test_llm_nv_dense.py's own docstrings: kernel UOp graphs are built directly (bypassing Tensor.custom_kernel for

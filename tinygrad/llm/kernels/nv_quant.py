@@ -110,13 +110,35 @@ def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int) -> tuple[UOp, UO
   return q.uop, scale.uop
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  if (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
   q_uop, scale_uop = _q8_quantize_cached(x.uop, tokens, in_features)
   return Tensor(q_uop), Tensor(scale_uop)
 
+# T4.123e: model.py's _ffn_output/GatedDeltaNetBlock's own norm-site helper call self.ffn_norm(h)/self.attn_norm(x)
+# completely normally (building nn.RMSNorm's ordinary lazy graph -- the exact Tensor object every consumer Linear
+# keeps using unchanged) but the fused add_rmsnorm_q8 kernel already computed that norm's (q, scale) itself, in
+# the SAME kernel as the residual-add. register_fused_q8 lets the q8_quantize call every consumer's nv_q8_linear
+# makes on that exact Tensor (shared across consumers since T4.123a -- FFN gate+up, GDN attn_gate/attn_qkv,
+# attention q/k/v all read one norm output) return those already-computed tensors instead of re-deriving them
+# with a second q8_quantize_nv kernel -- so the RMSNorm graph built above is dead code (nothing ever reads its
+# VALUE) and is never scheduled. Same cycle-safety rationale as _q8_quantize_cached above (a cache value holds a
+# strong path back to its own key): bounded by simple FIFO eviction, not unbounded -- entries are read back
+# within the same block's _run body, microseconds after being registered, so eviction order barely matters here
+# (unlike _q8_quantize_cached's true LRU, tuned for sharing across back-to-back calls).
+_FUSED_Q8_MAXSIZE = 16
+_fused_q8: dict[tuple[UOp, int, int], tuple[UOp, UOp]] = {}
+
+def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Tensor) -> None:
+  key = (x.uop, tokens, in_features)
+  if key not in _fused_q8 and len(_fused_q8) >= _FUSED_Q8_MAXSIZE: _fused_q8.pop(next(iter(_fused_q8)))
+  _fused_q8[key] = (q.uop, scale.uop)
+
 # ******** T4.123d: fused residual-add + RMSNorm + q8-quantize decode kernel (design doc section 3, P4 kernel
-# half) -- NOT wired into model.py (T4.123e). At each of the 129 norm sites per decode token the residual stream
-# today goes through 3-4 separate ~6us kernels (a generic residual-sum, r_16_320's one-warp RMSNorm sum-of-
-# squares, E_40_32_4's apply, q8_quantize_nv): this does all of it in one kernel, one block per token. ********
+# half) -- wired into model.py's FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention by T4.123e
+# (register_fused_q8 above is that wiring's other half). At each of the 129 norm sites per decode token the
+# residual stream used to go through 3-4 separate ~6us kernels (a generic residual-sum, r_16_320's one-warp
+# RMSNorm sum-of-squares, E_40_32_4's apply, q8_quantize_nv): this does all of it in one kernel, one block per
+# token -- at the sites T4.123e's two gates cover (dense ffn_norm both block types, GDN's attn_norm). ********
 
 def _q8_pack(values:tuple[UOp, ...], group_scale:UOp) -> UOp:
   # verbatim _q8_quantize_kernel's word-packing formula (the exact rounding/layout this task must match): 4
