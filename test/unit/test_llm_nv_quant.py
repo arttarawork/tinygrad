@@ -6,9 +6,10 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
-import contextlib, re, unittest
+import unittest
 from typing import cast
 from unittest import mock
+import contextlib
 import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
 from tinygrad.uop.ops import Ops, KernelInfo
@@ -878,7 +879,8 @@ class TestDecodeStepCensus(unittest.TestCase):
       census = _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
     print(f"\n{type(b).__name__} decode step: {len(census)} kernels", sorted(census))
     self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
-    self.assertEqual([k for k in census if re.search(r"<- unsigned char\[\d+\]$", k)], [], "no per-step norm-weight conversion")
+    conversions = [k for k in census if (ins := k.partition(" <- ")[2]).startswith("unsigned char[") and "," not in ins]
+    self.assertEqual(conversions, [], "no per-step norm-weight conversion (a kernel reading only a GGUF byte view)")
     self.assertNotIn(f"reduce float[{D}] <- float[{2*D}]", census, "the projection's partials are summed inside the ffn_norm kernel")
     return census
 
