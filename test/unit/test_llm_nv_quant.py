@@ -354,7 +354,7 @@ class TestKernelGraphAndRender(unittest.TestCase):
             self.assertNotRegex(src, r"unsigned char \w+ = \(\*\(data1_", f"{ggml_type} still loads bytes from the weight buffer")
 
   def test_rows_per_warp_builds_and_renders_for_every_r(self):
-    # T4.125d: R in {1 (default knob fallback), 2 (NV_GEMV_ROWS default), 4} must build and render for every
+    # T4.125d: R in {1 (the fallback), 2, 4 (NV_GEMV_ROWS default)} must build and render for every
     # format at both model-like shapes -- the dp4a dot survives regardless of how many rows one warp now produces.
     for ggml_type in NV_QUANT_TYPES:
       for out_features in self.SHAPES:

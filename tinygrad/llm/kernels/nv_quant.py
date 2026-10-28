@@ -21,11 +21,11 @@ from tinygrad.llm.kernels.nv import warp_reduce, _nv_device_ok, iq_grid
 
 NV_CUSTOM_QUANT = ContextVar("NV_CUSTOM_QUANT", 0)  # 0 = never take this path, even on NV (default: byte-identical everywhere)
 NV_QUANT_TYPES = (Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, Q3_K, IQ3_XXS, IQ3_S)  # T4.98k adds the three 3-bit formats
-# T4.125d: output rows per warp in the decode gemv (1, default 2, or 4) -- _decode_linear falls back to 1 when it
+# T4.125d: output rows per warp in the decode gemv (1, 2, or default 4) -- _decode_linear falls back to 1 when it
 # doesn't divide out_features. Read only in nv_q8_linear (uncached) and passed into _quant_decode_kernel's cache
 # key as rows_per_warp -- never read inside a @functools.cache'd kernel builder (nv_gemm.py's NV_WMMA_TOKEN_TILE
 # comment explains why: a cache hit would then silently serve a stale R for a later call with a different knob).
-NV_GEMV_ROWS = ContextVar("NV_GEMV_ROWS", 2)
+NV_GEMV_ROWS = ContextVar("NV_GEMV_ROWS", 4)  # 10-28 card sweep: R=1 28.6, R=2 28.0, R=4 27.9 ms/step (Q6_K head 1.62 -> 1.20 ms)
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
