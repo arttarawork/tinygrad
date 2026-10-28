@@ -21,6 +21,11 @@ from tinygrad.llm.kernels.nv import warp_reduce, _nv_device_ok, iq_grid
 
 NV_CUSTOM_QUANT = ContextVar("NV_CUSTOM_QUANT", 0)  # 0 = never take this path, even on NV (default: byte-identical everywhere)
 NV_QUANT_TYPES = (Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, Q3_K, IQ3_XXS, IQ3_S)  # T4.98k adds the three 3-bit formats
+# T4.125d: output rows per warp in the decode gemv (1, default 2, or 4) -- _decode_linear falls back to 1 when it
+# doesn't divide out_features. Read only in nv_q8_linear (uncached) and passed into _quant_decode_kernel's cache
+# key as rows_per_warp -- never read inside a @functools.cache'd kernel builder (nv_gemm.py's NV_WMMA_TOKEN_TILE
+# comment explains why: a cache hit would then silently serve a stale R for a later call with a different knob).
+NV_GEMV_ROWS = ContextVar("NV_GEMV_ROWS", 2)
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
@@ -64,16 +69,32 @@ def _iq4_bytes(packed:UOp, shift:int) -> UOp:
 
 # ******** q8-activation quant linear (verbatim amd.py structure; warp_reduce is the only device-specific piece) ********
 
-def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:str) -> UOp:
+def _decode_linear(out:UOp, xq:UOp, xd:UOp, out_features:int, group_count:int, group_dot, name:str, rows_per_warp:int=1) -> UOp:
+  # T4.125d: R output rows per warp amortise the per-group activation load (xwords/xd) over R weight dots instead of
+  # one -- a lane's 18-byte Q4_0 weight block is smaller than the 32 B of activation words + scale it loads to dot
+  # it, so at R=1 the gemv moves more activation bytes than weight bytes per dot (llama.cpp's mmvq does the same
+  # amortisation over several rows). R rows are a plain Python loop producing R values/warp_reduces/stores, grouped
+  # before .end() -- NOT a new LOCAL range: the lane range stays exactly the 32-wide one this function always built,
+  # because warp_reduce's butterfly shuffle combines whichever 32 threads the hardware warp maps these lanes to
+  # regardless of R (nv-custom-kernel-lane-split memory note: shuffle reductions here are lane-identity-agnostic).
+  R = rows_per_warp if out_features % rows_per_warp == 0 else 1  # fall back when R doesn't divide out_features
+  row_groups = out_features // R
   chunks = (group_count+31)//32
-  token_output_chunk, lane = UOp.range(out.shape[0]*out_features*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
-  token, output, chunk = token_output_chunk // (out_features*chunks), (token_output_chunk//chunks) % out_features, token_output_chunk % chunks
+  token_output_chunk, lane = UOp.range(out.shape[0]*row_groups*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  token, output, chunk = token_output_chunk // (row_groups*chunks), (token_output_chunk//chunks) % row_groups, token_output_chunk % chunks
   group = lane+chunk*32
-  value = group_dot(token, output, group) if group_count % 32 == 0 else \
-    (group < group_count).where(group_dot(token, output, group.minimum(group_count-1)), UOp.const(0, dtypes.float32))
-  total = warp_reduce(value, full_wave=True)
-  return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output_chunk, lane).sink(
-    arg=KernelInfo(name=name, opts_to_apply=()))
+  safe_group = group if group_count % 32 == 0 else group.minimum(group_count-1)
+  # the activation (xwords/xs) depends only on (token, group), never on the output row -- load it once per lane and
+  # reuse it for all R rows below, instead of reloading it inside group_dot once per row (R=1: identical load, same
+  # clamped safe_group the original inline ternary passed into group_dot, just hoisted one level up).
+  xwords, xs = _nv_load(xq[token, safe_group, 0], 8), xd[token, safe_group]
+  def value(row:UOp) -> UOp:
+    dot = group_dot(token, row, safe_group, xwords, xs)
+    return dot if group_count % 32 == 0 else (group < group_count).where(dot, UOp.const(0, dtypes.float32))
+  rows = tuple(output if R == 1 else output*R + r for r in range(R))  # R==1: no extra output*1+0 node -- bit-for-bit the old row index
+  totals = tuple(warp_reduce(value(row), full_wave=True) for row in rows)
+  stores = tuple(out[token, row, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)) for row, total in zip(rows, totals))
+  return UOp.group(*stores).end(token_output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
 def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
@@ -114,11 +135,13 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
   return Tensor(q_uop), Tensor(scale_uop)
 
 @functools.cache
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
+                          rows_per_warp:int=1) -> UOp:
   # grid: the IQ3 codebook (nv.py iq_grid) as a 5th kernel input for IQ3_XXS/IQ3_S (T4.98k), None for every other format
   group_count = in_features // Q8_GROUP_SIZE
-  def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
-    xwords = _nv_load(xq[token, group, 0], 8)
+  def group_dot(token:UOp, output:UOp, group:UOp, xwords:UOp, xs:UOp) -> UOp:
+    # T4.125d: xwords (the activation words) and xs (its scale) are hoisted into _decode_linear and passed in --
+    # loaded once per lane, shared across the R rows one warp now produces, instead of reloaded here per row.
     def _word32_u16(idx16:UOp) -> UOp:
       # T4.125a: raw is set_quantized's uint16 view here (Q4_0/IQ4_NL/Q6_K only) -- two u16 loads reconstruct the
       # same little-endian 32-bit word the byte view's four single-byte loads built (GPU loads are little-endian
@@ -140,7 +163,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         dot = UOp.const(0, dtypes.int32)
         for word_idx in range(8):
           dot = _nv_dp4a(_iq4_bytes(words[word_idx % 4], 4*(word_idx//4)), xwords[word_idx], dot)
-        return dot.float() * xd[token, group] * d
+        return dot.float() * xs * d
       # Q4_0 (gguf.py ggml_type==2, value = d*(q-8)): q_to_uint8(.,4)'s order is elements 0-15 = low nibbles of
       # qs[0:16], elements 16-31 = high nibbles of the SAME qs[0:16] -- the -8 offset folds into a dp4a-of-ones
       # qsum trick (T4.98i). Per-byte-lane extraction from the reassembled word: (word >> (i*8+shift)) & 0x0f ==
@@ -150,7 +173,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         shift = 4 if word_idx >= 4 else 0
         word = sum((((words[word_idx % 4] >> (i*8 + shift)) & 0x0f).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
         dot, qsum = _nv_dp4a(word, xwords[word_idx], dot), _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
-      return (dot.float() - 8*qsum.float()) * d * xd[token, group]
+      return (dot.float() - 8*qsum.float()) * d * xs
     if ggml_type in (Q8_0, Q4_1):
       # 32-weight blocks, byte view (34/20-byte blocks; Q4_1's 20 bytes ARE 4-byte aligned but kept on the byte
       # view for kernel-structure parity with Q4_0 -- T4.98i). Only Q4_0/IQ4_NL/Q6_K moved to the u16 view (T4.125a)
@@ -165,7 +188,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
           qbytes = _nv_load(raw[qs_base + word_idx*4], 4)
           word = sum((qbytes[i].cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
           dot = _nv_dp4a(word, xwords[word_idx], dot)
-        return dot.float() * d * xd[token, group]
+        return dot.float() * d * xs
       # Q4_1 (gguf.py ggml_type==3, value = d*q+m): same nibble unpack as Q4_0, q_to_uint8(.,4)'s order is
       # elements 0-15 = low nibbles of qs[0:16], elements 16-31 = high nibbles of the SAME qs[0:16]. m is a
       # constant added to every weight in the block, so over the dot product it becomes m * sum(activation) --
@@ -177,7 +200,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         shifted = (loads[word_idx % 4] >> 4) if word_idx >= 4 else loads[word_idx % 4]
         word = sum(((shifted[i] & 0x0f).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
         dot, qsum = _nv_dp4a(word, xwords[word_idx], dot), _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
-      return (dot.float()*d + qsum.float()*m) * xd[token, group]
+      return (dot.float()*d + qsum.float()*m) * xs
     # 256-weight superblocks: verbatim amd.py's group_dot (_nv_dp4a/_nv_load/_iq4_bytes in place of the _amd_ ones)
     block, subgroup = group // 8, group % 8
     if ggml_type in (Q4_K, Q5_K):
@@ -188,7 +211,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         if ggml_type == Q5_K: word |= ((raw[base+4+word_idx] >> subgroup.cast(dtypes.uint32)) & 0x01010101) << 4
         dot, qsum = _nv_dp4a(word, xwords[word_idx], dot), _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
       d, dmin, scale, minimum = _q5_scales(raw, base, subgroup)
-      return (dot.float()*d*scale - qsum.float()*dmin*minimum) * xd[token, group]
+      return (dot.float()*d*scale - qsum.float()*dmin*minimum) * xs
     if ggml_type == IQ4_XS:
       base = (output * in_features//GGML_BLOCK_SIZE + block) * IQ4_WORDS
       dot = UOp.const(0, dtypes.int32)
@@ -196,7 +219,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         packed = _nv_load(raw[base + 2 + subgroup*4 + word_idx%4])
         dot = _nv_dp4a(_iq4_bytes(packed, 4*(word_idx//4)), xwords[word_idx], dot)
       d, scale = _iq4_scales(raw, base, subgroup)
-      return dot.float() * xd[token, group] * d * scale
+      return dot.float() * xs * d * scale
     if ggml_type == Q3_K:
       # gguf.py ggml_type==11: 110-byte block (hmask[32], qs[64], scales[12], d f16). Each element e (i=e%32 in this
       # group) is q2 + 4*qh - 4 (q2 = 2-bit field p=subgroup%4 of qs byte at row=subgroup//4; qh = bit `subgroup` of
@@ -223,7 +246,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         high2 = (raw[base + 104 + k % 4].cast(dtypes.uint8) >> (2*(k//4)).cast(dtypes.uint8)) & 3
         return ((low4 | (high2 << 4)).bitcast(dtypes.int8) - 32).float()
       d = _half(raw[base+108].cast(dtypes.uint16) | (raw[base+109].cast(dtypes.uint16) << 8))
-      return (dots[0].float()*_q3_scale(0) + dots[1].float()*_q3_scale(1)) * xd[token, group] * d
+      return (dots[0].float()*_q3_scale(0) + dots[1].float()*_q3_scale(1)) * xs * d
     if ggml_type == IQ3_XXS:
       assert grid is not None, "IQ3 codebook input missing (nv.py iq_grid)"  # also narrows the Optional for mypy
       # gguf.py ggml_type==18: 98-byte block (d f16, qs[64] one code/4 weights, 8 uint32 scale+sign words at 66).
@@ -253,7 +276,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
           lanes.append(((mag ^ mask) - mask).cast(dtypes.uint8))
         word = sum((lanes[l].cast(dtypes.uint32) << (l*8) for l in range(4)), UOp.const(0, dtypes.uint32))
         dot = _nv_dp4a(word, xwords[word_idx], dot)
-      return dot.float() * db * xd[token, group]
+      return dot.float() * db * xs
     if ggml_type == IQ3_S:
       assert grid is not None, "IQ3 codebook input missing (nv.py iq_grid)"  # also narrows the Optional for mypy
       # gguf.py ggml_type==21: 110-byte block (d f16, qs[64], qh[8] one high-bit byte per group, signs[32],
@@ -284,7 +307,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
           lanes.append(((mag ^ mask) - mask).cast(dtypes.uint8))
         word = sum((lanes[l].cast(dtypes.uint32) << (l*8) for l in range(4)), UOp.const(0, dtypes.uint32))
         dot = _nv_dp4a(word, xwords[word_idx], dot)
-      return dot.float() * d * scale * xd[token, group]
+      return dot.float() * d * scale * xs
     # T4.125a: raw is the u16 view here too (210-byte blocks are even); base16 is base//2, exactly (210 is even).
     base16 = (output*in_features//GGML_BLOCK_SIZE+block)*(Q6_BYTES//2)
     dots = [UOp.const(0, dtypes.int32)] * 2
@@ -301,11 +324,11 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
       dots[word_idx//4] = _nv_dp4a(word, xwords[word_idx], dots[word_idx//4])
     scale_word = raw[base16 + 96 + subgroup]
     scales = [((scale_word >> (8*i)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
-    return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(raw[base16 + 104])
+    return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xs * _half(raw[base16 + 104])
   names = {Q4_K: "linear_q4_k_nv", Q5_K: "linear_q5_k_nv", IQ4_XS: "linear_iq4_xs_nv", Q6_K: "linear_q6_nv",
            Q8_0: "linear_q8_0_nv", Q4_0: "linear_q4_0_nv", Q4_1: "linear_q4_1_nv", IQ4_NL: "linear_iq4_nl_nv",
            Q3_K: "linear_q3_k_nv", IQ3_XXS: "linear_iq3_xxs_nv", IQ3_S: "linear_iq3_s_nv"}
-  return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
+  return _decode_linear(out, xq, xd, out_features, group_count, group_dot, names[ggml_type], rows_per_warp=rows_per_warp)
 
 def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """amd.py's q8_linear decode branch, ported to NV, restricted to small batches (tokens<=4): the WMMA gemm path
@@ -329,7 +352,8 @@ def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
     result = result.reshape(*x.shape[:-1], out_features)
     return result if layer.bias is None else result + layer.bias
   xq, xd = q8_quantize(x, tokens, in_features)
-  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
+  # T4.125d: read NV_GEMV_ROWS here (uncached) and pass it into the cache key -- never inside _quant_decode_kernel
+  decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type, rows_per_warp=NV_GEMV_ROWS.value)
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
   grids = (iq_grid(layer.ggml_type, cast(str, x.device)).uop,) if layer.ggml_type in IQ_GRID_SIZES else ()  # T4.98k: IQ3 codebook input
   return run(decode, out, raw, xq.uop, xd.uop, *grids)
