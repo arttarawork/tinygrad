@@ -239,7 +239,7 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
     val = residual[tok, d].load().float()
     # T4.125b: partials first, residual last -- renders as p0+...+p(C-1)+residual, exactly the generic reduce's sum and then the
     # residual add it replaces (the C renderer strips a same-op child's parens, so residual+(p0+...) compiled as (residual+p0)+...)
-    if C: val = sum((partials[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32)) + val
+    if C: val = sum((cast(UOp, partials)[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32)) + val
     vals.append(val)
     writes += [new_residual[tok, d].store(val), val_buf[d].store(val)]
   warp_sq = warp_reduce(sum((v*v for v in vals), UOp.const(0, dtypes.float32)), full_wave=True)
@@ -262,7 +262,7 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
     word_lane = lane.minimum(7)
     xs = tuple(vb[base + word_lane*4 + j].load() * inv_rms * weight[base + word_lane*4 + j].load().float() for j in range(4))
     stores += [q[tok, group, lane.valid(lane < 8)].store(_q8_pack(xs, group_scale)), scale[tok, group.valid(lane.eq(0))].store(group_scale)]
-    if want_fp16: stores.append(fp16_out[tok, base + lane].store(own.cast(dtypes.float16)))
+    if want_fp16: stores.append(cast(UOp, fp16_out)[tok, base + lane].store(own.cast(dtypes.float16)))
   return UOp.group(*stores).end(lane, warp, tok).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
 
 def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|None=None, want_fp16:bool=False,
@@ -289,7 +289,7 @@ def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|No
   # after the optional partials input, since the kernel keys optionals by position, not name (see its docstring)
   srcs = [new_residual, q, scale, residual, weight]
   if partials is not None: srcs.append(partials)
-  if want_fp16: srcs.append(fp16_out)
+  if fp16_out is not None: srcs.append(fp16_out)
   fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads)
   results = srcs[0].custom_kernel(*srcs[1:], fxn=fxn)
   return results[0], results[1], results[2], (results[-1] if want_fp16 else None)
@@ -479,8 +479,8 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
       # below matches the byte view's per-byte-lane shift: shift<=4 (low) / <=2 (high) never crosses a byte.
       low = _word32_u16(base16 + (pos//128)*32 + (within%64)//2) >> ((within//64)*4).cast(dtypes.uint32)
       high = _word32_u16(base16 + 64 + (pos//128)*16 + (within%32)//2) >> ((within//32)*2).cast(dtypes.uint32)
-      quant = [(((low >> (i*8)) & 15) | (((high >> (i*8)) & 3) << 4)).cast(dtypes.uint8).bitcast(dtypes.int8) - 32 for i in range(4)]
-      word = sum((quant[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+      quants = [(((low >> (i*8)) & 15) | (((high >> (i*8)) & 3) << 4)).cast(dtypes.uint8).bitcast(dtypes.int8) - 32 for i in range(4)]
+      word = sum((quants[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
       dots[word_idx//4] = _nv_dp4a(word, xwords[word_idx], dots[word_idx//4])
     scale_word = raw[base16 + 96 + subgroup]
     scales = [((scale_word >> (8*i)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
@@ -501,7 +501,7 @@ def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
   if tokens > 4: return None  # decode-only for now
   # T4.125a: Q4_0/IQ4_NL/Q6_K read their packed weight through set_quantized's uint16 view (half the load
   # instructions _quant_decode_kernel's group_dot issued through the byte view) -- every other format unchanged
-  weight = layer.packed_u16 if layer.ggml_type in (Q4_0, IQ4_NL, Q6_K) else layer.weight
+  weight = cast(Tensor, layer.packed_u16) if layer.ggml_type in (Q4_0, IQ4_NL, Q6_K) else layer.weight
   raw, out_features, in_features = weight.uop.buf_uop, layer.out_features, layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs

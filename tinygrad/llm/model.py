@@ -443,7 +443,7 @@ def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Line
   T, dim = x.shape[1], x.shape[-1]
   if not (isinstance(T, int) and T == 1 and isinstance(dim, int) and dim % 256 == 0 and weight is not None
           and nv_quant_supported(weight.device) and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
-  tokens = T * x.shape[0]
+  tokens = T * cast(int, x.shape[0])
   _, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), weight, norm.eps)
   register_fused_q8(normed := norm(x), tokens, dim, q, scale)
   return normed
@@ -579,7 +579,7 @@ class FFNBlock:
     if (isinstance(T, int) and T == 1 and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
         and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
         and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
-      tokens = T * x.shape[0]
+      tokens = T * cast(int, x.shape[0])
       # T4.125b: the producing gemv's own split-K partials (ssm_out/attn_output via nv_q8_linear), summed in-kernel -- attn_out's
       # summing reduce is then never read; anything else (a generic Linear) still folds in as one C=1 "split"
       partials = split_k_partials(attn_out)
@@ -956,7 +956,7 @@ class GatedDeltaNetBlock(FFNBlock):
     T, dim = x.shape[1], self.config.dim
     if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.nv_norm_weights is not None
         and nv_quant_supported(self.nv_norm_weights[0].device)):
-      tokens = T * x.shape[0]
+      tokens = T * cast(int, x.shape[0])
       _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
       assert fp16_out is not None
       register_fused_q8(normed := fp16_out.reshape(x.shape), tokens, dim, q, scale)
