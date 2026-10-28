@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode
-from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials
+from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, clear_step_caches
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -1643,8 +1643,16 @@ class Transformer:
     if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
       mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
       print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
-    return self.jit.setdefault(key, TinyJit(self.forward))(
+    return self.jit.setdefault(key, TinyJit(self._forward_step))(
       tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos, presence_penalty)
+
+  def _forward_step(self, *args) -> Tensor|tuple[Tensor, ...]:
+    # T4.126: nv_quant.py's per-step sharing caches (q8 activations, fused q8, split-K partials) only serve calls inside ONE
+    # forward, but their entries keep that step's buffers alive: at a 128-token prefill chunk that pinned ~180 MB of eager-pass
+    # activations while TinyJit allocated the capture's arenas, which no longer fit at 262k (10-28 card run). Drop them here,
+    # before TinyJit realizes/captures -- the returned graph keeps everything it still needs.
+    try: return self.forward(*args)
+    finally: clear_step_caches()
 
   def realize_placement(self):
     """Call once, right after loading weights into a device_map'd model (from_gguf does this for you) --

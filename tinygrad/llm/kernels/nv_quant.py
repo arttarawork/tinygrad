@@ -166,6 +166,13 @@ def _register_split_k(result:Tensor, partials:Tensor) -> None:
 
 def split_k_partials(result:Tensor) -> Tensor|None: return None if (p := _split_k.get(result.uop)) is None else Tensor(p)
 
+def clear_step_caches() -> None:
+  """T4.126: drop the per-step sharing caches above (Transformer._forward_step calls this after every forward) -- their entries
+  hold a step's activation buffers alive past the step, which a 128-token prefill capture at 262k cannot afford."""
+  _q8_quantize_cached.cache_clear()
+  _fused_q8.clear()
+  _split_k.clear()
+
 # ******** T4.123d: fused residual-add + RMSNorm + q8-quantize decode kernel (design doc section 3, P4 kernel
 # half) -- wired into model.py's FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention by T4.123e
 # (register_fused_q8 above is that wiring's other half). At each of the 129 norm sites per decode token the
