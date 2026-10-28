@@ -154,12 +154,12 @@ def _np_imma_reference(blocks:np.ndarray, xq:np.ndarray, xd:np.ndarray) -> np.nd
     acc = ((c[:, :, grp] * dw[None, :, grp]).astype(np.float64) * xd[:, None, grp] + acc).astype(np.float32)
   return acc
 
-def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2):
+def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4):
   groups = in_features // 32
   params = [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((out_features*groups*9,), dtypes.uint16, slot=1),
             UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)]
   return nv_gemm._q4_0_linear_imma_nv.__wrapped__(*params, out_features=out_features, in_features=in_features, token_tile=token_tile,
-                                                  warps=warps, out_tiles=out_tiles)
+                                                  warps=warps, out_tiles=out_tiles, stage=stage)
 
 class TestImmaKernel(unittest.TestCase):
   def test_renders_and_compiles_for_sm86_at_model_shapes(self):
@@ -176,7 +176,9 @@ class TestImmaKernel(unittest.TestCase):
         self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
         self.assertIn("int lidx0 = threadIdx.x; /* 32 */", src)  # the WARP range is the hardware lane, unsplit
         self.assertIn("int lidx1 = threadIdx.y; /* 4 */", src)   # the warps
-        self.assertEqual(tuple(prg.arg.global_size[:2]), (out_features // 64, 2))
+        self.assertEqual(tuple(prg.arg.global_size[:2]), (2, out_features // 64))  # token blocks fastest: they share weights in L2
+        self.assertIn("__syncthreads();", src)
+        self.assertIn("__shared__", src)
 
   def test_numpy_reference_matches_ggml_dequant(self):
     # the reference's integer form == gguf.py's own Q4_0 dequant times the dequantized activations (up to fp32 rounding)
@@ -191,14 +193,19 @@ class TestImmaKernel(unittest.TestCase):
 
   @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
   def test_kernel_runs_on_python_emulator(self):
-    # the kernel itself executed lane by lane (every fragment index, the WARP/LOCAL thread mapping, the epilogue scales) on
-    # the PYTHON emulator, whose m16n8k32 model is the PTX ISA's; out_features spans several output blocks and warps
-    for tokens, out_features, in_features, token_tile, warps, out_tiles in ((32, 64, 64, 32, 2, 2), (32, 32, 96, 16, 1, 4)):
-      with self.subTest(tokens=tokens, out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles):
+    # the kernel itself executed lane by lane (every fragment index, the WARP/LOCAL thread mapping, the shared-memory staging
+    # and its barriers, the epilogue scales) on the PYTHON emulator, whose m16n8k32 model is the PTX ISA's. Several output and
+    # token blocks and warps; stage 0 (global loads), 1, 2 and 4, including fills that don't divide the block's threads
+    # (16x1 scales over 64 threads, 16x8 words over 128) and a warp-range split (stage 4 x 2 warps: 32-word rows, 64 threads)
+    for tokens, out_features, in_features, token_tile, warps, out_tiles, stage in (
+        (32, 64, 64, 32, 2, 2, 0), (32, 64, 128, 16, 2, 2, 1), (64, 32, 128, 32, 1, 4, 4), (32, 128, 256, 16, 4, 1, 2),
+        (32, 64, 256, 16, 2, 2, 4)):
+      with self.subTest(tokens=tokens, out=out_features, inp=in_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles,
+                        stage=stage):
         rng = np.random.default_rng(tokens + out_features)
         blocks, (xq, xd) = _q4_0_blocks(rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
         fxn = functools.partial(nv_gemm._q4_0_linear_imma_nv.__wrapped__, out_features=out_features, in_features=in_features,
-                                token_tile=token_tile, warps=warps, out_tiles=out_tiles)
+                                token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage)
         out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device="PYTHON")
         srcs = [Tensor(a, device="PYTHON") for a in (blocks.reshape(-1).view(np.uint16), xq, xd)]
         res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
