@@ -347,7 +347,7 @@ def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, 
   # T4.124b: slots scale down as T_pad widens (64 at T_pad<=32, byte-identical to before; 32/16/8 at 64/128/256) so the partial
   # buffer stays ~48 MiB at every width instead of growing with T_pad -- see nv_prefill_attention's own docstring and the design
   # doc's section 3.3. The kernels need no change: _prefill_partial_kernel/_prefill_wmma_kernel read `chunks` back off out.shape[3].
-  chunks = min(PREFILL_CHUNKS * 32 // max(cast(int, T_pad), 32), N // BLOCK_N)
+  chunks = min(PREFILL_CHUNKS * 32 // max(T_pad, 32), N // BLOCK_N)
   partial = Tensor.empty(B, H, T_pad, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, T_pad, chunks, 2, dtype="float32", device=q.device)
   if wmma: fxn = functools.partial(_prefill_wmma_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, d_split=d_split)

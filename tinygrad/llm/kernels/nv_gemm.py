@@ -402,7 +402,7 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   grids = (iq_grid(layer.ggml_type, cast(str, x.device)).uop,) if layer.ggml_type in IQ_GRID_SIZES else ()  # T4.98k: IQ3 codebook input
   all_srcs = (out, raw, xh.uop, *grids)
   params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
-  token_tile = _token_tile_for(tokens, NV_WMMA_TOKEN_TILE.value)  # read the knob here, never inside the cached builder
+  token_tile = _token_tile_for(cast(int, tokens), NV_WMMA_TOKEN_TILE.value)  # read the knob here, never inside the cached builder
   kernel = _wmma_kernel(*params, out_features=out_features, in_features=in_features, ggml_type=layer.ggml_type,
                          token_tile=token_tile).call(*all_srcs)
   result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)
