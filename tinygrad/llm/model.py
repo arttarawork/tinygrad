@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode
-from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8
+from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -552,10 +552,10 @@ class FFNBlock:
     design doc section 3, P4): on the NV decode path (concrete T==1, dense FFN, both ffn_gate/ffn_up already
     NV-quantized -- the same gate test_llm_nv_quant.py's T4.123c fusion uses below) the residual-add (x+attn_out)
     and ffn_norm's RMSNorm+quantize collapse into ONE add_rmsnorm_q8 kernel instead of ~4 separate ones (a
-    generic residual-sum, RMSNorm's sum-of-squares + apply, q8_quantize_nv). `partials=attn_out.reshape(...,1)`
-    folds the plain residual-add in as a one-wide "split": the kernel sums however many partials it's given, and
-    one IS the whole value, so there is no need to reach into _attention/_feed_forward to get real split-K
-    partials (out of scope here, see HANDOFF). `self.ffn_norm(h)` below is called completely normally afterwards
+    generic residual-sum, RMSNorm's sum-of-squares + apply, q8_quantize_nv). The kernel sums however many partials it's
+    given: T4.125b passes the producing gemv's real split-K partials (nv_quant.py's split_k_partials, so attn_out's own
+    summing reduce is never scheduled), else attn_out.reshape(...,1) as a one-wide "split" (T4.123e's form).
+    `self.ffn_norm(h)` below is called completely normally afterwards
     (building nn.RMSNorm's ordinary lazy graph, the exact Tensor _feed_forward keeps using) but it is NEVER
     actually scheduled: register_fused_q8 (kernels/nv_quant.py) makes the q8_quantize call inside
     ffn_gate/ffn_up's nv_q8_linear (shared between the two since T4.123a) return the kernel's own (q, scale)
@@ -567,8 +567,11 @@ class FFNBlock:
         and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
         and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
       tokens = T * x.shape[0]
+      # T4.125b: the producing gemv's own split-K partials (ssm_out/attn_output via nv_q8_linear), summed in-kernel -- attn_out's
+      # summing reduce is then never read; anything else (a generic Linear) still folds in as one C=1 "split"
+      partials = split_k_partials(attn_out)
       new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[1], self.ffn_norm.eps,
-                                                   partials=attn_out.reshape(tokens, dim, 1))
+                                                   partials=attn_out.reshape(tokens, dim, 1) if partials is None else partials)
       h = new_residual.reshape(x.shape)
       normed = self.ffn_norm(h)
       register_fused_q8(normed, tokens, dim, q, scale)

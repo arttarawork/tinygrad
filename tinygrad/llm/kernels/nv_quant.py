@@ -133,6 +133,18 @@ def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Ten
   if key not in _fused_q8 and len(_fused_q8) >= _FUSED_Q8_MAXSIZE: _fused_q8.pop(next(iter(_fused_q8)))
   _fused_q8[key] = (q.uop, scale.uop)
 
+# T4.125b: nv_q8_linear's result is its kernel's split-K partials (tokens, out_features, C) summed by a generic reduce -- one
+# r_40_32_4_6 per ssm_out/attn_output per step. add_rmsnorm_q8 sums partials in-kernel, so _ffn_output (model.py) fetches the
+# producing gemv's un-summed partials here and the summed graph is never read (dead code, as with register_fused_q8 above). Same
+# bounded FIFO: the lookup comes right after the producing call.
+_split_k: dict[UOp, UOp] = {}
+
+def _register_split_k(result:Tensor, partials:Tensor) -> None:
+  if result.uop not in _split_k and len(_split_k) >= _FUSED_Q8_MAXSIZE: _split_k.pop(next(iter(_split_k)))
+  _split_k[result.uop] = partials.uop
+
+def split_k_partials(result:Tensor) -> Tensor|None: return None if (p := _split_k.get(result.uop)) is None else Tensor(p)
+
 # ******** T4.123d: fused residual-add + RMSNorm + q8-quantize decode kernel (design doc section 3, P4 kernel
 # half) -- wired into model.py's FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention by T4.123e
 # (register_fused_q8 above is that wiring's other half). At each of the 129 norm sites per decode token the
@@ -204,7 +216,9 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
   for r in range(per_thread):
     d = tid + r*threads
     val = residual[tok, d].load().float()
-    if C: val = val + sum((partials[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32))
+    # T4.125b: partials first, residual last -- renders as p0+...+p(C-1)+residual, exactly the generic reduce's sum and then the
+    # residual add it replaces (the C renderer strips a same-op child's parens, so residual+(p0+...) compiled as (residual+p0)+...)
+    if C: val = sum((partials[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32)) + val
     vals.append(val)
     writes += [new_residual[tok, d].store(val), val_buf[d].store(val)]
   warp_sq = warp_reduce(sum((v*v for v in vals), UOp.const(0, dtypes.float32)), full_wave=True)
@@ -443,8 +457,10 @@ def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
     kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
     result = Tensor(out.after(kernel))
+    partials = result  # T4.125b
     if len(result.shape) == 3: result = result.sum(-1)
     result = result.reshape(*x.shape[:-1], out_features)
+    if layer.bias is None: _register_split_k(result, partials)  # T4.125b: see split_k_partials
     return result if layer.bias is None else result + layer.bias
   xq, xd = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)

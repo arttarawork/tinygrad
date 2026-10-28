@@ -17,7 +17,7 @@ from tinygrad.llm.kernels.amd import (
   Linear, Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_WORDS, Q5_WORDS, IQ4_WORDS, Q3_K, IQ3_XXS, IQ3_S, QUANT_SIZES, IQ_GRID_SIZES)
 from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
-  nv_q8_linear, q8_quantize,
+  nv_q8_linear, q8_quantize, split_k_partials,
 )
 from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerConfig
 from test.helpers import check_schedule
@@ -881,5 +881,26 @@ class TestDecodeStepCensus(unittest.TestCase):
     self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
     self.assertEqual([k for k in census if "unsigned char" in k], [], "no per-step norm-weight conversion (prepare_nv_norms)")
     self.assertNotIn(f"elementwise half[{self.DIM}] <- half[{self.DIM}]", census, "the f16 gemvs read the fused fp16 output in place")
+    self.assertNotIn(f"reduce float[{self.DIM}] <- float[{2*self.DIM}]", census, "ssm_out's partials are summed inside the ffn_norm kernel")
+
+class TestSplitKPartials(unittest.TestCase):
+  """T4.125b: nv_q8_linear's summed result maps back to its kernel's un-summed split-K partials (split_k_partials), which
+  _ffn_output hands to add_rmsnorm_q8 so the summing reduce is never scheduled."""
+  def test_partials_are_exactly_what_the_result_sums(self):
+    linear = TestDecodeStepCensus._q4_0(2048, 64, 0)
+    out = nv_q8_linear(linear, Tensor.randn(1, 1, 2048))
+    assert out is not None
+    partials = split_k_partials(out)
+    assert partials is not None
+    self.assertEqual(partials.shape, (1, 64, 2))  # 2048 inputs = two 1024-wide chunks
+    self.assertIs(partials.sum(-1).reshape(out.shape).uop, out.uop, "hash-consing: the result IS the sum of these partials")
+
+  def test_anything_else_has_none(self):
+    self.assertIsNone(split_k_partials(Tensor.randn(1, 1, 64)))
+    linear = TestDecodeStepCensus._q4_0(2048, 64, 1)
+    linear.bias = Tensor.randn(64)
+    out = nv_q8_linear(linear, Tensor.randn(1, 1, 2048))
+    assert out is not None
+    self.assertIsNone(split_k_partials(out), "a bias is added after the sum: those partials don't sum to the result")
 
 if __name__ == "__main__": unittest.main()
