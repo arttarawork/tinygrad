@@ -119,11 +119,42 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     xwords = _nv_load(xq[token, group, 0], 8)
-    if ggml_type in (Q4_0, Q8_0, Q4_1, IQ4_NL):
-      # 32-weight blocks: one ggml block per activation group (no block/subgroup split). raw is a uint8 view
-      # (set_quantized): none of these block widths (34/18/20/18 bytes) are 4-byte aligned, so no uint32 word
-      # view here (T4.98c; T4.98i adds Q4_1/IQ4_NL)
-      block_bytes = {Q8_0: 34, Q4_1: 20}.get(ggml_type, 18)  # Q4_0 and IQ4_NL are both 18
+    def _word32_u16(idx16:UOp) -> UOp:
+      # T4.125a: raw is set_quantized's uint16 view here (Q4_0/IQ4_NL/Q6_K only) -- two u16 loads reconstruct the
+      # same little-endian 32-bit word the byte view's four single-byte loads built (GPU loads are little-endian
+      # on both AMD and NV, verified T4.98c), halving the load-instruction count. Every caller's idx16 is derived
+      # from a byte offset proven even (block widths 18/210 are both even), so the division is always exact.
+      return raw[idx16].cast(dtypes.uint32) | (raw[idx16+1].cast(dtypes.uint32) << 16)
+    if ggml_type in (Q4_0, IQ4_NL):
+      # 32-weight blocks, 18 bytes, 2-byte aligned -- u16 view (T4.125a)
+      base16 = (output * group_count + group) * 9  # 18 bytes / 2
+      d = _half(raw[base16])
+      qs_base16 = base16 + 1
+      words = [_word32_u16(qs_base16 + g*2) for g in range(4)]  # the same raw 4-byte qs words the byte view built
+      if ggml_type == IQ4_NL:
+        # gguf.py ggml_type==20: value = d * kvalues_iq4nl[q] -- Q4_0's exact byte layout and nibble order
+        # (elements 0-15 = low nibbles of qs[0:16], 16-31 = high nibbles of the SAME qs[0:16]) but each nibble
+        # indexes the 16-entry kvalues_iq4nl LUT instead of q-8, and there's no sub-block scale to apply.
+        # _iq4_bytes (IQ4_XS's LUT trick below) turns a raw packed byte-word straight into a dp4a-ready word of
+        # signed LUT values, so no separate nibble-unpack step is needed here (T4.98i)
+        dot = UOp.const(0, dtypes.int32)
+        for word_idx in range(8):
+          dot = _nv_dp4a(_iq4_bytes(words[word_idx % 4], 4*(word_idx//4)), xwords[word_idx], dot)
+        return dot.float() * xd[token, group] * d
+      # Q4_0 (gguf.py ggml_type==2, value = d*(q-8)): q_to_uint8(.,4)'s order is elements 0-15 = low nibbles of
+      # qs[0:16], elements 16-31 = high nibbles of the SAME qs[0:16] -- the -8 offset folds into a dp4a-of-ones
+      # qsum trick (T4.98i). Per-byte-lane extraction from the reassembled word: (word >> (i*8+shift)) & 0x0f ==
+      # the byte view's (byte_i >> shift) & 0x0f, since shift <= 4 never reaches into the next byte's bits.
+      dot, qsum = UOp.const(0, dtypes.int32), UOp.const(0, dtypes.int32)
+      for word_idx in range(8):
+        shift = 4 if word_idx >= 4 else 0
+        word = sum((((words[word_idx % 4] >> (i*8 + shift)) & 0x0f).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
+        dot, qsum = _nv_dp4a(word, xwords[word_idx], dot), _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
+      return (dot.float() - 8*qsum.float()) * d * xd[token, group]
+    if ggml_type in (Q8_0, Q4_1):
+      # 32-weight blocks, byte view (34/20-byte blocks; Q4_1's 20 bytes ARE 4-byte aligned but kept on the byte
+      # view for kernel-structure parity with Q4_0 -- T4.98i). Only Q4_0/IQ4_NL/Q6_K moved to the u16 view (T4.125a)
+      block_bytes = {Q8_0: 34, Q4_1: 20}[ggml_type]
       base = (output * group_count + group) * block_bytes
       d = _half(raw[base].cast(dtypes.uint16) | (raw[base+1].cast(dtypes.uint16) << 8))
       qs_base = base + (4 if ggml_type == Q4_1 else 2)  # Q4_1 has an extra f16 m before qs (Q4_0/Q8_0/IQ4_NL don't)
@@ -135,32 +166,18 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
           word = sum((qbytes[i].cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
           dot = _nv_dp4a(word, xwords[word_idx], dot)
         return dot.float() * d * xd[token, group]
-      if ggml_type == IQ4_NL:
-        # gguf.py ggml_type==20: value = d * kvalues_iq4nl[q] -- Q4_0's exact byte layout and nibble order
-        # (elements 0-15 = low nibbles of qs[0:16], 16-31 = high nibbles of the SAME qs[0:16]) but each nibble
-        # indexes the 16-entry kvalues_iq4nl LUT instead of q-8, and there's no sub-block scale to apply.
-        # _iq4_bytes (IQ4_XS's LUT trick below) turns a raw packed byte-word straight into a dp4a-ready word of
-        # signed LUT values, so no separate nibble-unpack step is needed here (T4.98i)
-        loads = [_nv_load(raw[qs_base + g*4], 4) for g in range(4)]
-        dot = UOp.const(0, dtypes.int32)
-        for word_idx in range(8):
-          word = sum((loads[word_idx % 4][i].cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
-          dot = _nv_dp4a(_iq4_bytes(word, 4*(word_idx//4)), xwords[word_idx], dot)
-        return dot.float() * xd[token, group] * d
-      # Q4_0 (gguf.py ggml_type==2, value = d*(q-8)) and Q4_1 (ggml_type==3, value = d*q+m) share the same nibble
-      # unpack: q_to_uint8(.,4)'s order is elements 0-15 = low nibbles of qs[0:16], elements 16-31 = high nibbles
-      # of the SAME qs[0:16]. Q4_1's m is a constant added to every weight in the block, so over the dot product
-      # it becomes m * sum(activation) -- same dp4a-of-ones qsum trick that folds Q4_0's -8 in, just added with
-      # coefficient m instead of subtracted with coefficient 8*d (T4.98i)
-      if ggml_type == Q4_1: m = _half(raw[base+2].cast(dtypes.uint16) | (raw[base+3].cast(dtypes.uint16) << 8))
+      # Q4_1 (gguf.py ggml_type==3, value = d*q+m): same nibble unpack as Q4_0, q_to_uint8(.,4)'s order is
+      # elements 0-15 = low nibbles of qs[0:16], elements 16-31 = high nibbles of the SAME qs[0:16]. m is a
+      # constant added to every weight in the block, so over the dot product it becomes m * sum(activation) --
+      # same dp4a-of-ones qsum trick Q4_0 uses for its -8 bias, just added with coefficient m (T4.98i)
+      m = _half(raw[base+2].cast(dtypes.uint16) | (raw[base+3].cast(dtypes.uint16) << 8))
       loads = [_nv_load(raw[qs_base + g*4], 4) for g in range(4)]
       dot, qsum = UOp.const(0, dtypes.int32), UOp.const(0, dtypes.int32)
       for word_idx in range(8):
         shifted = (loads[word_idx % 4] >> 4) if word_idx >= 4 else loads[word_idx % 4]
         word = sum(((shifted[i] & 0x0f).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
         dot, qsum = _nv_dp4a(word, xwords[word_idx], dot), _nv_dp4a(UOp.const(0x01010101, dtypes.uint32), xwords[word_idx], qsum)
-      if ggml_type == Q4_1: return (dot.float()*d + qsum.float()*m) * xd[token, group]
-      return (dot.float() - 8*qsum.float()) * d * xd[token, group]
+      return (dot.float()*d + qsum.float()*m) * xd[token, group]
     # 256-weight superblocks: verbatim amd.py's group_dot (_nv_dp4a/_nv_load/_iq4_bytes in place of the _amd_ ones)
     block, subgroup = group // 8, group % 8
     if ggml_type in (Q4_K, Q5_K):
@@ -268,18 +285,23 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *
         word = sum((lanes[l].cast(dtypes.uint32) << (l*8) for l in range(4)), UOp.const(0, dtypes.uint32))
         dot = _nv_dp4a(word, xwords[word_idx], dot)
       return dot.float() * d * scale * xd[token, group]
-    base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_BYTES
+    # T4.125a: raw is the u16 view here too (210-byte blocks are even); base16 is base//2, exactly (210 is even).
+    base16 = (output*in_features//GGML_BLOCK_SIZE+block)*(Q6_BYTES//2)
     dots = [UOp.const(0, dtypes.int32)] * 2
     for word_idx in range(8):
       pos, within = subgroup*32 + word_idx*4, (subgroup*32 + word_idx*4)%128
-      low = _nv_load(raw[base + (pos//128)*64 + within%64], 4) >> ((within//64)*4).cast(dtypes.uint8)
-      high = _nv_load(raw[base + 128 + (pos//128)*32 + within%32], 4) >> ((within//32)*2).cast(dtypes.uint8)
-      quant = ((low & 15) | ((high & 3) << 4)).bitcast(dtypes.int8) - 32
+      # the two 4-byte windows below (ggml's ql/qh fields) always start at even byte offsets (within%64 and
+      # within%32 are multiples of 4; every block stride added to them is even too) -- _word32_u16 reconstructs
+      # the same word the byte view's four single-byte loads built, from two u16 loads. The pre-shift trick
+      # below matches the byte view's per-byte-lane shift: shift<=4 (low) / <=2 (high) never crosses a byte.
+      low = _word32_u16(base16 + (pos//128)*32 + (within%64)//2) >> ((within//64)*4).cast(dtypes.uint32)
+      high = _word32_u16(base16 + 64 + (pos//128)*16 + (within%32)//2) >> ((within//32)*2).cast(dtypes.uint32)
+      quant = [(((low >> (i*8)) & 15) | (((high >> (i*8)) & 3) << 4)).cast(dtypes.uint8).bitcast(dtypes.int8) - 32 for i in range(4)]
       word = sum((quant[i].cast(dtypes.uint8).cast(dtypes.uint32) << (i*8) for i in range(4)), UOp.const(0, dtypes.uint32))
       dots[word_idx//4] = _nv_dp4a(word, xwords[word_idx], dots[word_idx//4])
-    scales = [raw[base + 192 + subgroup*2+i].cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
-    dbits = raw[base+208].cast(dtypes.uint16) | (raw[base+209].cast(dtypes.uint16) << 8)
-    return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(dbits)
+    scale_word = raw[base16 + 96 + subgroup]
+    scales = [((scale_word >> (8*i)) & 0xff).cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
+    return (dots[0].float()*scales[0] + dots[1].float()*scales[1]) * xd[token, group] * _half(raw[base16 + 104])
   names = {Q4_K: "linear_q4_k_nv", Q5_K: "linear_q5_k_nv", IQ4_XS: "linear_iq4_xs_nv", Q6_K: "linear_q6_nv",
            Q8_0: "linear_q8_0_nv", Q4_0: "linear_q4_0_nv", Q4_1: "linear_q4_1_nv", IQ4_NL: "linear_iq4_nl_nv",
            Q3_K: "linear_q3_k_nv", IQ3_XXS: "linear_iq3_xxs_nv", IQ3_S: "linear_iq3_s_nv"}
@@ -294,7 +316,10 @@ def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
   if not isinstance(numel, int): return None  # symbolic token count: no padded-chunk path ported yet (T4.98f)
   tokens = numel // layer.in_features
   if tokens > 4: return None  # decode-only for now
-  raw, out_features, in_features = layer.weight.uop.buf_uop, layer.out_features, layer.in_features
+  # T4.125a: Q4_0/IQ4_NL/Q6_K read their packed weight through set_quantized's uint16 view (half the load
+  # instructions _quant_decode_kernel's group_dot issued through the byte view) -- every other format unchanged
+  weight = layer.packed_u16 if layer.ggml_type in (Q4_0, IQ4_NL, Q6_K) else layer.weight
+  raw, out_features, in_features = weight.uop.buf_uop, layer.out_features, layer.in_features
   def run(fxn:Callable[..., UOp], out:UOp, *srcs:UOp) -> Tensor:
     all_srcs = (out,)+srcs
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
