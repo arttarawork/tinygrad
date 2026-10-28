@@ -11,7 +11,7 @@ from __future__ import annotations
 import functools, math
 from typing import Callable, cast
 from tinygrad import Tensor, UOp
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import ContextVar
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import (
@@ -110,8 +110,168 @@ def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int) -> tuple[UOp, UO
   return q.uop, scale.uop
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
+  if (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
   q_uop, scale_uop = _q8_quantize_cached(x.uop, tokens, in_features)
   return Tensor(q_uop), Tensor(scale_uop)
+
+# T4.123e: model.py's _ffn_output/GatedDeltaNetBlock's own norm-site helper call self.ffn_norm(h)/self.attn_norm(x)
+# completely normally (building nn.RMSNorm's ordinary lazy graph -- the exact Tensor object every consumer Linear
+# keeps using unchanged) but the fused add_rmsnorm_q8 kernel already computed that norm's (q, scale) itself, in
+# the SAME kernel as the residual-add. register_fused_q8 lets the q8_quantize call every consumer's nv_q8_linear
+# makes on that exact Tensor (shared across consumers since T4.123a -- FFN gate+up, GDN attn_gate/attn_qkv,
+# attention q/k/v all read one norm output) return those already-computed tensors instead of re-deriving them
+# with a second q8_quantize_nv kernel -- so the RMSNorm graph built above is dead code (nothing ever reads its
+# VALUE) and is never scheduled. Same cycle-safety rationale as _q8_quantize_cached above (a cache value holds a
+# strong path back to its own key): bounded by simple FIFO eviction, not unbounded -- entries are read back
+# within the same block's _run body, microseconds after being registered, so eviction order barely matters here
+# (unlike _q8_quantize_cached's true LRU, tuned for sharing across back-to-back calls).
+_FUSED_Q8_MAXSIZE = 16
+_fused_q8: dict[tuple[UOp, int, int], tuple[UOp, UOp]] = {}
+
+def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Tensor) -> None:
+  key = (x.uop, tokens, in_features)
+  if key not in _fused_q8 and len(_fused_q8) >= _FUSED_Q8_MAXSIZE: _fused_q8.pop(next(iter(_fused_q8)))
+  _fused_q8[key] = (q.uop, scale.uop)
+
+# T4.125b: nv_q8_linear's result is its kernel's split-K partials (tokens, out_features, C) summed by a generic reduce -- one
+# r_40_32_4_6 per ssm_out/attn_output per step. add_rmsnorm_q8 sums partials in-kernel, so _ffn_output (model.py) fetches the
+# producing gemv's un-summed partials here and the summed graph is never read (dead code, as with register_fused_q8 above). Same
+# bounded FIFO: the lookup comes right after the producing call.
+_split_k: dict[UOp, UOp] = {}
+
+def _register_split_k(result:Tensor, partials:Tensor) -> None:
+  if result.uop not in _split_k and len(_split_k) >= _FUSED_Q8_MAXSIZE: _split_k.pop(next(iter(_split_k)))
+  _split_k[result.uop] = partials.uop
+
+def split_k_partials(result:Tensor) -> Tensor|None: return None if (p := _split_k.get(result.uop)) is None else Tensor(p)
+
+# ******** T4.123d: fused residual-add + RMSNorm + q8-quantize decode kernel (design doc section 3, P4 kernel
+# half) -- wired into model.py's FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention by T4.123e
+# (register_fused_q8 above is that wiring's other half). At each of the 129 norm sites per decode token the
+# residual stream used to go through 3-4 separate ~6us kernels (a generic residual-sum, r_16_320's one-warp
+# RMSNorm sum-of-squares, E_40_32_4's apply, q8_quantize_nv): this does all of it in one kernel, one block per
+# token -- at the sites T4.123e's two gates cover (dense ffn_norm both block types, GDN's attn_norm). ********
+
+def _q8_pack(values:tuple[UOp, ...], group_scale:UOp) -> UOp:
+  # verbatim _q8_quantize_kernel's word-packing formula (the exact rounding/layout this task must match): 4
+  # signed-int8 lanes packed into one uint32 word, each lane independently round-half-to-even + clip(-127,127).
+  return sum(((v/group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8)
+              for i,v in enumerate(values)), UOp.const(0, dtypes.uint32))
+
+@functools.cache
+def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, want_fp16:bool, threads:int) -> UOp:
+  """params, in order: new_residual, q, scale, residual, weight, [partials if C>0], [fp16_out if want_fp16] --
+  the variadic *params (keyed by position, not by a keyword-with-default that would shift when an optional src
+  is omitted) is what lets Tensor.custom_kernel's one-placeholder-per-src convention carry two independent
+  optional tensors (nv_quant.py's other kernels only ever have one optional src, e.g. _quant_decode_kernel's
+  IQ3 grid, which a trailing `=None` kwarg handles fine -- two would collide positionally).
+
+  One block (AxisType.GLOBAL) per token, `threads` (a multiple of 32 dividing dim, <= 1024) threads per block.
+  Phase 1: every thread computes `per_thread` (=dim/threads) strided elements of residual+sum(partials),
+  writes them to the new_residual output AND stages them in a block-shared buffer (AddrSpace.LOCAL) -- the
+  LOCAL store is what makes the codegen pipeline's add_raw_barrier pass (tinygrad/codegen/__init__.py) insert
+  a __syncthreads() wherever this buffer is read back below, the same mechanism r_16_320's auto-scheduled
+  buf2/__syncthreads() uses and attn_kernel.py's local_buf/`.after(produce_done)` idiom hand-builds explicitly.
+  Each thread also reduces its own elements' sum-of-squares via warp_reduce (one shuffle-tree per warp) and
+  stashes its warp's total in a second LOCAL buffer, one slot per warp.
+  Phase 2: every thread re-reads all `threads/32` per-warp sums (now safely visible post-barrier) and computes
+  rms = sqrt(mean+eps) then 1/rms -- that exact two-op order, not a fused rsqrt, to match nn.RMSNorm._norm's
+  `.rsqrt()` decomposition (tensor.py: `self.sqrt().reciprocal()`) bit-for-bit. Each of the `threads/32` warps
+  then owns `per_thread` (== dim/32/warps exactly, given the dim%threads==0 assert -- see below) contiguous
+  32-wide q8 groups and quantizes its normed slice with _q8_pack -- the identical warp-per-group / lane<8-packs-4 layout
+  _q8_quantize_kernel uses, just reading the LOCAL-staged (not global) activation and multiplying in
+  inv_rms*weight first. An optional fp16 copy of the normed value (the GDN block's `x.half()` f16-gemv input,
+  design table row for E_40_32_4) is written from the same per-lane value, no recompute."""
+  assert threads % 32 == 0 and dim % threads == 0, f"threads={threads} must be a multiple of 32 dividing dim={dim}"
+  warps = threads // 32
+  # groups_per_warp (= groups/warps, groups=dim/32) is ALWAYS == per_thread (= dim/threads) given the assert
+  # above: dim=m*threads=m*32*warps => dim/32=m*warps => (dim/32)/warps=m=dim/threads. One variable, two uses.
+  per_thread = dim // threads
+  new_residual, q, scale, residual, weight = params[:5]
+  i = 5
+  partials = params[i] if C > 0 else None
+  if C > 0: i += 1
+  fp16_out = params[i] if want_fp16 else None
+
+  # warp (0..warps-1) is AxisType.LOCAL, lane (the 32 hardware lanes) is the dedicated AxisType.WARP (axis_id
+  # -1, same reserved id amd.py's _amd_flash_attention/codegen/opt/postrange.py's tensor-core path use) --
+  # NOT one size-`threads` AxisType.LOCAL range split via //32/%32: add_gpudims is free to decompose a single
+  # wide LOCAL range into (threadIdx.x, threadIdx.y) in whatever shape it likes (e.g. 256 -> (8,32)), which
+  # does NOT line up with CUDA's actual hardware warp boundary (threadIdx.x fastest, warps = contiguous
+  # linearized-thread-id chunks of 32) unless the 32-wide axis is specifically pinned to the warp slot via
+  # AxisType.WARP -- confirmed by rendering this kernel both ways (the first draft's split render showed
+  # local_size=(8,32) with our "lane" value NOT equal to the hardware lane, which would make warp_reduce's
+  # __shfl_xor_sync combine the wrong 32 threads).
+  tok = UOp.range(tokens, 0, AxisType.GLOBAL)
+  warp, lane = UOp.range(warps, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+  tid = warp * 32 + lane
+  val_buf = UOp.placeholder((dim,), dtypes.float32, slot=50, addrspace=AddrSpace.LOCAL)
+  wsum_buf = UOp.placeholder((warps,), dtypes.float32, slot=51, addrspace=AddrSpace.LOCAL)
+
+  # phase 1: residual add (+ optional partial sums), staged into val_buf for phase 2's re-read. Unrolled over
+  # per_thread (a compile-time int, 5 at the standing dim=5120/threads=1024) the same way _q8_quantize_kernel
+  # unrolls its 4-wide word pack -- no RANGE/REG machinery needed since each thread's per_thread elements are
+  # independent (no loop-carried state).
+  vals, writes = [], []
+  for r in range(per_thread):
+    d = tid + r*threads
+    val = residual[tok, d].load().float()
+    # T4.125b: partials first, residual last -- renders as p0+...+p(C-1)+residual, exactly the generic reduce's sum and then the
+    # residual add it replaces (the C renderer strips a same-op child's parens, so residual+(p0+...) compiled as (residual+p0)+...)
+    if C: val = sum((partials[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32)) + val
+    vals.append(val)
+    writes += [new_residual[tok, d].store(val), val_buf[d].store(val)]
+  warp_sq = warp_reduce(sum((v*v for v in vals), UOp.const(0, dtypes.float32)), full_wave=True)
+  writes.append(wsum_buf[warp.valid(lane.eq(0))].store(warp_sq))
+  phase1 = UOp.group(*writes)
+
+  # phase 1b: cross-warp combine -- every thread re-reads all `warps` shared partials post-barrier (same
+  # redundant-per-thread combine r_16_320's own 16-wide loop does for its one warp)
+  vb, wsum = val_buf.after(phase1), wsum_buf.after(phase1)
+  total = sum((wsum[w].load() for w in range(warps)), UOp.const(0, dtypes.float32))
+  inv_rms = ((total * (1.0 / dim)) + eps).sqrt().reciprocal()
+
+  # phase 2: normed = val_buf * inv_rms * weight, then _q8_quantize_kernel's exact per-32-group pack
+  stores = []
+  for g in range(per_thread):  # groups_per_warp == per_thread, see above
+    group = warp * per_thread + g
+    base = group * Q8_GROUP_SIZE
+    own = vb[base + lane].load() * inv_rms * weight[base + lane].load().float()
+    group_scale = (warp_reduce(own.abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
+    word_lane = lane.minimum(7)
+    xs = tuple(vb[base + word_lane*4 + j].load() * inv_rms * weight[base + word_lane*4 + j].load().float() for j in range(4))
+    stores += [q[tok, group, lane.valid(lane < 8)].store(_q8_pack(xs, group_scale)), scale[tok, group.valid(lane.eq(0))].store(group_scale)]
+    if want_fp16: stores.append(fp16_out[tok, base + lane].store(own.cast(dtypes.float16)))
+  return UOp.group(*stores).end(lane, warp, tok).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
+
+def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|None=None, want_fp16:bool=False,
+                    threads:int|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor|None]:
+  """Thin wrapper (T4.123d) around _add_rmsnorm_q8_kernel: residual (tokens,dim) fp32, optional partials
+  (tokens,dim,C) fp32 (the previous projection's un-summed split-K partials -- summed in-kernel), weight (dim,)
+  the RMSNorm weight. Returns (new_residual, q, scale, fp16_copy_or_None); q/scale are nv_q8_linear-ready
+  (same (tokens,groups,8) uint32 / (tokens,groups) float32 shape _q8_quantize_cached produces). Wired into
+  FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention's decode path by T4.123e."""
+  tokens, dim = cast(tuple[int, int], residual.shape)
+  # T4.125b: default = the widest block (<= 1024 threads): 1024 at dim=5120, i.e. 5 elements per thread and 5 q8 groups per warp
+  # instead of 256 threads' 20 each -- the 256-thread kernel was latency-bound (12.7 us per launch on the card, 10-28 profile)
+  if threads is None: threads = next((t for t in range(1024, 31, -32) if dim % t == 0), 32)
+  assert threads % 32 == 0 and dim % threads == 0, f"threads={threads} must be a multiple of 32 dividing dim={dim}"
+  groups = dim // Q8_GROUP_SIZE
+  C = 0 if partials is None else cast(int, partials.shape[-1])
+  dev = residual.device
+  new_residual = Tensor.empty(tokens, dim, dtype=dtypes.float32, device=dev)
+  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=dev)
+  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=dev)
+  fp16_out = Tensor.empty(tokens, dim, dtype=dtypes.float16, device=dev) if want_fp16 else None
+  # order must match _add_rmsnorm_q8_kernel's *params unpacking exactly: fixed outputs+inputs, then partials
+  # (if any), then fp16_out (if any) LAST -- fp16_out is conceptually an output but must sit positionally
+  # after the optional partials input, since the kernel keys optionals by position, not name (see its docstring)
+  srcs = [new_residual, q, scale, residual, weight]
+  if partials is not None: srcs.append(partials)
+  if want_fp16: srcs.append(fp16_out)
+  fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads)
+  results = srcs[0].custom_kernel(*srcs[1:], fxn=fxn)
+  return results[0], results[1], results[2], (results[-1] if want_fp16 else None)
 
 @functools.cache
 def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int) -> UOp:
@@ -325,8 +485,10 @@ def nv_q8_linear(layer:Linear, x:Tensor) -> Tensor|None:
     params = tuple(UOp.placeholder_like(src, slot=i) for i,src in enumerate(all_srcs))
     kernel = fxn(*params, out_features=out_features, in_features=in_features).call(*all_srcs)
     result = Tensor(out.after(kernel))
+    partials = result  # T4.125b
     if len(result.shape) == 3: result = result.sum(-1)
     result = result.reshape(*x.shape[:-1], out_features)
+    if layer.bias is None: _register_split_k(result, partials)  # T4.125b: see split_k_partials
     return result if layer.bias is None else result + layer.bias
   xq, xd = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)

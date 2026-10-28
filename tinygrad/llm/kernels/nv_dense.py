@@ -108,7 +108,10 @@ def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
     layer.dense_weight = _fp16_copy(layer)
   weight = layer.dense_weight
   x_pad = x.pad_to(x.max_shape) if symbolic else x  # concrete shape from here on (mirrors nv_gemm.py's nv_wmma_linear)
-  xh = x_pad.contiguous() if x_pad.dtype == dtypes.float16 else x_pad.cast(dtypes.float16).contiguous()
+  # T4.125b: a reshaped fp16 kernel output (add_rmsnorm_q8's want_fp16 copy at GDN's attn_norm site) already is a whole contiguous
+  # buffer, but .contiguous() only short-circuits a plain BUFFER, not an AFTER -- it copied it again every step (E_40_32_4_1)
+  xh = x_pad if x_pad.dtype == dtypes.float16 and x_pad.uop.has_buffer_identity(after_ok=True) else \
+    x_pad.contiguous() if x_pad.dtype == dtypes.float16 else x_pad.cast(dtypes.float16).contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=out_dtype, device=x.device)
   fxn = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
   result = Tensor.custom_kernel(out, weight.reshape(-1), xh.reshape(tokens, layer.in_features), fxn=fxn)[0]
