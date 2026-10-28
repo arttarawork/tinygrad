@@ -11,7 +11,7 @@ from tinygrad.llm.kernels.nv_quant import NV_CUSTOM_QUANT  # importing nv_quant 
 BLOCK = {Q8_0: (32, 34), Q4_0: (32, 18), Q4_1: (32, 20), IQ4_NL: (32, 18),
          **{t: (256, QUANT_SIZES[t]) for t in (Q4_K, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS, IQ3_S)}}
 
-def _sink(ggml_type:int, tokens:int, out_features:int, in_features:int):
+def _sink(ggml_type:int, tokens:int, out_features:int, in_features:int, token_tile:int|None=None):
   weights, block_bytes = BLOCK[ggml_type]
   dt = dtypes.uint8  # the kernel always gets a byte view (amd.py packed_bytes for the word-view formats)
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32).uop
@@ -21,7 +21,10 @@ def _sink(ggml_type:int, tokens:int, out_features:int, in_features:int):
   if ggml_type in IQ_GRID_SIZES:  # T4.98k: the IQ3 codebook, bound the same way nv_wmma_linear binds it (see iq_grid)
     srcs.append(Tensor.empty(IQ_GRID_SIZES[ggml_type], dtype=dtypes.uint32).uop)
   params = tuple(UOp.placeholder_like(s, slot=i) for i, s in enumerate(srcs))
-  return nv_gemm._wmma_kernel(*params, out_features=out_features, in_features=in_features, ggml_type=ggml_type)
+  # token_tile is a required kwarg on _wmma_kernel (T4.124c); default here reproduces what every caller (incl. nv_wmma_linear
+  # with the knob at its default 64) computes: _token_tile_for(tokens) with no override.
+  tile = nv_gemm._token_tile_for(tokens) if token_tile is None else token_tile
+  return nv_gemm._wmma_kernel(*params, out_features=out_features, in_features=in_features, ggml_type=ggml_type, token_tile=tile)
 
 def _shapes(ggml_type:int):  # (tokens, out, in): 1-4 M tiles, 1/4 N tiles, several K blocks; K a multiple of the format's block
   k = nv_gemm.WMMA_FORMATS[ggml_type][1]
@@ -57,6 +60,33 @@ class TestKernelGraphAndRender(unittest.TestCase):
           if ggml_type in IQ_GRID_SIZES:  # T4.98k: the codebook (slot 3) must actually be read, not optimized away
             self.assertIn("data3_", src)
 
+  def test_token_tile_knob_changes_global_grid_and_mma_count(self):
+    # T4.124c (PB.3): NV_WMMA_TOKEN_TILE lets a narrower token tile dispatch more, smaller token blocks. Shape matches the
+    # gemm model in prefill-batch-design.md section 3 (Q4_0 gate/up, out=17408 x in=5120 -> grid.x = 17408/32 = 544).
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    tokens, out_features, in_features = 64, 17408, 5120
+    def mma_count(sink): return sum(1 for u in sink.toposort() if u.op is Ops.WMMA)
+
+    default_sink = _sink(Q4_0, tokens, out_features, in_features)  # token_tile omitted -> _token_tile_for(64) == 64
+    self.assertEqual(mma_count(default_sink), 32)
+    self.assertEqual(to_program(default_sink, renderer).arg.global_size[:2], (544, 1))
+
+    tile32_sink = _sink(Q4_0, tokens, out_features, in_features, token_tile=32)
+    self.assertEqual(mma_count(tile32_sink), 16)
+    self.assertEqual(to_program(tile32_sink, renderer).arg.global_size[:2], (544, 2))
+
+  def test_default_tile_matches_pre_knob_fixed_rule(self):
+    # the knob's default (64) must reproduce the original hardcoded rule exactly, for every shape the other tests cover --
+    # same tile value => the deterministic builder renders byte-identical output (tile is the only shape-shaping input).
+    for ggml_type in nv_gemm.WMMA_FORMATS:
+      for tokens, _o, _i in _shapes(ggml_type):
+        fixed_rule = 64 if tokens % 64 == 0 else 32 if tokens % 32 == 0 else nv_gemm.WMMA_M
+        self.assertEqual(nv_gemm._token_tile_for(tokens), fixed_rule, (ggml_type, tokens))
+
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):
     # CPU: nv_quant_supported is False, so Linear.__call__ never reaches nv_wmma_linear; and called directly it returns None
@@ -85,6 +115,9 @@ class TestGates(unittest.TestCase):
 
   def test_tile_helpers(self):
     self.assertEqual([nv_gemm._token_tile_for(t) for t in (16, 32, 48, 64, 128)], [16, 32, 16, 64, 64])
+    # T4.124c: the knob caps which of {64, 32, 16} is tried; tokens=64 picks the largest divisor <= knob (128 doesn't
+    # divide 64, so it falls through to 32, same as the uncapped default would for tokens=32).
+    self.assertEqual([nv_gemm._token_tile_for(64, knob=k) for k in (16, 32, 64, 128)], [16, 32, 64, 32])
     self.assertEqual([nv_gemm._output_tiles_for(o) for o in (8, 16, 32, 48)], [1, 1, 4, 1])
 
 if __name__ == "__main__": unittest.main()

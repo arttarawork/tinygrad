@@ -362,9 +362,12 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
 
   def test_auto_chunk_is_device_aware(self):
     # auto (GDN_CHUNK=0): 32 only on the GPU backends it was measured on; CPU keeps the one-token-per-step prefill (x86 clang 18
-    # crashes on the unrolled 32-step scan kernel -- CI's Test LLM job); an explicit GDN_CHUNK wins everywhere
+    # crashes on the unrolled 32-step scan kernel -- CI's Test LLM job); an explicit GDN_CHUNK wins everywhere. T4.124a:
+    # gdn_chunk_for("NV"*) now also consults nv_custom_kernels_supported (real hardware detection in production) -- mocked
+    # False here, same convention as test_llm_nv_scan.py's decode_gate(), so this device-string-parsing test opens no device
+    # and keeps exercising the pre-T4.124a fallback this comment describes.
     from tinygrad.llm.model import gdn_chunk_for
-    with Context(GDN_CHUNK=0):
+    with patch("tinygrad.llm.model.nv_custom_kernels_supported", return_value=False), Context(GDN_CHUNK=0):
       self.assertEqual([gdn_chunk_for(d) for d in ("METAL", "NV", "NV:1", "CUDA", ("METAL", "NV"))], [32, 32, 32, 32, 32])
       self.assertEqual([gdn_chunk_for(d) for d in ("CPU", "CPU:1", "NULL", "AMD", ("CPU", "METAL"))], [1, 1, 1, 1, 1])
     with Context(GDN_CHUNK=16): self.assertEqual([gdn_chunk_for(d) for d in ("CPU", "METAL")], [16, 16])

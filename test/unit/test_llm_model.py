@@ -1,5 +1,7 @@
 import unittest
-from tinygrad import Tensor
+from unittest.mock import patch
+from tinygrad import Tensor, Context
+from tinygrad.llm import model as model_mod
 from tinygrad.llm.model import Transformer
 from test.unit.test_llm_server import TEST_CONFIG
 
@@ -123,3 +125,39 @@ class TestPrefillOnly(unittest.TestCase):
     self.assertEqual(model._cached_tokens, [1, 2, 3])
     self.assertEqual(model.get_start_pos([1, 2, 3, 9, 9]), 3)   # extends the prefix -- reused
     self.assertEqual(model.get_start_pos([1, 2, 9, 9]), 0)       # diverges at position 2 -- must NOT reuse
+
+class TestPrefillChunkKnob(unittest.TestCase):
+  """T4.124a: PREFILL_CHUNK -- generate()/prefill_only() fall back to it when no explicit chunk_size is given, and
+  gdn_chunk_for caps it at MAX_PREFILL_ROWS on devices whose fused NV scan is on. The default (32) must stay byte-
+  identical to the pre-T4.124a chunk_size=32 default everywhere (TestOneSamplingFamily/TestPrefillOnly above, run
+  unchanged, already pin that for the common chunk_size= callers)."""
+
+  def test_gdn_chunk_for_nv_cap_and_overrides(self):
+    cap = model_mod.MAX_PREFILL_ROWS  # 64 pre-T4.124b, 256 after -- compute relative to it so this test survives either
+    with patch.object(model_mod, "nv_custom_kernels_supported", return_value=True):
+      with Context(PREFILL_CHUNK=cap // 2): self.assertEqual(model_mod.gdn_chunk_for("NV"), cap // 2)  # below the cap
+      with Context(PREFILL_CHUNK=cap * 2): self.assertEqual(model_mod.gdn_chunk_for("NV"), cap)         # capped
+      with Context(GDN_CHUNK=16): self.assertEqual(model_mod.gdn_chunk_for("NV"), 16)  # GDN_CHUNK still wins outright
+      self.assertEqual(model_mod.gdn_chunk_for("METAL"), 32)  # default PREFILL_CHUNK=32 reproduces the old METAL answer either way
+
+  def test_prefill_chunk_contextvar_matches_explicit_chunk_size(self):
+    # the ContextVar default path (PREFILL_CHUNK=8, no explicit chunk_size) and an explicit chunk_size=4 must both be
+    # token-identical to each other (chunk width never changes greedy output -- same invariant TestPrefillOnly checks),
+    # and the context-var run's own jit must show a prefill family captured at chunk 8.
+    from dataclasses import replace
+    from tinygrad import nn
+    cfg = replace(TEST_CONFIG, max_context=64)
+    prompt = list(range(1, 21))  # 20-token prompt
+    def fresh():
+      Tensor.manual_seed(5)
+      m = Transformer(cfg)
+      for p in nn.state.get_parameters(m): p.replace(Tensor.randn(*p.shape) * 0.1)
+      Tensor.realize(*nn.state.get_parameters(m))
+      return m
+    with Context(PREFILL_CHUNK=8):
+      m1 = fresh()
+      via_context = [t for _, t in zip(range(5), m1.generate(list(prompt), temperature=0.0))]
+      self.assertTrue(any(k[0] and k[2] == 8 for k in m1.jit), m1.jit.keys())
+    m2 = fresh()
+    via_explicit = [t for _, t in zip(range(5), m2.generate(list(prompt), chunk_size=4, temperature=0.0))]
+    self.assertEqual(via_context, via_explicit)

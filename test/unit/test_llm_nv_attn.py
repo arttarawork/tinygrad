@@ -2,6 +2,7 @@
 with its 32 lanes as one warp, the merge and the in-kernel dequant convention agree with a plain-tensor reference on CPU, and the
 NV_CUSTOM_ATTN gate leaves every other path untouched. Kernel numerics on the card: extra/nv_attn_validate_real.py."""
 import math, pickle, re, unittest
+from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, Context
 from tinygrad.uop.ops import Ops, KernelInfo
@@ -181,6 +182,47 @@ class TestPrefillKernel(unittest.TestCase):
           self.assertFalse(np.isnan(got).any())
           np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
 
+  def test_kernel_matches_numpy_on_cpu_wide_chunk(self):
+    # T4.124b: T=128/256 (MAX_PREFILL_ROWS raised from 64) against a cache that spans more live 128-key chunks than the
+    # scaled slot count (N=4096, valid ~3000+T > slots*BLOCK_N: 16*128=2048 at T=128, 8*128=1024 at T=256) -- exercises the
+    # per-slot `offset` REDUCE loop's multiple passes over the same slot (several real chunks folded into one output slot).
+    rng = np.random.default_rng(3)
+    Hq, KVH, Dh, N = 4, 2, 64, 4096
+    for dtype in (dtypes.uint8, dtypes.float16):   # int4-packed and plain fp16 caches (the two the design doc names)
+      for T in (128, 256):
+        with self.subTest(dtype=dtype, T=T):
+          shape = (2, 1, KVH, N, Dh // 2 if dtype == dtypes.uint8 else Dh)
+          raw = rng.integers(0, 256, size=shape, dtype=np.uint8) if dtype == dtypes.uint8 else rng.standard_normal(shape).astype(np.float16)
+          kv = Tensor(raw, dtype=dtype).contiguous().realize()
+          scale = Tensor(rng.uniform(0.01, 0.2, size=(2, 1, KVH, N, Dh // 32)).astype(np.float16)).contiguous().realize() \
+            if dtype != dtypes.float16 else None
+          q_np = (rng.standard_normal((1, Hq, T, Dh)) * 2).astype(np.float16)
+          q = Tensor(q_np).contiguous().realize()
+          q_start, valid = 3000, 3000 + T
+          # q_rows stays at its default (1): the kernel-builder python-unrolls the row/head/key loops by q_rows*G*KEY_GROUP,
+          # so q_rows=T would blow that up to tens of thousands of UOps (hung the CPU lowerer + CHECK_OOB's z3 pass past the
+          # 300s test-timeout watchdog, see conftest.py). tiles=T//q_rows=T absorbs the width as a RUNTIME block-range bound.
+          got = nv_attn.nv_prefill_attention(q, kv, scale, valid, q_start, lanes=1).numpy()[0]
+          ref_kv = _dequant_reference_np(kv, scale, Dh)
+          ref = self._reference(q_np[0], ref_kv, valid, q_start)
+          self.assertFalse(np.isnan(got).any())
+          np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
+
+  def test_slot_count_scales_with_t_pad(self):
+    # T4.124b: the partial/stats buffers' slot count is PREFILL_CHUNKS*32//max(T_pad,32) -- 64 (unchanged) at T_pad<=32,
+    # 32/16/8 at 64/128/256 -- so the partial buffer stays ~48 MiB at every width instead of growing with T_pad (design
+    # doc section 3.3). T_pad<=32 keeping 64 slots is exactly PB.2's byte-identity requirement for the standing width.
+    Hq, KVH, Dh, N = 4, 2, 64, 8192  # N >= PREFILL_CHUNKS(64) * BLOCK_N(128) so the unscaled cap never binds here
+    kv = Tensor.zeros(2, 1, KVH, N, Dh, dtype=dtypes.float16)
+    for T_pad, want_chunks in ((32, 64), (64, 32), (128, 16), (256, 8)):
+      q = Tensor.ones(1, Hq, T_pad, Dh, dtype=dtypes.float16)
+      # q_rows stays at its default (1) -- see the wide_chunk test above for why NV_ATTN_QROWS=T_pad would blow up the
+      # python-unrolled kernel builder; T_pad==T here since q_rows=1 divides every T.
+      with patch.object(nv_attn.Tensor, "empty", wraps=nv_attn.Tensor.empty) as m:
+        nv_attn.nv_prefill_attention(q, kv, None, T_pad, 0, lanes=1)
+      self.assertEqual(len(m.call_args_list), 2)  # partial, stats
+      for call in m.call_args_list: self.assertEqual(call.args[:4], (1, Hq, T_pad, want_chunks))  # (B,H,T_pad,chunks,...)
+
   def test_symbolic_chunk_is_padded_and_sliced(self):
     # a bound chunk width below the static tile (generate()'s last, short chunk): the kernel sees the static T_pad rows (a multiple
     # of NV_ATTN_QROWS) and the result is sliced back to the chunk's own bound width -- graph-level (the CPU C renderer cannot
@@ -241,6 +283,25 @@ class TestPrefillWMMAKernel(unittest.TestCase):
         # there (2026-09-16 card run); the RANGE-looped kernel must pickle at the default limits, on the main thread
         self.assertLess(len(pickle.dumps(prg)), 2_000_000)
         self.assertLess(len(src), 150_000)
+
+  def test_render_at_wide_m_matches_m16(self):
+    # T4.124b: MAX_PREFILL_ROWS 64 -> 256, so the model can now call this kernel at M up to 256 query rows. The spec's STOP
+    # condition is a register-file or lane-split change at the wider M: tiles (M//WMMA_M) only widens the GLOBAL block range,
+    # never the per-warp body, so the lane pins and the mma.sync count per source must match M=16 (one row tile) exactly.
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    srcs = {}
+    for M in (16, 256):
+      prg = to_program(_wmma_sink(dtypes.float16, 4096, 4095, 4063, M=M), renderer)
+      srcs[M] = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+      self.assertIn("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32", srcs[M])
+      self.assertIn("int lidx0 = threadIdx.x; /* 4 */", srcs[M])
+      self.assertIn("int lidx1 = threadIdx.y; /* 8 */", srcs[M])
+      self.assertLess(len(pickle.dumps(prg)), 2_000_000)
+    self.assertEqual(srcs[16].count("mma.sync"), srcs[256].count("mma.sync"))  # same per-warp body; only the GLOBAL range widens
 
   def test_routing_and_fallback(self):
     # graph-level: the flag picks the wmma kernel (16-row tiles) for a head_dim the fragments cover; a head_dim that is not a multiple
