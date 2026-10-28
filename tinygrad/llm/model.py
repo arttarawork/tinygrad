@@ -11,6 +11,7 @@ from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attentio
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8
+from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
@@ -932,6 +933,7 @@ class MLATransformerBlock(FFNBlock):
 
 class GatedDeltaNetBlock(FFNBlock):
   nv_decode_weights: tuple[Tensor, Tensor, Tensor, Tensor]|None = None  # T4.123f+g, set by prepare_nv_decode
+  nv_beta_alpha_weight: Tensor|None = None  # T4.127b: ssm_beta+ssm_alpha concatenated fp16 weight, set by prepare_nv_decode
   def __init__(self, config:TransformerConfig, ssm:SSMConfig):
     super().__init__(config)
     self.head_k_dim, self.num_k_heads, self.num_v_heads = ssm.state_size, ssm.group_count, ssm.time_step_rank
@@ -977,11 +979,19 @@ class GatedDeltaNetBlock(FFNBlock):
   def prepare_nv_decode(self) -> None:
     """T4.123f+g: realized fp32 copies of the four small weights kernels/nv.py's gdn_decode reads -- made once at load (from_gguf), never
     inside a JIT capture: the loaded tensors are lazy GGUF byte views a custom kernel would re-copy on every step. Leaves
-    nv_decode_weights None (decode keeps the generic graph + fused scan) off the gate or outside the kernels' geometry."""
+    nv_decode_weights None (decode keeps the generic graph + fused scan) off the gate or outside the kernels' geometry.
+    T4.127b: ssm_beta/ssm_alpha's weights concatenated into one (2*num_v_heads, dim) fp16 buffer -- same dtype convention as
+    nv_dense.py's _fp16_copy (every nv_f16_gemv input is fp16 regardless of the GGUF dtype) -- so _attention's decode branch
+    runs ONE gemv (nv_f16_gemv_raw) instead of two. Left None (falls back to the two separate calls, _attention's own
+    dispatch, below) when config.dim isn't a multiple of 128: nv_f16_gemv_raw's kernel needs that (nv_dense.py's
+    nv_dense_eligible check, which the ORIGINAL per-Linear self.ssm_beta(x)/self.ssm_alpha(x) calls apply themselves --
+    this gemv doesn't go through Linear.__call__, so the same check has to happen here)."""
     if hasattr(self, "ssm_g_a") or self.ssm_norm.weight is None or not nv_decode_kernel_supported(self.ssm_a.device): return
     if self.head_k_dim % 32 or self.head_v_dim % 8 or self.head_v_dim > 256 or self.conv_channels % 32: return  # 32-lane rows, <= 1024 threads
     self.nv_decode_weights = cast(tuple[Tensor, Tensor, Tensor, Tensor], tuple(t.float().contiguous().realize() for t in
       (self.ssm_conv1d["weight"], self.ssm_norm.weight, self.ssm_dt["bias"], self.ssm_a)))
+    if self.config.dim % 128 == 0:
+      self.nv_beta_alpha_weight = self.ssm_beta.weight.cat(self.ssm_alpha.weight, dim=0).cast(dtypes.float16).contiguous().realize()
 
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
     # rope: unused, GDN has no positions (T5.3); kept so FFNBlock.__call__ can pass it positionally to every block type.
@@ -1026,7 +1036,13 @@ class GatedDeltaNetBlock(FFNBlock):
     # fused decode scan below; prefill (symbolic or T > 1) never comes here.
     if not symbolic and T == 1 and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
       x = x.half()
-      z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), self.ssm_beta(x), self.ssm_alpha(x), self.conv_state, self.recurrent_state,
+      # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs on the same input -- fused into one over their load-time
+      # concatenated weight (prepare_nv_decode) when that's ready; gdn_decode reads beta/alpha out of the one result
+      # (beta at [:heads], alpha at [heads:]). Falls back to the two separate calls (dim not a multiple of 128 --
+      # prepare_nv_decode's own comment) with the same (B,1,2*heads) shape via one concat.
+      beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B, self.config.dim), 2*self.num_v_heads)
+                    if self.nv_beta_alpha_weight is not None else self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
+      z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
                         *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps)
       return self.ssm_out(z)
 
