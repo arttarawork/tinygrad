@@ -880,5 +880,6 @@ class TestDecodeStepCensus(unittest.TestCase):
     print("\nGDN decode step census:", len(census), "kernels", sorted(census))
     self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
     self.assertEqual([k for k in census if "unsigned char" in k], [], "no per-step norm-weight conversion (prepare_nv_norms)")
+    self.assertNotIn(f"elementwise half[{self.DIM}] <- half[{self.DIM}]", census, "the f16 gemvs read the fused fp16 output in place")
 
 if __name__ == "__main__": unittest.main()
