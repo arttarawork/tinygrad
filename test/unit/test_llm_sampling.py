@@ -54,3 +54,33 @@ class TestMinPSampling(unittest.TestCase):
     self.assertEqual(sample_logits(logits, Tensor([1.0]), min_p=1.0).numpy().ravel().tolist(), [0]*64)   # only the top survives
     ids0 = sample_logits(Tensor([[0.0, 0.0, 0.0, 0.0]]).expand(256, 4).contiguous(), Tensor([1.0]), min_p=0.0).numpy().ravel().tolist()
     self.assertEqual(set(ids0), {0, 1, 2, 3})   # uniform logits, no cut: every token reachable
+
+
+class TestMinPMaskLogDomain(unittest.TestCase):
+  """T4.125c: `scaled >= scaled.max() + log(min_p)` (the mask sample_logits uses now) must select exactly the same
+  tokens as the softmax-based mask it replaced, `probs >= probs.max() * min_p` (softmax is monotone in `scaled`
+  and its normalizer cancels out of the ratio -- these are the same test by construction, not by luck) -- checked
+  on random logits that include ties, -inf entries (what a presence penalty or a vocab mask produces) and both
+  very small and very large temperatures."""
+  def test_new_mask_matches_old_softmax_mask(self):
+    import math
+    import numpy as np
+    rng = np.random.default_rng(125)
+    for min_p in (1e-6, 0.1, 0.5, 0.9, 1.0):
+      for temperature in (1e-3, 0.6, 1.0, 5.0, 100.0):
+        logits_np = rng.normal(size=(16, 37)).astype(np.float32)
+        logits_np[:, 2] = -np.inf                 # a masked-out token (presence penalty / vocab mask)
+        logits_np[0, 3] = logits_np[0, 4] = 10.0   # an explicit tie at the top of row 0
+        logits = Tensor(logits_np)
+        temp_t = Tensor([temperature])
+        scaled = logits / temp_t.maximum(1e-12)
+        probs = scaled.softmax(-1)
+        old_mask = (probs >= probs.max(-1, keepdim=True) * min_p).numpy()
+        new_mask = (scaled >= scaled.max(-1, keepdim=True) + math.log(min_p)).numpy()
+        np.testing.assert_array_equal(old_mask, new_mask, err_msg=f"min_p={min_p} temperature={temperature}")
+        # the top token always survives, every row, under both masks
+        top = logits_np.argmax(-1)
+        self.assertTrue(old_mask[np.arange(16), top].all())
+        self.assertTrue(new_mask[np.arange(16), top].all())
+        # the tied pair at row 0's top both survive (a tie is not accidentally broken by the log-domain rewrite)
+        self.assertTrue(old_mask[0, 3] and old_mask[0, 4] and new_mask[0, 3] and new_mask[0, 4])
