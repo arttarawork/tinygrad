@@ -455,6 +455,103 @@ class TestFFNActQ8Kernel(unittest.TestCase):
     np.testing.assert_allclose(scale_np, ref_scale, rtol=1e-6)
     np.testing.assert_array_equal(q_np.view(np.int8).reshape(ref_q.shape), ref_q)
 
+def np_q8_quantize(x:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """q8_quantize_nv's math on (tokens, in_features) fp32: int8 q (tokens, groups, 32), scale, and T4.128's group sums scale*sum(q)."""
+  g = x.reshape(x.shape[0], -1, Q8_GROUP_SIZE)
+  scale = np.maximum(np.abs(g).max(-1) / np.float32(127), np.float32(1e-8)).astype(np.float32)
+  q = np.clip(np.rint(g / scale[..., None]), -127, 127).astype(np.int8)
+  return q, scale, (scale * q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32)
+
+class TestQ8QuantizeSums(unittest.TestCase):
+  """T4.128: q8_quantize's optional group-sums output (the IMMA Q4_1/Q5_K prefill's activation side): computed in the same kernel,
+  q/scale unchanged by it, the plain kernel's graph untouched, and the variant its own cache entry."""
+  def _params(self, tokens:int, in_features:int, sums:bool) -> list[UOp]:
+    groups = in_features // Q8_GROUP_SIZE
+    return [UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=0), UOp.placeholder((tokens, groups), dtypes.float32, slot=1),
+            UOp.placeholder((tokens * in_features,), dtypes.float32, slot=2)] + \
+           ([UOp.placeholder((tokens, groups), dtypes.float32, slot=3)] if sums else [])
+
+  def test_plain_kernel_has_no_third_reduce(self):
+    plain = nv_quant._q8_quantize_kernel.__wrapped__(*self._params(4, 256, False), tokens=4, in_features=256)
+    with_sums = nv_quant._q8_quantize_kernel.__wrapped__(*self._params(4, 256, True), tokens=4, in_features=256)
+    def shuffles(sink:UOp) -> int: return sum(1 for u in sink.toposort() if u.op is Ops.CUSTOM and "__shfl_xor_sync" in u.arg[0])
+    self.assertEqual((shuffles(plain), shuffles(with_sums)), (5, 10))
+
+  def test_variant_is_its_own_cache_entry(self):
+    x = Tensor.randn(2, 64)
+    q, s = q8_quantize(x, 2, 64)
+    q2, s2, sums = q8_quantize(x, 2, 64, sums=True)
+    self.assertIsNot(q.uop, q2.uop)
+    self.assertEqual(sums.shape, (2, 2))
+    self.assertIs(q8_quantize(x, 2, 64, sums=True)[2].uop, sums.uop)
+    self.assertIs(q8_quantize(x, 2, 64)[0].uop, q.uop)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_runs_on_python_emulator(self):
+    tokens, in_features = 3, 128
+    x = (np.random.default_rng(5).standard_normal((tokens, in_features)) * 3).astype(np.float32)
+    x[1, 32:64] = 0  # an all-zero group: scale clamps to 1e-8, sums 0
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce_one_warp), \
+         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):  # bypass the cache
+      plain = [t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features)]
+      q, scale, sums = (t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features, sums=True))
+    ref_q, ref_scale, ref_sums = np_q8_quantize(x)
+    np.testing.assert_array_equal(q, plain[0])
+    np.testing.assert_array_equal(scale, plain[1])
+    np.testing.assert_array_equal(q.view(np.int8).reshape(ref_q.shape), ref_q)
+    np.testing.assert_allclose(scale, ref_scale, rtol=1e-6)
+    np.testing.assert_array_equal(sums, (scale * ref_q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32))  # exact
+    np.testing.assert_allclose(sums, ref_sums, rtol=1e-6)
+
+class TestQ8QuantizeWarps(unittest.TestCase):
+  """T4.128 (step 6): prefill-sized quantizes (tokens > 4) put NV_Q8_WARPS (token, group)s in one block -- one hardware warp each,
+  the lane a WARP range -- instead of one 32-thread block per group; decode keeps its kernel byte for byte."""
+  def _kernel(self, tokens:int, in_features:int, sums:bool=False) -> UOp:
+    outs = q8_quantize(Tensor.empty(tokens, in_features), tokens, in_features, sums=sums)
+    return next(u.src[0] for u in outs[0].uop.toposort() if u.op is Ops.CALL)
+
+  def _program(self, sink:UOp):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    return to_program(sink, renderer)
+
+  def test_decode_renders_the_one_warp_kernel(self):
+    import hashlib
+    for tokens, digest in ((1, "d4e80a037a736a75f08834f79d3de674"), (4, "902633179900e3a0814943c6b24430a7")):  # md5s at 0c6178834
+      with self.subTest(tokens=tokens):
+        prg = self._program(self._kernel(tokens, 5120))
+        self.assertEqual(hashlib.md5(next(u.arg for u in prg.src if u.op is Ops.SOURCE).encode()).hexdigest(), digest)
+        self.assertEqual(tuple(prg.arg.local_size), (32, 1, 1))
+
+  def test_prefill_blocks_hold_nv_q8_warps_warps(self):
+    for warps in (8, 4, 6):  # 6: 128 x 160 groups don't split into 6-warp blocks -> the last block's surplus warps redo a group
+      for in_features, sums in ((5120, False), (17408, True), (6144, True)):
+        with self.subTest(warps=warps, in_features=in_features, sums=sums), Context(NV_Q8_WARPS=warps):
+          prg = self._program(self._kernel(128, in_features, sums))
+          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+          self.assertEqual(tuple(prg.arg.local_size), (32, warps, 1))
+          self.assertEqual(tuple(prg.arg.global_size), (-(-128 * in_features // 32 // warps), 1, 1))
+          self.assertIn(f"__launch_bounds__({32 * warps})", src)
+          self.assertEqual(src.count("__shfl_xor_sync"), 10 if sums else 5)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_multi_warp_runs_on_python_emulator(self):
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce  # handles the WARP lane + LOCAL warp ranges
+    tokens, in_features = 5, 96  # 15 (token, group)s: 8- and 4-warp blocks leave surplus warps in the last block
+    x = (np.random.default_rng(6).standard_normal((tokens, in_features)) * 3).astype(np.float32)
+    x[2, :32] = 0
+    ref_q, ref_scale, _ = np_q8_quantize(x)
+    for warps in (8, 4, 1):
+      with self.subTest(warps=warps), Context(NV_Q8_WARPS=warps), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+           mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):  # bypass the cache
+        q, scale, sums = (t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features, sums=True))
+        np.testing.assert_array_equal(q.view(np.int8).reshape(ref_q.shape), ref_q)
+        np.testing.assert_allclose(scale, ref_scale, rtol=1e-6)
+        np.testing.assert_array_equal(sums, (scale * ref_q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32))
+
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
   attn_gate/attn_qkv, attention q/k/v) -- q8_quantize must run once per distinct INPUT UOP, shared by every
@@ -710,6 +807,18 @@ class TestPackedU16View(unittest.TestCase):
       with self.subTest(ggml_type=ggml_type):
         linear = self._linear_for(ggml_type, n, row_bytes)
         self.assertIsNone(linear.packed_u16)
+
+  def test_u32_view_for_q4_1_only(self):
+    # T4.128: Q4_1 also gets a uint32 view (the IMMA prefill's aligned loads); its self.weight stays the byte view the decode gemv reads
+    for ggml_type, n, row_bytes in ((Q4_1, 64, 40), (Q4_0, 32, 18), (Q8_0, 32, 34), (Q5_K, 256, 176)):
+      with self.subTest(ggml_type=ggml_type):
+        linear = self._linear_for(ggml_type, n, row_bytes)
+        if ggml_type != Q4_1:
+          self.assertIsNone(linear.packed_u32)
+          continue
+        u32 = cast(Tensor, linear.packed_u32)
+        self.assertEqual((u32.dtype, u32.nbytes(), linear.weight.dtype), (dtypes.uint32, row_bytes, dtypes.uint8))
+        self.assertIs(u32.uop.buf_uop.buffer.base, linear.weight.uop.buf_uop.buffer.base)
 
 class TestFFNActivationFusion(unittest.TestCase):
   """T4.123c (decode fusion design, P3): FFNBlock._feed_forward's dense branch (model.py) drops the

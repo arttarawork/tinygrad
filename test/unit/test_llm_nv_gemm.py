@@ -1,9 +1,11 @@
 """T4.98f/T4.98j: NV WMMA (mma.sync m16n8k16) prefill gemm for Q8_0/Q4_0/Q4_1/IQ4_NL and the K-quants -- graph builds
 for the real shapes, the sm_86 render pins the lane-range split the fragment mapping relies on, and the dispatch gates.
 Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py). T4.126's int8 (IMMA, m16n8k32) Q4_0 kernel is different:
-the PYTHON emulator models that mma, so its fragment map, staging and epilogue are executed there bit-exact vs numpy."""
-import functools, sys, unittest
+the PYTHON emulator models that mma, so its fragment map, staging and epilogue are executed there bit-exact vs numpy (T4.128: and
+the same kernel for Q4_1 and Q5_K)."""
+import functools, itertools, re, sys, unittest
 from math import prod
+from typing import cast
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.dtype import AddrSpace
@@ -127,41 +129,84 @@ class TestImmaRenderer(unittest.TestCase):
     res = out.custom_kernel(Tensor(a, device="PYTHON"), Tensor(b, device="PYTHON"), fxn=_imma_probe)[0].numpy()
     np.testing.assert_array_equal(res, a.astype(np.int32) @ b.astype(np.int32).T)
 
-# ******** T4.126: the IMMA Q4_0 kernel -- numpy reference of the exact quantized math, executed on the PYTHON emulator ********
+# ******** T4.126: the IMMA kernel -- numpy reference of the exact quantized math, executed on the PYTHON emulator (T4.128: + Q4_1, Q5_K)
 
-def _q4_0_blocks(rng, out_features:int, groups:int) -> np.ndarray:
-  # random Q4_0 blocks (out, groups, 18 bytes): f16 d then 16 qs bytes (any byte is a valid pair of nibbles)
-  blocks = rng.integers(0, 256, (out_features, groups, 18), dtype=np.uint8)
-  blocks[..., :2] = rng.uniform(-0.05, 0.05, (out_features, groups)).astype(np.float16)[..., None].view(np.uint8)
+IMMA_TYPES = (Q4_0, Q4_1, Q5_K)
+
+def _blocks(ggml_type:int, rng, out_features:int, groups:int) -> np.ndarray:
+  # random packed blocks with small finite f16 scales: Q4_0 (out, groups, 18: d, qs[16]), Q4_1 (out, groups, 20: d, m, qs[16]),
+  # Q5_K (out, groups/8, 176: d, dmin, scales[12], qh[32], qs[128]) -- any other byte is a valid nibble/bit/6-bit-scale pattern
+  nblk, nbytes, nhalf = {Q4_0: (groups, 18, 1), Q4_1: (groups, 20, 2), Q5_K: (groups // 8, 176, 2)}[ggml_type]
+  blocks = rng.integers(0, 256, (out_features, nblk, nbytes), dtype=np.uint8)
+  blocks[..., :2*nhalf] = rng.uniform(-0.05, 0.05, (out_features, nblk, nhalf)).astype(np.float16).view(np.uint8)
   return blocks
 
-def _q8(rng, tokens:int, in_features:int) -> tuple[np.ndarray, np.ndarray]:
-  # q8_quantize_nv's exact formula (scale = max|x|/127 clamped at 1e-8, q = clip(rint(x/scale))), packed 4 int8 per uint32
+def _raw(ggml_type:int, blocks:np.ndarray) -> np.ndarray:  # the view the kernel reads: Q4_0 u16 (packed_u16), Q4_1/Q5_K u32
+  return blocks.reshape(-1).view(np.uint16 if ggml_type == Q4_0 else np.uint32)
+
+def _q8(rng, tokens:int, in_features:int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  # q8_quantize_nv's exact formula (scale = max|x|/127 clamped at 1e-8, q = clip(rint(x/scale))), packed 4 int8 per uint32, and
+  # T4.128's group sums scale * sum(q) (one fp32 product of exact values, as the kernel computes it)
   x = rng.standard_normal((tokens, in_features // 32, 32)).astype(np.float32)
   xd = np.maximum(np.abs(x).max(-1) / np.float32(127), np.float32(1e-8)).astype(np.float32)
   q = np.clip(np.rint(x / xd[..., None]), -127, 127).astype(np.int8)
-  return q.view(np.uint32), xd
+  return q.view(np.uint32), xd, (xd * q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32)
 
-def _np_imma_reference(blocks:np.ndarray, xq:np.ndarray, xd:np.ndarray) -> np.ndarray:
-  # the kernel's math: int32 dot per (token, output, group) of q8 x (nibble-8), then acc = fma(float(c) * d_w, xd, acc) in fp32,
-  # group by group in order (the kernel's REDUCE loop). Fused like the card's FFMA (nvcc contracts a*b+c by default) and the
-  # PYTHON renderer's MULACC: the fp32 product of two fp32 values is exact in fp64, so one rounding after the add
-  q = xq.view(np.int8).astype(np.int64)                                                    # (tokens, groups, 32)
-  qs = blocks[..., 2:]
-  w = np.concatenate([qs & 0xF, qs >> 4], axis=-1).astype(np.int64) - 8                    # (out, groups, 32)
-  c = np.einsum("tgk,ogk->tog", q, w).astype(np.float32)
-  dw = blocks[..., :2].copy().view(np.float16)[..., 0].astype(np.float32)                 # (out, groups)
+def _f16(b:np.ndarray) -> np.ndarray: return b.copy().view(np.float16)[..., 0].astype(np.float32)
+
+def _np_weights(ggml_type:int, blocks:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray|None]:
+  # (q, D, M) with weight = D*q + M per (output, group): q (out, groups, 32) int as the B fragment holds it, D/M (out, groups) fp32
+  # exactly as the kernel's epilogue computes them (Q5_K: d*sc and -dmin*m, both exact products)
+  if ggml_type in (Q4_0, Q4_1):
+    qs = blocks[..., 2*(ggml_type == Q4_1) + 2:].astype(np.int64)
+    q = np.concatenate([qs & 0xF, qs >> 4], axis=-1) - (8 if ggml_type == Q4_0 else 0)
+    return q, _f16(blocks[..., 0:2]), (_f16(blocks[..., 2:4]) if ggml_type == Q4_1 else None)
+  d, dmin = _f16(blocks[..., 0:2]), _f16(blocks[..., 2:4])
+  sc8, qh, qs = (blocks[..., a:b].astype(np.int64) for a, b in ((4, 16), (16, 48), (48, 176)))
+  qj, Dj, Mj = [], [], []
+  for j in range(8):  # gguf.py ggml_type 13 / _q4q5_k_scales
+    if j < 4: sc, mn = sc8[..., j] & 63, sc8[..., j + 4] & 63
+    else: sc, mn = (sc8[..., j + 4] & 0xF) | ((sc8[..., j - 4] >> 6) << 4), (sc8[..., j + 4] >> 4) | ((sc8[..., j] >> 6) << 4)
+    nib = qs[..., (j // 2)*32:(j // 2)*32 + 32]
+    qj.append(((nib >> 4) if j % 2 else (nib & 0xF)) | (((qh >> j) & 1) << 4))
+    Dj.append(d * sc.astype(np.float32))
+    Mj.append(-(dmin * mn.astype(np.float32)))
+  out = blocks.shape[0]
+  return np.stack(qj, 2).reshape(out, -1, 32), np.stack(Dj, 2).reshape(out, -1), np.stack(Mj, 2).reshape(out, -1)
+
+def _np_imma_reference(ggml_type:int, blocks:np.ndarray, xq:np.ndarray, xd:np.ndarray, xs:np.ndarray|None=None) -> np.ndarray:
+  # the kernel's math: int32 dot per (token, output, group) of q8 x q, then acc = fma(float(c) * D, xd, acc) in fp32 (T4.128: then
+  # acc = fma(M, xs, acc) for Q4_1/Q5_K), group by group in order (the kernel's REDUCE loop). Fused like the card's FFMA (nvcc
+  # contracts a*b+c by default) and the PYTHON renderer's MULACC: the fp32 product of two fp32 values is exact in fp64, so one
+  # rounding after the add
+  qw, D, M = _np_weights(ggml_type, blocks)
+  c = np.einsum("tgk,ogk->tog", xq.view(np.int8).astype(np.int64), qw).astype(np.float32)
   acc = np.zeros(c.shape[:2], np.float32)
   for grp in range(c.shape[2]):
-    acc = ((c[:, :, grp] * dw[None, :, grp]).astype(np.float64) * xd[:, None, grp] + acc).astype(np.float32)
+    acc = ((c[:, :, grp] * D[None, :, grp]).astype(np.float64) * xd[:, None, grp] + acc).astype(np.float32)
+    if M is not None: acc = (M[None, :, grp].astype(np.float64) * cast(np.ndarray, xs)[:, None, grp] + acc).astype(np.float32)
   return acc
 
-def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4):
+def _imma_params(ggml_type:int, tokens:int, out_features:int, in_features:int) -> list[UOp]:
   groups = in_features // 32
-  params = [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((out_features*groups*9,), dtypes.uint16, slot=1),
-            UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)]
-  return nv_gemm._q4_0_linear_imma_nv.__wrapped__(*params, out_features=out_features, in_features=in_features, token_tile=token_tile,
-                                                  warps=warps, out_tiles=out_tiles, stage=stage)
+  raw = {Q4_0: (out_features*groups*9, dtypes.uint16), Q4_1: (out_features*groups*5, dtypes.uint32),
+         Q5_K: (out_features*groups//8*44, dtypes.uint32)}[ggml_type]
+  return [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((raw[0],), raw[1], slot=1),
+          UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)] + \
+         ([UOp.placeholder((tokens, groups), dtypes.float32, slot=4)] if ggml_type != Q4_0 else [])
+
+def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4,
+               ggml_type:int=Q4_0, pipe:int=0):
+  return nv_gemm._linear_imma_nv.__wrapped__(*_imma_params(ggml_type, tokens, out_features, in_features), ggml_type=ggml_type,
+                                             out_features=out_features, in_features=in_features, token_tile=token_tile, warps=warps,
+                                             out_tiles=out_tiles, stage=stage, pipe=pipe)
+
+def _shared_bytes(src:str) -> int:  # static __shared__ total of a rendered kernel (every tile here is a 4-byte type)
+  return sum(4 * int(n) for n in re.findall(r"__shared__ __align__\(\d+\) \w+ \w+\[(\d+)\];", src))
+
+# Qwen3.8-27B's IMMA prefill linears (out, in): Q4_0 attn/ssm out, ffn gate/up, GDN qkv, ffn down; Q4_1 ffn_down of 8 blocks;
+# Q5_K GDN ssm_out
+MODEL_SHAPES = {Q4_0: ((5120, 5120), (17408, 5120), (10240, 5120), (5120, 17408)), Q4_1: ((5120, 17408),), Q5_K: ((5120, 6144),)}
 
 class TestImmaKernel(unittest.TestCase):
   def test_renders_and_compiles_for_sm86_at_model_shapes(self):
@@ -170,20 +215,23 @@ class TestImmaKernel(unittest.TestCase):
     from tinygrad.helpers import DEV
     try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
     except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
-    # Qwen3.8-27B's Q4_0 prefill linears at the standing 128-token chunk: attn/ssm out, ffn gate/up, GDN qkv, ffn down
-    for out_features, in_features in ((5120, 5120), (17408, 5120), (10240, 5120), (5120, 17408)):
-      with self.subTest(out=out_features, inp=in_features):
-        prg = to_program(_imma_sink(128, out_features, in_features), renderer)
-        src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
-        self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
-        self.assertIn("int lidx0 = threadIdx.x; /* 32 */", src)  # the WARP range is the hardware lane, unsplit
-        self.assertIn("int lidx1 = threadIdx.y; /* 4 */", src)   # the warps
-        self.assertEqual(tuple(prg.arg.global_size[:2]), (2, out_features // 64))  # token blocks fastest: they share weights in L2
-        self.assertIn("__syncthreads();", src)
-        self.assertIn("__shared__", src)
+    for ggml_type, shapes in MODEL_SHAPES.items():
+      for out_features, in_features in shapes:
+        with self.subTest(ggml_type=ggml_type, out=out_features, inp=in_features):
+          prg = to_program(_imma_sink(128, out_features, in_features, ggml_type=ggml_type), renderer)
+          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+          self.assertIn(nv_gemm.IMMA_FORMATS[ggml_type][2], src)
+          self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
+          self.assertIn("int lidx0 = threadIdx.x; /* 32 */", src)  # the WARP range is the hardware lane, unsplit
+          self.assertIn("int lidx1 = threadIdx.y; /* 4 */", src)   # the warps
+          self.assertEqual(tuple(prg.arg.global_size[:2]), (2, out_features // 64))  # token blocks fastest: they share weights in L2
+          self.assertEqual(src.count("__syncthreads();"), 2)
+          self.assertEqual(src.count("__shared__"), 2 if ggml_type == Q4_0 else 3)  # T4.128: + the group sums tile
+          if ggml_type != Q4_0: self.assertIn("data4_", src)  # the sums input is read
 
   def test_every_knob_value_renders_and_compiles(self):
-    # each knob value the card sweep would try, one factor at a time around the defaults, at gate/up (in 5120) and down (in 17408)
+    # each knob value the card sweep would try, one factor at a time around the defaults, at gate/up (in 5120) and down (in 17408);
+    # T4.128: the same sweep for Q4_1 and Q5_K at their model shapes
     from tinygrad.codegen import to_program
     from tinygrad.renderer.cstyle import CUDARenderer
     from tinygrad.helpers import DEV
@@ -192,45 +240,94 @@ class TestImmaKernel(unittest.TestCase):
     default = (64, 4, 2, 2)
     variants = [default] + [default[:i] + (v,) + default[i+1:] for i, vals in enumerate(((16, 32, 128), (1, 2, 8), (1, 4), (0, 1, 4, 8)))
                             for v in vals]
-    for out_features, in_features in ((17408, 5120), (5120, 17408)):
-      for token_tile, warps, out_tiles, stage in variants:
-        with self.subTest(out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage):
-          prg = to_program(_imma_sink(128, out_features, in_features, token_tile, warps, out_tiles, stage), renderer)
-          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
-          self.assertIn(f"__launch_bounds__({32*warps})", src)
-          self.assertEqual(src.count("__syncthreads();"), 2 if stage else 0)
-          self.assertEqual(prod(prg.arg.global_size), 128 // token_tile * out_features // (8*warps*out_tiles))  # a size-1 axis drops out
+    for ggml_type, shapes in ((Q4_0, ((17408, 5120), (5120, 17408))), (Q4_1, MODEL_SHAPES[Q4_1]), (Q5_K, MODEL_SHAPES[Q5_K])):
+      for out_features, in_features in shapes:
+        for token_tile, warps, out_tiles, stage in variants:
+          for pipe in ((0, 1) if stage else (0,)):  # T4.128: and the pipelined kernel wherever there is a stage tile
+            with self.subTest(ggml_type=ggml_type, out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage,
+                              pipe=pipe):
+              prg = to_program(_imma_sink(128, out_features, in_features, token_tile, warps, out_tiles, stage, ggml_type, pipe), renderer)
+              src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+              self.assertIn(f"__launch_bounds__({32*warps})", src)
+              self.assertEqual(src.count("__syncthreads();"), 2 if stage else 0)  # pipe: one before the loop, one per step
+              self.assertEqual(prod(prg.arg.global_size), 128 // token_tile * out_features // (8*warps*out_tiles))  # a size-1 axis drops out
+              self.assertLessEqual(_shared_bytes(src), 48 * 1024)
+
+  def test_pipe_0_is_the_t4126_render(self):
+    # T4.128: NV_IMMA_PIPE=0 must render exactly the kernel the card measured (md5 of the T4.126 source at 0c6178834, the
+    # standing Q4_0 attn/ssm-out shape and knob defaults). A legitimate codegen change elsewhere moves this hash too: re-pin it
+    # only after checking the diff is that change, not this kernel
+    import hashlib
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    src = next(u.arg for u in to_program(_imma_sink(128, 5120, 5120), renderer).src if u.op is Ops.SOURCE)
+    self.assertEqual(hashlib.md5(src.encode()).hexdigest(), "91ffc1757984810a4116f7fb2f7f3e40")
+
+  def test_pipe_one_barrier_per_step_and_prefetch_stores_after_the_mmas(self):
+    # T4.128: the pipelined kernel's point, as rendered: the prologue fill + its barrier before the loop, inside the loop the
+    # current copy's mmas BEFORE the next stage's shared-memory stores (so their global loads' latency hides behind the mmas),
+    # then the step's one barrier closing the loop body. Twice the tile memory.
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    for ggml_type, shapes in MODEL_SHAPES.items():
+      for out_features, in_features in shapes:
+        with self.subTest(ggml_type=ggml_type, out=out_features, inp=in_features):
+          srcs = [next(u.arg for u in to_program(_imma_sink(128, out_features, in_features, ggml_type=ggml_type, pipe=pipe), renderer).src
+                       if u.op is Ops.SOURCE) for pipe in (0, 1)]
+          head, loop = srcs[1].split("  for (int Ridx3 = 0;")
+          self.assertEqual((head.count("__syncthreads();"), loop.count("__syncthreads();")), (1, 1))
+          self.assertTrue(loop.split("\n  }\n")[0].endswith("__syncthreads();"), "the step's barrier must close the loop body")
+          body = loop.split("\n  }\n")[0]
+          self.assertLess(body.rindex("__WMMA_8_16_32_signed_char_int("), body.index("*((uint4*)((buf8+"))
+          self.assertEqual(_shared_bytes(srcs[1]), 2 * _shared_bytes(srcs[0]))
 
   def test_numpy_reference_matches_ggml_dequant(self):
-    # the reference's integer form == gguf.py's own Q4_0 dequant times the dequantized activations (up to fp32 rounding)
+    # the reference's integer form == gguf.py's own dequant times the dequantized activations (up to fp32 rounding)
     from tinygrad.llm.gguf import ggml_data_to_tensor
-    rng = np.random.default_rng(1)
-    tokens, out_features, in_features = 4, 8, 128
-    blocks = _q4_0_blocks(rng, out_features, in_features // 32)
-    xq, xd = _q8(rng, tokens, in_features)
-    w = ggml_data_to_tensor(Tensor(blocks.reshape(-1)), out_features * in_features, Q4_0).reshape(out_features, in_features).numpy()
-    x = (xq.view(np.int8).astype(np.float32) * xd[..., None]).reshape(tokens, in_features)
-    np.testing.assert_allclose(_np_imma_reference(blocks, xq, xd), x @ w.T, rtol=1e-4, atol=1e-4)
+    for ggml_type in IMMA_TYPES:
+      with self.subTest(ggml_type=ggml_type):
+        rng = np.random.default_rng(1)
+        tokens, out_features, in_features = 4, 8, 512
+        blocks = _blocks(ggml_type, rng, out_features, in_features // 32)
+        xq, xd, xs = _q8(rng, tokens, in_features)
+        w = ggml_data_to_tensor(Tensor(blocks.reshape(-1)), out_features * in_features, ggml_type).reshape(out_features, in_features).numpy()
+        qw, D, M = _np_weights(ggml_type, blocks)  # the decomposition itself, element by element
+        np.testing.assert_allclose(D[..., None] * qw + (0 if M is None else M[..., None]), w.reshape(qw.shape), rtol=1e-6, atol=1e-7)
+        x = (xq.view(np.int8).astype(np.float32) * xd[..., None]).reshape(tokens, in_features)
+        np.testing.assert_allclose(_np_imma_reference(ggml_type, blocks, xq, xd, xs), x @ w.T, rtol=1e-4, atol=1e-4)
 
   @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
   def test_kernel_runs_on_python_emulator(self):
     # the kernel itself executed lane by lane (every fragment index, the WARP/LOCAL thread mapping, the shared-memory staging
     # and its barriers, the epilogue scales) on the PYTHON emulator, whose m16n8k32 model is the PTX ISA's. Several output and
     # token blocks and warps; stage 0 (global loads), 1, 2 and 4, including fills that don't divide the block's threads
-    # (16x1 scales over 64 threads, 16x8 words over 128) and a warp-range split (stage 4 x 2 warps: 32-word rows, 64 threads)
-    for tokens, out_features, in_features, token_tile, warps, out_tiles, stage in (
-        (32, 64, 64, 32, 2, 2, 0), (32, 64, 128, 16, 2, 2, 1), (64, 32, 128, 32, 1, 4, 4), (32, 128, 256, 16, 4, 1, 2),
-        (32, 64, 256, 16, 2, 2, 4)):
-      with self.subTest(tokens=tokens, out=out_features, inp=in_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles,
-                        stage=stage):
-        rng = np.random.default_rng(tokens + out_features)
-        blocks, (xq, xd) = _q4_0_blocks(rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
-        fxn = functools.partial(nv_gemm._q4_0_linear_imma_nv.__wrapped__, out_features=out_features, in_features=in_features,
-                                token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage)
-        out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device="PYTHON")
-        srcs = [Tensor(a, device="PYTHON") for a in (blocks.reshape(-1).view(np.uint16), xq, xd)]
-        res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
-        np.testing.assert_array_equal(res, _np_imma_reference(blocks, xq, xd))  # same fp32 op order: bit-exact
+    # (16x1 scales over 64 threads, 16x8 words over 128) and a warp-range split (stage 4 x 2 warps: 32-word rows, 64 threads).
+    # T4.128: Q4_1 and Q5_K too (Q5_K needs in % 256: two super-blocks, a stage of 8 = one whole super-block per step)
+    # T4.128 pipe=1 (every staged config): also a single step (128 / stage 4) and an odd step count (96 / stage 1, 768 / stage 8)
+    cfgs = {Q4_0: ((32, 64, 64, 32, 2, 2, 0), (32, 64, 128, 16, 2, 2, 1), (64, 32, 128, 32, 1, 4, 4), (32, 128, 256, 16, 4, 1, 2),
+                   (32, 64, 256, 16, 2, 2, 4), (32, 64, 96, 16, 2, 2, 1))}
+    cfgs[Q4_1] = cfgs[Q4_0]
+    cfgs[Q5_K] = ((32, 64, 256, 32, 2, 2, 0), (32, 64, 512, 16, 2, 2, 1), (64, 32, 512, 32, 1, 4, 8), (32, 128, 512, 16, 4, 1, 2),
+                  (32, 64, 512, 16, 2, 2, 4), (32, 32, 768, 16, 2, 2, 8))
+    for ggml_type, configs in cfgs.items():
+      for tokens, out_features, in_features, token_tile, warps, out_tiles, stage in configs:
+        for pipe in ((0, 1) if stage else (0,)):
+          with self.subTest(ggml_type=ggml_type, tokens=tokens, out=out_features, inp=in_features, token_tile=token_tile, warps=warps,
+                            out_tiles=out_tiles, stage=stage, pipe=pipe):
+            rng = np.random.default_rng(tokens + out_features + ggml_type)
+            blocks, (xq, xd, xs) = _blocks(ggml_type, rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
+            fxn = functools.partial(nv_gemm._linear_imma_nv.__wrapped__, ggml_type=ggml_type, out_features=out_features,
+                                    in_features=in_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage, pipe=pipe)
+            out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device="PYTHON")
+            srcs = [Tensor(a, device="PYTHON") for a in (_raw(ggml_type, blocks), xq, xd) + ((xs,) if ggml_type != Q4_0 else ())]
+            res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
+            np.testing.assert_array_equal(res, _np_imma_reference(ggml_type, blocks, xq, xd, xs))  # same fp32 op order: bit-exact
 
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):
@@ -288,7 +385,7 @@ def _kernels(t:Tensor) -> dict[str, UOp]:
 class TestImmaDispatch(unittest.TestCase):
   """T4.126: nv_wmma_linear with the sm_80 gate forced open (graph build only, nothing realized): NV_IMMA=0 builds exactly the
   fp16 WMMA kernel (the very UOp _wmma_kernel builds, so the same render), NV_IMMA=1 swaps in q8_quantize + the IMMA kernel
-  for Q4_0 only and reads its knobs at call time."""
+  for Q4_0 (T4.128: and Q4_1, Q5_K, with the quantizer's sums) only and reads its knobs at call time."""
   def setUp(self):
     from unittest import mock
     patcher = mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True)
@@ -297,23 +394,30 @@ class TestImmaDispatch(unittest.TestCase):
 
   def test_imma_off_is_the_fp16_kernel(self):
     from tinygrad import Context
-    lin, x = _quantized_linear(Q4_0, 256, 128), Tensor.empty(1, 64, 128, dtype=dtypes.float32)
-    with Context(NV_IMMA=0):  # T4.126: on by default since the 10-28 card run; 0 is the rollback to the fp16 kernel
-      kernels = _kernels(nv_gemm.nv_wmma_linear(lin, x))
-    self.assertEqual(set(kernels), {"linear_q4_0_wmma_nv"})
-    self.assertIs(kernels["linear_q4_0_wmma_nv"], _sink(Q4_0, 64, 256, 128))
+    for ggml_type, in_features in ((Q4_0, 128), (Q4_1, 128), (Q5_K, 256)):
+      lin, x = _quantized_linear(ggml_type, 256, in_features), Tensor.empty(1, 64, in_features, dtype=dtypes.float32)
+      with Context(NV_IMMA=0):  # T4.126: on by default since the 10-28 card run; 0 is the rollback to the fp16 kernel
+        kernels = _kernels(nv_gemm.nv_wmma_linear(lin, x))
+      name = nv_gemm.WMMA_FORMATS[ggml_type][2]
+      self.assertEqual(set(kernels), {name})
+      self.assertIs(kernels[name], _sink(ggml_type, 64, 256, in_features))
 
-  def test_imma_on_takes_q4_0_only(self):
+  def test_imma_on_takes_q4_0_q4_1_q5_k_only(self):
     from tinygrad import Context
-    x = Tensor.empty(1, 64, 128, dtype=dtypes.float32)
     with Context(NV_IMMA=1):
-      kernels = _kernels(out := nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 256, 128), x))
-      self.assertEqual(set(kernels), {"q8_quantize_nv", "linear_q4_0_imma_nv"})
-      self.assertEqual(out.shape, (1, 64, 256))
-      self.assertIs(kernels["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128))  # the knob defaults: tile 64, 4 warps, 2 tiles, stage 4
-      for ggml_type in (Q8_0, Q4_1, IQ4_NL):  # every other format keeps its fp16 WMMA kernel
-        self.assertNotIn("linear_q4_0_imma_nv", _kernels(nv_gemm.nv_wmma_linear(_quantized_linear(ggml_type, 256, 128), x)))
-      self.assertEqual(set(_kernels(nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 72, 128), x))), {"linear_q4_0_wmma_nv"})  # 72 % 64
+      for ggml_type, in_features in ((Q4_0, 128), (Q4_1, 128), (Q5_K, 256)):
+        x = Tensor.empty(1, 64, in_features, dtype=dtypes.float32)
+        kernels = _kernels(out := nv_gemm.nv_wmma_linear(_quantized_linear(ggml_type, 256, in_features), x))
+        name = nv_gemm.IMMA_FORMATS[ggml_type][2]
+        self.assertEqual(set(kernels), {"q8_quantize_nv", name})
+        self.assertEqual(out.shape, (1, 64, 256))
+        # the knob defaults (tile 64, 4 warps, 2 tiles, stage 4); T4.128: Q4_1/Q5_K's kernel takes the sums as a 5th input
+        self.assertIs(kernels[name], _imma_sink(64, 256, in_features, ggml_type=ggml_type))
+        self.assertEqual(sum(u.op is Ops.PARAM for u in kernels["q8_quantize_nv"].toposort()), 3 if ggml_type == Q4_0 else 4)
+      x = Tensor.empty(1, 64, 256, dtype=dtypes.float32)
+      for ggml_type in (Q8_0, IQ4_NL, Q4_K, Q6_K, IQ4_XS):  # every other format keeps its fp16 WMMA kernel
+        self.assertEqual(set(_kernels(nv_gemm.nv_wmma_linear(_quantized_linear(ggml_type, 256, 256), x))), {nv_gemm.WMMA_FORMATS[ggml_type][2]})
+      self.assertEqual(set(_kernels(nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 72, 256), x))), {"linear_q4_0_wmma_nv"})  # 72 % 64
 
   def test_knobs_reach_the_kernel(self):
     from tinygrad import Context
@@ -322,6 +426,17 @@ class TestImmaDispatch(unittest.TestCase):
       self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128, 32, 2, 4, 0))
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=3):  # tile: largest power of two dividing 64; stage: gcd with 4 groups
       self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128, 64, 4, 2, 1))
+
+  def test_pipe_knob_reaches_the_kernel(self):
+    # T4.128: NV_IMMA_PIPE=1 builds the pipelined kernel for all three formats; without a stage tile there is nothing to pipeline
+    from tinygrad import Context
+    for ggml_type, in_features in ((Q4_0, 128), (Q4_1, 128), (Q5_K, 256)):
+      lin, x = _quantized_linear(ggml_type, 256, in_features), Tensor.empty(1, 64, in_features, dtype=dtypes.float32)
+      name = nv_gemm.IMMA_FORMATS[ggml_type][2]
+      with Context(NV_IMMA=1, NV_IMMA_PIPE=1):
+        self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))[name], _imma_sink(64, 256, in_features, ggml_type=ggml_type, pipe=1))
+      with Context(NV_IMMA=1, NV_IMMA_PIPE=1, NV_IMMA_STAGE=0):
+        self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))[name], _imma_sink(64, 256, in_features, 64, 4, 2, 0, ggml_type))
 
   def test_symbolic_chunk_pads_and_shrinks(self):
     from tinygrad import Context, UOp as U
@@ -337,35 +452,43 @@ class TestImmaDispatch(unittest.TestCase):
     lin = _quantized_linear(Q4_0, 256, 1024)  # 32 groups
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32):
       self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
+    with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32, NV_IMMA_PIPE=1):  # T4.128: two copies -> 2 x 128 x (36 + 5) = 41 KB
+      self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1})
 
+_emu_slot = itertools.count(60)
 def _emulated_lane_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  # warp_reduce's xor butterfly for q8_quantize_nv's one-warp lane range, each __shfl_xor_sync swapped for a shared exchange
-  # (the PYTHON emulator has no CUDA intrinsics and runs the block in lockstep) -- test_llm_nv_norm's _emulated_warp_reduce
+  # warp_reduce's xor butterfly for q8_quantize_nv's lane range, each __shfl_xor_sync swapped for a shared exchange (the PYTHON
+  # emulator has no CUDA intrinsics and runs the block in lockstep) -- test_llm_nv_norm's _emulated_warp_reduce. T4.128: a fresh
+  # buffer per exchange (the sums variant reduces twice), and the multi-warp prefill quantizer's WARP lane + LOCAL warp ranges
+  # (thread warp*32 + lane, whose xor partner stays in its warp) besides the one-warp kernel's LOCAL lane
   assert full_wave
-  lane = next(u for u in val.toposort() if u.op is Ops.RANGE and u.arg[-1] is AxisType.LOCAL)
+  rngs = {u.arg[-1]: u for u in val.toposort() if u.op is Ops.RANGE}
+  if AxisType.WARP in rngs: tid, n = rngs[AxisType.LOCAL] * 32 + rngs[AxisType.WARP], rngs[AxisType.LOCAL].src[0].arg * 32
+  else: tid, n = rngs[AxisType.LOCAL], 32
   for off in (16, 8, 4, 2, 1):
-    buf = UOp.placeholder((32,), dtypes.float32, slot=60 + off, addrspace=AddrSpace.LOCAL)
-    other = buf.after(buf[lane].store(val))[lane + off - (lane // off) % 2 * (2 * off)].load()
+    buf = UOp.placeholder((n,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
+    other = buf.after(buf[tid].store(val))[tid + off - (tid // off) % 2 * (2 * off)].load()
     val = val.maximum(other) if maximum else val + other
   return val
 
 @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
 class TestImmaEndToEndOnEmulator(unittest.TestCase):
-  """T4.126: Linear.set_quantized's real Q4_0 views -> nv_wmma_linear with NV_IMMA=1 -> q8_quantize + the IMMA kernel, all executed
-  on the PYTHON emulator (gate forced open, warp shuffle emulated). Bit-exact vs the numpy reference fed the quantizer's own
-  output, and close to the fp32 matmul of the dequantized weights (q8 activations are the only approximation)."""
-  def test_q4_0_linear(self):
+  """T4.126: Linear.set_quantized's real views -> nv_wmma_linear with NV_IMMA=1 -> q8_quantize + the IMMA kernel, all executed on
+  the PYTHON emulator (gate forced open, warp shuffle emulated). Bit-exact vs the numpy reference fed the quantizer's own output,
+  and close to the fp32 matmul of the dequantized weights (q8 activations are the only approximation). T4.128: Q4_1 (u32 view)
+  and Q5_K (word view) with the quantizer's sums."""
+  def _check(self, ggml_type:int, in_features:int):
     from unittest import mock
     from tinygrad import nn, Context
     from tinygrad.llm.gguf import ggml_data_to_tensor
     from tinygrad.llm.kernels import nv_quant
     from tinygrad.llm.kernels.amd import Linear
-    tokens, out_features, in_features = 32, 64, 128
+    tokens, out_features = 32, 64
     rng = np.random.default_rng(7)
-    blocks = _q4_0_blocks(rng, out_features, in_features // 32)
+    blocks = _blocks(ggml_type, rng, out_features, in_features // 32)
     raw = Tensor(np.pad(blocks.reshape(-1), (4, 0)), device="PYTHON").contiguous().realize()[4:]
     lin = Linear(in_features, out_features, bias=False)
-    decoded = ggml_data_to_tensor(raw, out_features * in_features, Q4_0).reshape(out_features, in_features)
+    decoded = ggml_data_to_tensor(raw, out_features * in_features, ggml_type).reshape(out_features, in_features)
     nn.state.load_state_dict(lin, {"weight": decoded}, verbose=False, realize=False)
     lin.set_quantized(lin.weight)
     x_np = rng.standard_normal((1, tokens, in_features)).astype(np.float32)
@@ -373,11 +496,18 @@ class TestImmaEndToEndOnEmulator(unittest.TestCase):
     with mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
          mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__), Context(NV_IMMA=1, NV_IMMA_WARPS=2):
       out = nv_gemm.nv_wmma_linear(lin, x)
-      self.assertIn("linear_q4_0_imma_nv", _kernels(out))
-      xq, xd = (t.numpy() for t in nv_quant.q8_quantize(x, tokens, in_features))  # the very tensors the dispatch used (T4.123a cache)
+      self.assertIn(nv_gemm.IMMA_FORMATS[ggml_type][2], _kernels(out))
+      # the very tensors the dispatch used (T4.123a cache)
+      acts = [t.numpy() for t in nv_quant.q8_quantize(x, tokens, in_features, sums=ggml_type != Q4_0)]
       res = out.numpy()
-    np.testing.assert_array_equal(res[0], _np_imma_reference(blocks, xq, xd))
-    # q8 activation error only: max 0.033 here on outputs of mean magnitude 1.2 (a wiring slip would be O(1))
-    np.testing.assert_allclose(res[0], x_np[0] @ decoded.numpy().T, rtol=0, atol=0.05)
+    np.testing.assert_array_equal(res[0], _np_imma_reference(ggml_type, blocks, *acts))
+    # q8 activation error only: max 2.7 % (Q4_0), 2.3 % (Q4_1), 4.5 % (Q5_K: 31*63-scale weights, all positive q) of the mean
+    # output magnitude here; a wiring slip would be O(100 %)
+    ref = x_np[0] @ decoded.numpy().T
+    np.testing.assert_allclose(res[0], ref, rtol=0, atol=0.06 * np.abs(ref).mean())
+
+  def test_q4_0_linear(self): self._check(Q4_0, 128)
+  def test_q4_1_linear(self): self._check(Q4_1, 128)
+  def test_q5_k_linear(self): self._check(Q5_K, 256)
 
 if __name__ == "__main__": unittest.main()

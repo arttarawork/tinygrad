@@ -82,6 +82,8 @@ class Linear(nn.Linear):
   packed_u16:Tensor|None = None  # T4.125a: a uint16 view of the packed weight for Q4_0/IQ4_NL/Q6_K (2-byte-aligned, 18/18/210-byte
                                   # blocks) -- nv_quant.py's decode gemv reads it instead of self.weight's byte view to halve its
                                   # load-instruction count; None for every other format
+  packed_u32:Tensor|None = None  # T4.128: a uint32 view for Q4_1 (20-byte blocks, 4-byte aligned): the IMMA prefill gemm (nv_gemm.py) reads
+                                  # its d|m and qs words with aligned 32-bit loads; Q4_1's self.weight stays the byte view the decode gemv uses
   dense_weight:Tensor|None = None  # T4.98h: cached realized-fp16 copy of a non-quantized dense weight (nv_dense.py's
                                     # gemv) -- cast+.contiguous() is real work, cached so it runs once, not every decode step
   def __init__(self, in_features:int, out_features:int, bias=True):
@@ -118,6 +120,7 @@ class Linear(nn.Linear):
     # halves its load-instruction count with 16-bit instead of 8-bit loads. raw_offset % 4 == 0 is already
     # asserted above, so % 2 == 0 (all this view needs) holds too; every block width here (18, 18, 210) is even.
     self.packed_u16 = Tensor(UOp.from_buffer(buffer.view(nbytes // 2, dtypes.uint16, raw_offset))) if self.ggml_type in (Q4_0, IQ4_NL, Q6_K) else None
+    self.packed_u32 = Tensor(UOp.from_buffer(buffer.view(nbytes // 4, dtypes.uint32, raw_offset))) if self.ggml_type == Q4_1 else None
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels import nv_quant, nv_dense, nv_gemm  # local: both import Linear/QUANT_SIZES etc. from here --
                                                           # a module-level import there of this module would cycle (T4.98c)

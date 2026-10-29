@@ -1671,7 +1671,16 @@ class Transformer:
     if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
       mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
       print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
-    return self.jit.setdefault(key, TinyJit(self._forward_step))(
+    if key not in self.jit:
+      self.jit[key] = jit = TinyJit(self._forward_step, prune=is_prefill and not spec)
+      # T4.128: a prefill family captures on its FIRST call. TinyJit's default first call runs the forward eagerly, and an eager
+      # schedule can't plan the buffers custom kernels write into (Tensor.empty outputs count as held), so every block's partials
+      # and q8 activations are alive at once -- at 262k that pass was the card's memory peak (within ~50 MB of OOM, 10-28/29). The
+      # capture plans them; prune=True runs the input-independent first-call work (KV cache zero-fill) once instead of every replay.
+      # Not the spec (MTP verify/redo) families: captured first, their graphs differ from the eager ones by fp16 ulps
+      # (test_generate_maintains_cache_and_snapshot_round_trips); the server never takes that path.
+      if is_prefill and not spec: jit.cnt = 1
+    return self.jit[key](
       tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos, presence_penalty)
 
   def _forward_step(self, *args) -> Tensor|tuple[Tensor, ...]:

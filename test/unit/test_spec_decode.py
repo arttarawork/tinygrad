@@ -781,7 +781,7 @@ class TestStaleReplayShape(unittest.TestCase):
     self.assertNotIn(0, want)  # so a pad zero leaking into the emitted stream is visible below, not just a mismatch
     m = _split(ref)
     for _ in range(2): Tensor.realize(*_spec_call(m, prompt, nt=1, bound=4))
-    self.assertEqual(m.jit[(True, True, 4, True)].cnt, 2, "VERIFY/REDO key must be captured (at width 1) before the real run")
+    self.assertIsNotNone(m.jit[(True, True, 4, True)].captured, "VERIFY/REDO key must be captured (at width 1) before the real run")
     got = _run(m, prompt, 12, spec=True, k=3)  # pre-fix: [7, 1, 7, 1, 7, 1, 7, 0, 2, 2, 2, 2] -- id 0, then divergence
     self.assertNotIn(0, got, f"{got=}: a pad zero reached the emitted stream")
     self.assertEqual(got, want)
