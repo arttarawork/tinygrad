@@ -136,7 +136,8 @@ def main() -> None:
   print(f"load {time.perf_counter()-st:.3f}s", flush=True)
 
   st = time.perf_counter()
-  model.warmup()  # mtp_head is not None -> this also warms speculative_generate's own jit keys (T4.66e)
+  model.warmup(spec_k=max(ks))  # mtp_head is not None -> this also warms speculative_generate's own jit keys (T4.66e); T4.132: every
+                                # VERIFY/REDO width up to the largest --k, so no timed run captures a family mid-iteration
   print(f"warm {time.perf_counter()-st:.3f}s", flush=True)
 
   fill_tokens = deterministic_prompt(args.fill, offset=0) if args.fill else []
