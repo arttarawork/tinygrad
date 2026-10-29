@@ -59,8 +59,9 @@ NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the gen
 NV_WMMA_TOKEN_TILE = ContextVar("NV_WMMA_TOKEN_TILE", 64)  # T4.124c: card knob -- more/fewer token-tile warps per block (PB.3)
 # T4.126: Q4_0 prefill on the int8 tensor cores (q8 activations, decode's quantizer) instead of the fp16 WMMA kernel. On by
 # default since the 10-28 card run (128-token chunk 233.5 -> 156.2 ms; gates 11/1152 and 12/1152 at near-ties vs the fp16 path);
-# NV_IMMA=0 restores the fp16 kernel. The four
-# shape knobs are card-sweepable and, like NV_WMMA_TOKEN_TILE, read only in nv_wmma_linear (never in the cached builder):
+# NV_IMMA=0 restores the fp16 kernel. T4.128: the same switch takes Q4_1 (ffn_down of 8 blocks) and Q5_K (GDN ssm_out) onto the
+# same kernel (card gates pending); NV_IMMA=0 = all three on fp16. The shape knobs are card-sweepable and, like
+# NV_WMMA_TOKEN_TILE, read only in nv_wmma_linear (never in the cached builder):
 NV_IMMA = ContextVar("NV_IMMA", 1)
 NV_IMMA_TOKEN_TILE = ContextVar("NV_IMMA_TOKEN_TILE", 64)  # tokens per block (largest power of two <= knob dividing the chunk)
 NV_IMMA_WARPS = ContextVar("NV_IMMA_WARPS", 4)            # warps per block, sharing one staged activation tile
@@ -417,7 +418,8 @@ def _q4_0_imma_b(raw:UOp, n:UOp, groups:int, group:UOp, t:UOp) -> tuple[UOp, UOp
   # (no carry: n + 0x78 <= 0x87)
   base16 = (n*groups + group)*9
   qs = raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16)
-  return tuple((nib + 0x78787878) ^ 0x80808080 for nib in (qs & 0x0F0F0F0F, (qs >> 4) & 0x0F0F0F0F))  # type: ignore[return-value]
+  def unsign(nib:UOp) -> UOp: return (nib + 0x78787878) ^ 0x80808080
+  return unsign(qs & 0x0F0F0F0F), unsign((qs >> 4) & 0x0F0F0F0F)
 
 def _q4_0_imma_scales(raw:UOp, n:UOp, groups:int, group:UOp) -> tuple[UOp, UOp|None]: return _half(raw[(n*groups + group)*9]), None
 
@@ -542,7 +544,7 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
           fills += [buf[base + j].store(load(at, r, c0 + j)) for j in range(vec)]
       return UOp.group(*fills)
     if pipe:
-      # T4.128: the prologue fills copy 0 with stage 0 before the loop (its barrier lands outside it); step then reads copy step%2
+      # T4.128: the prologue fills copy 0 with stage 0 before the loop (its barrier lands outside it); step then reads copy step&1
       # and stores stage step+1 into the other copy. Nothing in the step reads those stores, so the linearizer places them last
       # (stores late), after the mmas: the global loads issue at the top and their latency hides behind the step's tensor work.
       # add_war_barrier's one __syncthreads() at the end of the step orders both hazards (next step's reads after these stores,
