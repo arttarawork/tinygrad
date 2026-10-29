@@ -759,6 +759,18 @@ class TestPackedU16View(unittest.TestCase):
         linear = self._linear_for(ggml_type, n, row_bytes)
         self.assertIsNone(linear.packed_u16)
 
+  def test_u32_view_for_q4_1_only(self):
+    # T4.128: Q4_1 also gets a uint32 view (the IMMA prefill's aligned loads); its self.weight stays the byte view the decode gemv reads
+    for ggml_type, n, row_bytes in ((Q4_1, 64, 40), (Q4_0, 32, 18), (Q8_0, 32, 34), (Q5_K, 256, 176)):
+      with self.subTest(ggml_type=ggml_type):
+        linear = self._linear_for(ggml_type, n, row_bytes)
+        if ggml_type != Q4_1:
+          self.assertIsNone(linear.packed_u32)
+          continue
+        u32 = cast(Tensor, linear.packed_u32)
+        self.assertEqual((u32.dtype, u32.nbytes(), linear.weight.dtype), (dtypes.uint32, row_bytes, dtypes.uint8))
+        self.assertIs(u32.uop.buf_uop.buffer.base, linear.weight.uop.buf_uop.buffer.base)
+
 class TestFFNActivationFusion(unittest.TestCase):
   """T4.123c (decode fusion design, P3): FFNBlock._feed_forward's dense branch (model.py) drops the
   `.contiguous()` between silu(gate) and the up-multiply ONLY when T==1 (concrete) and both ffn_gate/ffn_up

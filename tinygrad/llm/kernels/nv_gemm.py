@@ -49,7 +49,7 @@ from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo
 from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS, IQ3_S,
-                                      IQ_GRID_SIZES, Q8_GROUP_SIZE, QUANT_SIZES, _half)
+                                      IQ_GRID_SIZES, Q8_GROUP_SIZE, QUANT_SIZES, Q5_WORDS, _half)
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok, iq_grid
@@ -383,11 +383,11 @@ def _token_tile_for(tokens:int, knob:int=64) -> int:
   return WMMA_M
 def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA_N*4) == 0 else 1
 
-# ******** T4.126: int8 tensor-core (IMMA) Q4_0 prefill gemm -- q8 activations x (nibble-8) weights ********
+# ******** T4.126: int8 tensor-core (IMMA) prefill gemm -- q8 activations x int8-unpacked weights (T4.128: Q4_1, Q5_K) ********
 
 def _i8x4(word:UOp) -> tuple[UOp, ...]:
   # the 4 signed bytes of a uint32, little-endian (element 4j+i of a packed fragment register is byte i). The renderer packs
-  # them back into the mma's .b32 operand through the fragment struct; nvcc folds the round trip (see _q4_0_linear_imma_nv)
+  # them back into the mma's .b32 operand through the fragment struct; nvcc folds the round trip (see _linear_imma_nv)
   return tuple((word >> (8*i)).cast(dtypes.int8) for i in range(4))
 
 def _int_times_half(c:UOp, d:UOp) -> UOp:
@@ -397,16 +397,75 @@ def _int_times_half(c:UOp, d:UOp) -> UOp:
   # significant bits), so fma(f, d, -1.5*2**23*d) rounds the exact c*d once: the same bits as cvt.rn.f32.s32 then FMUL. A
   # Q4_0 x q8 group dot is |c| <= 32*8*127 = 32512. The codegen's pm_wmma_add folds the +0x4B400000 into the mma's C operand
   # (WMMA(a,b,0)+k -> WMMA(a,b,k)): the tensor core does the integer add.
+  # T4.128: also exact for Q5_K's d*sc (fp16 d times a 6-bit sc: <= 17 significant bits, 19 after the 1.5*2**23) and |c| <=
+  # 32*31*127 = 125984; Q4_1's d is fp16 and |c| <= 32*15*127.
   return (c + 0x4B400000).bitcast(dtypes.float32) * d + d * -12582912.0
 
+# T4.128: the per-format halves of the IMMA kernel. imma_b(raw, n, groups, group, t) -> the lane's two B registers (uint32, 4 int8
+# each): weight elements 4t..4t+3 and 16+4t..16+4t+3 of output row n's 32-group `group` (the fragment map in _linear_imma_nv).
+# imma_scales(raw, n, groups, group) -> (D, M) with weight = D*q + M for that group's q in the B registers: the group adds
+# D*xd*dot(q, x8) + M*xs to the output (xs = xd*sum(x8), q8_quantize's sums) -- M is None for Q4_0, whose -8 is folded into q.
+# Every index here is lane-dependent only through n and t, and the WARP lane range is never split, so the word views' //, %
+# and shifts are safe (unlike the fp16 kernel's LOCAL lane, _byte).
+
+def _q4_0_imma_b(raw:UOp, n:UOp, groups:int, group:UOp, t:UOp) -> tuple[UOp, UOp]:
+  # u16 view, 9 per 18-byte block (d, qs[0:16]): elements 0-15 are the low nibbles of qs[0:16] and 16-31 the high nibbles of the
+  # same bytes (gguf.py), so qs[4t..4t+3]'s low nibbles are b0 and its high nibbles b1; nibble-8 per byte is (n + 0x78) ^ 0x80
+  # (no carry: n + 0x78 <= 0x87)
+  base16 = (n*groups + group)*9
+  qs = raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16)
+  return tuple((nib + 0x78787878) ^ 0x80808080 for nib in (qs & 0x0F0F0F0F, (qs >> 4) & 0x0F0F0F0F))  # type: ignore[return-value]
+
+def _q4_0_imma_scales(raw:UOp, n:UOp, groups:int, group:UOp) -> tuple[UOp, UOp|None]: return _half(raw[(n*groups + group)*9]), None
+
+def _q4_1_imma_b(raw:UOp, n:UOp, groups:int, group:UOp, t:UOp) -> tuple[UOp, UOp]:
+  # u32 view (amd.py packed_u32), 5 words per 20-byte block: d | m << 16, then qs[0:16] in Q4_0's nibble order; q = 0..15 as is
+  qs = raw[(n*groups + group)*5 + 1 + t]
+  return qs & 0x0F0F0F0F, (qs >> 4) & 0x0F0F0F0F
+
+def _q4_1_imma_scales(raw:UOp, n:UOp, groups:int, group:UOp) -> tuple[UOp, UOp|None]:
+  dm = raw[(n*groups + group)*5]
+  return _half(dm), _half(dm >> 16)
+
+def _q5_k_imma_b(raw:UOp, n:UOp, groups:int, group:UOp, t:UOp) -> tuple[UOp, UOp]:
+  # u32 view (Q5_K's self.weight), 44 words per 176-byte super-block: d | dmin << 16, scales[12] (words 1-3), qh[32] (4-11),
+  # qs[128] (12-43). Sub-block j's element i is nibble (j odd: high) of qs[(j//2)*32 + i] with bit j of qh[i] on top (gguf.py,
+  # _q5_k_dequant4): q = 0..31, four elements per word -- nv_quant's decode gemv builds the same words
+  base, j = _kquant_base(n, groups, group, Q5_WORDS)
+  shift, bit = ((j % 2)*4).cast(dtypes.uint32), j.cast(dtypes.uint32)
+  def q(r:int) -> UOp:
+    return ((raw[base + 12 + (j//2)*8 + 4*r + t] >> shift) & 0x0F0F0F0F) | (((raw[base + 4 + 4*r + t] >> bit) & 0x01010101) << 4)
+  return q(0), q(1)
+
+def _q5_k_imma_scales(raw:UOp, n:UOp, groups:int, group:UOp) -> tuple[UOp, UOp|None]:
+  # _q4q5_k_scales on words: byte j%4 of scales[0:4] / [4:8] / [8:12] (words 1, 2, 3); j < 4: sc, m = the low 6 bits of the first
+  # two, else the low / high nibble of the third topped up with the first two's spare high bits. D = d*sc, M = -dmin*m (both exact).
+  # The minus is dmin's fp16 sign bit flipped, not a *-1: the codegen turns acc + (x*-1)*y into acc - x*y, which nvcc still fuses
+  # (FFMA with a negated operand) but the PYTHON emulator rounds x*y first -- the two would then disagree in the last bit
+  base, j = _kquant_base(n, groups, group, Q5_WORDS)
+  sh = ((j % 4)*8).cast(dtypes.uint32)
+  dm, lo_sc, lo_mn, hi = raw[base], raw[base + 1] >> sh, raw[base + 2] >> sh, raw[base + 3] >> sh
+  low = j < 4
+  sc = low.where(lo_sc & 63, (hi & 0xF) | (((lo_sc >> 6) & 3) << 4))
+  mn = low.where(lo_mn & 63, ((hi >> 4) & 0xF) | (((lo_mn >> 6) & 3) << 4))
+  return _half(dm) * sc.float(), _half((dm >> 16) ^ 0x8000) * mn.float()
+
+# ggml_type -> (B-register builder, epilogue scales, kernel name); the formats with an M need q8_quantize's sums
+IMMA_FORMATS: dict[int, tuple[Callable, Callable, str]] = {
+  Q4_0: (_q4_0_imma_b, _q4_0_imma_scales, "linear_q4_0_imma_nv"), Q4_1: (_q4_1_imma_b, _q4_1_imma_scales, "linear_q4_1_imma_nv"),
+  Q5_K: (_q5_k_imma_b, _q5_k_imma_scales, "linear_q5_k_imma_nv")}
+
 @functools.cache
-def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, in_features:int, token_tile:int, warps:int,
-                         out_tiles:int, stage:int) -> UOp:
+def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
+                    token_tile:int, warps:int, out_tiles:int, stage:int) -> UOp:
   """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
   (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
   acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
   Q4_0 weight's uint16 view (amd.py packed_u16; 9 u16 per 18-byte block: d, then qs[0:16]), xq/xd = nv_quant.q8_quantize's
   (tokens, groups, 8) uint32 words (4 int8 per word, element 4w+i = byte i) and (tokens, groups) fp32 scales.
+  T4.128: the same kernel for Q4_1 and Q5_K -- IMMA_FORMATS supplies the B registers and the per-output (D, M); with an M the
+  group adds M[n] * xsum[m] after the D term (one more FFMA per output element), xsum = q8_quantize(sums=True)'s third output,
+  staged like xd.
 
   Layout: grid (tokens/token_tile, out_features/(8*out_tiles*warps)) with the token blocks fastest, block = `warps` warps x 32
   lanes. lane is its own AxisType.WARP range (never split by the lowerer, mark_range_mod skips WARP: renders as threadIdx.x, 32)
@@ -431,10 +490,9 @@ def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, 
     a3 = A[g+8, 16+4t..16+4t+3]        (byte i of a register = the i-th k of its run)
 
   So a0..a3 are xq words t, t, t+4, t+4 of tokens g, g+8, g, g+8 -- the quantizer's packing IS the fragment, no unpack. b0/b1
-  come from ONE 32-bit qs word: Q4_0 elements 0-15 are the low nibbles of qs[0:16] and 16-31 the high nibbles of the same
-  bytes (gguf.py), so qs[4t..4t+3]'s low nibbles are b0 and its high nibbles b1; nibble-8 per byte is (n + 0x78) ^ 0x80 (no
-  carry: n + 0x78 <= 0x87). C's n index (2t, 2t+1) is a different lane split than B's (g) -- the d_w the epilogue needs are
-  the blocks of outputs 2t and 2t+1, not the block this lane decoded."""
+  come from ONE 32-bit qs word in Q4_0/Q4_1 (low and high nibbles, _q4_0_imma_b). C's n index (2t, 2t+1) is a different lane
+  split than B's (g) -- the scales the epilogue needs are those of outputs 2t and 2t+1, not of the row this lane decoded."""
+  imma_b, imma_scales, name = IMMA_FORMATS[ggml_type]
   groups, S = in_features // Q8_GROUP_SIZE, max(stage, 1)  # S groups per REDUCE iteration
   # output_block gets the lower axis id so the token blocks of one output block are adjacent in the launch order (gidx0 is the
   # LAST global axis): they run together and share their weight rows through L2 instead of each streaming them from DRAM
@@ -460,11 +518,15 @@ def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, 
     wstride, dstride, threads = 8*S + 4, S + 1, warps*WARP_SIZE
     xs_buf = UOp.placeholder((token_tile*wstride,), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
     xd_buf = UOp.placeholder((token_tile*dstride,), dtypes.float32, slot=101, addrspace=AddrSpace.LOCAL)
+    tiles = [(xs_buf, wstride, 8*S, 4, lambda r, c: xq[t0 + r, step*S + c // 8, c % 8]),
+             (xd_buf, dstride, S, 1, lambda r, c: xd[t0 + r, step*S + c])]
+    if xsum is not None:  # T4.128: the sums ride along with the scales (same layout, same fill index)
+      tiles.append((sum_buf := UOp.placeholder((token_tile*dstride,), dtypes.float32, slot=102, addrspace=AddrSpace.LOCAL), dstride, S, 1,
+                    lambda r, c: xsum[t0 + r, step*S + c]))
     fills = []
     # each thread fills 4 consecutive words (a 16-byte-aligned run in both buffers: 8S and 8S+4 are multiples of 4), which the
     # coalescer turns into one uint4 LDG + one uint4 STS; the scales go one float per thread
-    for buf, stride, per_row, vec, load in ((xs_buf, wstride, 8*S, 4, lambda r, c: xq[t0 + r, step*S + c // 8, c % 8]),
-                                            (xd_buf, dstride, S, 1, lambda r, c: xd[t0 + r, step*S + c])):
+    for buf, stride, per_row, vec, load in tiles:
       total = token_tile*per_row//vec
       for i in range(-(-total // threads)):
         idx = warp*WARP_SIZE + lane + i*threads
@@ -474,24 +536,29 @@ def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, 
     xs, xds = xs_buf.after(UOp.group(*fills)), xd_buf.after(UOp.group(*fills))
     def word(row, w:int, s:int): return xs[row*wstride + s*8 + w]
     def scale(row, s:int): return xds[row*dstride + s]
+    if xsum is not None:
+      sums = sum_buf.after(UOp.group(*fills))
+      def gsum(row, s:int): return sums[row*dstride + s]
   else:  # stage 0: every warp loads its fragments straight from global (the pre-staging kernel, kept as a card A/B)
     def word(row, w:int, s:int): return xq[t0 + row, step, w]
     def scale(row, s:int): return xd[t0 + row, step]
+    def gsum(row, s:int): return cast(UOp, xsum)[t0 + row, step]
   running = [[acc.after(step) for acc in row] for row in accs]
   for s in range(S):
     group = step*S + s
     afrags = tuple(UOp.stack(*(b for r in range(4) for b in _i8x4(word(r0 + g + 8*(r % 2), t + 4*(r // 2), s)))) for r0 in r0s)
     xss = tuple(UOp.stack(*(scale(r0 + g + 8*(i // 2), s) for i in range(4))) for r0 in r0s)  # C's m index: g for c0/c1, g+8 for c2/c3
+    if xsum is not None: sss = tuple(UOp.stack(*(gsum(r0 + g + 8*(i // 2), s) for i in range(4))) for r0 in r0s)
     for o, n0 in enumerate(n0s):
-      base16 = ((n0 + g)*groups + group)*9
-      qs = raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16)
-      bfrag = UOp.stack(*(b for nib in (qs & 0x0F0F0F0F, (qs >> 4) & 0x0F0F0F0F) for b in _i8x4((nib + 0x78787878) ^ 0x80808080)))
-      dw = tuple(_half(raw[((n0 + 2*t + j)*groups + group)*9]) for j in (0, 1))
-      dws = UOp.stack(*(dw[i % 2] for i in range(4)))  # C's n index: 2t for c0/c2, 2t+1 for c1/c3
+      bfrag = UOp.stack(*(b for word32 in imma_b(raw, n0 + g, groups, group, t) for b in _i8x4(word32)))
+      dm = tuple(imma_scales(raw, n0 + 2*t + j, groups, group) for j in (0, 1))
+      dws = UOp.stack(*(dm[i % 2][0] for i in range(4)))  # C's n index: 2t for c0/c2, 2t+1 for c1/c3
+      mws = None if dm[0][1] is None else UOp.stack(*(dm[i % 2][1] for i in range(4)))
       for mt, afrag in enumerate(afrags):
         # acc += (c * d_w) * xd: two FFMAs per element. Not c*(d_w*xd): the C renderer strips a same-op child's parens, so the
         # card would compile it as (c*d_w)*xd anyway and round differently from this graph on the emulator
         running[o][mt] = running[o][mt] + _int_times_half(UOp.wmma(afrag, bfrag, zero, *IMMA_ARG), dws) * xss[mt]
+        if mws is not None: running[o][mt] = running[o][mt] + mws * sss[mt]  # T4.128: + M[n] * xsum[m], the third FFMA
   update = UOp.group(*(acc.store(value) for row, values in zip(accs, running) for acc, value in zip(row, values))).end(step)
   stores = []
   for n0, row in zip(n0s, accs):
@@ -499,7 +566,7 @@ def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, 
       c0, c1, c2, c3 = (acc.after(update)[i].load() for i in range(4))
       m = t0 + r0 + g
       stores += [out[m, n0 + 2*t].store(c0), out[m, n0 + 2*t + 1].store(c1), out[m + 8, n0 + 2*t].store(c2), out[m + 8, n0 + 2*t + 1].store(c3)]
-  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name="linear_q4_0_imma_nv", opts_to_apply=()))
+  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
 def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
@@ -513,17 +580,23 @@ def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:in
   layout = _wmma_layout_nv(out, out_features, token_tile, _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, dequant4, name)
 
+def _imma_weight(layer:Linear) -> Tensor|None:
+  # T4.128: the aligned view each IMMA format reads (amd.py set_quantized): Q4_0's u16 view, Q4_1's u32 view, Q5_K's word view
+  return {Q4_0: layer.packed_u16, Q4_1: layer.packed_u32, Q5_K: layer.weight}.get(cast(int, layer.ggml_type))
+
 def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   # T4.126: the IMMA kernel's shape arguments from the NV_IMMA_* knobs, or None (-> the fp16 WMMA kernel) when NV_IMMA is off,
-  # the layer isn't Q4_0, or out_features doesn't split into whole blocks. tokens % 16 == 0 and in_features % 32 == 0 hold here.
+  # the layer isn't an IMMA format (T4.128: Q4_0, Q4_1, Q5_K), or out_features doesn't split into whole blocks. tokens % 16 == 0
+  # and in_features % 32 (Q5_K: 256) == 0 hold here.
   warps, out_tiles = NV_IMMA_WARPS.value, NV_IMMA_OUT_TILES.value
-  if not NV_IMMA.value or layer.ggml_type != Q4_0 or layer.packed_u16 is None or layer.out_features % (WMMA_N*out_tiles*warps): return None
+  if not NV_IMMA.value or _imma_weight(layer) is None or layer.out_features % (WMMA_N*out_tiles*warps): return None
   token_tile = WMMA_M
   while token_tile*2 <= NV_IMMA_TOKEN_TILE.value and tokens % (token_tile*2) == 0: token_tile *= 2
   groups = layer.in_features // Q8_GROUP_SIZE
   stage = NV_IMMA_STAGE.value and math.gcd(NV_IMMA_STAGE.value, groups)  # must divide the groups; 0 = off
+  scale_rows = 1 if layer.ggml_type == Q4_0 else 2  # T4.128: the sums buffer is a second scale-sized tile
   # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
-  while stage > 1 and token_tile*((8*stage + 4) + (stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
+  while stage > 1 and token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
   return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage}
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
@@ -542,12 +615,13 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   if not _nv_wmma_ok(x.device): return None
   x_pad = x.pad_to(x.max_shape) if symbolic else x  # concrete shape from here on
   if (imma := _imma_geometry(layer, cast(int, tokens))) is not None:
-    # T4.126: q8 activations (shared across the Linears reading one x, nv_quant's T4.123a cache) x the u16 weight view
-    xq, xd = q8_quantize(x_pad, cast(int, tokens), in_features)
+    # T4.126: q8 activations (shared across the Linears reading one x, nv_quant's T4.123a cache) x the aligned weight view;
+    # T4.128: Q4_1/Q5_K also take the quantizer's group sums
+    acts = q8_quantize(x_pad, cast(int, tokens), in_features, sums=layer.ggml_type != Q4_0)
     out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
-    all_srcs = (out, cast(Tensor, layer.packed_u16).uop.buf_uop, xq.uop, xd.uop)
+    all_srcs = (out, cast(Tensor, _imma_weight(layer)).uop.buf_uop, *(a.uop for a in acts))
     params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
-    kernel = _q4_0_linear_imma_nv(*params, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
+    kernel = _linear_imma_nv(*params, ggml_type=layer.ggml_type, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
     result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)
     if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], out_features)))
     return result if layer.bias is None else result + layer.bias
