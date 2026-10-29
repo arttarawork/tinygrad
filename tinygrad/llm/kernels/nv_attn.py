@@ -369,7 +369,7 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   Shared memory holds the tiles in FRAGMENT order: each 32-lane slot group is one mma operand (K: per 8-key n-tile x 16-dim k-step,
   4 fp16 per lane = b0 b1; V: per 16-key k-step x 8-dim n-tile, the same with keys and dims swapped -- the P.V B operand is V's
   transpose, which the dequant writes directly), so a fragment read is one 8-byte load per lane over 256 contiguous bytes. The slot
-  of lane (g, t) inside its group is XOR-swizzled with a function of the operand (K: t ^ (n-tile + k-step pair), V: g ^ (n-tile/2))
+  of lane (g, t) inside its group is rotated by a function of the operand (K: t + n-tile + k-step pair mod 4, V: g + n-tile/2 mod 8)
   -- a permutation, so reads stay conflict-free, and it spreads the dequant threads' stores (which all write the same (g, t) slot of
   different groups) over the banks. lane is AxisType.WARP (threadIdx.x, never split), the warp a LOCAL range (_linear_imma_nv's
   layout); the barriers come from add_raw_barrier (stores -> loads of a tile) and add_war_barrier (end of the tile loop)."""
@@ -384,9 +384,12 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
     and KT % WMMA_K == 0 and mtiles % W == 0 and 4 * KT * D <= SMEM_BYTES
   valid_chunks = (valid_kv_len + BLOCK_N - 1) // BLOCK_N
   group_count = min(valid_chunks, chunks) if isinstance(valid_chunks, int) else valid_chunks.minimum(chunks)
-  block = UOp.range(B * H_KV * (mtiles // W) * group_count, 0, AxisType.GLOBAL)
-  block_rest, block_n = block // group_count, block % group_count
-  bh, mgroup = block_rest // (mtiles // W), block_rest % (mtiles // W)
+  mgroups = mtiles // W
+  block = UOp.range(B * H_KV * group_count * mgroups, 0, AxisType.GLOBAL)
+  # the m-groups of one (kv head, slot) are ADJACENT blocks: launched together they stream the same K/V tiles, so the group's
+  # 2nd..12th reads (model geometry: 48 m-tiles / 4 warps) hit L2 instead of DRAM (T4.113 ordered the slots fastest)
+  block_rest, mgroup = block // mgroups, block % mgroups
+  bh, block_n = block_rest // group_count, block_rest % group_count
   b, kv_head = bh // H_KV, bh % H_KV
   warp, lane = UOp.range(W, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
   g, t = lane // 4, lane % 4  # fragment row/col (0-7), k/n sub-index (0-3): the hardware lane is 4*g + t
@@ -407,8 +410,9 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   def tasks(total:int):
     for i in range(-(-total // threads)):  # surplus threads redo the last task: same values, same addresses, no gate
       yield (tid + i * threads).minimum(total - 1) if total % threads else tid + i * threads
-  def k_slot(j, ks, gg, tt): return (j * KS + ks) * WARP_SIZE + 4 * gg + (tt ^ ((j + NT * (ks // 2)) & 3))
-  def v_slot(kstep, n, gg, tt): return (kstep * OT + n) * WARP_SIZE + 4 * (gg ^ ((n // 2) & 3)) + tt
+  # rotations, not XORs: CHECK_OOB's z3 pass (CI) has no XOR with a constant; the bank argument only needs a permutation per group
+  def k_slot(j, ks, gg, tt): return (j * KS + ks) * WARP_SIZE + 4 * gg + (tt + j + NT * (ks // 2)) % 4
+  def v_slot(kstep, n, gg, tt): return (kstep * OT + n) * WARP_SIZE + 4 * ((gg + n // 2) % 8) + tt
   stores = []
   # K: a task = (key, 32-dim scale block) -> the b0/b1 pairs of 4 lanes x 2 k-steps of its n-tile
   for task in tasks(KT * D // 32):
@@ -476,7 +480,10 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
     d0 = n * WMMA_N + 2 * t
     out_stores += [out[b, q_head, rows[i // 2], block_n, d0 + i % 2].store(acc[i].load()) for i in range(4)]
   stats_head = q_head.valid(t.eq(0))
-  out_stores += [stats[b, stats_head, rows[r], block_n, i].store(x) for r in range(2) for i, x in enumerate((row_max[r].load(), sums[r]))]
+  # the running max lives in the exp2 domain (scores carry log2 e); _merge_partials weighs slots as exp2((m_s - m) * LOG2E), the
+  # decode/T4.107b kernels' NATURAL-domain max -- so store m / LOG2E (the T4.113 kernel stores its exp2-domain max unconverted,
+  # which that merge mis-weighs whenever a row's live slots have different maxes; emulator-checked, see test_llm_nv_attn)
+  out_stores += [stats[b, stats_head, rows[r], block_n, i].store(x) for r in range(2) for i, x in enumerate((row_max[r].load() / LOG2E, sums[r]))]
   return UOp.group(*out_stores).end(block, warp, lane).sink(arg=KernelInfo(name="flash_prefill_gqa_nv", opts_to_apply=()))
 
 def _gqa_geometry(H:int, H_KV:int, T_pad:int, D:int) -> dict[str, int]|None:
