@@ -70,6 +70,9 @@ NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 4)            # 32-groups per shared
 # T4.128: 1 = double-buffered stage tile, the next stage's activation fills overlapping this stage's mmas (one barrier per stage);
 # 0 = the T4.126 kernel, byte-identical. Card A/B pending; with NV_IMMA_STAGE=0 (no tile) it has nothing to do
 NV_IMMA_PIPE = ContextVar("NV_IMMA_PIPE", 0)
+# T4.131: occupancy. The T4.126 kernel takes 196 registers (ptxas, nvcc 12.8 sm_86) = 2 blocks of 4 warps per SM; min blocks per SM
+# through __launch_bounds__(threads, n): 3 -> 158 registers, 0 spills; 4 -> 128 registers, 144 B spills. 0 = today's render
+NV_IMMA_MINBLOCKS = ContextVar("NV_IMMA_MINBLOCKS", 0)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -462,7 +465,7 @@ IMMA_FORMATS: dict[int, tuple[Callable, Callable, str]] = {
 
 @functools.cache
 def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
-                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0) -> UOp:
+                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0) -> UOp:
   """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
   (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
   acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
@@ -589,7 +592,8 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
       c0, c1, c2, c3 = (acc.after(update)[i].load() for i in range(4))
       m = t0 + r0 + g
       stores += [out[m, n0 + 2*t].store(c0), out[m, n0 + 2*t + 1].store(c1), out[m + 8, n0 + 2*t].store(c2), out[m + 8, n0 + 2*t + 1].store(c3)]
-  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
+  # T4.131: minblocks -> __launch_bounds__(threads, minblocks) (KernelInfo.min_blocks, the CUDA renderer); 0 = today's KernelInfo
+  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=(), min_blocks=minblocks))
 
 @functools.cache
 def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
@@ -621,7 +625,8 @@ def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   copies = 2 if NV_IMMA_PIPE.value and stage else 1  # T4.128: the pipelined kernel holds two copies of the stage tile
   # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
   while stage > 1 and copies*token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
-  return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage, "pipe": int(copies == 2)}
+  return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage, "pipe": int(copies == 2),
+          "minblocks": NV_IMMA_MINBLOCKS.value}
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to

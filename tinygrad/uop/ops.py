@@ -1236,6 +1236,7 @@ class KernelInfo:
   opts_to_apply: tuple|None = None
   estimates: Estimates|None = None
   beam: int = 0
+  min_blocks: int = 0           # T4.131: CUDA __launch_bounds__(threads, min_blocks) -- ptxas fits that many blocks per SM; 0 = unset
   @property
   def function_name(self): return to_function_name(self.name)
 

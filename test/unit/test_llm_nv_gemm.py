@@ -196,10 +196,10 @@ def _imma_params(ggml_type:int, tokens:int, out_features:int, in_features:int) -
          ([UOp.placeholder((tokens, groups), dtypes.float32, slot=4)] if ggml_type != Q4_0 else [])
 
 def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4,
-               ggml_type:int=Q4_0, pipe:int=0):
+               ggml_type:int=Q4_0, pipe:int=0, minblocks:int=0):
   return nv_gemm._linear_imma_nv.__wrapped__(*_imma_params(ggml_type, tokens, out_features, in_features), ggml_type=ggml_type,
                                              out_features=out_features, in_features=in_features, token_tile=token_tile, warps=warps,
-                                             out_tiles=out_tiles, stage=stage, pipe=pipe)
+                                             out_tiles=out_tiles, stage=stage, pipe=pipe, minblocks=minblocks)
 
 def _shared_bytes(src:str) -> int:  # static __shared__ total of a rendered kernel (every tile here is a 4-byte type)
   return sum(4 * int(n) for n in re.findall(r"__shared__ __align__\(\d+\) \w+ \w+\[(\d+)\];", src))
@@ -453,7 +453,27 @@ class TestImmaDispatch(unittest.TestCase):
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32):
       self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32, NV_IMMA_PIPE=1):  # T4.128: two copies -> 2 x 128 x (36 + 5) = 41 KB
-      self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1})
+      self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1, "minblocks": 0})
+
+  def test_minblocks_knob_reaches_the_kernel_and_the_launch_bounds(self):
+    # T4.131: NV_IMMA_MINBLOCKS=n -> KernelInfo.min_blocks=n -> __launch_bounds__(threads, n) in the CUDA render; 0 = today's
+    # KernelInfo (test_pipe_0_is_the_t4126_render pins that render byte-for-byte)
+    from tinygrad import Context
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    lin, x = _quantized_linear(Q4_0, 256, 128), Tensor.empty(1, 64, 128, dtype=dtypes.float32)
+    with Context(NV_IMMA=1, NV_IMMA_MINBLOCKS=3):
+      kernel = _kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"]
+    self.assertIs(kernel, _imma_sink(64, 256, 128, minblocks=3))
+    self.assertEqual(kernel.arg.min_blocks, 3)
+    self.assertEqual(_imma_sink(64, 256, 128).arg.min_blocks, 0)
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    for minblocks, bounds in ((0, "__launch_bounds__(128) "), (3, "__launch_bounds__(128, 3) "), (4, "__launch_bounds__(128, 4) ")):
+      src = next(u.arg for u in to_program(_imma_sink(128, 5120, 5120, minblocks=minblocks), renderer).src if u.op is Ops.SOURCE)
+      self.assertIn(bounds, src)
+      self.assertEqual(src.count("__launch_bounds__"), 1)
 
 _emu_slot = itertools.count(60)
 def _emulated_lane_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
