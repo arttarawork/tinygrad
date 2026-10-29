@@ -57,14 +57,15 @@ from tinygrad.llm.kernels.nv_quant import q8_quantize
 
 NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the generic prefill matmul (A/B lever for the bench)
 NV_WMMA_TOKEN_TILE = ContextVar("NV_WMMA_TOKEN_TILE", 64)  # T4.124c: card knob -- more/fewer token-tile warps per block (PB.3)
-# T4.126: Q4_0 prefill on the int8 tensor cores (q8 activations, decode's quantizer) instead of the fp16 WMMA kernel. Off by
-# default: the activations change from fp16 to q8 per 32-group, a numerics change the card's flip-rate gate decides. The four
+# T4.126: Q4_0 prefill on the int8 tensor cores (q8 activations, decode's quantizer) instead of the fp16 WMMA kernel. On by
+# default since the 10-28 card run (128-token chunk 233.5 -> 156.2 ms; gates 11/1152 and 12/1152 at near-ties vs the fp16 path);
+# NV_IMMA=0 restores the fp16 kernel. The four
 # shape knobs are card-sweepable and, like NV_WMMA_TOKEN_TILE, read only in nv_wmma_linear (never in the cached builder):
-NV_IMMA = ContextVar("NV_IMMA", 0)
+NV_IMMA = ContextVar("NV_IMMA", 1)
 NV_IMMA_TOKEN_TILE = ContextVar("NV_IMMA_TOKEN_TILE", 64)  # tokens per block (largest power of two <= knob dividing the chunk)
 NV_IMMA_WARPS = ContextVar("NV_IMMA_WARPS", 4)            # warps per block, sharing one staged activation tile
 NV_IMMA_OUT_TILES = ContextVar("NV_IMMA_OUT_TILES", 2)    # 8-output n-tiles per warp (each A fragment feeds this many mmas)
-NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 2)            # 32-groups per shared-memory stage (barrier pair); 0 = no staging
+NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 4)            # 32-groups per shared-memory stage (barrier pair); 0 = no staging (10-28: 4 best)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims

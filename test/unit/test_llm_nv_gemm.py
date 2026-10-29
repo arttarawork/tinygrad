@@ -156,7 +156,7 @@ def _np_imma_reference(blocks:np.ndarray, xq:np.ndarray, xd:np.ndarray) -> np.nd
     acc = ((c[:, :, grp] * dw[None, :, grp]).astype(np.float64) * xd[:, None, grp] + acc).astype(np.float32)
   return acc
 
-def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=2):
+def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4):
   groups = in_features // 32
   params = [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((out_features*groups*9,), dtypes.uint16, slot=1),
             UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)]
@@ -298,11 +298,10 @@ class TestImmaDispatch(unittest.TestCase):
   def test_imma_off_is_the_fp16_kernel(self):
     from tinygrad import Context
     lin, x = _quantized_linear(Q4_0, 256, 128), Tensor.empty(1, 64, 128, dtype=dtypes.float32)
-    for ctx in ({}, {"NV_IMMA": 0}):
-      with Context(**ctx):
-        kernels = _kernels(nv_gemm.nv_wmma_linear(lin, x))
-      self.assertEqual(set(kernels), {"linear_q4_0_wmma_nv"})
-      self.assertIs(kernels["linear_q4_0_wmma_nv"], _sink(Q4_0, 64, 256, 128))
+    with Context(NV_IMMA=0):  # T4.126: on by default since the 10-28 card run; 0 is the rollback to the fp16 kernel
+      kernels = _kernels(nv_gemm.nv_wmma_linear(lin, x))
+    self.assertEqual(set(kernels), {"linear_q4_0_wmma_nv"})
+    self.assertIs(kernels["linear_q4_0_wmma_nv"], _sink(Q4_0, 64, 256, 128))
 
   def test_imma_on_takes_q4_0_only(self):
     from tinygrad import Context
@@ -311,7 +310,7 @@ class TestImmaDispatch(unittest.TestCase):
       kernels = _kernels(out := nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 256, 128), x))
       self.assertEqual(set(kernels), {"q8_quantize_nv", "linear_q4_0_imma_nv"})
       self.assertEqual(out.shape, (1, 64, 256))
-      self.assertIs(kernels["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128))  # the knob defaults: tile 64, 4 warps, 2 tiles, stage 2
+      self.assertIs(kernels["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128))  # the knob defaults: tile 64, 4 warps, 2 tiles, stage 4
       for ggml_type in (Q8_0, Q4_1, IQ4_NL):  # every other format keeps its fp16 WMMA kernel
         self.assertNotIn("linear_q4_0_imma_nv", _kernels(nv_gemm.nv_wmma_linear(_quantized_linear(ggml_type, 256, 128), x)))
       self.assertEqual(set(_kernels(nv_gemm.nv_wmma_linear(_quantized_linear(Q4_0, 72, 128), x))), {"linear_q4_0_wmma_nv"})  # 72 % 64
