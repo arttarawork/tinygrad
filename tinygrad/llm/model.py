@@ -9,7 +9,7 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
-  gdn_decode as nv_gdn_decode
+  gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
   clear_step_caches
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
@@ -1034,14 +1034,15 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # T4.123f+g: a decode token on the card is two kernels from the four projections (conv + conv_state shift, then norms/beta/alpha/
     # scan/ssm_norm/gate) instead of 13 small generic kernels around the fused scan -- kernels/nv.py's gdn_decode. Same gate as the
-    # fused decode scan below; prefill (symbolic or T > 1) never comes here.
-    if not symbolic and T == 1 and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
+    # fused decode scan below; prefill (symbolic or T > GDN_DECODE_TOKENS) never comes here. T4.132: a concrete run of up to
+    # GDN_DECODE_TOKENS tokens (speculative decoding's VERIFY/REDO) takes the same two kernels, the tokens sequential inside them.
+    if not symbolic and T <= GDN_DECODE_TOKENS and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
       x = x.half()
       # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs on the same input -- fused into one over their load-time
       # concatenated weight (prepare_nv_decode) when that's ready; gdn_decode reads beta/alpha out of the one result
       # (beta at [:heads], alpha at [heads:]). Falls back to the two separate calls (dim not a multiple of 128 --
-      # prepare_nv_decode's own comment) with the same (B,1,2*heads) shape via one concat.
-      beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B, self.config.dim), 2*self.num_v_heads)
+      # prepare_nv_decode's own comment) with the same (B,T,2*heads) shape via one concat.
+      beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B*T, self.config.dim), 2*self.num_v_heads).reshape(B, T, -1)
                     if self.nv_beta_alpha_weight is not None else self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
       z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
                         *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps)
