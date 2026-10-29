@@ -107,7 +107,7 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:i
   groups = in_features//Q8_GROUP_SIZE
   if warps == 1:  # one 32-lane block per (token, group): the decode kernel, unchanged
     token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
-    ranges = (token_group, lane)
+    ranges: tuple[UOp, ...] = (token_group, lane)
   else:
     # T4.128 (step 6): `warps` (token, group)s per block, each warp exactly the one-warp kernel. lane is the AxisType.WARP range
     # (threadIdx.x, never split) and warp a LOCAL range, so warp_reduce's shuffles combine one hardware warp (_add_rmsnorm_q8_kernel's
@@ -124,7 +124,7 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:i
   xs = tuple(x[token, group, word_lane*4+i].float() for i in range(4))
   word = sum(((v/group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8)
               for i,v in enumerate(xs)), UOp.const(0, dtypes.uint32))
-  stores = (q[token, group, lane.valid(lane < 8)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
+  stores: tuple[UOp, ...] = (q[token, group, lane.valid(lane < 8)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
   if sums is not None:
     # T4.128: each lane's own element quantized exactly as the packing does, summed by one more warp reduce (integers <= 32*127:
     # exact in fp32 in any order), times the scale once

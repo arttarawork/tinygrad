@@ -529,7 +529,7 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
              (xd_buf, dstride, S, 1, lambda at, r, c: xd[t0 + r, at*S + c])]
     if xsum is not None:  # T4.128: the sums ride along with the scales (same layout, same fill index)
       tiles.append((sum_buf := UOp.placeholder((copies*token_tile*dstride,), dtypes.float32, slot=102, addrspace=AddrSpace.LOCAL), dstride,
-                    S, 1, lambda at, r, c: cast(UOp, xsum)[t0 + r, at*S + c]))
+                    S, 1, lambda at, r, c: xsum[t0 + r, at*S + c]))
     def fill(at, copy) -> UOp:  # stage `at`'s tiles into tile copy `copy` (None: the one copy of the unpipelined kernel)
       fills = []
       # each thread fills 4 consecutive words (a 16-byte-aligned run in both buffers: 8S and 8S+4 are multiples of 4), which the
