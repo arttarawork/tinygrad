@@ -26,6 +26,10 @@ NV_QUANT_TYPES = (Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, Q4_0, Q4_1, IQ4_NL, Q3_K, IQ3_
 # key as rows_per_warp -- never read inside a @functools.cache'd kernel builder (nv_gemm.py's NV_WMMA_TOKEN_TILE
 # comment explains why: a cache hit would then silently serve a stale R for a later call with a different knob).
 NV_GEMV_ROWS = ContextVar("NV_GEMV_ROWS", 4)  # 10-28 card sweep: R=1 28.6, R=2 28.0, R=4 27.9 ms/step (Q6_K head 1.62 -> 1.20 ms)
+# T4.128 (step 6): warps per block of the q8 quantizer for prefill-sized calls (tokens > 4; decode keeps its one-warp blocks). One
+# 32-thread block per (token, group) hit Ampere's 16-resident-blocks-per-SM cap: 16 of 48 warp slots, 150-190 GB/s on the card
+# (10-28 q8_bench). Read in q8_quantize (uncached) and passed into the cache keys, like NV_GEMV_ROWS
+NV_Q8_WARPS = ContextVar("NV_Q8_WARPS", 8)
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
@@ -97,11 +101,22 @@ def _decode_linear(out:UOp, xq:UOp, xd:UOp, out_features:int, group_count:int, g
   return UOp.group(*stores).end(token_output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:int, in_features:int, warps:int=1) -> UOp:
   # T4.128: `sums` (optional 4th param, an output after the input so the 3-param kernel and its render stay as they were) gets
   # xd * sum(q8) per (token, group) -- llama.cpp q8_1's `s`, the activation side of Q4_1's +m and Q5_K's -dmin*m terms
   groups = in_features//Q8_GROUP_SIZE
-  token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  if warps == 1:  # one 32-lane block per (token, group): the decode kernel, unchanged
+    token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+    ranges = (token_group, lane)
+  else:
+    # T4.128 (step 6): `warps` (token, group)s per block, each warp exactly the one-warp kernel. lane is the AxisType.WARP range
+    # (threadIdx.x, never split) and warp a LOCAL range, so warp_reduce's shuffles combine one hardware warp (_add_rmsnorm_q8_kernel's
+    # layout). A count the warps don't divide: the last block's surplus warps redo the last group -- same values, same addresses
+    total = tokens*groups
+    block, warp, lane = UOp.range(-(-total // warps), 0), UOp.range(warps, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+    token_group = block*warps + warp
+    if total % warps: token_group = token_group.minimum(total - 1)
+    ranges = (block, warp, lane)
   token, group = token_group//groups, token_group%groups
   x = x.reshape(tokens, groups, 32)
   group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
@@ -115,7 +130,7 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:i
     # exact in fp32 in any order), times the scale once
     qsum = warp_reduce((x[token, group, lane].float()/group_scale).round().clip(-127, 127), full_wave=True)
     stores += (sums[token, group.valid(lane.eq(0))].store(group_scale * qsum),)
-  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
+  return UOp.group(*stores).end(*ranges).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
 
 # T4.123a: several Linears in one forward step quantize the SAME activation (FFN gate+up, GDN attn_gate/attn_qkv,
 # attention q/k/v all read one norm output) -- q8_quantize used to run the quantize kernel once per Linear even
@@ -129,13 +144,14 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:i
 # big bound would pin up to that many old activation graphs (and the buffers an eager/capture run realized for them) on a
 # card that runs within ~1 GB of full at 262k context.
 @functools.lru_cache(maxsize=16)
-def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int, sums:bool) -> tuple[UOp, ...]:
+def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int, sums:bool, warps:int) -> tuple[UOp, ...]:
   x = Tensor(x_uop)
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
   extra = [Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)] if sums else []
-  outs = Tensor.custom_kernel(q, scale, x, *extra, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))
+  fxn = functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features, warps=warps)
+  outs = Tensor.custom_kernel(q, scale, x, *extra, fxn=fxn)
   return tuple(t.uop for t in outs[:2] + outs[3:])
 
 def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple[Tensor, ...]:
@@ -144,7 +160,8 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple
   its render, and no activation of the 27B feeds both kinds of consumer (Q4_1 ffn_down and Q5_K ssm_out read their own inputs), so
   the split never costs a second launch. The fused (decode-only) entries carry no sums and are skipped for a sums request."""
   if not sums and (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
-  return tuple(Tensor(u) for u in _q8_quantize_cached(x.uop, tokens, in_features, sums))
+  warps = max(NV_Q8_WARPS.value, 1) if tokens > 4 else 1  # T4.128 (step 6): multi-warp blocks for prefill; decode as it was
+  return tuple(Tensor(u) for u in _q8_quantize_cached(x.uop, tokens, in_features, sums, warps))
 
 # T4.123e: model.py's _ffn_output/GatedDeltaNetBlock's own norm-site helper call self.ffn_norm(h)/self.attn_norm(x)
 # completely normally (building nn.RMSNorm's ordinary lazy graph -- the exact Tensor object every consumer Linear

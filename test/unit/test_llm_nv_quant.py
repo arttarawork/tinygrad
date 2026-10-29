@@ -503,6 +503,55 @@ class TestQ8QuantizeSums(unittest.TestCase):
     np.testing.assert_array_equal(sums, (scale * ref_q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32))  # exact
     np.testing.assert_allclose(sums, ref_sums, rtol=1e-6)
 
+class TestQ8QuantizeWarps(unittest.TestCase):
+  """T4.128 (step 6): prefill-sized quantizes (tokens > 4) put NV_Q8_WARPS (token, group)s in one block -- one hardware warp each,
+  the lane a WARP range -- instead of one 32-thread block per group; decode keeps its kernel byte for byte."""
+  def _kernel(self, tokens:int, in_features:int, sums:bool=False) -> UOp:
+    outs = q8_quantize(Tensor.empty(tokens, in_features), tokens, in_features, sums=sums)
+    return next(u.src[0] for u in outs[0].uop.toposort() if u.op is Ops.CALL)
+
+  def _program(self, sink:UOp):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    return to_program(sink, renderer)
+
+  def test_decode_renders_the_one_warp_kernel(self):
+    import hashlib
+    for tokens, digest in ((1, "d4e80a037a736a75f08834f79d3de674"), (4, "902633179900e3a0814943c6b24430a7")):  # md5s at 0c6178834
+      with self.subTest(tokens=tokens):
+        prg = self._program(self._kernel(tokens, 5120))
+        self.assertEqual(hashlib.md5(next(u.arg for u in prg.src if u.op is Ops.SOURCE).encode()).hexdigest(), digest)
+        self.assertEqual(tuple(prg.arg.local_size), (32, 1, 1))
+
+  def test_prefill_blocks_hold_nv_q8_warps_warps(self):
+    for warps in (8, 4, 6):  # 6: 128 x 160 groups don't split into 6-warp blocks -> the last block's surplus warps redo a group
+      for in_features, sums in ((5120, False), (17408, True), (6144, True)):
+        with self.subTest(warps=warps, in_features=in_features, sums=sums), Context(NV_Q8_WARPS=warps):
+          prg = self._program(self._kernel(128, in_features, sums))
+          src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+          self.assertEqual(tuple(prg.arg.local_size), (32, warps, 1))
+          self.assertEqual(tuple(prg.arg.global_size), (-(-128 * in_features // 32 // warps), 1, 1))
+          self.assertIn(f"__launch_bounds__({32 * warps})", src)
+          self.assertEqual(src.count("__shfl_xor_sync"), 10 if sums else 5)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_multi_warp_runs_on_python_emulator(self):
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce  # handles the WARP lane + LOCAL warp ranges
+    tokens, in_features = 5, 96  # 15 (token, group)s: 8- and 4-warp blocks leave surplus warps in the last block
+    x = (np.random.default_rng(6).standard_normal((tokens, in_features)) * 3).astype(np.float32)
+    x[2, :32] = 0
+    ref_q, ref_scale, _ = np_q8_quantize(x)
+    for warps in (8, 4, 1):
+      with self.subTest(warps=warps), Context(NV_Q8_WARPS=warps), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+           mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):  # bypass the cache
+        q, scale, sums = (t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features, sums=True))
+        np.testing.assert_array_equal(q.view(np.int8).reshape(ref_q.shape), ref_q)
+        np.testing.assert_allclose(scale, ref_scale, rtol=1e-6)
+        np.testing.assert_array_equal(sums, (scale * ref_q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32))
+
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
   attn_gate/attn_qkv, attention q/k/v) -- q8_quantize must run once per distinct INPUT UOP, shared by every
