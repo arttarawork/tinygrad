@@ -158,12 +158,12 @@ def _shfl(val:UOp, src_lane:UOp) -> UOp:
   return UOp(Ops.CUSTOM, src=(val, src_lane.cast(dtypes.int32)), arg=("__shfl_sync(0xffffffff, {0}, {1})", dtypes.float))
 
 def _decode_mma_ok(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None) -> bool:
-  # KV_INT4 (uint8 nibbles; uint32 = the same bytes as words, the emulator test's form) with 32-wide scale blocks, G <= 8 heads per
-  # kv head (rows of one m-tile), D in 64/128/256 (each of the 8 mma row groups owns D/8 dims inside ONE scale block), sm_80+
+  # KV_INT4 (uint8 nibbles) with 32-wide scale blocks, G <= 8 heads per kv head (rows of one m-tile), D in 64/128/256 (each of the
+  # 8 mma row groups owns D/8 dims inside ONE scale block), sm_80+ (the int8 mma)
   from tinygrad.llm.kernels.nv_gemm import _nv_wmma_ok
   H, D, H_KV, N = q.shape[1], q.shape[3], cache_kv.shape[2], cache_kv.shape[3]
-  if cache_kv.dtype not in (dtypes.uint8, dtypes.uint32) or cache_kv_scale is None or not all(isinstance(x, int) for x in (H, D, H_KV, N)): return False
-  if D not in (64, 128, 256) or cache_kv_scale.shape[-1] * 32 != D or H % H_KV or H // H_KV > 8 or N % BLOCK_N: return False
+  if cache_kv.dtype != dtypes.uint8 or cache_kv_scale is None or not all(isinstance(x, int) for x in (H, D, H_KV, N)): return False
+  if D not in (64, 128, 256) or cache_kv_scale.shape[-1] * 32 != D or H % H_KV or not 2 <= H // H_KV <= 8 or N % BLOCK_N: return False
   return _nv_wmma_ok(q.device)
 
 @functools.cache
@@ -189,11 +189,11 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   Numerics vs the T4.107a kernel: q rounded to int8 per 32-block (llama.cpp's q8 x q4 K); P and V*sv rounded to fp16 for the PV
   mma (fp32 accumulate); softmax state in fp32."""
   valid_kv_len = _unbind(valid_kv_len)
-  if cache_kv.dtype != dtypes.uint32: cache_kv = cache_kv.flatten().bitcast(dtypes.uint32).reshape(*cache_kv.shape[:-1], cache_kv.shape[-1] // 4)
   _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, D = cast(tuple[int, int, int, int], q.shape)
   G, slots, KS, blocks, run = H // H_KV, cast(int, out.shape[2]), 16 * k_tiles, D // 32, D // 64  # run = V words per row group
-  assert M == 1 and G <= 8 and H % H_KV == 0 and D in (64, 128, 256) and max_kv_len == N and N % KS == 0 and cache_kv.shape[4] * 8 == D
+  assert M == 1 and 2 <= G <= 8 and H % H_KV == 0 and D in (64, 128, 256) and max_kv_len == N and N % KS == 0
+  assert cache_kv.dtype == dtypes.uint32 and cache_kv.shape[4] * 8 == D, "the int4 cache arrives as uint32 words (_decode_mma_attention)"
   live = (valid_kv_len + KS - 1) // KS
   S = min(live, slots) if isinstance(live, int) else live.minimum(slots)
   per_bh = (S + warps - 1) // warps
@@ -208,10 +208,13 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   from tinygrad.llm.kernels.nv_quant import _q8_pack
   head = kvh * G + g
   head_ok = g < G
+  # A masked index component is gated on the `dim` (or key) component, never on the head: the index lowering substitutes what a gate
+  # pins (oh < 2 pins t = 0) into the gated component and then drops a gate whose ranges no longer appear in it
+  # (schedule/indexing.py's reshape rewrite, pm_drop_and_clauses) -- a head-gated store rendered unconditional at G in {2, 3}
   zeros = (UOp.const(0, dtypes.int8),) * 4
   afrags, sqs = [], []
   for blk in range(blocks):
-    qv = [q[b, head.valid(head_ok) if G < 8 else head, 0, blk * 32 + 8 * t + i].load().float() for i in range(8)]
+    qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
     amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
     amax = amax.maximum(_shfl(amax, lane ^ 1))
     amax = amax.maximum(_shfl(amax, lane ^ 2))
@@ -274,13 +277,13 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   m_fin, l_fin = row_max.after(update)[0].load(), row_sum.after(update)[0].load()
   l_fin = l_fin + _shfl(l_fin, lane ^ 1)
   l_fin = l_fin + _shfl(l_fin, lane ^ 2)
-  stat_head = head.valid(t.eq(0) & head_ok)
+  stat_head = head.valid(t.eq(0) & head_ok)  # head keeps g (G >= 2: `g < G` pins nothing, eq is not parsed), so the gate survives
   stores = [stats[b, stat_head, slot, 0].store(m_fin * (1 / LOG2E)), stats[b, stat_head, slot, 1].store(l_fin)]
   for j, acc in enumerate(o_acc):
     vals = acc.after(update)
     for i in range(4):
       oh = 2 * t + i % 2
-      stores.append(out[b, (kvh * G + oh).valid(oh < G), slot, (D // 8) * g + 2 * j + i // 2].store(vals[i].load()))
+      stores.append(out[b, kvh * G + oh, slot, ((D // 8) * g + 2 * j + i // 2).valid(oh < G)].store(vals[i].load()))
   ends = (lane, warp, block) if warps > 1 else (lane, block)
   return UOp.group(*stores).end(*ends).sink(arg=KernelInfo(name="flash_decode_mma_nv", opts_to_apply=()))
 
@@ -291,8 +294,14 @@ def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, vali
   slots = min(NV_ATTN_DEC_SLOTS.value, N // (16 * k_tiles))
   partial = Tensor.empty(B, H, slots, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, slots, 2, dtype="float32", device=q.device)
-  fxn = functools.partial(_decode_mma_kernel, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles)
-  partial, stats = Tensor.custom_kernel(partial, stats, q.contiguous(), cache_kv, cache_kv_scale, fxn=fxn)[:2]
+  # Tensor.custom_kernel's call by hand so the int4 cache's parameter is uint32 words over the same uint8 buffer (a kernel argument
+  # is a pointer: no view, no copy -- a Tensor-level bitcast of the stored cache would schedule a full copy every step)
+  srcs = (partial, stats, q.contiguous(), cache_kv, cache_kv_scale)
+  params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
+  params[3] = UOp.placeholder((2, B, cast(int, cache_kv.shape[2]), N, D // 8), dtypes.uint32, slot=3)
+  kernel = _decode_mma_kernel(*params, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles)
+  call = kernel.call(*(s.uop for s in srcs))
+  partial, stats = Tensor(partial.uop.after(call)), Tensor(stats.uop.after(call))
   # live slots = ceil(valid / KS): _merge_partials counts ceil(valid' / BLOCK_N), so hand it valid' = valid * BLOCK_N / KS
   return _merge_partials(partial, stats, valid_kv_len * (BLOCK_N // (16 * k_tiles))).unsqueeze(2)
 
