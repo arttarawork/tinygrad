@@ -6,7 +6,6 @@ if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays nump
 # CI lanes (Test LLM, SPEC=2) have no numpy installed. The sampled speculative path imports it lazily inside the
 # functions that actually need it; annotations are lazy via `from __future__ import annotations`.
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.engine.realize import capturing
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
@@ -1598,14 +1597,7 @@ class Transformer:
       x = vis_m[:, :T].to(x.device).unsqueeze(-1).where(vis_e[:, :T].to(x.device).float(), x)
       rope = vis_pos[:, :T]
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
-    # T4.128: TinyJit's first (eager) call runs a prefill chunk as ONE unplanned schedule, so every block's temporaries (e.g. 16 x 50 MB
-    # prefill-attention partials at 128 tokens) are alive at once -- at 262k that eager pass, not the planned capture, is the card's
-    # memory peak (10-28: within ~50 MB of OOM). Outside a capture, realize block by block so each block's temporaries are freed
-    # before the next. Never during a capture: per-block linears defeat the planner's buffer sharing (10-28: arenas 315 MB -> 3.5 GB).
-    per_block = resolve(tokens.shape[1] != 1) and not capturing
-    for block in self.blk:
-      x = cast(Tensor, block(x.to(block.device), start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
-      if per_block: x = x.realize()
+    for block in self.blk: x = cast(Tensor, block(x.to(block.device), start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
