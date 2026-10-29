@@ -437,13 +437,18 @@ class TransformerConfig:
   # override that never needed to reach FFNBlock.__init__ at all).
   tp: tuple[tuple[str, float], ...] = ()
 
+# T4.132: the NV decode fusions below (the fused norm/residual/activation kernels, one block per token) serve a concrete run of up to
+# this many tokens -- nv_q8_linear's dp4a gemv batch cap (kernels/nv_quant.py: tokens > 4 take the gemm/generic path), the same
+# run the GDN decode kernels cover (GDN_DECODE_TOKENS) -- i.e. a decode step (1) or speculative decoding's VERIFY/REDO (<= k+1).
+NV_SMALL_T = 4
+
 def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Linear) -> Tensor:
-  """norm(x) -- T4.125b: on the NV decode path (concrete T==1, `weight` = norm's fp32 copy prepared at load, every consumer an
-  NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
+  """norm(x) -- T4.125b: on the NV decode path (concrete T <= NV_SMALL_T, `weight` = norm's fp32 copy prepared at load, every consumer
+  an NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
   register_fused_q8 hands that quantize the kernel's (q, scale), so the RMSNorm graph returned here is never read -- _ffn_output's
   trick at the attention blocks' attn_norm (q/k/v) and at output_norm (the head). Anything else: plain norm(x), byte-identical."""
   T, dim = x.shape[1], x.shape[-1]
-  if not (isinstance(T, int) and T == 1 and isinstance(dim, int) and dim % 256 == 0 and weight is not None
+  if not (isinstance(T, int) and T <= NV_SMALL_T and isinstance(dim, int) and dim % 256 == 0 and weight is not None
           and nv_quant_supported(weight.device) and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
   tokens = T * cast(int, x.shape[0])
   _, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), weight, norm.eps)
@@ -556,7 +561,7 @@ class FFNBlock:
     # launches/step on the 27B (T4.123 profile, P3). Every other path (generic dequant+matmul, AMD, prefill,
     # symbolic T) keeps the contiguous: this task must not change their kernels or numerics.
     T = x.shape[1]
-    if (isinstance(T, int) and T == 1 and nv_quant_supported(self.ffn_gate.weight.device)
+    if (isinstance(T, int) and T <= NV_SMALL_T and nv_quant_supported(self.ffn_gate.weight.device)
         and self.ffn_gate.ggml_type in NV_QUANT_TYPES and self.ffn_up.ggml_type in NV_QUANT_TYPES):
       gate, up = self.ffn_gate(x), self.ffn_up(x)
       # T4.127a: when ffn_down will actually read it through nv_q8_linear (same build-only-if-consumed guard
@@ -589,7 +594,7 @@ class FFNBlock:
     lowered. Every other path (MoE, tensor-parallel FFN, symbolic T, non-NV, ggml_type not yet probed or not
     NV-quantized, norm weights not prepared by prepare_nv_norms) keeps the original two-step byte-identical form."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
+    if (isinstance(T, int) and T <= NV_SMALL_T and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
         and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
         and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
       tokens = T * cast(int, x.shape[0])
@@ -968,7 +973,7 @@ class GatedDeltaNetBlock(FFNBlock):
     q8_quantize_nv per GDN block per step) -- register_fused_q8 hands them the kernel's own (q, scale), quantized from
     the fp32 normed value instead of its fp16 rounding (a small numerics change); ssm_beta/ssm_alpha keep the fp16 copy."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.nv_norm_weights is not None
+    if (isinstance(T, int) and T <= NV_SMALL_T and dim % 256 == 0 and self.nv_norm_weights is not None
         and nv_quant_supported(self.nv_norm_weights[0].device)):
       tokens = T * cast(int, x.shape[0])
       _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
@@ -1655,7 +1660,8 @@ class Transformer:
       # since-reverted partial-accept path -- see SPEC_NOTES.md/SPEC_FIXES_NOTES.md). T4.66d's partial-accept
       # REDO call (spec=True, same as this one) also uses this return shape; it wants only its own last position
       # too. Callers that only ever wanted the last position (the prefill tail) slice `[:, -1:]` themselves.
-      return self.output(self.output_norm(x)), x.contiguous()  # (B,T,vocab) logits, (B,T,D) hidden
+      # T4.132: the head's norm fused with its q8 quantize at a concrete small width (nv_fused_norm gates; symbolic T = plain norm)
+      return self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x, self.output)), x.contiguous()  # (B,T,vocab), (B,T,D)
     # only run the output projection on the last token
     logits = self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x[:, -1:], self.output))[:, -1, :]  # T4.125b
     # T4.92: presence penalty -- self.penalty_mask is a (1,vocab) 0/1 buffer, reset in place at the start of generate() and
