@@ -455,6 +455,54 @@ class TestFFNActQ8Kernel(unittest.TestCase):
     np.testing.assert_allclose(scale_np, ref_scale, rtol=1e-6)
     np.testing.assert_array_equal(q_np.view(np.int8).reshape(ref_q.shape), ref_q)
 
+def np_q8_quantize(x:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """q8_quantize_nv's math on (tokens, in_features) fp32: int8 q (tokens, groups, 32), scale, and T4.128's group sums scale*sum(q)."""
+  g = x.reshape(x.shape[0], -1, Q8_GROUP_SIZE)
+  scale = np.maximum(np.abs(g).max(-1) / np.float32(127), np.float32(1e-8)).astype(np.float32)
+  q = np.clip(np.rint(g / scale[..., None]), -127, 127).astype(np.int8)
+  return q, scale, (scale * q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32)
+
+class TestQ8QuantizeSums(unittest.TestCase):
+  """T4.128: q8_quantize's optional group-sums output (the IMMA Q4_1/Q5_K prefill's activation side): computed in the same kernel,
+  q/scale unchanged by it, the plain kernel's graph untouched, and the variant its own cache entry."""
+  def _params(self, tokens:int, in_features:int, sums:bool) -> list[UOp]:
+    groups = in_features // Q8_GROUP_SIZE
+    return [UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=0), UOp.placeholder((tokens, groups), dtypes.float32, slot=1),
+            UOp.placeholder((tokens * in_features,), dtypes.float32, slot=2)] + \
+           ([UOp.placeholder((tokens, groups), dtypes.float32, slot=3)] if sums else [])
+
+  def test_plain_kernel_has_no_third_reduce(self):
+    plain = nv_quant._q8_quantize_kernel.__wrapped__(*self._params(4, 256, False), tokens=4, in_features=256)
+    with_sums = nv_quant._q8_quantize_kernel.__wrapped__(*self._params(4, 256, True), tokens=4, in_features=256)
+    def shuffles(sink:UOp) -> int: return sum(1 for u in sink.toposort() if u.op is Ops.CUSTOM and "__shfl_xor_sync" in u.arg[0])
+    self.assertEqual((shuffles(plain), shuffles(with_sums)), (5, 10))
+
+  def test_variant_is_its_own_cache_entry(self):
+    x = Tensor.randn(2, 64)
+    q, s = q8_quantize(x, 2, 64)
+    q2, s2, sums = q8_quantize(x, 2, 64, sums=True)
+    self.assertIsNot(q.uop, q2.uop)
+    self.assertEqual(sums.shape, (2, 2))
+    self.assertIs(q8_quantize(x, 2, 64, sums=True)[2].uop, sums.uop)
+    self.assertIs(q8_quantize(x, 2, 64)[0].uop, q.uop)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_runs_on_python_emulator(self):
+    tokens, in_features = 3, 128
+    x = (np.random.default_rng(5).standard_normal((tokens, in_features)) * 3).astype(np.float32)
+    x[1, 32:64] = 0  # an all-zero group: scale clamps to 1e-8, sums 0
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce_one_warp), \
+         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):  # bypass the cache
+      plain = [t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features)]
+      q, scale, sums = (t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features, sums=True))
+    ref_q, ref_scale, ref_sums = np_q8_quantize(x)
+    np.testing.assert_array_equal(q, plain[0])
+    np.testing.assert_array_equal(scale, plain[1])
+    np.testing.assert_array_equal(q.view(np.int8).reshape(ref_q.shape), ref_q)
+    np.testing.assert_allclose(scale, ref_scale, rtol=1e-6)
+    np.testing.assert_array_equal(sums, (scale * ref_q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32))  # exact
+    np.testing.assert_allclose(sums, ref_sums, rtol=1e-6)
+
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN
   attn_gate/attn_qkv, attention q/k/v) -- q8_quantize must run once per distinct INPUT UOP, shared by every

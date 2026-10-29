@@ -97,7 +97,9 @@ def _decode_linear(out:UOp, xq:UOp, xd:UOp, out_features:int, group_count:int, g
   return UOp.group(*stores).end(token_output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) -> UOp:
+def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:int, in_features:int) -> UOp:
+  # T4.128: `sums` (optional 4th param, an output after the input so the 3-param kernel and its render stay as they were) gets
+  # xd * sum(q8) per (token, group) -- llama.cpp q8_1's `s`, the activation side of Q4_1's +m and Q5_K's -dmin*m terms
   groups = in_features//Q8_GROUP_SIZE
   token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
@@ -108,6 +110,11 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
   word = sum(((v/group_scale).round().clip(-127, 127).cast(dtypes.int8).cast(dtypes.uint8).cast(dtypes.uint32) << (i*8)
               for i,v in enumerate(xs)), UOp.const(0, dtypes.uint32))
   stores = (q[token, group, lane.valid(lane < 8)].store(word), scale[token, group.valid(lane.eq(0))].store(group_scale))
+  if sums is not None:
+    # T4.128: each lane's own element quantized exactly as the packing does, summed by one more warp reduce (integers <= 32*127:
+    # exact in fp32 in any order), times the scale once
+    qsum = warp_reduce((x[token, group, lane].float()/group_scale).round().clip(-127, 127), full_wave=True)
+    stores += (sums[token, group.valid(lane.eq(0))].store(group_scale * qsum),)
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
 
 # T4.123a: several Linears in one forward step quantize the SAME activation (FFN gate+up, GDN attn_gate/attn_qkv,
@@ -122,18 +129,22 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, tokens:int, in_features:int) ->
 # big bound would pin up to that many old activation graphs (and the buffers an eager/capture run realized for them) on a
 # card that runs within ~1 GB of full at 262k context.
 @functools.lru_cache(maxsize=16)
-def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int) -> tuple[UOp, UOp]:
+def _q8_quantize_cached(x_uop:UOp, tokens:int, in_features:int, sums:bool) -> tuple[UOp, ...]:
   x = Tensor(x_uop)
   groups = in_features//Q8_GROUP_SIZE
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
-  q, scale = Tensor.custom_kernel(q, scale, x, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))[:2]
-  return q.uop, scale.uop
+  extra = [Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)] if sums else []
+  outs = Tensor.custom_kernel(q, scale, x, *extra, fxn=functools.partial(_q8_quantize_kernel, tokens=tokens, in_features=in_features))
+  return tuple(t.uop for t in outs[:2] + outs[3:])
 
-def q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Tensor]:
-  if (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
-  q_uop, scale_uop = _q8_quantize_cached(x.uop, tokens, in_features)
-  return Tensor(q_uop), Tensor(scale_uop)
+def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple[Tensor, ...]:
+  """(q, scale), or with sums=True (q, scale, sums) -- T4.128: the IMMA Q4_1/Q5_K prefill kernels need the per-group sums. The
+  variant is its own cache entry rather than always computed: the plain kernel (every decode quantize, the Q4_0 prefill one) keeps
+  its render, and no activation of the 27B feeds both kinds of consumer (Q4_1 ffn_down and Q5_K ssm_out read their own inputs), so
+  the split never costs a second launch. The fused (decode-only) entries carry no sums and are skipped for a sums request."""
+  if not sums and (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
+  return tuple(Tensor(u) for u in _q8_quantize_cached(x.uop, tokens, in_features, sums))
 
 # T4.123e: model.py's _ffn_output/GatedDeltaNetBlock's own norm-site helper call self.ffn_norm(h)/self.attn_norm(x)
 # completely normally (building nn.RMSNorm's ordinary lazy graph -- the exact Tensor object every consumer Linear
