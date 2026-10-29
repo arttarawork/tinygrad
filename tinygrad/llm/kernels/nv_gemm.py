@@ -73,6 +73,9 @@ NV_IMMA_PIPE = ContextVar("NV_IMMA_PIPE", 0)
 # T4.131: occupancy. The T4.126 kernel takes 196 registers (ptxas, nvcc 12.8 sm_86) = 2 blocks of 4 warps per SM; min blocks per SM
 # through __launch_bounds__(threads, n): 3 -> 158 registers, 0 spills; 4 -> 128 registers, 144 B spills. 0 = today's render
 NV_IMMA_MINBLOCKS = ContextVar("NV_IMMA_MINBLOCKS", 0)
+# T4.131: 1 = the next stage's weight words are loaded into registers one stage ahead (their global-load latency, exposed at the
+# top of every step today, hides behind this stage's mmas); 0 = today's kernel, byte-identical. Costs one register per word read
+NV_IMMA_WPREFETCH = ContextVar("NV_IMMA_WPREFETCH", 0)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -463,9 +466,24 @@ IMMA_FORMATS: dict[int, tuple[Callable, Callable, str]] = {
   Q4_0: (_q4_0_imma_b, _q4_0_imma_scales, "linear_q4_0_imma_nv"), Q4_1: (_q4_1_imma_b, _q4_1_imma_scales, "linear_q4_1_imma_nv"),
   Q5_K: (_q5_k_imma_b, _q5_k_imma_scales, "linear_q5_k_imma_nv")}
 
+class _RegRaw:
+  """T4.131 (NV_IMMA_WPREFETCH=1): a stand-in for `raw` in the imma_b/imma_scales calls. Record mode (regs and raw): every raw[i]
+  becomes a global load stored into the next slot of the register array `regs`; replay mode (regs only): the same call sequence
+  hands the slots back, in order, as register loads; count mode (raw only) just counts the reads to size the array. The format
+  functions' call order is the whole contract -- the index arithmetic (Q5_K's sub-block shift and bit) is recomputed on replay
+  from the stage being computed, only the words come from the registers."""
+  def __init__(self, regs:UOp|None, raw:UOp|None): self.regs, self.raw, self.k, self.stores, self.loads = regs, raw, 0, [], []
+  def __getitem__(self, idx:UOp) -> UOp:
+    k, self.k = self.k, self.k + 1
+    if self.raw is None:
+      self.loads.append(ld := cast(UOp, self.regs)[k].load())
+      return ld
+    if self.regs is not None: self.stores.append(self.regs[k].store(self.raw[idx]))
+    return self.raw[idx]
+
 @functools.cache
 def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
-                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0) -> UOp:
+                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0, wprefetch:int=0) -> UOp:
   """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
   (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
   acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
@@ -569,15 +587,42 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
     def word(row, w:int, s:int): return xq[t0 + row, step, w]
     def scale(row, s:int): return xd[t0 + row, step]
     def gsum(row, s:int): return cast(UOp, xsum)[t0 + row, step]
+  def wside(rr, at) -> list[tuple[UOp, tuple]]:
+    # the weight side of stage `at` read through raw view rr (raw itself, or T4.131's _RegRaw): per (s, n-tile) the B fragment and
+    # (D, M) for outputs 2t and 2t+1 -- this call order is _RegRaw's record/replay contract
+    vals = []
+    for s in range(S):
+      group = at*S + s
+      for n0 in n0s:
+        bfrag = UOp.stack(*(b for word32 in imma_b(rr, n0 + g, groups, group, t) for b in _i8x4(word32)))
+        vals.append((bfrag, tuple(imma_scales(rr, n0 + 2*t + j, groups, group) for j in (0, 1))))
+    return vals
+  if wprefetch:
+    # T4.131: the weight words of stage step+1 (every raw[] read imma_b/imma_scales make: Q4_0 2 qs + 2 d per (group, n-tile)) are
+    # loaded one stage ahead into a register array that lives across the loop back-edge, so their global-load latency hides behind
+    # this stage's mmas (T4.128's pipe did that for the activation tile only; the weights were the latency left exposed at the top
+    # of every step). The prologue loads stage 0; the step replays the array for its own stage, then refills it with the next
+    # stage's words (the last step reloads the last stage: a harmless re-read, no gate, as pipe's fill). The refill stores go
+    # through a view `after` the replay loads, so the linearizer can never put a refill ahead of the read it would clobber
+    probe = _RegRaw(None, raw)
+    wside(probe, step.const_like(0))
+    wregs = UOp.placeholder((probe.k,), raw.dtype, slot=103, addrspace=AddrSpace.REG)  # the raw view's word type (u16 or u32)
+    first = _RegRaw(wregs, raw)
+    wside(first, step.const_like(0))
+    wr = wregs.after(UOp.group(*first.stores)).after(step)
+    replay = _RegRaw(wr, None)
+    wvals = wside(replay, step)
+    ahead = _RegRaw(wr.after(*replay.loads), raw)
+    wside(ahead, (step + 1).minimum(groups // S - 1))
+    prefetch += ahead.stores
+  else: wvals = wside(raw, step)
   running = [[acc.after(step) for acc in row] for row in accs]
   for s in range(S):
-    group = step*S + s
     afrags = tuple(UOp.stack(*(b for r in range(4) for b in _i8x4(word(r0 + g + 8*(r % 2), t + 4*(r // 2), s)))) for r0 in r0s)
     xss = tuple(UOp.stack(*(scale(r0 + g + 8*(i // 2), s) for i in range(4))) for r0 in r0s)  # C's m index: g for c0/c1, g+8 for c2/c3
     if xsum is not None: sss = tuple(UOp.stack(*(gsum(r0 + g + 8*(i // 2), s) for i in range(4))) for r0 in r0s)
-    for o, n0 in enumerate(n0s):
-      bfrag = UOp.stack(*(b for word32 in imma_b(raw, n0 + g, groups, group, t) for b in _i8x4(word32)))
-      dm = tuple(imma_scales(raw, n0 + 2*t + j, groups, group) for j in (0, 1))
+    for o in range(out_tiles):
+      bfrag, dm = wvals[s*out_tiles + o]
       dws = UOp.stack(*(dm[i % 2][0] for i in range(4)))  # C's n index: 2t for c0/c2, 2t+1 for c1/c3
       mws = None if dm[0][1] is None else UOp.stack(*(dm[i % 2][1] for i in range(4)))
       for mt, afrag in enumerate(afrags):
@@ -626,7 +671,7 @@ def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
   while stage > 1 and copies*token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
   return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage, "pipe": int(copies == 2),
-          "minblocks": NV_IMMA_MINBLOCKS.value}
+          "minblocks": NV_IMMA_MINBLOCKS.value, "wprefetch": NV_IMMA_WPREFETCH.value}
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to
