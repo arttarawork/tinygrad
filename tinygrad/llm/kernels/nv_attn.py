@@ -126,7 +126,10 @@ def _merge_partials(partial:Tensor, stats:Tensor, valid_kv_len:int|UOp) -> Tenso
 
 def nv_decode_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, valid_kv_len:int|UOp) -> Tensor:
   """q (B,H,1,D) against the cache (already written through for this step, so the AFTER chain orders the kernel behind the store);
-  valid_kv_len = start_pos+1 stays bound at the graph level. Returns (B,H,1,D) in float32."""
+  valid_kv_len = start_pos+1 stays bound at the graph level. Returns (B,H,1,D) in float32. T4.129: a KV_INT4 cache on sm_80+ takes
+  the tensor-core kernel (_decode_mma_kernel) unless NV_ATTN_DEC_MMA=0."""
+  if NV_ATTN_DEC_MMA.value and _decode_mma_ok(q, cache_kv, cache_kv_scale):
+    return _decode_mma_attention(q, cache_kv, cast(Tensor, cache_kv_scale), valid_kv_len)
   B, H, D = cast(int, cache_kv.shape[1]), cast(int, q.shape[1]), cast(int, q.shape[3])
   N = cast(int, cache_kv.shape[3])
   chunks = min(MAX_CHUNKS, N // BLOCK_N)
@@ -136,6 +139,172 @@ def nv_decode_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, v
   srcs = (partial, stats, q.contiguous(), cache_kv) + ((cache_kv_scale,) if cache_kv_scale is not None else ())
   partial, stats = Tensor.custom_kernel(*srcs, fxn=fxn)[:2]
   return _merge_partials(partial, stats, valid_kv_len).unsqueeze(2)
+
+# ******** T4.129: KV_INT4 decode on the tensor cores ********
+# The T4.107a kernel above reached ~159 GB/s at a 131k fill (951 us per layer for 151 MB): every key cost a 32-lane shuffle-reduce
+# dot per GQA head (G = 6), a long serial chain per key at ~12 one-warp blocks per SM. Here the G heads of a kv head are the rows
+# of int8 mma tiles instead, so a key costs ~1/16 of an mma for S and ~1/16 for P.V, and the per-key work is a handful of
+# fragment unpacks. Knobs are read in _decode_mma_attention only (never inside the cached builder):
+NV_ATTN_DEC_MMA = ContextVar("NV_ATTN_DEC_MMA", 1)       # 0 = the T4.107a kernel for KV_INT4 too (A/B)
+NV_ATTN_DEC_SLOTS = ContextVar("NV_ATTN_DEC_SLOTS", 256)  # partial slots per (batch, q head) at most (= warps per kv head)
+NV_ATTN_DEC_WARPS = ContextVar("NV_ATTN_DEC_WARPS", 4)    # warps (each its own slot) per block
+NV_ATTN_DEC_KTILES = ContextVar("NV_ATTN_DEC_KTILES", 1)  # 16-key tiles per loop step (one softmax rescale per step); divides 8
+DEC_IMMA_ARG = ((WMMA_N, WMMA_M, 32), 'CUDA', WARP_SIZE)  # m16n8k32 s8 -> s32 ('CUDA': the PYTHON emulator's fragment model; the
+DEC_HMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)  # renderer ignores the string) and m16n8k16 f16 -> f32
+MAGIC = 0x4B400000  # bitcast(MAGIC + c) = 1.5*2**23 + c exactly for |c| < 2**22 (T4.126): int32 -> fp32 without an I2F
+
+def _shfl(val:UOp, src_lane:UOp) -> UOp:
+  """T4.129: __shfl_sync from hardware lane src_lane (the kernel's lane range is AxisType.WARP: lane IS the hardware lane)."""
+  return UOp(Ops.CUSTOM, src=(val, src_lane.cast(dtypes.int32)), arg=("__shfl_sync(0xffffffff, {0}, {1})", dtypes.float))
+
+def _decode_mma_ok(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None) -> bool:
+  # KV_INT4 (uint8 nibbles) with 32-wide scale blocks, G <= 8 heads per kv head (rows of one m-tile), D in 64/128/256 (each of the
+  # 8 mma row groups owns D/8 dims inside ONE scale block), sm_80+ (the int8 mma)
+  from tinygrad.llm.kernels.nv_gemm import _nv_wmma_ok
+  H, D, H_KV, N = q.shape[1], q.shape[3], cache_kv.shape[2], cache_kv.shape[3]
+  if cache_kv.dtype != dtypes.uint8 or cache_kv_scale is None or not all(isinstance(x, int) for x in (H, D, H_KV, N)): return False
+  if D not in (64, 128, 256) or cache_kv_scale.shape[-1] * 32 != D or H % H_KV or not 2 <= H // H_KV <= 8 or N % BLOCK_N: return False
+  return _nv_wmma_ok(q.device)
+
+@functools.cache
+def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, valid_kv_len:int|UOp, max_kv_len:int, warps:int,
+                       k_tiles:int) -> UOp:
+  """T4.129: _decode_partial_kernel's contract -- (acc, m, l) per (batch, q head, slot) for _merge_partials -- for a KV_INT4 cache, on
+  the tensor cores. Grid: (batch x kv head) x slot blocks of `warps` warps; each warp is one slot and walks chunks slot, slot+S,
+  slot+2S, ... of KS = 16*k_tiles keys (S = live slots = min(ceil(valid/KS), out.shape[2])); lane is AxisType.WARP (threadIdx.x,
+  never split), g = lane//4, t = lane%4 (nv_gemm's fragment maps). Per 16-key tile:
+
+  S = Q.K^T on mma.m16n8k32 s8 (two 8-key n-tiles x one mma per 32-dim scale block): A = the G heads' q, quantized to int8 per
+  (head, block) in the prologue (rows g; rows g+8 and heads >= G are zero), B = the int4 K words as int8 (nibble-8, T4.126's
+  unsign). Lane (g, t) gives word 4*blk+t of key g: low nibbles = k 4t..4t+3, high nibbles = k 16+4t.., and A takes q's dims in the
+  same order (dims 32*blk+8t+2i / +1), so k never leaves the block and the int32 C is that block's exact dot. The block's scales
+  join in fp32: S += float(C) * sq[head, blk] * sk[key, blk], float(C) via MAGIC (folded into the mma's C init). sq carries
+  log2(e)/sqrt(D): S is in the exp2 domain.
+  The online softmax runs on C's (row g = head, cols 2t, 2t+1 = keys) -- per head over the tile by two xor shuffles -- and the
+  same registers ARE the B fragment of O^T += V^T.P^T on mma.m16n8k16 f16 (B[k][n] = P[key k][head n]: k 2t, 2t+1 from n-tile 0,
+  2t+8, 2t+9 from n-tile 1, n = g), so P never moves. M = 16 dims per m-tile: row g -> dim D/8*g + 2j (low nibble of byte j of
+  row g's D/16-byte run), row g+8 -> the high nibble, so a lane reads one D/16-byte run of V per key and its rows sit in one
+  scale block: A = (nibble-8)*sv in fp16 (the prefill kernel's V rounding). C of O^T is (dims, heads 2t/2t+1): the rescale
+  needs alpha of heads 2t and 2t+1, two shuffles from lanes 8t, 8t+4. Stored m is natural-log (the merge's convention).
+  Numerics vs the T4.107a kernel: q rounded to int8 per 32-block (llama.cpp's q8 x q4 K); P and V*sv rounded to fp16 for the PV
+  mma (fp32 accumulate); softmax state in fp32."""
+  valid_kv_len = _unbind(valid_kv_len)
+  _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
+  _, H, M, D = cast(tuple[int, int, int, int], q.shape)
+  G, slots, KS, blocks, run = H // H_KV, cast(int, out.shape[2]), 16 * k_tiles, D // 32, D // 64  # run = V words per row group
+  assert M == 1 and 2 <= G <= 8 and H % H_KV == 0 and D in (64, 128, 256) and max_kv_len == N and N % KS == 0
+  assert cache_kv.dtype == dtypes.uint32 and cache_kv.shape[4] * 8 == D, "the int4 cache arrives as uint32 words (_decode_mma_attention)"
+  live = (valid_kv_len + KS - 1) // KS
+  S = min(live, slots) if isinstance(live, int) else live.minimum(slots)
+  per_bh = (S + warps - 1) // warps
+  block = UOp.range(B * H_KV * per_bh, 0, AxisType.GLOBAL)
+  warp = UOp.range(warps, 1, AxisType.LOCAL) if warps > 1 else UOp.const(0, dtypes.weakint)
+  lane = UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  bh, slot = block // per_bh, ((block % per_bh) * warps + warp).minimum(S - 1)  # surplus warps redo the last slot: same values
+  b, kvh = bh // H_KV, bh % H_KV
+  g, t = lane // 4, lane % 4
+  # prologue: this lane's A fragments (head g, dims 32*blk+8t..+7) and the per-(head, block) scales, q8_quantize's rounding
+  from tinygrad.llm.kernels.nv_gemm import _i8x4
+  from tinygrad.llm.kernels.nv_quant import _q8_pack
+  head = kvh * G + g
+  head_ok = g < G
+  # A masked index component is gated on the `dim` (or key) component, never on the head: the index lowering substitutes what a gate
+  # pins (oh < 2 pins t = 0) into the gated component and then drops a gate whose ranges no longer appear in it
+  # (schedule/indexing.py's reshape rewrite, pm_drop_and_clauses) -- a head-gated store rendered unconditional at G in {2, 3}
+  zeros = (UOp.const(0, dtypes.int8),) * 4
+  afrags, sqs = [], []
+  for blk in range(blocks):
+    qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
+    amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
+    amax = amax.maximum(_shfl(amax, lane ^ 1))
+    amax = amax.maximum(_shfl(amax, lane ^ 2))
+    sq = (amax / 127).maximum(1e-8)
+    afrags.append(UOp.stack(*_i8x4(_q8_pack(tuple(qv[0::2]), sq)), *zeros, *_i8x4(_q8_pack(tuple(qv[1::2]), sq)), *zeros))
+    # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
+    sqs.append((amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D)))
+  row_max, row_sum = _reg((1,), 1, SENTINEL, block), _reg((1,), 2, 0, block)
+  o_acc = tuple(_reg((4,), 10 + j, 0, block) for j in range(D // 16))  # O^T m-tile j: (dim rows g, g+8) x (heads 2t, 2t+1)
+  steps = (live + S - 1) // S
+  step = UOp.range(steps, 100, AxisType.REDUCE)
+  base = (slot + step * S) * KS
+  def unsign(x:UOp) -> UOp: return (x + 0x78787878) ^ 0x80808080  # 4 nibbles (one per byte) -> 4 int8 nibble-8, T4.126
+  scores, oks, tiles = [], [], []
+  for kt in range(k_tiles):
+    keys = [base + 16 * kt + 8 * nt + 2 * t + i for nt in range(2) for i in range(2)]  # this lane's C keys = its PV k 2t, 2t+1, +8, +9
+    key_ok = [key < valid_kv_len for key in keys]
+    for nt in range(2):
+      kb = base + 16 * kt + 8 * nt + g  # this lane's B (K) key
+      kb = kb.valid(kb < valid_kv_len)
+      sks = [[scale[0, b, kvh, key.valid(ok), blk].load().float() for blk in range(blocks)]
+             for key, ok in zip(keys[2*nt:2*nt+2], key_ok[2*nt:2*nt+2])]
+      s = [UOp.const(0, dtypes.float), UOp.const(0, dtypes.float)]
+      for blk in range(blocks):
+        word = cache_kv[0, b, kvh, kb, 4 * blk + t].load()
+        bfrag = UOp.stack(*_i8x4(unsign(word & 0x0F0F0F0F)), *_i8x4(unsign((word >> 4) & 0x0F0F0F0F)))
+        c = (UOp.wmma(afrags[blk], bfrag, UOp.const((0,) * 4, dtypes.int32), *DEC_IMMA_ARG) + MAGIC).bitcast(dtypes.float32)
+        # (c - 1.5*2**23) * d, never (c + s) - 1.5*2**23: the symbolic pass reassociates a constant out of an add chain
+        s = [s[i] + (c[i] - 12582912.0) * (sqs[blk] * sks[i][blk]) for i in range(2)]
+      scores += s
+    oks += key_ok
+    tiles.append(keys)
+  prev_max, prev_sum = row_max.after(step)[0].load(), row_sum.after(step)[0].load()
+  tile_max = functools.reduce(lambda a, x: a.maximum(x), (ok.where(sc, SENTINEL) for sc, ok in zip(scores, oks)))
+  tile_max = tile_max.maximum(_shfl(tile_max, lane ^ 1))
+  tile_max = tile_max.maximum(_shfl(tile_max, lane ^ 2))  # head g's max over the step's keys (the 4 lanes of row g)
+  new_max = prev_max.maximum(tile_max)
+  alpha = (prev_max - new_max).exp2()
+  ps = [ok.where((sc - new_max).exp2(), 0.0) for sc, ok in zip(scores, oks)]
+  new_sum = prev_sum * alpha + functools.reduce(lambda a, x: a + x, ps)  # this lane's keys only: the 4 lanes are summed at the end
+  alphas = (_shfl(alpha, 8 * t), _shfl(alpha, 8 * t + 4))  # O^T's columns are heads 2t, 2t+1 = S rows of lanes 8t, 8t+4
+  # V: per tile key, this lane's run of row group g (D/16 bytes) and its block's scale, as fp16
+  vruns = [[[cache_kv[1, b, kvh, key.valid(ok), run * g + w].load() for w in range(run)] for key, ok in zip(keys, key_ok)]
+           for keys, key_ok in zip(tiles, [oks[4*kt:4*kt+4] for kt in range(k_tiles)])]
+  svs = [[scale[1, b, kvh, key.valid(ok), (D // 8) * g // 32].load() for key, ok in zip(keys, oks[4*kt:4*kt+4])] for kt, keys in enumerate(tiles)]
+  def vval(kt:int, k:int, j:int, high:int) -> UOp:
+    # dim row of byte j (high nibble: row g+8) of tile key k, (nibble - 8) * sv in fp16: 0x6400|n is 1024+n exactly
+    nib = (vruns[kt][k][j // 4] >> (8 * (j % 4) + 4 * high)) & 0xF
+    return ((nib | 0x6400).cast(dtypes.uint16).bitcast(dtypes.float16) - 1032.0) * svs[kt][k]
+  pfrags = [UOp.stack(*(p.cast(dtypes.float16) for p in ps[4*kt:4*kt+4])) for kt in range(k_tiles)]
+  o_stores = []
+  for j, acc in enumerate(o_acc):
+    prev = acc.after(step)
+    o = UOp.stack(*(prev[i].load() * alphas[i % 2] for i in range(4)))
+    for kt in range(k_tiles):
+      # A e0..e7 = (rows g, g+8) x (k 2t, 2t+1, 2t+8, 2t+9) in the m16n8k16 order: A[g][2t], A[g][2t+1], A[g+8][2t], A[g+8][2t+1], ...
+      afrag = UOp.stack(*(vval(kt, 2 * kh + kk, j, high) for kh in range(2) for high in range(2) for kk in range(2)))
+      o = UOp.wmma(afrag, pfrags[kt], o, *DEC_HMMA_ARG)
+    o_stores.append(acc.store(o))
+  update = UOp.group(*o_stores, row_max[0].store(new_max), row_sum[0].store(new_sum)).end(step)
+  m_fin, l_fin = row_max.after(update)[0].load(), row_sum.after(update)[0].load()
+  l_fin = l_fin + _shfl(l_fin, lane ^ 1)
+  l_fin = l_fin + _shfl(l_fin, lane ^ 2)
+  stat_head = head.valid(t.eq(0) & head_ok)  # head keeps g (G >= 2: `g < G` pins nothing, eq is not parsed), so the gate survives
+  stores = [stats[b, stat_head, slot, 0].store(m_fin * (1 / LOG2E)), stats[b, stat_head, slot, 1].store(l_fin)]
+  for j, acc in enumerate(o_acc):
+    vals = acc.after(update)
+    for i in range(4):
+      oh = 2 * t + i % 2
+      stores.append(out[b, kvh * G + oh, slot, ((D // 8) * g + 2 * j + i // 2).valid(oh < G)].store(vals[i].load()))
+  ends = (lane, warp, block) if warps > 1 else (lane, block)
+  return UOp.group(*stores).end(*ends).sink(arg=KernelInfo(name="flash_decode_mma_nv", opts_to_apply=()))
+
+def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, valid_kv_len:int|UOp) -> Tensor:
+  B, H, D, N = cast(int, cache_kv.shape[1]), cast(int, q.shape[1]), cast(int, q.shape[3]), cast(int, cache_kv.shape[3])
+  k_tiles = NV_ATTN_DEC_KTILES.value
+  assert BLOCK_N % (16 * k_tiles) == 0, f"NV_ATTN_DEC_KTILES={k_tiles} must divide {BLOCK_N // 16}"
+  slots = min(NV_ATTN_DEC_SLOTS.value, N // (16 * k_tiles))
+  partial = Tensor.empty(B, H, slots, D, dtype="float32", device=q.device)
+  stats = Tensor.empty(B, H, slots, 2, dtype="float32", device=q.device)
+  # Tensor.custom_kernel's call by hand so the int4 cache's parameter is uint32 words over the same uint8 buffer (a kernel argument
+  # is a pointer: no view, no copy -- a Tensor-level bitcast of the stored cache would schedule a full copy every step)
+  srcs = (partial, stats, q.contiguous(), cache_kv, cache_kv_scale)
+  params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
+  params[3] = UOp.placeholder((2, B, cast(int, cache_kv.shape[2]), N, D // 8), dtypes.uint32, slot=3)
+  kernel = _decode_mma_kernel(*params, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles)
+  call = kernel.call(*(s.uop for s in srcs))
+  partial, stats = Tensor(partial.uop.after(call)), Tensor(stats.uop.after(call))
+  # live slots = ceil(valid / KS): _merge_partials counts ceil(valid' / BLOCK_N), so hand it valid' = valid * BLOCK_N / KS
+  return _merge_partials(partial, stats, valid_kv_len * (BLOCK_N // (16 * k_tiles))).unsqueeze(2)
 
 # ******** T4.107b: prefill chunks ********
 
