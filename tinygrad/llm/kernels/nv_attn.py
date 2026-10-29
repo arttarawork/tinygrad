@@ -331,12 +331,172 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
   stores += [stats[b, stats_head, rows[r], block_n, 1].store(sums[r]) for r in range(2)]
   return UOp.group(*stores).end(lane, block).sink(arg=KernelInfo(name="flash_prefill_wmma_nv", opts_to_apply=()))
 
+# ******** T4.130: prefill chunks, each K/V tile dequantised once for the whole GQA group ********
+
+NV_ATTN_GQA = ContextVar("NV_ATTN_GQA", 1)  # T4.130: inside NV_ATTN_WMMA=1, the shared-tile kernel below (0 = the T4.113 kernel, byte-identical)
+NV_ATTN_GQA_WARPS = ContextVar("NV_ATTN_GQA_WARPS", 4)  # T4.130: query m-tiles (one warp each) sharing a staged K/V tile; card knob
+NV_ATTN_GQA_KEYS = ContextVar("NV_ATTN_GQA_KEYS", 32)  # T4.130: keys per staged tile (16 or 32: K + V tiles are 4*keys*head_dim bytes); card knob
+# the CUDA renderer ignores the wmma device string; the PYTHON emulator keys its NVIDIA fragment model on 'CUDA' (nv_gemm.IMMA_ARG)
+GQA_WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)
+SMEM_BYTES = 48 * 1024  # static __shared__ cap
+
+def _kv_halves(cache_kv:UOp, sc:UOp|None, kv:int, b:UOp, h:UOp, key:UOp, d0:UOp, n:int) -> list[UOp]:
+  """K/V elements d0 .. d0+n-1 at `key` as fp16 (d0 a multiple of n, n a multiple of 8, the run inside one scale block). The int4
+  cache arrives as uint32 WORDS (nv_prefill_attention binds the uint8 buffer to a uint32 parameter: 8 elements per word, element e =
+  bits 4e..4e+3 -- the coalescer merges a run into one vector load, it never merges uint8) and is dequantised in fp16 with no
+  int->float conversion: bitcast(0x6400 | nibble) = 1024 + nibble exactly, minus 1032 = nibble - 8 exactly, times the fp16 scale = ONE
+  rounding of the exact product -- the same bits as kv_value's fp32 (nibble - 8) * scale cast to fp16. The other caches take
+  kv_value as is."""
+  if cache_kv.dtype != dtypes.uint32: return [kv_value(cache_kv, sc, kv, b, h, key, d0 + i).cast(dtypes.float16) for i in range(n)]
+  assert sc is not None
+  scale = sc[kv, b, h, key, d0 // (cast(int, cache_kv.shape[-1]) * 8 // cast(int, sc.shape[-1]))].load()
+  out = []
+  for w in range(n // 8):
+    word = cache_kv[kv, b, h, key, d0 // 8 + w].load()
+    out += [((((word >> (4 * e)) & 0xF) | 0x6400).cast(dtypes.uint16).bitcast(dtypes.float16) - 1032.0) * scale for e in range(8)]
+  return out
+
+@functools.cache
+def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, valid_kv_len:int|UOp, q_start:int|UOp, max_kv_len:int,
+                        warps:int, keys:int) -> UOp:
+  """_prefill_wmma_kernel's contract and arithmetic (m16n8k16, fp32 online softmax per row, P kept in registers as the P.V A operand)
+  with the K/V work shared across the GQA group. The G query heads of a kv head x the chunk's rows are G*T/16 query m-tiles; a block
+  = `warps` of them (one warp each) x a chunk slot. Per `keys`-key tile, every thread of the block dequantises a share of the tile
+  into shared memory ONCE (fp16), then each warp runs S = Q.K^T, the softmax and O += P.V for its own m-tile from there: the int4
+  loads and dequant are shared by `warps` m-tiles instead of redone per query head (T4.113: 6 heads x 8 row tiles = 48x per kv head).
+  Q's A fragments are loaded once per block into registers (16 x 4 at head_dim 256), O is 32 n-tiles x 4 fp32 per lane.
+
+  Shared memory holds the tiles in FRAGMENT order: each 32-lane slot group is one mma operand (K: per 8-key n-tile x 16-dim k-step,
+  4 fp16 per lane = b0 b1; V: per 16-key k-step x 8-dim n-tile, the same with keys and dims swapped -- the P.V B operand is V's
+  transpose, which the dequant writes directly), so a fragment read is one 8-byte load per lane over 256 contiguous bytes. The slot
+  of lane (g, t) inside its group is XOR-swizzled with a function of the operand (K: t ^ (n-tile + k-step pair), V: g ^ (n-tile/2))
+  -- a permutation, so reads stay conflict-free, and it spreads the dequant threads' stores (which all write the same (g, t) slot of
+  different groups) over the banks. lane is AxisType.WARP (threadIdx.x, never split), the warp a LOCAL range (_linear_imma_nv's
+  layout); the barriers come from add_raw_barrier (stores -> loads of a tile) and add_war_barrier (end of the tile loop)."""
+  valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start)
+  sc = scale[0] if scale else None
+  _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
+  _, H, M, D = cast(tuple[int, int, int, int], q.shape)
+  G, chunks, W, KT = H // H_KV, cast(int, out.shape[3]), warps, keys
+  KS, OT, NT, TT = D // WMMA_K, D // WMMA_N, KT // WMMA_N, KT // WMMA_K  # k-steps of S, n-tiles of O, S n-tiles / P.V k-steps per tile
+  mtiles = G * (M // WMMA_M)
+  assert M % WMMA_M == 0 and H % H_KV == 0 and D % 32 == 0 and max_kv_len == N and N % BLOCK_N == 0 and BLOCK_N % KT == 0 \
+    and KT % WMMA_K == 0 and mtiles % W == 0 and 4 * KT * D <= SMEM_BYTES
+  valid_chunks = (valid_kv_len + BLOCK_N - 1) // BLOCK_N
+  group_count = min(valid_chunks, chunks) if isinstance(valid_chunks, int) else valid_chunks.minimum(chunks)
+  block = UOp.range(B * H_KV * (mtiles // W) * group_count, 0, AxisType.GLOBAL)
+  block_rest, block_n = block // group_count, block % group_count
+  bh, mgroup = block_rest // (mtiles // W), block_rest % (mtiles // W)
+  b, kv_head = bh // H_KV, bh % H_KV
+  warp, lane = UOp.range(W, 1, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  g, t = lane // 4, lane % 4  # fragment row/col (0-7), k/n sub-index (0-3): the hardware lane is 4*g + t
+  mtile = mgroup * W + warp
+  q_head = kv_head * G + mtile % G
+  rows = ((mtile // G) * WMMA_M + g, (mtile // G) * WMMA_M + g + 8)  # this lane's two fragment rows
+  # Q's A fragments for all k-steps, once per block (registers): a0 a1 = row g, cols 2t/+1; a2 a3 = row g+8; a4..a7 = cols +8/+9
+  afrags = [UOp.stack(*(q[b, q_head, rows[r], ks * WMMA_K + 2 * t + c8 + c].load().cast(dtypes.float16)
+                        for c8 in (0, 8) for r in (0, 1) for c in (0, 1))) for ks in range(KS)]
+  o_acc = tuple(_reg((4,), 10 + n, 0, block) for n in range(OT))
+  row_max, row_sum = _reg((2,), 1, SENTINEL, block), _reg((2,), 2, 0, block)
+  k_tile = UOp.placeholder((KT * D,), dtypes.float16, slot=100, addrspace=AddrSpace.LOCAL)
+  v_tile = UOp.placeholder((KT * D,), dtypes.float16, slot=101, addrspace=AddrSpace.LOCAL)
+  steps = (valid_chunks + group_count - 1) // group_count
+  offset, sub = UOp.range(steps, 100, AxisType.REDUCE), UOp.range(BLOCK_N // KT, 101, AxisType.REDUCE)
+  key0 = (block_n + offset * group_count) * BLOCK_N + sub * KT
+  threads, tid = W * WARP_SIZE, warp * WARP_SIZE + lane
+  def tasks(total:int):
+    for i in range(-(-total // threads)):  # surplus threads redo the last task: same values, same addresses, no gate
+      yield (tid + i * threads).minimum(total - 1) if total % threads else tid + i * threads
+  def k_slot(j, ks, gg, tt): return (j * KS + ks) * WARP_SIZE + 4 * gg + (tt ^ ((j + NT * (ks // 2)) & 3))
+  def v_slot(kstep, n, gg, tt): return (kstep * OT + n) * WARP_SIZE + 4 * (gg ^ ((n // 2) & 3)) + tt
+  stores = []
+  # K: a task = (key, 32-dim scale block) -> the b0/b1 pairs of 4 lanes x 2 k-steps of its n-tile
+  for task in tasks(KT * D // 32):
+    kn, blk = task % KT, task // KT
+    key = key0 + kn
+    vals = _kv_halves(cache_kv, sc, 0, b, kv_head, key.valid(key < valid_kv_len), blk * 32, 32)
+    for kso in range(2):
+      for tt in range(4):
+        slot = k_slot(kn // 8, blk * 2 + kso, kn % 8, tt)
+        stores += [k_tile[slot * 4 + i].store(vals[16 * kso + 2 * tt + o]) for i, o in enumerate((0, 1, 8, 9))]
+  # V: a task = (the 4 keys 2t/+1/+8/+9 of a 16-key step, 16 dims) -> b0/b1 of 8 lanes x 2 n-tiles, V transposed on the way
+  for task in tasks(KT // 4 * D // 16):
+    quad, half = task % (KT // 4), task // (KT // 4)
+    kstep, tq = quad // 4, quad % 4
+    vals = []
+    for dk in (0, 1, 8, 9):
+      key = key0 + kstep * WMMA_K + 2 * tq + dk
+      vals.append(_kv_halves(cache_kv, sc, 1, b, kv_head, key.valid(key < valid_kv_len), half * 16, 16))
+    for np_ in range(2):
+      for gg in range(8):
+        slot = v_slot(kstep, half * 2 + np_, gg, tq)
+        stores += [v_tile[slot * 4 + i].store(vals[i][8 * np_ + gg]) for i in range(4)]
+  k_tile, v_tile = k_tile.after(*stores), v_tile.after(*stores)
+  # S = Q.K^T over the tile's NT n-tiles (8 keys each), all k-steps unrolled (static register indices for the Q fragments)
+  zero = UOp.const((0.0,) * 4, dtypes.float)
+  s_vals = [zero] * NT
+  for ks in range(KS):
+    for j in range(NT):
+      bfrag = UOp.stack(*(k_tile[k_slot(j, ks, g, t) * 4 + i].load() for i in range(4)))
+      s_vals[j] = UOp.wmma(afrags[ks], bfrag, s_vals[j], *GQA_WMMA_ARG)
+  # masked scores (rows[0] at c0/c1, rows[1] at c2/c3; keys 2t, 2t+1 of each 8-key n-tile), online softmax as _prefill_wmma_kernel
+  scale_log2 = LOG2E / math.sqrt(D)
+  scores, oks = [], []
+  for j in range(NT):
+    for i in range(4):
+      key, row = key0 + j * WMMA_N + 2 * t + (i % 2), rows[i // 2]
+      ok = (key < valid_kv_len) & (key <= q_start + row)
+      oks.append(ok)
+      scores.append(ok.where(s_vals[j][i] * scale_log2, UOp.const(SENTINEL, dtypes.float)))
+  prev_max, prev_sum = row_max.after(sub), row_sum.after(sub)
+  new_max, alphas = [], []
+  for r in range(2):
+    m = functools.reduce(lambda a, s: a.maximum(s), [s for idx, s in enumerate(scores) if idx % 4 // 2 == r], UOp.const(SENTINEL, dtypes.float))
+    nm = prev_max[r].load().maximum(_shfl_xor(_shfl_xor(m, 1, maximum=True), 2, maximum=True))
+    new_max.append(nm)
+    alphas.append((prev_max[r].load() - nm).exp2())
+  ps = [ok.where((s - new_max[idx % 4 // 2]).exp2(), UOp.const(0, dtypes.float)) for idx, (s, ok) in enumerate(zip(scores, oks))]
+  lane_sums = [functools.reduce(lambda a, p: a + p, [p for idx, p in enumerate(ps) if idx % 4 // 2 == r], UOp.const(0, dtypes.float))
+               for r in range(2)]
+  # O = O * alpha + P.V: P's A fragment for k-step tt = S n-tiles 2tt and 2tt+1 (the C layout of two adjacent tiles)
+  pfrags = [UOp.stack(*(ps[(2 * tt + jj) * 4 + i].cast(dtypes.float16) for jj in (0, 1) for i in range(4))) for tt in range(TT)]
+  updates = []
+  for n in range(OT):
+    prev = o_acc[n].after(sub)
+    acc = UOp.stack(*(prev[i].load() * alphas[i // 2] for i in range(4)))
+    for tt in range(TT):
+      acc = UOp.wmma(pfrags[tt], UOp.stack(*(v_tile[v_slot(tt, n, g, t) * 4 + i].load() for i in range(4))), acc, *GQA_WMMA_ARG)
+    updates.append(o_acc[n].store(acc))
+  updates += [row_max[r].store(new_max[r]) for r in range(2)] + [row_sum[r].store(prev_sum[r].load() * alphas[r] + lane_sums[r]) for r in range(2)]
+  update = UOp.group(*updates).end(sub, offset)
+  o_acc, row_max, row_sum = tuple(acc.after(update) for acc in o_acc), row_max.after(update), row_sum.after(update)
+  sums = [_shfl_xor(_shfl_xor(row_sum[r].load(), 1), 2) for r in range(2)]  # the four lanes of a row hold partial sums
+  out_stores = []
+  for n, acc in enumerate(o_acc):
+    d0 = n * WMMA_N + 2 * t
+    out_stores += [out[b, q_head, rows[i // 2], block_n, d0 + i % 2].store(acc[i].load()) for i in range(4)]
+  stats_head = q_head.valid(t.eq(0))
+  out_stores += [stats[b, stats_head, rows[r], block_n, i].store(x) for r in range(2) for i, x in enumerate((row_max[r].load(), sums[r]))]
+  return UOp.group(*out_stores).end(block, warp, lane).sink(arg=KernelInfo(name="flash_prefill_gqa_nv", opts_to_apply=()))
+
+def _gqa_geometry(H:int, H_KV:int, T_pad:int, D:int) -> dict[str, int]|None:
+  """T4.130: the shared-tile kernel's shape from the NV_ATTN_GQA_* knobs (read here, never inside the cached builder), or None (-> the
+  T4.113 kernel) when NV_ATTN_GQA is off or head_dim isn't whole 32-wide scale blocks. warps = the largest divisor of the m-tile
+  count (G * T_pad/16) <= the knob; keys = the knob rounded down to a power of two in [16, 128] whose K + V tiles fit SMEM_BYTES."""
+  if not NV_ATTN_GQA.value or D % 32 or H % H_KV: return None
+  mtiles = H // H_KV * T_pad // WMMA_M
+  warps = max(w for w in range(1, max(NV_ATTN_GQA_WARPS.value, 1) + 1) if mtiles % w == 0)
+  keys = WMMA_K
+  while keys * 2 <= min(NV_ATTN_GQA_KEYS.value, BLOCK_N) and 4 * keys * 2 * D <= SMEM_BYTES: keys *= 2
+  return {"warps": warps, "keys": keys} if 4 * keys * D <= SMEM_BYTES else None
+
 def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, valid_kv_len:int|UOp, q_start:int|UOp,
                          lanes:int=WARP_SIZE) -> Tensor:
   """q (B,H,T,D) for a prefill chunk whose keys are already stored (valid_kv_len = q_start + T); row r attends keys <= q_start + r.
   T may be a bound Variable: the queries are padded to the chunk's static width (padded rows attend every valid key and are
   sliced off), exactly amd.py's flash_attention. Returns (B,H,T,D) float32. `lanes` is only for the CPU test (lanes=1).
-  NV_ATTN_WMMA=1 (T4.113) takes the tensor-core kernel when head_dim allows it (16-row tiles); otherwise the T4.107b kernel."""
+  NV_ATTN_WMMA=1 (T4.113) takes the tensor-core kernel when head_dim allows it (16-row tiles); otherwise the T4.107b kernel.
+  T4.130: under NV_ATTN_WMMA=1, NV_ATTN_GQA=1 (default) takes the shared-tile kernel (_gqa_geometry); 0 = the T4.113 kernel."""
   B, H, T, D = q.shape
   d_split = NV_ATTN_WMMA_DSPLIT.value
   wmma = bool(NV_ATTN_WMMA.value) and lanes == WARP_SIZE and cast(int, D) % WMMA_K == 0 and cast(int, D) % (WMMA_N * d_split) == 0
@@ -350,9 +510,17 @@ def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, 
   chunks = min(PREFILL_CHUNKS * 32 // max(T_pad, 32), N // BLOCK_N)
   partial = Tensor.empty(B, H, T_pad, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, T_pad, chunks, 2, dtype="float32", device=q.device)
-  if wmma: fxn = functools.partial(_prefill_wmma_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, d_split=d_split)
-  else: fxn = functools.partial(_prefill_partial_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, q_rows=q_rows, lanes=lanes)
   srcs = (partial, stats, q.contiguous(), cache_kv) + ((cache_kv_scale,) if cache_kv_scale is not None else ())
-  partial, stats = Tensor.custom_kernel(*srcs, fxn=fxn)[:2]
+  if wmma and (gqa := _gqa_geometry(cast(int, H), cast(int, cache_kv.shape[2]), T_pad, cast(int, D))) is not None:
+    # T4.130: Tensor.custom_kernel's call by hand so the int4 cache's parameter can be uint32 words over the same uint8 buffer (a
+    # kernel argument is a pointer: no view, no copy -- a Tensor-level bitcast of the stored cache schedules a full copy)
+    params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
+    if cache_kv.dtype == dtypes.uint8: params[3] = UOp.placeholder((*cache_kv.shape[:-1], cast(int, cache_kv.shape[-1]) // 4), dtypes.uint32, slot=3)
+    kernel = _prefill_gqa_kernel(*params, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, **gqa).call(*(s.uop for s in srcs))
+    partial, stats = Tensor(partial.uop.after(kernel)), Tensor(stats.uop.after(kernel))
+  else:
+    if wmma: fxn = functools.partial(_prefill_wmma_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, d_split=d_split)
+    else: fxn = functools.partial(_prefill_partial_kernel, valid_kv_len=valid_kv_len, q_start=q_start, max_kv_len=N, q_rows=q_rows, lanes=lanes)
+    partial, stats = Tensor.custom_kernel(*srcs, fxn=fxn)[:2]
   out = _merge_partials(partial, stats, valid_kv_len)
   return out if resolve(T == T_pad) else out[:, :, :T]
