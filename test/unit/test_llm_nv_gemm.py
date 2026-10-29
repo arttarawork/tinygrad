@@ -3,7 +3,7 @@ for the real shapes, the sm_86 render pins the lane-range split the fragment map
 Numerics are hardware-only (t4x/wmma_probe.py, nv_gemm_validate.py). T4.126's int8 (IMMA, m16n8k32) Q4_0 kernel is different:
 the PYTHON emulator models that mma, so its fragment map, staging and epilogue are executed there bit-exact vs numpy (T4.128: and
 the same kernel for Q4_1 and Q5_K)."""
-import functools, itertools, sys, unittest
+import functools, itertools, re, sys, unittest
 from math import prod
 from typing import cast
 import numpy as np
@@ -196,10 +196,13 @@ def _imma_params(ggml_type:int, tokens:int, out_features:int, in_features:int) -
          ([UOp.placeholder((tokens, groups), dtypes.float32, slot=4)] if ggml_type != Q4_0 else [])
 
 def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4,
-               ggml_type:int=Q4_0):
+               ggml_type:int=Q4_0, pipe:int=0):
   return nv_gemm._linear_imma_nv.__wrapped__(*_imma_params(ggml_type, tokens, out_features, in_features), ggml_type=ggml_type,
                                              out_features=out_features, in_features=in_features, token_tile=token_tile, warps=warps,
-                                             out_tiles=out_tiles, stage=stage)
+                                             out_tiles=out_tiles, stage=stage, pipe=pipe)
+
+def _shared_bytes(src:str) -> int:  # static __shared__ total of a rendered kernel (every tile here is a 4-byte type)
+  return sum(4 * int(n) for n in re.findall(r"__shared__ __align__\(\d+\) \w+ \w+\[(\d+)\];", src))
 
 # Qwen3.8-27B's IMMA prefill linears (out, in): Q4_0 attn/ssm out, ffn gate/up, GDN qkv, ffn down; Q4_1 ffn_down of 8 blocks;
 # Q5_K GDN ssm_out
@@ -240,12 +243,49 @@ class TestImmaKernel(unittest.TestCase):
     for ggml_type, shapes in ((Q4_0, ((17408, 5120), (5120, 17408))), (Q4_1, MODEL_SHAPES[Q4_1]), (Q5_K, MODEL_SHAPES[Q5_K])):
       for out_features, in_features in shapes:
         for token_tile, warps, out_tiles, stage in variants:
-          with self.subTest(ggml_type=ggml_type, out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage):
-            prg = to_program(_imma_sink(128, out_features, in_features, token_tile, warps, out_tiles, stage, ggml_type), renderer)
-            src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
-            self.assertIn(f"__launch_bounds__({32*warps})", src)
-            self.assertEqual(src.count("__syncthreads();"), 2 if stage else 0)
-            self.assertEqual(prod(prg.arg.global_size), 128 // token_tile * out_features // (8*warps*out_tiles))  # a size-1 axis drops out
+          for pipe in ((0, 1) if stage else (0,)):  # T4.128: and the pipelined kernel wherever there is a stage tile
+            with self.subTest(ggml_type=ggml_type, out=out_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage,
+                              pipe=pipe):
+              prg = to_program(_imma_sink(128, out_features, in_features, token_tile, warps, out_tiles, stage, ggml_type, pipe), renderer)
+              src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+              self.assertIn(f"__launch_bounds__({32*warps})", src)
+              self.assertEqual(src.count("__syncthreads();"), 2 if stage else 0)  # pipe: one before the loop, one per step
+              self.assertEqual(prod(prg.arg.global_size), 128 // token_tile * out_features // (8*warps*out_tiles))  # a size-1 axis drops out
+              self.assertLessEqual(_shared_bytes(src), 48 * 1024)
+
+  def test_pipe_0_is_the_t4126_render(self):
+    # T4.128: NV_IMMA_PIPE=0 must render exactly the kernel the card measured (md5 of the T4.126 source at 0c6178834, the
+    # standing Q4_0 attn/ssm-out shape and knob defaults). A legitimate codegen change elsewhere moves this hash too: re-pin it
+    # only after checking the diff is that change, not this kernel
+    import hashlib
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    src = next(u.arg for u in to_program(_imma_sink(128, 5120, 5120), renderer).src if u.op is Ops.SOURCE)
+    self.assertEqual(hashlib.md5(src.encode()).hexdigest(), "91ffc1757984810a4116f7fb2f7f3e40")
+
+  def test_pipe_one_barrier_per_step_and_prefetch_stores_after_the_mmas(self):
+    # T4.128: the pipelined kernel's point, as rendered: the prologue fill + its barrier before the loop, inside the loop the
+    # current copy's mmas BEFORE the next stage's shared-memory stores (so their global loads' latency hides behind the mmas),
+    # then the step's one barrier closing the loop body. Twice the tile memory.
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    for ggml_type, shapes in MODEL_SHAPES.items():
+      for out_features, in_features in shapes:
+        with self.subTest(ggml_type=ggml_type, out=out_features, inp=in_features):
+          srcs = [next(u.arg for u in to_program(_imma_sink(128, out_features, in_features, ggml_type=ggml_type, pipe=pipe), renderer).src
+                       if u.op is Ops.SOURCE) for pipe in (0, 1)]
+          head, loop = srcs[1].split("  for (int Ridx3 = 0;")
+          self.assertEqual((head.count("__syncthreads();"), loop.count("__syncthreads();")), (1, 1))
+          self.assertTrue(loop.split("\n  }\n")[0].endswith("__syncthreads();"), "the step's barrier must close the loop body")
+          body = loop.split("\n  }\n")[0]
+          self.assertLess(body.rindex("__WMMA_8_16_32_signed_char_int("), body.index("*((uint4*)((buf8+"))
+          self.assertEqual(_shared_bytes(srcs[1]), 2 * _shared_bytes(srcs[0]))
 
   def test_numpy_reference_matches_ggml_dequant(self):
     # the reference's integer form == gguf.py's own dequant times the dequantized activations (up to fp32 rounding)
@@ -269,23 +309,25 @@ class TestImmaKernel(unittest.TestCase):
     # token blocks and warps; stage 0 (global loads), 1, 2 and 4, including fills that don't divide the block's threads
     # (16x1 scales over 64 threads, 16x8 words over 128) and a warp-range split (stage 4 x 2 warps: 32-word rows, 64 threads).
     # T4.128: Q4_1 and Q5_K too (Q5_K needs in % 256: two super-blocks, a stage of 8 = one whole super-block per step)
+    # T4.128 pipe=1 (every staged config): also a single step (128 / stage 4) and an odd step count (96 / stage 1, 768 / stage 8)
     cfgs = {Q4_0: ((32, 64, 64, 32, 2, 2, 0), (32, 64, 128, 16, 2, 2, 1), (64, 32, 128, 32, 1, 4, 4), (32, 128, 256, 16, 4, 1, 2),
-                   (32, 64, 256, 16, 2, 2, 4))}
+                   (32, 64, 256, 16, 2, 2, 4), (32, 64, 96, 16, 2, 2, 1))}
     cfgs[Q4_1] = cfgs[Q4_0]
     cfgs[Q5_K] = ((32, 64, 256, 32, 2, 2, 0), (32, 64, 512, 16, 2, 2, 1), (64, 32, 512, 32, 1, 4, 8), (32, 128, 512, 16, 4, 1, 2),
-                  (32, 64, 512, 16, 2, 2, 4))
+                  (32, 64, 512, 16, 2, 2, 4), (32, 32, 768, 16, 2, 2, 8))
     for ggml_type, configs in cfgs.items():
       for tokens, out_features, in_features, token_tile, warps, out_tiles, stage in configs:
-        with self.subTest(ggml_type=ggml_type, tokens=tokens, out=out_features, inp=in_features, token_tile=token_tile, warps=warps,
-                          out_tiles=out_tiles, stage=stage):
-          rng = np.random.default_rng(tokens + out_features + ggml_type)
-          blocks, (xq, xd, xs) = _blocks(ggml_type, rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
-          fxn = functools.partial(nv_gemm._linear_imma_nv.__wrapped__, ggml_type=ggml_type, out_features=out_features,
-                                  in_features=in_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage)
-          out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device="PYTHON")
-          srcs = [Tensor(a, device="PYTHON") for a in (_raw(ggml_type, blocks), xq, xd) + ((xs,) if ggml_type != Q4_0 else ())]
-          res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
-          np.testing.assert_array_equal(res, _np_imma_reference(ggml_type, blocks, xq, xd, xs))  # same fp32 op order: bit-exact
+        for pipe in ((0, 1) if stage else (0,)):
+          with self.subTest(ggml_type=ggml_type, tokens=tokens, out=out_features, inp=in_features, token_tile=token_tile, warps=warps,
+                            out_tiles=out_tiles, stage=stage, pipe=pipe):
+            rng = np.random.default_rng(tokens + out_features + ggml_type)
+            blocks, (xq, xd, xs) = _blocks(ggml_type, rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
+            fxn = functools.partial(nv_gemm._linear_imma_nv.__wrapped__, ggml_type=ggml_type, out_features=out_features,
+                                    in_features=in_features, token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage, pipe=pipe)
+            out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device="PYTHON")
+            srcs = [Tensor(a, device="PYTHON") for a in (_raw(ggml_type, blocks), xq, xd) + ((xs,) if ggml_type != Q4_0 else ())]
+            res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
+            np.testing.assert_array_equal(res, _np_imma_reference(ggml_type, blocks, xq, xd, xs))  # same fp32 op order: bit-exact
 
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):
@@ -385,6 +427,17 @@ class TestImmaDispatch(unittest.TestCase):
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=3):  # tile: largest power of two dividing 64; stage: gcd with 4 groups
       self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"], _imma_sink(64, 256, 128, 64, 4, 2, 1))
 
+  def test_pipe_knob_reaches_the_kernel(self):
+    # T4.128: NV_IMMA_PIPE=1 builds the pipelined kernel for all three formats; without a stage tile there is nothing to pipeline
+    from tinygrad import Context
+    for ggml_type, in_features in ((Q4_0, 128), (Q4_1, 128), (Q5_K, 256)):
+      lin, x = _quantized_linear(ggml_type, 256, in_features), Tensor.empty(1, 64, in_features, dtype=dtypes.float32)
+      name = nv_gemm.IMMA_FORMATS[ggml_type][2]
+      with Context(NV_IMMA=1, NV_IMMA_PIPE=1):
+        self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))[name], _imma_sink(64, 256, in_features, ggml_type=ggml_type, pipe=1))
+      with Context(NV_IMMA=1, NV_IMMA_PIPE=1, NV_IMMA_STAGE=0):
+        self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))[name], _imma_sink(64, 256, in_features, 64, 4, 2, 0, ggml_type))
+
   def test_symbolic_chunk_pads_and_shrinks(self):
     from tinygrad import Context, UOp as U
     lin = _quantized_linear(Q4_0, 256, 128)
@@ -399,6 +452,8 @@ class TestImmaDispatch(unittest.TestCase):
     lin = _quantized_linear(Q4_0, 256, 1024)  # 32 groups
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32):
       self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
+    with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32, NV_IMMA_PIPE=1):  # T4.128: two copies -> 2 x 128 x (36 + 5) = 41 KB
+      self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1})
 
 _emu_slot = itertools.count(60)
 def _emulated_lane_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:

@@ -66,6 +66,9 @@ NV_IMMA_TOKEN_TILE = ContextVar("NV_IMMA_TOKEN_TILE", 64)  # tokens per block (l
 NV_IMMA_WARPS = ContextVar("NV_IMMA_WARPS", 4)            # warps per block, sharing one staged activation tile
 NV_IMMA_OUT_TILES = ContextVar("NV_IMMA_OUT_TILES", 2)    # 8-output n-tiles per warp (each A fragment feeds this many mmas)
 NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 4)            # 32-groups per shared-memory stage (barrier pair); 0 = no staging (10-28: 4 best)
+# T4.128: 1 = double-buffered stage tile, the next stage's activation fills overlapping this stage's mmas (one barrier per stage);
+# 0 = the T4.126 kernel, byte-identical. Card A/B pending; with NV_IMMA_STAGE=0 (no tile) it has nothing to do
+NV_IMMA_PIPE = ContextVar("NV_IMMA_PIPE", 0)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -457,7 +460,7 @@ IMMA_FORMATS: dict[int, tuple[Callable, Callable, str]] = {
 
 @functools.cache
 def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
-                    token_tile:int, warps:int, out_tiles:int, stage:int) -> UOp:
+                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0) -> UOp:
   """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
   (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
   acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
@@ -473,7 +476,8 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
   relabelling of the warps), so the hardware lane IS `lane` -- no lane%8/lane//8 trick needed here (_wmma_layout_nv). Each warp
   owns out_tiles n-tiles and every m-tile of the token tile: B is decoded once per (n-tile, group) and reused over the m-tiles,
   A once per (m-tile, group) and reused over the n-tiles. The REDUCE loop steps `stage` groups at a time through a
-  shared-memory copy of the block's activations (stage 0 = no staging, fragments straight from global).
+  shared-memory copy of the block's activations (stage 0 = no staging, fragments straight from global). T4.128 pipe=1: two
+  copies of that tile, the loop's own fills prefetching the next stage into the other copy while it computes on this one.
 
   Fragment map for m16n8k32 .s8 (g = lane//4 in [0,8), t = lane%4; k relative to the 32-wide group). Derived like T4.98f:
   a forced-TC fp8 matmul (16x64 @ 64x8, codegen/opt/tc.py's cuda_81632_f8 = the same m16n8k32 8-bit fragment shape),
@@ -507,6 +511,7 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
   zero = UOp.const((0,)*4, dtypes.int32)
   step = UOp.range(groups // S, 3, AxisType.REDUCE)
+  prefetch:list[UOp] = []
   if stage:
     # T4.126: the block's activation tile for these S groups (token_tile x 8S words + token_tile x S scales) staged once in
     # shared memory by all warps, then read by every warp: the warps differ only in their n-tiles, so global activation traffic
@@ -515,30 +520,46 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
     # g*(8S+4) + t (+const), bank 4*(g*(2S+1) mod 8) + t, a bijection over the 32 lanes since 2S+1 is odd; the scale read
     # g*(S+1) (+const) hits 8 distinct banks (S+1 odd) or, S odd, 2-way at worst. The LOCAL stores make add_raw_barrier put a
     # __syncthreads() before the reads, and add_war_barrier one at the end of the step loop (codegen/__init__.py).
-    wstride, dstride, threads = 8*S + 4, S + 1, warps*WARP_SIZE
-    xs_buf = UOp.placeholder((token_tile*wstride,), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
-    xd_buf = UOp.placeholder((token_tile*dstride,), dtypes.float32, slot=101, addrspace=AddrSpace.LOCAL)
-    tiles = [(xs_buf, wstride, 8*S, 4, lambda r, c: xq[t0 + r, step*S + c // 8, c % 8]),
-             (xd_buf, dstride, S, 1, lambda r, c: xd[t0 + r, step*S + c])]
+    wstride, dstride, threads, copies = 8*S + 4, S + 1, warps*WARP_SIZE, 2 if pipe else 1
+    xs_buf = UOp.placeholder((copies*token_tile*wstride,), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
+    xd_buf = UOp.placeholder((copies*token_tile*dstride,), dtypes.float32, slot=101, addrspace=AddrSpace.LOCAL)
+    tiles = [(xs_buf, wstride, 8*S, 4, lambda at, r, c: xq[t0 + r, at*S + c // 8, c % 8]),
+             (xd_buf, dstride, S, 1, lambda at, r, c: xd[t0 + r, at*S + c])]
     if xsum is not None:  # T4.128: the sums ride along with the scales (same layout, same fill index)
-      tiles.append((sum_buf := UOp.placeholder((token_tile*dstride,), dtypes.float32, slot=102, addrspace=AddrSpace.LOCAL), dstride, S, 1,
-                    lambda r, c: xsum[t0 + r, step*S + c]))
-    fills = []
-    # each thread fills 4 consecutive words (a 16-byte-aligned run in both buffers: 8S and 8S+4 are multiples of 4), which the
-    # coalescer turns into one uint4 LDG + one uint4 STS; the scales go one float per thread
-    for buf, stride, per_row, vec, load in tiles:
-      total = token_tile*per_row//vec
-      for i in range(-(-total // threads)):
-        idx = warp*WARP_SIZE + lane + i*threads
-        if total % threads: idx = idx.minimum(total - 1)  # surplus threads rewrite the last element with its own value: no gate
-        r, c0 = idx // (per_row//vec), idx % (per_row//vec) * vec
-        fills += [buf[r * stride + c0 + j].store(load(r, c0 + j)) for j in range(vec)]
-    xs, xds = xs_buf.after(UOp.group(*fills)), xd_buf.after(UOp.group(*fills))
-    def word(row, w:int, s:int): return xs[row*wstride + s*8 + w]
-    def scale(row, s:int): return xds[row*dstride + s]
+      tiles.append((sum_buf := UOp.placeholder((copies*token_tile*dstride,), dtypes.float32, slot=102, addrspace=AddrSpace.LOCAL), dstride,
+                    S, 1, lambda at, r, c: cast(UOp, xsum)[t0 + r, at*S + c]))
+    def fill(at, copy) -> UOp:  # stage `at`'s tiles into tile copy `copy` (None: the one copy of the unpipelined kernel)
+      fills = []
+      # each thread fills 4 consecutive words (a 16-byte-aligned run in both buffers: 8S and 8S+4 are multiples of 4), which the
+      # coalescer turns into one uint4 LDG + one uint4 STS; the scales go one float per thread
+      for buf, stride, per_row, vec, load in tiles:
+        total = token_tile*per_row//vec
+        for i in range(-(-total // threads)):
+          idx = warp*WARP_SIZE + lane + i*threads
+          if total % threads: idx = idx.minimum(total - 1)  # surplus threads rewrite the last element with its own value: no gate
+          r, c0 = idx // (per_row//vec), idx % (per_row//vec) * vec
+          base = r * stride + c0 if copy is None else copy*(token_tile*stride) + r*stride + c0
+          fills += [buf[base + j].store(load(at, r, c0 + j)) for j in range(vec)]
+      return UOp.group(*fills)
+    if pipe:
+      # T4.128: the prologue fills copy 0 with stage 0 before the loop (its barrier lands outside it); step then reads copy step%2
+      # and stores stage step+1 into the other copy. Nothing in the step reads those stores, so the linearizer places them last
+      # (stores late), after the mmas: the global loads issue at the top and their latency hides behind the step's tensor work.
+      # add_war_barrier's one __syncthreads() at the end of the step orders both hazards (next step's reads after these stores,
+      # these stores after the previous step's reads of that copy) -- one barrier per step instead of two. The last step's
+      # prefetch is clamped to the last stage: a copy nobody reads again, no gate. The copy index is step & 1, NOT step % 2: a
+      # RANGE % c makes pm_split_ranges split the loop into (n/2, 2) ranges whose 3-tuple args add_war_barrier's r.arg[1] check
+      # doesn't recognise -- the end-of-step barrier silently vanished (a WAR race; test_llm_nv_gemm pins the barriers)
+      ready, cur = fill(0, 0), step & 1
+      prefetch.append(fill((step + 1).minimum(groups // S - 1), 1 - (step & 1)))
+    else: ready, cur = fill(step, None), None
+    xs, xds = xs_buf.after(ready), xd_buf.after(ready)
+    def at_copy(i, stride:int): return i if cur is None else cur*(token_tile*stride) + i
+    def word(row, w:int, s:int): return xs[at_copy(row*wstride + s*8 + w, wstride)]
+    def scale(row, s:int): return xds[at_copy(row*dstride + s, dstride)]
     if xsum is not None:
-      sums = sum_buf.after(UOp.group(*fills))
-      def gsum(row, s:int): return sums[row*dstride + s]
+      sums = sum_buf.after(ready)
+      def gsum(row, s:int): return sums[at_copy(row*dstride + s, dstride)]
   else:  # stage 0: every warp loads its fragments straight from global (the pre-staging kernel, kept as a card A/B)
     def word(row, w:int, s:int): return xq[t0 + row, step, w]
     def scale(row, s:int): return xd[t0 + row, step]
@@ -559,7 +580,7 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
         # card would compile it as (c*d_w)*xd anyway and round differently from this graph on the emulator
         running[o][mt] = running[o][mt] + _int_times_half(UOp.wmma(afrag, bfrag, zero, *IMMA_ARG), dws) * xss[mt]
         if mws is not None: running[o][mt] = running[o][mt] + mws * sss[mt]  # T4.128: + M[n] * xsum[m], the third FFMA
-  update = UOp.group(*(acc.store(value) for row, values in zip(accs, running) for acc, value in zip(row, values))).end(step)
+  update = UOp.group(*(acc.store(value) for row, values in zip(accs, running) for acc, value in zip(row, values)), *prefetch).end(step)
   stores = []
   for n0, row in zip(n0s, accs):
     for r0, acc in zip(r0s, row):
@@ -595,9 +616,10 @@ def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   groups = layer.in_features // Q8_GROUP_SIZE
   stage = NV_IMMA_STAGE.value and math.gcd(NV_IMMA_STAGE.value, groups)  # must divide the groups; 0 = off
   scale_rows = 1 if layer.ggml_type == Q4_0 else 2  # T4.128: the sums buffer is a second scale-sized tile
+  copies = 2 if NV_IMMA_PIPE.value and stage else 1  # T4.128: the pipelined kernel holds two copies of the stage tile
   # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
-  while stage > 1 and token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
-  return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage}
+  while stage > 1 and copies*token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
+  return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage, "pipe": int(copies == 2)}
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to
