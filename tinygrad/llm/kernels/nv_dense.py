@@ -118,3 +118,14 @@ def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
   result = result.reshape(*x_pad.shape[:-1], layer.out_features)
   if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], layer.out_features)))
   return result if layer.bias is None else result + layer.bias
+
+def nv_f16_gemv_raw(weight:Tensor, x:Tensor, out_features:int) -> Tensor:
+  """T4.127b: _nv_f16_gemv_kernel called directly on a weight that isn't one Linear's own dense_weight -- no
+  ggml/bias/eligibility checks, for a caller that already has its own prepared fp16 weight and knows this is a
+  small bias=False dense gemv (GatedDeltaNetBlock's ssm_beta+ssm_alpha concatenated weight, prepare_nv_decode).
+  x must already be fp16, 2D (tokens, in_features); weight 2D (out_features, in_features)."""
+  tokens, in_features = cast(int, x.shape[0]), cast(int, x.shape[1])
+  xh = x if x.uop.has_buffer_identity(after_ok=True) else x.contiguous()  # T4.125b: nv_f16_gemv's own dance, fp16-only here
+  out = Tensor.empty(tokens, out_features, dtype=dtypes.float16, device=x.device)
+  fxn = functools.partial(_nv_f16_gemv_kernel, in_features=in_features, out_features=out_features, tokens=tokens)
+  return Tensor.custom_kernel(out, weight.reshape(-1), xh.reshape(tokens, in_features), fxn=fxn)[0]

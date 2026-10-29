@@ -43,7 +43,7 @@ the same logical N axis -- that is how the ISA actually wires it (cross-checked 
 "simplify" this to reuse one variable for both, that would silently transpose/scramble the output.
 """
 from __future__ import annotations
-import functools
+import functools, math
 from typing import cast, Callable
 from tinygrad import Tensor, UOp, Device, Context
 from tinygrad.dtype import AddrSpace, dtypes
@@ -53,12 +53,26 @@ from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok, iq_grid
+from tinygrad.llm.kernels.nv_quant import q8_quantize
 
 NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the generic prefill matmul (A/B lever for the bench)
 NV_WMMA_TOKEN_TILE = ContextVar("NV_WMMA_TOKEN_TILE", 64)  # T4.124c: card knob -- more/fewer token-tile warps per block (PB.3)
+# T4.126: Q4_0 prefill on the int8 tensor cores (q8 activations, decode's quantizer) instead of the fp16 WMMA kernel. On by
+# default since the 10-28 card run (128-token chunk 233.5 -> 156.2 ms; gates 11/1152 and 12/1152 at near-ties vs the fp16 path);
+# NV_IMMA=0 restores the fp16 kernel. The four
+# shape knobs are card-sweepable and, like NV_WMMA_TOKEN_TILE, read only in nv_wmma_linear (never in the cached builder):
+NV_IMMA = ContextVar("NV_IMMA", 1)
+NV_IMMA_TOKEN_TILE = ContextVar("NV_IMMA_TOKEN_TILE", 64)  # tokens per block (largest power of two <= knob dividing the chunk)
+NV_IMMA_WARPS = ContextVar("NV_IMMA_WARPS", 4)            # warps per block, sharing one staged activation tile
+NV_IMMA_OUT_TILES = ContextVar("NV_IMMA_OUT_TILES", 2)    # 8-output n-tiles per warp (each A fragment feeds this many mmas)
+NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 4)            # 32-groups per shared-memory stage (barrier pair); 0 = no staging (10-28: 4 best)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
+# T4.126: mma.sync.aligned.m16n8k32 s8 x s8 -> s32 (one 32-wide Q4_0/q8 group per K). The CUDA renderer ignores the device
+# string; the PYTHON emulator keys its NVIDIA fragment model on "CUDA", which lets the IMMA kernel run there unchanged.
+IMMA_K = 32
+IMMA_ARG = ((WMMA_N, WMMA_M, IMMA_K), 'CUDA', WARP_SIZE)
 
 @functools.cache
 def _nv_wmma_ok(device:str|tuple[str, ...]|None) -> bool:
@@ -369,6 +383,124 @@ def _token_tile_for(tokens:int, knob:int=64) -> int:
   return WMMA_M
 def _output_tiles_for(out_features:int) -> int: return 4 if out_features % (WMMA_N*4) == 0 else 1
 
+# ******** T4.126: int8 tensor-core (IMMA) Q4_0 prefill gemm -- q8 activations x (nibble-8) weights ********
+
+def _i8x4(word:UOp) -> tuple[UOp, ...]:
+  # the 4 signed bytes of a uint32, little-endian (element 4j+i of a packed fragment register is byte i). The renderer packs
+  # them back into the mma's .b32 operand through the fragment struct; nvcc folds the round trip (see _q4_0_linear_imma_nv)
+  return tuple((word >> (8*i)).cast(dtypes.int8) for i in range(4))
+
+def _int_times_half(c:UOp, d:UOp) -> UOp:
+  # T4.126: float(c) * d for an int32 c with |c| < 2**22 and an fp16-valued fp32 d, as ONE fused multiply-add and no I2F
+  # (sm_86 issues I2F at 16/clk/SM vs 128 for FFMA -- four conversions per lane per mma would cap the kernel at half the
+  # int8 tensor rate). f = bitcast(c + 0x4B400000) is 1.5*2**23 + c exactly; 1.5*2**23 * d is exact in fp32 (2 + 11
+  # significant bits), so fma(f, d, -1.5*2**23*d) rounds the exact c*d once: the same bits as cvt.rn.f32.s32 then FMUL. A
+  # Q4_0 x q8 group dot is |c| <= 32*8*127 = 32512. The codegen's pm_wmma_add folds the +0x4B400000 into the mma's C operand
+  # (WMMA(a,b,0)+k -> WMMA(a,b,k)): the tensor core does the integer add.
+  return (c + 0x4B400000).bitcast(dtypes.float32) * d + d * -12582912.0
+
+@functools.cache
+def _q4_0_linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, *, out_features:int, in_features:int, token_tile:int, warps:int,
+                         out_tiles:int, stage:int) -> UOp:
+  """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
+  (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
+  acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
+  Q4_0 weight's uint16 view (amd.py packed_u16; 9 u16 per 18-byte block: d, then qs[0:16]), xq/xd = nv_quant.q8_quantize's
+  (tokens, groups, 8) uint32 words (4 int8 per word, element 4w+i = byte i) and (tokens, groups) fp32 scales.
+
+  Layout: grid (tokens/token_tile, out_features/(8*out_tiles*warps)) with the token blocks fastest, block = `warps` warps x 32
+  lanes. lane is its own AxisType.WARP range (never split by the lowerer, mark_range_mod skips WARP: renders as threadIdx.x, 32)
+  and warp an AxisType.LOCAL range (threadIdx.y; a stage whose fill index needs warp%k splits it into y/z, a consistent
+  relabelling of the warps), so the hardware lane IS `lane` -- no lane%8/lane//8 trick needed here (_wmma_layout_nv). Each warp
+  owns out_tiles n-tiles and every m-tile of the token tile: B is decoded once per (n-tile, group) and reused over the m-tiles,
+  A once per (m-tile, group) and reused over the n-tiles. The REDUCE loop steps `stage` groups at a time through a
+  shared-memory copy of the block's activations (stage 0 = no staging, fragments straight from global).
+
+  Fragment map for m16n8k32 .s8 (g = lane//4 in [0,8), t = lane%4; k relative to the 32-wide group). Derived like T4.98f:
+  a forced-TC fp8 matmul (16x64 @ 64x8, codegen/opt/tc.py's cuda_81632_f8 = the same m16n8k32 8-bit fragment shape),
+  Opt(OptOps.TC, 0, (-1,0,1)), rendered for sm_89 via CUDARenderer(DEV.target("NV", arch="sm_89")): lidx0 = threadIdx.x (32),
+  g = lidx0>>2, t = lidx0&3; A loaded as four 4-byte runs A[g][4t..], A[g+8][4t..], A[g][16+4t..], A[g+8][16+4t..] (in that
+  register order), B as B[4t..4t+3][g] then B[16+4t..16+4t+3][g], C stored as C[g][2t..2t+1] and C[g+8][2t..2t+1]. Agrees with
+  the PTX ISA's m16n8k32 8-bit layout (groupID/threadID_in_group) and with ops_python's (8,16,32) emulator model, which
+  test_llm_nv_gemm's _imma_probe runs against numpy:
+
+           A (MxK = tokens x k)            B (KxN = k x outputs)          C/D (MxN) int32
+    a0 = A[g,   4t..4t+3]              b0 = B[4t..4t+3,    g]         c0 = C[g,   2t]   c1 = C[g,   2t+1]
+    a1 = A[g+8, 4t..4t+3]              b1 = B[16+4t..+3,   g]         c2 = C[g+8, 2t]   c3 = C[g+8, 2t+1]
+    a2 = A[g,   16+4t..16+4t+3]
+    a3 = A[g+8, 16+4t..16+4t+3]        (byte i of a register = the i-th k of its run)
+
+  So a0..a3 are xq words t, t, t+4, t+4 of tokens g, g+8, g, g+8 -- the quantizer's packing IS the fragment, no unpack. b0/b1
+  come from ONE 32-bit qs word: Q4_0 elements 0-15 are the low nibbles of qs[0:16] and 16-31 the high nibbles of the same
+  bytes (gguf.py), so qs[4t..4t+3]'s low nibbles are b0 and its high nibbles b1; nibble-8 per byte is (n + 0x78) ^ 0x80 (no
+  carry: n + 0x78 <= 0x87). C's n index (2t, 2t+1) is a different lane split than B's (g) -- the d_w the epilogue needs are
+  the blocks of outputs 2t and 2t+1, not the block this lane decoded."""
+  groups, S = in_features // Q8_GROUP_SIZE, max(stage, 1)  # S groups per REDUCE iteration
+  # output_block gets the lower axis id so the token blocks of one output block are adjacent in the launch order (gidx0 is the
+  # LAST global axis): they run together and share their weight rows through L2 instead of each streaming them from DRAM
+  output_block, token_block = UOp.range(out_features // (WMMA_N*out_tiles*warps), 0), UOp.range(out.shape[0] // token_tile, 1)
+  warp, lane = UOp.range(warps, 2, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  g, t = lane // 4, lane % 4
+  t0 = token_block*token_tile
+  n0s = tuple(((output_block*warps + warp)*out_tiles + o)*WMMA_N for o in range(out_tiles))
+  r0s = tuple(mt*WMMA_M for mt in range(token_tile // WMMA_M))  # m-tile rows within the token tile
+  accs = [[UOp.placeholder((4,), dtypes.float32, slot=o*len(r0s)+mt, addrspace=AddrSpace.REG) for mt in range(len(r0s))]
+          for o in range(out_tiles)]
+  accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
+  zero = UOp.const((0,)*4, dtypes.int32)
+  step = UOp.range(groups // S, 3, AxisType.REDUCE)
+  if stage:
+    # T4.126: the block's activation tile for these S groups (token_tile x 8S words + token_tile x S scales) staged once in
+    # shared memory by all warps, then read by every warp: the warps differ only in their n-tiles, so global activation traffic
+    # drops `warps`-fold and a token's S groups are one contiguous 32S-byte run (its S scales 4S bytes) instead of scattered
+    # 4-byte reads. Row strides 8S+4 words / S+1 floats keep the fragment reads conflict-free: lane (g,t) reads word
+    # g*(8S+4) + t (+const), bank 4*(g*(2S+1) mod 8) + t, a bijection over the 32 lanes since 2S+1 is odd; the scale read
+    # g*(S+1) (+const) hits 8 distinct banks (S+1 odd) or, S odd, 2-way at worst. The LOCAL stores make add_raw_barrier put a
+    # __syncthreads() before the reads, and add_war_barrier one at the end of the step loop (codegen/__init__.py).
+    wstride, dstride, threads = 8*S + 4, S + 1, warps*WARP_SIZE
+    xs_buf = UOp.placeholder((token_tile*wstride,), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
+    xd_buf = UOp.placeholder((token_tile*dstride,), dtypes.float32, slot=101, addrspace=AddrSpace.LOCAL)
+    fills = []
+    # each thread fills 4 consecutive words (a 16-byte-aligned run in both buffers: 8S and 8S+4 are multiples of 4), which the
+    # coalescer turns into one uint4 LDG + one uint4 STS; the scales go one float per thread
+    for buf, stride, per_row, vec, load in ((xs_buf, wstride, 8*S, 4, lambda r, c: xq[t0 + r, step*S + c // 8, c % 8]),
+                                            (xd_buf, dstride, S, 1, lambda r, c: xd[t0 + r, step*S + c])):
+      total = token_tile*per_row//vec
+      for i in range(-(-total // threads)):
+        idx = warp*WARP_SIZE + lane + i*threads
+        if total % threads: idx = idx.minimum(total - 1)  # surplus threads rewrite the last element with its own value: no gate
+        r, c0 = idx // (per_row//vec), idx % (per_row//vec) * vec
+        fills += [buf[r * stride + c0 + j].store(load(r, c0 + j)) for j in range(vec)]
+    xs, xds = xs_buf.after(UOp.group(*fills)), xd_buf.after(UOp.group(*fills))
+    def word(row, w:int, s:int): return xs[row*wstride + s*8 + w]
+    def scale(row, s:int): return xds[row*dstride + s]
+  else:  # stage 0: every warp loads its fragments straight from global (the pre-staging kernel, kept as a card A/B)
+    def word(row, w:int, s:int): return xq[t0 + row, step, w]
+    def scale(row, s:int): return xd[t0 + row, step]
+  running = [[acc.after(step) for acc in row] for row in accs]
+  for s in range(S):
+    group = step*S + s
+    afrags = tuple(UOp.stack(*(b for r in range(4) for b in _i8x4(word(r0 + g + 8*(r % 2), t + 4*(r // 2), s)))) for r0 in r0s)
+    xss = tuple(UOp.stack(*(scale(r0 + g + 8*(i // 2), s) for i in range(4))) for r0 in r0s)  # C's m index: g for c0/c1, g+8 for c2/c3
+    for o, n0 in enumerate(n0s):
+      base16 = ((n0 + g)*groups + group)*9
+      qs = raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16)
+      bfrag = UOp.stack(*(b for nib in (qs & 0x0F0F0F0F, (qs >> 4) & 0x0F0F0F0F) for b in _i8x4((nib + 0x78787878) ^ 0x80808080)))
+      dw = tuple(_half(raw[((n0 + 2*t + j)*groups + group)*9]) for j in (0, 1))
+      dws = UOp.stack(*(dw[i % 2] for i in range(4)))  # C's n index: 2t for c0/c2, 2t+1 for c1/c3
+      for mt, afrag in enumerate(afrags):
+        # acc += (c * d_w) * xd: two FFMAs per element. Not c*(d_w*xd): the C renderer strips a same-op child's parens, so the
+        # card would compile it as (c*d_w)*xd anyway and round differently from this graph on the emulator
+        running[o][mt] = running[o][mt] + _int_times_half(UOp.wmma(afrag, bfrag, zero, *IMMA_ARG), dws) * xss[mt]
+  update = UOp.group(*(acc.store(value) for row, values in zip(accs, running) for acc, value in zip(row, values))).end(step)
+  stores = []
+  for n0, row in zip(n0s, accs):
+    for r0, acc in zip(r0s, row):
+      c0, c1, c2, c3 = (acc.after(update)[i].load() for i in range(4))
+      m = t0 + r0 + g
+      stores += [out[m, n0 + 2*t].store(c0), out[m, n0 + 2*t + 1].store(c1), out[m + 8, n0 + 2*t].store(c2), out[m + 8, n0 + 2*t + 1].store(c3)]
+  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name="linear_q4_0_imma_nv", opts_to_apply=()))
+
 @functools.cache
 def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
                   token_tile:int) -> UOp:
@@ -380,6 +512,19 @@ def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:in
   if ggml_type in IQ_GRID_SIZES: dequant4 = functools.partial(dequant4, grid=grid)
   layout = _wmma_layout_nv(out, out_features, token_tile, _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, dequant4, name)
+
+def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
+  # T4.126: the IMMA kernel's shape arguments from the NV_IMMA_* knobs, or None (-> the fp16 WMMA kernel) when NV_IMMA is off,
+  # the layer isn't Q4_0, or out_features doesn't split into whole blocks. tokens % 16 == 0 and in_features % 32 == 0 hold here.
+  warps, out_tiles = NV_IMMA_WARPS.value, NV_IMMA_OUT_TILES.value
+  if not NV_IMMA.value or layer.ggml_type != Q4_0 or layer.packed_u16 is None or layer.out_features % (WMMA_N*out_tiles*warps): return None
+  token_tile = WMMA_M
+  while token_tile*2 <= NV_IMMA_TOKEN_TILE.value and tokens % (token_tile*2) == 0: token_tile *= 2
+  groups = layer.in_features // Q8_GROUP_SIZE
+  stage = NV_IMMA_STAGE.value and math.gcd(NV_IMMA_STAGE.value, groups)  # must divide the groups; 0 = off
+  # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
+  while stage > 1 and token_tile*((8*stage + 4) + (stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
+  return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage}
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to
@@ -396,6 +541,16 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   if tokens <= 4 or tokens % WMMA_M != 0: return None  # tokens<=4: nv_quant.py's decode gemv covers it
   if not _nv_wmma_ok(x.device): return None
   x_pad = x.pad_to(x.max_shape) if symbolic else x  # concrete shape from here on
+  if (imma := _imma_geometry(layer, cast(int, tokens))) is not None:
+    # T4.126: q8 activations (shared across the Linears reading one x, nv_quant's T4.123a cache) x the u16 weight view
+    xq, xd = q8_quantize(x_pad, cast(int, tokens), in_features)
+    out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
+    all_srcs = (out, cast(Tensor, layer.packed_u16).uop.buf_uop, xq.uop, xd.uop)
+    params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
+    kernel = _q4_0_linear_imma_nv(*params, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
+    result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)
+    if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], out_features)))
+    return result if layer.bias is None else result + layer.bias
   xh = x_pad.cast(dtypes.float16).contiguous().reshape(tokens, in_features)
   raw = (layer.packed_bytes if layer.packed_bytes is not None else layer.weight).uop.buf_uop  # always the byte view, see _byte
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop

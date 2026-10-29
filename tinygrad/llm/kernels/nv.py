@@ -146,18 +146,21 @@ def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, _
   return UOp.group(out, *shifts).end(*ends).sink(arg=KernelInfo(name="gdn_conv_decode_nv", opts_to_apply=()))
 
 @functools.cache
-def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta:UOp, alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, _bound:UOp,
+def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, _bound:UOp,
                        start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float, lanes:int=32, row_tile:int=8) -> UOp:
   """model.py's decode graph from conv_out on, per (b, v-head h): q/k = conv_out's k-head h % k_heads l2-normalized (q * key_dim^-0.5),
   v = conv_out's v channels, beta = sigmoid(beta) in its own dtype, alpha = exp(softplus(alpha + dt_bias) * ssm_a), the fused scan's
-  one-token step on state (B,H,V,K) in place (zeroed at start_pos 0), then z (B,H*V) = rmsnorm(core) * norm_weight * SiLU(sum_p gate)."""
+  one-token step on state (B,H,V,K) in place (zeroed at start_pos 0), then z (B,H*V) = rmsnorm(core) * norm_weight * SiLU(sum_p gate).
+  T4.127b: beta_alpha (B, 2*heads) is ssm_beta(x)/ssm_alpha(x) run as ONE f16 gemv over their concatenated weight
+  (model.py's GatedDeltaNetBlock.prepare_nv_decode/nv_f16_gemv_raw) -- beta at column h, alpha at column heads+h,
+  plain indexing into the one buffer (no copy kernel)."""
   batch, heads, value_dim, key_dim = state.shape
   parts = gate.shape[-1]
   assert all(isinstance(s, int) for s in (batch, heads, value_dim, key_dim, parts)) and heads % k_heads == 0
   batch, heads, value_dim, key_dim, parts = cast(tuple[int, int, int, int, int], (batch, heads, value_dim, key_dim, parts))
   assert key_dim % lanes == 0 and value_dim % row_tile == 0 and value_dim // row_tile <= 32
   waves, q_dim = value_dim // row_tile if lanes > 1 else 1, k_heads*key_dim
-  beta, alpha = beta.reshape(batch, heads), alpha.reshape(batch, heads)
+  beta_alpha = beta_alpha.reshape(batch, 2*heads)
   bh, lane = UOp.range(batch*heads, 0), _lane(lanes, 1)
   wave = UOp.range(waves, 2, AxisType.LOCAL) if waves > 1 else UOp.const(0, dtypes.weakint)
   b, h = bh // heads, bh % heads
@@ -173,8 +176,8 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta:UOp, alpha:UOp, dt_b
   q = tuple(x * key_dim**-0.5 for x in l2(tuple(conv_out[b, k_head*key_dim + c].load() for c in cols)))
   k = l2(tuple(conv_out[b, q_dim + k_head*key_dim + c].load() for c in cols))
   kq, initial = dot(q, k), start_pos.eq(0)
-  bv = beta[b, h].load().sigmoid().float()
-  av = ((alpha[b, h].load().float() + dt_bias[h].load()).softplus() * ssm_a[h].load()).exp()
+  bv = beta_alpha[b, h].load().sigmoid().float()
+  av = ((beta_alpha[b, heads+h].load().float() + dt_bias[h].load()).softplus() * ssm_a[h].load()).exp()
   outs, stores = [], []
   for row in rows:  # _gated_delta_prefill_kernel's step at tokens == 1
     previous = tuple(initial.where(0, state[b, h, row, c].load().float()) for c in cols)
@@ -203,11 +206,13 @@ def _split_k_partials(t:Tensor) -> Tensor:
     u = u.src[0]
   return t.reshape(t.shape[0], t.shape[-1], 1)
 
-def gdn_decode(qkv:Tensor, out_gate:Tensor, beta:Tensor, alpha:Tensor, conv_state:Tensor, state:Tensor, conv_weight:Tensor, norm_weight:Tensor,
+def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor, conv_state:Tensor, state:Tensor, conv_weight:Tensor, norm_weight:Tensor,
                dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float) -> Tensor:
-  """One GatedDeltaNet decode token (T == 1) from the projections: qkv = attn_qkv(x), out_gate = attn_gate(x), beta = ssm_beta(x),
-  alpha = ssm_alpha(x) (all (B,1,F)). Updates conv_state and state in place; returns z (B,1,H*V) fp16, ssm_out's input.
-  The four weights must be realized buffers (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be re-copied every step."""
+  """One GatedDeltaNet decode token (T == 1) from the projections: qkv = attn_qkv(x), out_gate = attn_gate(x), beta_alpha = ssm_beta(x)
+  and ssm_alpha(x) run as ONE f16 gemv (T4.127b, model.py's prepare_nv_decode/nv_f16_gemv_raw) over their concatenated weight --
+  (B,1,2*heads), beta at [:heads], alpha at [heads:]. Updates conv_state and state in place; returns z (B,1,H*V) fp16, ssm_out's
+  input. The four weights must be realized buffers (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be
+  re-copied every step."""
   batch, heads, value_dim, _ = state.shape
   channels, device = conv_state.shape[2], conv_state.device
   lanes = 32 if isinstance(device, str) and device.split(":")[0] == "NV" else 1  # off NV only the CPU tests get here
@@ -220,7 +225,7 @@ def gdn_decode(qkv:Tensor, out_gate:Tensor, beta:Tensor, alpha:Tensor, conv_stat
   conv_out = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, bound,
                                   fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes))[0]
   z = Tensor.empty(batch, heads*value_dim, dtype=dtypes.float16, device=device)
-  z = Tensor.custom_kernel(z, state, conv_out, beta.reshape(batch, heads), alpha.reshape(batch, heads), dt_bias, ssm_a,
+  z = Tensor.custom_kernel(z, state, conv_out, beta_alpha.reshape(batch, 2*heads), dt_bias, ssm_a,
                            _split_k_partials(out_gate), norm_weight, bound, fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads,
                            qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes))[0]
   return z.reshape(batch, 1, heads*value_dim)
