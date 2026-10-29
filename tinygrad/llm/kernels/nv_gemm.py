@@ -76,6 +76,12 @@ NV_IMMA_MINBLOCKS = ContextVar("NV_IMMA_MINBLOCKS", 0)
 # T4.131: 1 = the next stage's weight words are loaded into registers one stage ahead (their global-load latency, exposed at the
 # top of every step today, hides behind this stage's mmas); 0 = today's kernel, byte-identical. Costs one register per word read
 NV_IMMA_WPREFETCH = ContextVar("NV_IMMA_WPREFETCH", 0)
+# T4.131: split-K for the low-N / high-K shapes. The 5120-output layers get 160 blocks for the 3090's 82 SMs (one wave at 2 blocks
+# per SM) and each walks every stage step serially (136 for ffn_down). splitk blocks per output tile each walk steps/splitk
+# stages into their own fp32 partial, (splitk, tokens, out) summed by the caller (NOT bit-identical to one pass: fp32 order).
+# 1 = off (today's kernel); 0 = auto (the smallest divisor of the step count that gives ~2 waves of resident blocks, else the
+# largest <= 8; the wide layers keep one pass); n = that split wherever it divides the step count
+NV_IMMA_SPLITK = ContextVar("NV_IMMA_SPLITK", 1)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -483,7 +489,7 @@ class _RegRaw:
 
 @functools.cache
 def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
-                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0, wprefetch:int=0) -> UOp:
+                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0, wprefetch:int=0, splitk:int=1) -> UOp:
   """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
   (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
   acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
@@ -492,6 +498,9 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
   T4.128: the same kernel for Q4_1 and Q5_K -- IMMA_FORMATS supplies the B registers and the per-output (D, M); with an M the
   group adds M[n] * xsum[m] after the D term (one more FFMA per output element), xsum = q8_quantize(sums=True)'s third output,
   staged like xd.
+
+  T4.131 splitk > 1: a third grid axis (fastest) of splitk blocks per output tile, each walking steps/splitk consecutive stages
+  from a zero accumulator into out[k] of a (splitk, tokens, out_features) partials buffer; the caller sums over k.
 
   Layout: grid (tokens/token_tile, out_features/(8*out_tiles*warps)) with the token blocks fastest, block = `warps` warps x 32
   lanes. lane is its own AxisType.WARP range (never split by the lowerer, mark_range_mod skips WARP: renders as threadIdx.x, 32)
@@ -521,9 +530,11 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
   split than B's (g) -- the scales the epilogue needs are those of outputs 2t and 2t+1, not of the row this lane decoded."""
   imma_b, imma_scales, name = IMMA_FORMATS[ggml_type]
   groups, S = in_features // Q8_GROUP_SIZE, max(stage, 1)  # S groups per REDUCE iteration
+  assert (groups // S) % splitk == 0, f"split-K {splitk} must divide the {groups // S} stage steps"
+  steps = groups // S // splitk  # T4.131: stage steps per block (every step of the one pass when splitk == 1)
   # output_block gets the lower axis id so the token blocks of one output block are adjacent in the launch order (gidx0 is the
   # LAST global axis): they run together and share their weight rows through L2 instead of each streaming them from DRAM
-  output_block, token_block = UOp.range(out_features // (WMMA_N*out_tiles*warps), 0), UOp.range(out.shape[0] // token_tile, 1)
+  output_block, token_block = UOp.range(out_features // (WMMA_N*out_tiles*warps), 0), UOp.range(out.shape[-2] // token_tile, 1)
   warp, lane = UOp.range(warps, 2, AxisType.LOCAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
   g, t = lane // 4, lane % 4
   t0 = token_block*token_tile
@@ -533,7 +544,11 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
           for o in range(out_tiles)]
   accs = [[acc.after(acc.store(acc.const_like(0))) for acc in row] for row in accs]
   zero = UOp.const((0,)*4, dtypes.int32)
-  step = UOp.range(groups // S, 3, AxisType.REDUCE)
+  step = UOp.range(steps, 3, AxisType.REDUCE)
+  # T4.131: the split-K axis is a global range with the highest axis id (the global dims sort by id, the last one is gidx0): the
+  # splits of one output tile launch adjacently, its token blocks `splitk` launches apart, still within one wave
+  kblk = UOp.range(splitk, 4) if splitk > 1 else None
+  def stage_of(st): return st if kblk is None else kblk*steps + st  # this block's stage `st` as an index into every stage
   prefetch:list[UOp] = []
   if stage:
     # T4.126: the block's activation tile for these S groups (token_tile x 8S words + token_tile x S scales) staged once in
@@ -573,9 +588,9 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
       # prefetch is clamped to the last stage: a copy nobody reads again, no gate. The copy index is step & 1, NOT step % 2: a
       # RANGE % c makes pm_split_ranges split the loop into (n/2, 2) ranges whose 3-tuple args add_war_barrier's r.arg[1] check
       # doesn't recognise -- the end-of-step barrier silently vanished (a WAR race; test_llm_nv_gemm pins the barriers)
-      ready, cur = fill(0, 0), step & 1
-      prefetch.append(fill((step + 1).minimum(groups // S - 1), 1 - (step & 1)))
-    else: ready, cur = fill(step, None), None
+      ready, cur = fill(stage_of(0), 0), step & 1
+      prefetch.append(fill(stage_of((step + 1).minimum(steps - 1)), 1 - (step & 1)))
+    else: ready, cur = fill(stage_of(step), None), None
     xs, xds = xs_buf.after(ready), xd_buf.after(ready)
     def at_copy(i, stride:int): return i if cur is None else cur*(token_tile*stride) + i
     def word(row, w:int, s:int): return xs[at_copy(row*wstride + s*8 + w, wstride)]
@@ -584,9 +599,9 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
       sums = sum_buf.after(ready)
       def gsum(row, s:int): return sums[at_copy(row*dstride + s, dstride)]
   else:  # stage 0: every warp loads its fragments straight from global (the pre-staging kernel, kept as a card A/B)
-    def word(row, w:int, s:int): return xq[t0 + row, step, w]
-    def scale(row, s:int): return xd[t0 + row, step]
-    def gsum(row, s:int): return cast(UOp, xsum)[t0 + row, step]
+    def word(row, w:int, s:int): return xq[t0 + row, stage_of(step), w]
+    def scale(row, s:int): return xd[t0 + row, stage_of(step)]
+    def gsum(row, s:int): return cast(UOp, xsum)[t0 + row, stage_of(step)]
   def wside(rr, at) -> list[tuple[UOp, tuple]]:
     # the weight side of stage `at` read through raw view rr (raw itself, or T4.131's _RegRaw): per (s, n-tile) the B fragment and
     # (D, M) for outputs 2t and 2t+1 -- this call order is _RegRaw's record/replay contract
@@ -605,17 +620,17 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
     # stage's words (the last step reloads the last stage: a harmless re-read, no gate, as pipe's fill). The refill stores go
     # through a view `after` the replay loads, so the linearizer can never put a refill ahead of the read it would clobber
     probe = _RegRaw(None, raw)
-    wside(probe, step.const_like(0))
+    wside(probe, stage_of(step.const_like(0)))
     wregs = UOp.placeholder((probe.k,), raw.dtype, slot=103, addrspace=AddrSpace.REG)  # the raw view's word type (u16 or u32)
     first = _RegRaw(wregs, raw)
-    wside(first, step.const_like(0))
+    wside(first, stage_of(step.const_like(0)))
     wr = wregs.after(UOp.group(*first.stores)).after(step)
     replay = _RegRaw(wr, None)
-    wvals = wside(replay, step)
+    wvals = wside(replay, stage_of(step))
     ahead = _RegRaw(wr.after(*replay.loads), raw)
-    wside(ahead, (step + 1).minimum(groups // S - 1))
+    wside(ahead, stage_of((step + 1).minimum(steps - 1)))
     prefetch += ahead.stores
-  else: wvals = wside(raw, step)
+  else: wvals = wside(raw, stage_of(step))
   running = [[acc.after(step) for acc in row] for row in accs]
   for s in range(S):
     afrags = tuple(UOp.stack(*(b for r in range(4) for b in _i8x4(word(r0 + g + 8*(r % 2), t + 4*(r // 2), s)))) for r0 in r0s)
@@ -636,9 +651,11 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
     for r0, acc in zip(r0s, row):
       c0, c1, c2, c3 = (acc.after(update)[i].load() for i in range(4))
       m = t0 + r0 + g
-      stores += [out[m, n0 + 2*t].store(c0), out[m, n0 + 2*t + 1].store(c1), out[m + 8, n0 + 2*t].store(c2), out[m + 8, n0 + 2*t + 1].store(c3)]
+      o_ = out if kblk is None else out[kblk]  # T4.131: this split's partial
+      stores += [o_[m, n0 + 2*t].store(c0), o_[m, n0 + 2*t + 1].store(c1), o_[m + 8, n0 + 2*t].store(c2), o_[m + 8, n0 + 2*t + 1].store(c3)]
   # T4.131: minblocks -> __launch_bounds__(threads, minblocks) (KernelInfo.min_blocks, the CUDA renderer); 0 = today's KernelInfo
-  return UOp.group(*stores).end(token_block, output_block, warp, lane).sink(arg=KernelInfo(name=name, opts_to_apply=(), min_blocks=minblocks))
+  ranges = (token_block, output_block, warp, lane) if kblk is None else (kblk, token_block, output_block, warp, lane)
+  return UOp.group(*stores).end(*ranges).sink(arg=KernelInfo(name=name, opts_to_apply=(), min_blocks=minblocks))
 
 @functools.cache
 def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:int, in_features:int, ggml_type:int,
@@ -671,7 +688,18 @@ def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
   while stage > 1 and copies*token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
   return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage, "pipe": int(copies == 2),
-          "minblocks": NV_IMMA_MINBLOCKS.value, "wprefetch": NV_IMMA_WPREFETCH.value}
+          "minblocks": NV_IMMA_MINBLOCKS.value, "wprefetch": NV_IMMA_WPREFETCH.value,
+          "splitk": _imma_splitk(groups // max(stage, 1), layer.out_features // (WMMA_N*out_tiles*warps) * (tokens // token_tile))}
+
+def _imma_splitk(steps:int, blocks:int) -> int:
+  # T4.131: NV_IMMA_SPLITK's rule for a kernel of `blocks` (output tiles x token blocks) each walking `steps` stage steps. 0 = auto:
+  # below two waves of the 3090's resident blocks (82 SMs x NV_IMMA_MINBLOCKS, or ptxas's 2 blocks per SM at the defaults) take
+  # the smallest divisor of the steps that reaches two waves, else the largest <= 8 (128 tokens at the defaults: 5120-out 160
+  # blocks -> 4, 10240-out 320 -> 2, 17408-out 544 -> 1); n = n wherever it divides the steps (1 = off)
+  if (knob := NV_IMMA_SPLITK.value) != 0: return knob if knob > 1 and steps % knob == 0 else 1
+  if blocks >= (target := 2 * 82 * (NV_IMMA_MINBLOCKS.value or 2)): return 1
+  candidates = [k for k in range(1, 9) if steps % k == 0]
+  return next((k for k in candidates if blocks * k >= target), candidates[-1])
 
 def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
   """WMMA gemm for every format in WMMA_FORMATS at prefill (tokens > 4, multiple of 16 -- or symbolic, padded to
@@ -692,11 +720,16 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
     # T4.126: q8 activations (shared across the Linears reading one x, nv_quant's T4.123a cache) x the aligned weight view;
     # T4.128: Q4_1/Q5_K also take the quantizer's group sums
     acts = q8_quantize(x_pad, cast(int, tokens), in_features, sums=layer.ggml_type != Q4_0)
-    out = Tensor.empty(tokens, out_features, dtype=dtypes.float32, device=x.device).uop
+    # T4.131: split-K writes (splitk, tokens, out) fp32 partials, summed here by the generic reduce (its order: p0 + p1 + ... as the
+    # reduce loop runs them, from a zero accumulator -- a different fp32 order than the one-pass kernel's serial accumulation, so
+    # not bit-identical to it; each partial is bit-exact for its own groups)
+    out = Tensor.empty(*((imma["splitk"], tokens) if imma["splitk"] > 1 else (tokens,)), out_features, dtype=dtypes.float32, device=x.device).uop
     all_srcs = (out, cast(Tensor, _imma_weight(layer)).uop.buf_uop, *(a.uop for a in acts))
     params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
     kernel = _linear_imma_nv(*params, ggml_type=layer.ggml_type, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
-    result = Tensor(out.after(kernel)).reshape(*x_pad.shape[:-1], out_features)
+    result = Tensor(out.after(kernel))
+    if imma["splitk"] > 1: result = result.sum(0)
+    result = result.reshape(*x_pad.shape[:-1], out_features)
     if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], out_features)))
     return result if layer.bias is None else result + layer.bias
   xh = x_pad.cast(dtypes.float16).contiguous().reshape(tokens, in_features)

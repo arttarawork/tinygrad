@@ -187,19 +187,20 @@ def _np_imma_reference(ggml_type:int, blocks:np.ndarray, xq:np.ndarray, xd:np.nd
     if M is not None: acc = (M[None, :, grp].astype(np.float64) * cast(np.ndarray, xs)[:, None, grp] + acc).astype(np.float32)
   return acc
 
-def _imma_params(ggml_type:int, tokens:int, out_features:int, in_features:int) -> list[UOp]:
+def _imma_params(ggml_type:int, tokens:int, out_features:int, in_features:int, splitk:int=1) -> list[UOp]:
   groups = in_features // 32
   raw = {Q4_0: (out_features*groups*9, dtypes.uint16), Q4_1: (out_features*groups*5, dtypes.uint32),
          Q5_K: (out_features*groups//8*44, dtypes.uint32)}[ggml_type]
-  return [UOp.placeholder((tokens, out_features), dtypes.float32, slot=0), UOp.placeholder((raw[0],), raw[1], slot=1),
+  out_shape = (splitk, tokens, out_features) if splitk > 1 else (tokens, out_features)  # T4.131: split-K partials
+  return [UOp.placeholder(out_shape, dtypes.float32, slot=0), UOp.placeholder((raw[0],), raw[1], slot=1),
           UOp.placeholder((tokens, groups, 8), dtypes.uint32, slot=2), UOp.placeholder((tokens, groups), dtypes.float32, slot=3)] + \
          ([UOp.placeholder((tokens, groups), dtypes.float32, slot=4)] if ggml_type != Q4_0 else [])
 
 def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4,
-               ggml_type:int=Q4_0, pipe:int=0, minblocks:int=0, wprefetch:int=0):
-  return nv_gemm._linear_imma_nv.__wrapped__(*_imma_params(ggml_type, tokens, out_features, in_features), ggml_type=ggml_type,
+               ggml_type:int=Q4_0, pipe:int=0, minblocks:int=0, wprefetch:int=0, splitk:int=1):
+  return nv_gemm._linear_imma_nv.__wrapped__(*_imma_params(ggml_type, tokens, out_features, in_features, splitk), ggml_type=ggml_type,
                                              out_features=out_features, in_features=in_features, token_tile=token_tile, warps=warps,
-                                             out_tiles=out_tiles, stage=stage, pipe=pipe, minblocks=minblocks, wprefetch=wprefetch)
+                                             out_tiles=out_tiles, stage=stage, pipe=pipe, minblocks=minblocks, wprefetch=wprefetch, splitk=splitk)
 
 def _shared_bytes(src:str) -> int:  # static __shared__ total of a rendered kernel (every tile here is a 4-byte type)
   return sum(4 * int(n) for n in re.findall(r"__shared__ __align__\(\d+\) \w+ \w+\[(\d+)\];", src))
@@ -368,6 +369,88 @@ class TestImmaKernel(unittest.TestCase):
             res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
             np.testing.assert_array_equal(res, _np_imma_reference(ggml_type, blocks, xq, xd, xs))  # same fp32 op order: bit-exact
 
+class TestImmaSplitK(unittest.TestCase):
+  """T4.131: split-K -- splitk blocks per output tile each walk steps/splitk stages into out[k] of a (splitk, tokens, out) partials
+  buffer; the caller sums over k. Not bit-identical to the one-pass kernel (fp32 order), but every partial is bit-exact for its
+  own groups and the sum is within fp32 rounding of one pass."""
+  def setUp(self):
+    from unittest import mock
+    patcher = mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True)  # the dispatch test: the sm_80 gate forced open
+    patcher.start()
+    self.addCleanup(patcher.stop)
+
+  def test_renders_at_model_shapes(self):
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.helpers import DEV
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
+    for ggml_type, shapes in MODEL_SHAPES.items():
+      for out_features, in_features in shapes:
+        for splitk, pipe, wprefetch in itertools.product((2, 4), (0, 1), (0, 1)):
+          with self.subTest(ggml_type=ggml_type, out=out_features, inp=in_features, splitk=splitk, pipe=pipe, wprefetch=wprefetch):
+            prg = to_program(_imma_sink(128, out_features, in_features, ggml_type=ggml_type, pipe=pipe, wprefetch=wprefetch, splitk=splitk), renderer)
+            src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+            # the split axis is the fastest grid axis; each block walks steps/splitk stages; the partials buffer is the 3-D out
+            self.assertEqual(tuple(prg.arg.global_size), (splitk, 2, out_features // 64))
+            self.assertIn(f"int gidx0 = blockIdx.x; /* {splitk} */", src)
+            self.assertIn(f"for (int Ridx3 = 0; Ridx3 < {in_features // 32 // 4 // splitk}; Ridx3++)", src)
+            self.assertIn(f"float* data0_{splitk * 128 * out_features}", src)
+            self.assertEqual(src.count("__syncthreads();"), 2)
+
+  def test_splitk_must_divide_the_steps(self):
+    with self.assertRaises(AssertionError): _imma_sink(32, 64, 256, 16, 2, 2, 2, splitk=3)  # 4 steps
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_partials_on_python_emulator(self):
+    # every partial == the numpy reference over its own groups, bit-exact (a serial fp32 accumulation from zero, like the one-pass
+    # kernel over all groups); their fp32 sum is within rounding of the one-pass reference (Q5_K's partials are the largest)
+    cfgs = {Q4_0: (32, 64, 256, 16, 2, 2, 2), Q4_1: (32, 64, 256, 16, 2, 2, 2), Q5_K: (32, 64, 1024, 16, 2, 2, 4)}
+    for ggml_type, (tokens, out_features, in_features, token_tile, warps, out_tiles, stage) in cfgs.items():
+      for splitk, wprefetch, pipe in ((2, 0, 0), (4, 0, 0), (4, 1, 1)):
+        with self.subTest(ggml_type=ggml_type, splitk=splitk, wprefetch=wprefetch, pipe=pipe):
+          rng = np.random.default_rng(5)
+          blocks, (xq, xd, xs) = _blocks(ggml_type, rng, out_features, in_features // 32), _q8(rng, tokens, in_features)
+          fxn = functools.partial(nv_gemm._linear_imma_nv.__wrapped__, ggml_type=ggml_type, out_features=out_features, in_features=in_features,
+                                  token_tile=token_tile, warps=warps, out_tiles=out_tiles, stage=stage, pipe=pipe, wprefetch=wprefetch, splitk=splitk)
+          out = Tensor.empty(splitk, tokens, out_features, dtype=dtypes.float32, device="PYTHON")
+          srcs = [Tensor(a, device="PYTHON") for a in (_raw(ggml_type, blocks), xq, xd) + ((xs,) if ggml_type != Q4_0 else ())]
+          res = out.custom_kernel(*srcs, fxn=fxn)[0].numpy()
+          g, sb = in_features // 32 // splitk, 8 if ggml_type == Q5_K else 1  # groups per split; Q5_K blocks hold 8 groups
+          for k in range(splitk):
+            ref = _np_imma_reference(ggml_type, blocks[:, k*g//sb:(k+1)*g//sb], xq[:, k*g:(k+1)*g], xd[:, k*g:(k+1)*g],
+                                     None if xs is None else xs[:, k*g:(k+1)*g])
+            np.testing.assert_array_equal(res[k], ref)
+          np.testing.assert_allclose(res.sum(0), _np_imma_reference(ggml_type, blocks, xq, xd, xs), rtol=1e-4, atol=1e-5)
+
+  def test_auto_rule_splits_only_the_low_n_high_k_shapes(self):
+    # _imma_splitk(steps, blocks): 128 tokens at the defaults (token tile 64 -> 2 token blocks, 64 outputs per block): the 5120-output
+    # layers (160 blocks) and the 10240-output qkv (320) are below two waves of 82 SMs x 2 blocks, gate/up (544) are not
+    from tinygrad import Context
+    steps = {5120: 40, 17408: 136, 6144: 48}  # stage 4
+    with Context(NV_IMMA_SPLITK=0):
+      self.assertEqual([nv_gemm._imma_splitk(steps[i], o // 64 * 2) for o, i in ((5120, 5120), (5120, 17408), (10240, 5120), (17408, 5120), (5120, 6144))],
+                       [4, 4, 2, 1, 3])
+      with Context(NV_IMMA_MINBLOCKS=3):  # three resident blocks per SM -> two waves = 492 blocks (gate/up's 544 still one pass)
+        self.assertEqual([nv_gemm._imma_splitk(steps[i], o // 64 * 2) for o, i in ((5120, 5120), (10240, 5120), (17408, 5120), (5120, 6144))], [4, 2, 1, 4])
+      self.assertEqual(nv_gemm._imma_splitk(3, 160), 3)  # no divisor reaches two waves: the largest <= 8
+      self.assertEqual(nv_gemm._imma_splitk(1, 160), 1)
+    with Context(NV_IMMA_SPLITK=1): self.assertEqual([nv_gemm._imma_splitk(40, b) for b in (160, 544)], [1, 1])
+    with Context(NV_IMMA_SPLITK=2): self.assertEqual([nv_gemm._imma_splitk(s, 544) for s in (40, 3)], [2, 1])  # forced where it divides
+
+  def test_knob_reaches_the_kernel_and_the_result_is_summed(self):
+    from tinygrad import Context
+    lin, x = _quantized_linear(Q4_0, 256, 256), Tensor.empty(1, 64, 256, dtype=dtypes.float32)  # 8 groups, stage 4 -> 2 steps
+    with Context(NV_IMMA=1, NV_IMMA_SPLITK=2):
+      out = nv_gemm.nv_wmma_linear(lin, x)
+      kernel = _kernels(out)["linear_q4_0_imma_nv"]
+    self.assertIs(kernel, _imma_sink(64, 256, 256, splitk=2))
+    self.assertEqual(out.shape, (1, 64, 256))
+    self.assertEqual(next(u._shape for u in kernel.toposort() if u.op is Ops.PARAM and u.arg.slot == 0), (2 * 64 * 256,))  # the partials
+    self.assertTrue(any(u.op is Ops.REDUCE for u in out.uop.toposort()))  # summed by the generic reduce
+    with Context(NV_IMMA=1, NV_IMMA_SPLITK=4):  # 4 doesn't divide 2 steps: one pass
+      self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"], _imma_sink(64, 256, 256))
+
 class TestGates(unittest.TestCase):
   def test_dispatch_stays_generic_off_nv(self):
     # CPU: nv_quant_supported is False, so Linear.__call__ never reaches nv_wmma_linear; and called directly it returns None
@@ -493,7 +576,7 @@ class TestImmaDispatch(unittest.TestCase):
       self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32, NV_IMMA_PIPE=1):  # T4.128: two copies -> 2 x 128 x (36 + 5) = 41 KB
       self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1, "minblocks": 0,
-                                                          "wprefetch": 0})
+                                                          "wprefetch": 0, "splitk": 1})
 
   def test_wprefetch_knob_reaches_the_kernel(self):
     # T4.131: NV_IMMA_WPREFETCH=1 builds the register-prefetch kernel for all three formats, with and without a stage tile
@@ -548,7 +631,7 @@ class TestImmaEndToEndOnEmulator(unittest.TestCase):
   the PYTHON emulator (gate forced open, warp shuffle emulated). Bit-exact vs the numpy reference fed the quantizer's own output,
   and close to the fp32 matmul of the dequantized weights (q8 activations are the only approximation). T4.128: Q4_1 (u32 view)
   and Q5_K (word view) with the quantizer's sums."""
-  def _check(self, ggml_type:int, in_features:int):
+  def _check(self, ggml_type:int, in_features:int, splitk:int=1):
     from unittest import mock
     from tinygrad import nn, Context
     from tinygrad.llm.gguf import ggml_data_to_tensor
@@ -565,13 +648,19 @@ class TestImmaEndToEndOnEmulator(unittest.TestCase):
     x_np = rng.standard_normal((1, tokens, in_features)).astype(np.float32)
     x = Tensor(x_np, device="PYTHON")
     with mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
-         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__), Context(NV_IMMA=1, NV_IMMA_WARPS=2):
+         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__), \
+         Context(NV_IMMA=1, NV_IMMA_WARPS=2, NV_IMMA_SPLITK=splitk):
       out = nv_gemm.nv_wmma_linear(lin, x)
       self.assertIn(nv_gemm.IMMA_FORMATS[ggml_type][2], _kernels(out))
       # the very tensors the dispatch used (T4.123a cache)
       acts = [t.numpy() for t in nv_quant.q8_quantize(x, tokens, in_features, sums=ggml_type != Q4_0)]
       res = out.numpy()
-    np.testing.assert_array_equal(res[0], _np_imma_reference(ggml_type, blocks, *acts))
+    if splitk == 1: np.testing.assert_array_equal(res[0], _np_imma_reference(ggml_type, blocks, *acts))
+    else:
+      # T4.131: the generic reduce sums the partials p0 + p1 + ... in order from zero; each partial is the reference over its groups
+      g = in_features // 32 // splitk
+      refs = [_np_imma_reference(ggml_type, blocks[:, k*g:(k+1)*g], *(a[:, k*g:(k+1)*g] for a in acts)) for k in range(splitk)]
+      np.testing.assert_array_equal(res[0], functools.reduce(np.add, refs))
     # q8 activation error only: max 2.7 % (Q4_0), 2.3 % (Q4_1), 4.5 % (Q5_K: 31*63-scale weights, all positive q) of the mean
     # output magnitude here; a wiring slip would be O(100 %)
     ref = x_np[0] @ decoded.numpy().T
@@ -580,5 +669,6 @@ class TestImmaEndToEndOnEmulator(unittest.TestCase):
   def test_q4_0_linear(self): self._check(Q4_0, 128)
   def test_q4_1_linear(self): self._check(Q4_1, 128)
   def test_q5_k_linear(self): self._check(Q5_K, 256)
+  def test_q4_0_linear_splitk(self): self._check(Q4_0, 512, splitk=4)  # T4.131: 16 groups, stage 4 -> 4 steps, 4 splits of one step
 
 if __name__ == "__main__": unittest.main()
