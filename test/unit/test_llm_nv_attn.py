@@ -505,7 +505,7 @@ class TestPrefillGQAKernel(unittest.TestCase):
     self.assertEqual(route(0)[0], ["flash_prefill_wmma_nv"])
     # the geometry from the knobs: warps = the largest divisor of the m-tile count (G * T_pad / 16) <= NV_ATTN_GQA_WARPS, keys the
     # largest power of two <= NV_ATTN_GQA_KEYS whose K + V fp16 tiles fit the 48 KB static shared-memory cap
-    self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 4, "keys": 32})           # the model: 48 m-tiles per kv head
+    self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 8, "keys": 32})  # the model: 48 m-tiles per kv head; default 8 (10-29)
     with Context(NV_ATTN_GQA_WARPS=16, NV_ATTN_GQA_KEYS=128): self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 16, "keys": 32})
     with Context(NV_ATTN_GQA_WARPS=5): self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256)["warps"], 4)
     with Context(NV_ATTN_GQA_KEYS=128): self.assertEqual(nv_attn._gqa_geometry(4, 2, 16, 64)["keys"], 128)  # 4*128*64 = 32 KB fits

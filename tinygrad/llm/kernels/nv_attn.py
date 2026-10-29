@@ -337,7 +337,7 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
 # ******** T4.130: prefill chunks, each K/V tile dequantised once for the whole GQA group ********
 
 NV_ATTN_GQA = ContextVar("NV_ATTN_GQA", 1)  # T4.130: inside NV_ATTN_WMMA=1, the shared-tile kernel below (0 = the T4.113 kernel, byte-identical)
-NV_ATTN_GQA_WARPS = ContextVar("NV_ATTN_GQA_WARPS", 4)  # T4.130: query m-tiles (one warp each) sharing a staged K/V tile; card knob
+NV_ATTN_GQA_WARPS = ContextVar("NV_ATTN_GQA_WARPS", 8)  # T4.130: m-tiles (one warp each) sharing a staged K/V tile; 10-29 card: 8 best
 NV_ATTN_GQA_KEYS = ContextVar("NV_ATTN_GQA_KEYS", 32)  # T4.130: keys per staged tile (16 or 32: K + V tiles are 4*keys*head_dim bytes); card knob
 # the CUDA renderer ignores the wmma device string; the PYTHON emulator keys its NVIDIA fragment model on 'CUDA' (nv_gemm.IMMA_ARG)
 GQA_WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)
@@ -430,14 +430,14 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   for task in tasks(KT // 4 * D // 16):
     quad, half = task % (KT // 4), task // (KT // 4)
     kstep, tq = quad // 4, quad % 4
-    vals = []
+    vrows: list[list[UOp]] = []
     for dk in (0, 1, 8, 9):
       key = key0 + kstep * WMMA_K + 2 * tq + dk
-      vals.append(_kv_halves(cache_kv, sc, 1, b, kv_head, key.valid(key < valid_kv_len), half * 16, 16))
+      vrows.append(_kv_halves(cache_kv, sc, 1, b, kv_head, key.valid(key < valid_kv_len), half * 16, 16))
     for np_ in range(2):
       for gg in range(8):
         slot = v_slot(kstep, half * 2 + np_, gg, tq)
-        stores += [v_tile[slot * 4 + i].store(vals[i][8 * np_ + gg]) for i in range(4)]
+        stores += [v_tile[slot * 4 + i].store(vrows[i][8 * np_ + gg]) for i in range(4)]
   k_tile, v_tile = k_tile.after(*stores), v_tile.after(*stores)
   # S = Q.K^T over the tile's NT n-tiles (8 keys each), all k-steps unrolled (static register indices for the Q fragments)
   zero = UOp.const((0.0,) * 4, dtypes.float)
