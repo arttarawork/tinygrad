@@ -1,11 +1,14 @@
 """T4.107a: NV split-KV decode attention (kernels/nv_attn.py) -- the kernel graph builds for the real geometry and renders on sm_86
 with its 32 lanes as one warp, the merge and the in-kernel dequant convention agree with a plain-tensor reference on CPU, and the
-NV_CUSTOM_ATTN gate leaves every other path untouched. Kernel numerics on the card: extra/nv_attn_validate_real.py."""
-import math, pickle, re, unittest
+NV_CUSTOM_ATTN gate leaves every other path untouched. Kernel numerics on the card: extra/nv_attn_validate_real.py.
+T4.129 (TestDecodeMMAKernel): the tensor-core KV_INT4 decode kernel EXECUTED on the PYTHON emulator against numpy (the warp
+shuffle swapped for a shared exchange, as test_llm_nv_norm does), its sm_86 render, the store gates at small G, the dispatch."""
+import itertools, math, pickle, re, sys, unittest
 from unittest.mock import patch
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, Context
-from tinygrad.uop.ops import Ops, KernelInfo
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import Ops, KernelInfo, AxisType
 from tinygrad.llm.kernels import nv_attn
 from tinygrad.llm.kernels.nv_attn import BLOCK_N, MAX_CHUNKS
 
@@ -358,5 +361,168 @@ class TestGates(unittest.TestCase):
     a = run()
     with Context(NV_CUSTOM_ATTN=1): b = run()
     np.testing.assert_array_equal(a, b)
+
+# ******** T4.129: KV_INT4 decode on the tensor cores ********
+
+def _mma_sink(N:int, valid, warps:int=4, k_tiles:int=1, G:int=6, kvh:int=KVH, Dh:int=D):
+  Hq, slots = kvh * G, min(nv_attn.NV_ATTN_DEC_SLOTS.value, N // (16 * k_tiles))
+  srcs = [Tensor.empty(B, Hq, slots, Dh, dtype=dtypes.float32).uop, Tensor.empty(B, Hq, slots, 2, dtype=dtypes.float32).uop,
+          Tensor.empty(B, Hq, 1, Dh, dtype=dtypes.float16).uop, Tensor.empty(2, B, kvh, N, Dh // 2, dtype=dtypes.uint8).uop,
+          Tensor.empty(2, B, kvh, N, Dh // 32, dtype=dtypes.float16).uop]
+  params = [UOp.placeholder_like(s, slot=i) for i, s in enumerate(srcs)]
+  params[3] = UOp.placeholder((2, B, kvh, N, Dh // 8), dtypes.uint32, slot=3)  # the words view _decode_mma_attention hands the kernel
+  return nv_attn._decode_mma_kernel(*params, valid_kv_len=valid, max_kv_len=N, warps=warps, k_tiles=k_tiles)
+
+def _render_sm86(test, sink) -> str:
+  from tinygrad.codegen import to_program
+  from tinygrad.renderer.cstyle import CUDARenderer
+  from tinygrad.helpers import DEV
+  try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+  except Exception as e: test.skipTest(f"CUDA renderer unavailable: {e!r}")
+  prg = to_program(sink, renderer)
+  test.assertLess(len(pickle.dumps(prg)), 2_000_000)  # the compile worker pool pickles the lowered PROGRAM (test_llm_nv_gemm's limit)
+  return next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+
+_emu_slot = itertools.count(200)
+def _emulated_shfl(warps:int):
+  """_shfl (__shfl_sync from lane src_lane) as a block-shared exchange for the PYTHON emulator: thread warp*32+lane writes val and
+  reads its partner's (the emulator runs the block in lockstep) -- test_llm_nv_norm's _emulated_warp_reduce, with the partner index
+  clamped so CHECK_OOB's cheap vmin/vmax bound passes (its z3 pass has no model for lane ^ 1)."""
+  def shfl(val:UOp, src_lane:UOp) -> UOp:
+    lane = UOp.range(nv_attn.WARP_SIZE, -1, AxisType.WARP)
+    warp = UOp.range(warps, 1, AxisType.LOCAL) if warps > 1 else UOp.const(0, dtypes.weakint)
+    buf = UOp.placeholder((warps * 32,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
+    partner = (warp * 32 + src_lane).maximum(0).minimum(warps * 32 - 1)
+    return buf.after(buf[warp * 32 + lane].store(val))[partner].load()
+  return shfl
+
+def _dequant_int4_np(kv:np.ndarray, scale:np.ndarray, Dh:int) -> np.ndarray:
+  """(2,KVH,N,D/2) packed nibbles + (2,KVH,N,D/32) fp16 scales -> (2,KVH,N,D) float64, model.py's layout (low nibble = even element)"""
+  q = np.stack([kv & 0xF, kv >> 4], -1).reshape(*kv.shape[:-1], Dh).astype(np.float64) - 8
+  return (q.reshape(*q.shape[:-1], Dh // 32, 32) * scale.astype(np.float64)[..., None]).reshape(q.shape)
+
+def _q8_round_np(q:np.ndarray) -> np.ndarray:
+  """the kernel's prologue: q rounded to int8 per 32-wide block (absmax/127, round half to even, clip) -- the one approximation the
+  tensor-core path adds over the T4.107a kernel (P and V*scale go to fp16 for the P.V mma, like the T4.113 prefill kernel)"""
+  blk = q.reshape(*q.shape[:-1], q.shape[-1] // 32, 32).astype(np.float32)
+  sq = np.maximum(np.abs(blk).max(-1, keepdims=True) / 127, 1e-8)
+  return (np.clip(np.rint(blk / sq), -127, 127) * sq).reshape(q.shape)
+
+class TestDecodeMMAKernel(unittest.TestCase):
+  """T4.129: the tensor-core decode kernel (one warp per partial slot, KS = 16*k_tiles keys per step, int8 mma for Q.K^T, fp16 mma
+  for P.V, the T4.107a (acc, m, l) partial contract)."""
+  def test_graph_builds(self):
+    for warps, k_tiles in ((1, 1), (4, 1), (4, 2), (2, 4)):
+      for valid in (1, 4095, UOp.variable("start_pos", 0, 4095) + 1):
+        with self.subTest(warps=warps, k_tiles=k_tiles, valid=str(valid)):
+          sink = _mma_sink(4096, valid, warps=warps, k_tiles=k_tiles)
+          self.assertIs(sink.op, Ops.SINK)
+          nodes = list(sink.toposort())
+          wmma = [u for u in nodes if u.op is Ops.WMMA]
+          self.assertEqual({u.arg[0] for u in wmma}, {(8, 16, 32), (8, 16, 16)})          # S on int8 m16n8k32, P.V on fp16 m16n8k16
+          self.assertEqual(len(wmma), (2 * (D // 32) + D // 16) * k_tiles)               # per step: 2 n-tiles x 8 blocks, 16 m-tiles
+          self.assertTrue(any(u.op is Ops.CUSTOM and "__shfl_sync(0xffffffff" in u.arg[0] for u in nodes))
+
+  def test_render_for_sm86(self):
+    # the mma fragment maps key on the HARDWARE lane: the WARP range must render as threadIdx.x /* 32 */ unsplit (nv_gemm's IMMA
+    # kernel's pin), the warps on threadIdx.y; both mma shapes and the lane shuffles are in the source; the bound decode position
+    # reaches the kernel as a parameter
+    for warps, k_tiles in ((4, 1), (4, 2), (1, 1)):
+      with self.subTest(warps=warps, k_tiles=k_tiles):
+        src = _render_sm86(self, _mma_sink(4096, UOp.variable("start_pos", 0, 4095) + 1, warps=warps, k_tiles=k_tiles))
+        self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
+        self.assertIn("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32", src)
+        self.assertIn("__shfl_sync(0xffffffff", src)
+        self.assertIn("int lidx0 = threadIdx.x; /* 32 */", src)
+        if warps > 1: self.assertIn(f"int lidx1 = threadIdx.y; /* {warps} */", src)
+        else: self.assertNotIn("lidx1", src)
+        self.assertIn(f"__launch_bounds__({32 * warps})", src)
+        self.assertIn("start_pos", src)
+        self.assertEqual(src.count("__WMMA_8_16_32_signed_char_int("), 1 + 16 * k_tiles)  # the helper's definition + its call sites
+        self.assertEqual(src.count("__WMMA_8_16_16_half_float("), 1 + 16 * k_tiles)
+        self.assertLess(len(src), 150_000)
+
+  def test_out_store_gates_survive_small_g(self):
+    # the index lowering substitutes what a gate pins into the gated component and drops a gate whose ranges then no longer appear
+    # in it (schedule/indexing.py's reshape rewrite, pm_drop_and_clauses): gated on the head (oh < 2 pins t = 0) the out stores
+    # rendered UNCONDITIONAL at G = 2 and 3 and every lane wrote head 0/1's rows (found on the emulator, 10-29). The gate now sits
+    # on the dim component (depends on g): every out store of the small-G renders must sit under an if
+    for G in (2, 3, 6):
+      with self.subTest(G=G):
+        lines = [l.strip() for l in _render_sm86(self, _mma_sink(128, 16, warps=1, G=G, kvh=1, Dh=64)).splitlines()]
+        stores = [i for i, l in enumerate(lines) if "data0_" in l and " = " in l]
+        self.assertTrue(stores)
+        for i in stores: self.assertTrue(lines[i - 1].startswith("if ("), f"G={G}: unguarded out store: {lines[i][:80]}")
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_kernel_matches_numpy_on_emulator(self):
+    # the whole path (q8 prologue, int8 S mma, online softmax across steps and slots, fp16 P.V mma, stats, _merge_partials) executed
+    # lane by lane on the PYTHON emulator, against numpy attention over the dequantized cache with q rounded as the kernel rounds it:
+    # lengths that fill no whole 16-key tile (1, 17, 37, 50, 100), one that fills every tile (128), slots that fold several tiles
+    # (steps > 1, incl. a step with no visible key for a slot: alpha = 1, p = 0), 1/2 warps per block, 1/2 key tiles per step,
+    # D = 64 / 128, G = 3 / 6 / 8 (the padded m-tile rows), and a bound symbolic length
+    from tinygrad.llm.kernels import nv_gemm
+    rng = np.random.default_rng(4)
+    configs = [(2, 3, 64, 128, 37, 2, 1, 1), (2, 3, 64, 128, 128, 2, 1, 1), (2, 3, 64, 128, 1, 2, 1, 1), (2, 3, 64, 128, 17, 2, 1, 1),
+               (1, 6, 64, 128, 100, 4, 2, 1), (1, 6, 64, 128, 100, 4, 2, 2), (1, 8, 128, 128, 50, 2, 1, 1)]
+    for kvh, G, Dh, N, valid, slots, warps, k_tiles in configs:
+      for symbolic in ((False, True) if valid == 37 else (False,)):
+        with self.subTest(kvh=kvh, G=G, D=Dh, N=N, valid=valid, slots=slots, warps=warps, k_tiles=k_tiles, symbolic=symbolic):
+          Hq = kvh * G
+          raw = rng.integers(0, 256, size=(2, 1, kvh, N, Dh // 2), dtype=np.uint8)
+          scale = rng.uniform(0.01, 0.2, size=(2, 1, kvh, N, Dh // 32)).astype(np.float16)
+          q_np = (rng.standard_normal((1, Hq, 1, Dh)) * 2).astype(np.float16)
+          kv, sc, q = (Tensor(a, device="PYTHON").contiguous().realize() for a in (raw, scale, q_np))
+          vl = UOp.variable("start_pos", 0, N - 1).bind(valid - 1) + 1 if symbolic else valid
+          with patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), patch.object(nv_attn, "_shfl", _emulated_shfl(warps)), \
+               patch.object(nv_attn, "_decode_mma_kernel", nv_attn._decode_mma_kernel.__wrapped__), \
+               Context(NV_ATTN_DEC_MMA=1, NV_ATTN_DEC_SLOTS=slots, NV_ATTN_DEC_WARPS=warps, NV_ATTN_DEC_KTILES=k_tiles):
+            out = nv_attn.nv_decode_attention(q, kv, sc, vl)
+            self.assertIn("flash_decode_mma_nv", [u.arg.name for u in out.uop.toposort() if u.op is Ops.SINK and isinstance(u.arg, KernelInfo)])
+            got = out.numpy()[0, :, 0]
+          kvd, qr = _dequant_int4_np(raw[:, 0], scale[:, 0], Dh), _q8_round_np(q_np[0, :, 0].astype(np.float32))
+          ref = np.zeros((Hq, Dh))
+          for h in range(Hq):
+            s = kvd[0, h // G, :valid] @ qr[h].astype(np.float64) / math.sqrt(Dh)
+            p = np.exp(s - s.max())
+            ref[h] = p @ kvd[1, h // G, :valid] / p.sum()
+          self.assertFalse(np.isnan(got).any())
+          np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
+
+  def test_merge_counts_16_key_slots(self):
+    # _decode_mma_attention hands _merge_partials valid * BLOCK_N/KS, so the merge's ceil(. / BLOCK_N) live count is ceil(valid / KS)
+    partial = Tensor([[[[1.], [2.], [3.], [4.]]]])
+    stats = Tensor([[[[0., 1.], [0., 1.], [100., 1.], [100., 1.]]]])
+    for valid, want in ((1, 1.0), (16, 1.0), (17, 1.5), (32, 1.5), (33, 3.0)):
+      self.assertAlmostEqual(nv_attn._merge_partials(partial, stats, valid * (BLOCK_N // 16)).item(), want, places=5)
+
+  def test_dispatch(self):
+    # graph-level, on CPU with the sm_80 check mocked: a KV_INT4 cache takes the mma kernel and sizes the partial buffer at
+    # min(NV_ATTN_DEC_SLOTS, N/16) slots; NV_ATTN_DEC_MMA=0, an int8/fp16 cache, G = 1, a head_dim the fragments don't cover and a
+    # device below sm_80 (or CPU, unmocked) keep the T4.107a kernel
+    from tinygrad.llm.kernels import nv_gemm
+    def run(kv_dtype=dtypes.uint8, G:int=6, Dh:int=D, N:int=4096, mma:int=1, wmma_ok:bool|None=True):
+      kvh = 2
+      kv = Tensor.zeros(2, 1, kvh, N, Dh // 2 if kv_dtype == dtypes.uint8 else Dh, dtype=kv_dtype)
+      scale = Tensor.ones(2, 1, kvh, N, Dh // 32, dtype=dtypes.float16) if kv_dtype != dtypes.float16 else None
+      q = Tensor.ones(1, kvh * G, 1, Dh, dtype=dtypes.float16)
+      mocks = [patch.object(nv_gemm, "_nv_wmma_ok", lambda device: wmma_ok)] if wmma_ok is not None else []
+      with Context(NV_ATTN_DEC_MMA=mma), patch.object(nv_attn.Tensor, "empty", wraps=nv_attn.Tensor.empty) as m:
+        for mk in mocks: mk.start()
+        try: out = nv_attn.nv_decode_attention(q, kv, scale, 100)
+        finally:
+          for mk in mocks: mk.stop()
+      names = [u.arg.name for u in out.uop.toposort() if u.op is Ops.SINK and isinstance(u.arg, KernelInfo)]
+      return names, m.call_args_list[0].args[:4]
+    self.assertEqual(run(), (["flash_decode_mma_nv"], (1, 12, 256, D)))
+    self.assertEqual(run(N=2048), (["flash_decode_mma_nv"], (1, 12, 128, D)))
+    with Context(NV_ATTN_DEC_SLOTS=64): self.assertEqual(run()[1], (1, 12, 64, D))
+    self.assertEqual(run(mma=0), (["flash_decode_partial_nv"], (1, 12, 32, D)))
+    self.assertEqual(run(kv_dtype=dtypes.int8)[0], ["flash_decode_partial_nv"])
+    self.assertEqual(run(kv_dtype=dtypes.float16)[0], ["flash_decode_partial_nv"])
+    self.assertEqual(run(G=1)[0], ["flash_decode_partial_nv"])
+    self.assertEqual(run(Dh=32)[0], ["flash_decode_partial_nv"])
+    self.assertEqual(run(wmma_ok=False)[0], ["flash_decode_partial_nv"])
+    self.assertEqual(run(wmma_ok=None)[0], ["flash_decode_partial_nv"])  # CPU: no CUDA renderer
 
 if __name__ == "__main__": unittest.main()

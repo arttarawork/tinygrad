@@ -235,7 +235,8 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
     for nt in range(2):
       kb = base + 16 * kt + 8 * nt + g  # this lane's B (K) key
       kb = kb.valid(kb < valid_kv_len)
-      sks = [[scale[0, b, kvh, key.valid(ok), blk].load().float() for blk in range(blocks)] for key, ok in zip(keys[2*nt:2*nt+2], key_ok[2*nt:2*nt+2])]
+      sks = [[scale[0, b, kvh, key.valid(ok), blk].load().float() for blk in range(blocks)]
+             for key, ok in zip(keys[2*nt:2*nt+2], key_ok[2*nt:2*nt+2])]
       s = [UOp.const(0, dtypes.float), UOp.const(0, dtypes.float)]
       for blk in range(blocks):
         word = cache_kv[0, b, kvh, kb, 4 * blk + t].load()
