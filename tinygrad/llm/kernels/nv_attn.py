@@ -327,7 +327,10 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
     stores += [out[b, q_head, rows[0], block_n, d0].store(acc[0].load()), out[b, q_head, rows[0], block_n, d0 + 1].store(acc[1].load()),
                out[b, q_head, rows[1], block_n, d0].store(acc[2].load()), out[b, q_head, rows[1], block_n, d0 + 1].store(acc[3].load())]
   stats_head = q_head.valid(lane_lo.eq(0) & dpart.eq(0)) if d_split > 1 else q_head.valid(lane_lo.eq(0))
-  stores += [stats[b, stats_head, rows[r], block_n, 0].store(row_max[r].load()) for r in range(2)]
+  # T4.130 fix (10-29): row_max is in the exp2 domain (scores carry log2 e) but _merge_partials weighs slots as exp2((m_s - m) * LOG2E),
+  # i.e. it expects the natural-domain max the decode/T4.107b kernels store -- stored unconverted (09-16 .. 10-29) every slot below the
+  # row max was under-weighted (w^1.44) on any prompt longer than one chunk
+  stores += [stats[b, stats_head, rows[r], block_n, 0].store(row_max[r].load() / LOG2E) for r in range(2)]
   stores += [stats[b, stats_head, rows[r], block_n, 1].store(sums[r]) for r in range(2)]
   return UOp.group(*stores).end(lane, block).sink(arg=KernelInfo(name="flash_prefill_wmma_nv", opts_to_apply=()))
 
