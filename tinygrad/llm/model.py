@@ -2066,8 +2066,11 @@ class Transformer:
     its LIVE counterpart's device first (a no-op when snapshot_state left it there already, i.e. STATE_CACHE_DEVICE
     unset) -- the live caches themselves never move, only where snapshot_state parked the clone."""
     assert len(snap["blocks"]) == len(self.blk), "restore_state: snapshot block count doesn't match this model"
-    assigns: list[Tensor] = []
+    # T4.135 (10-30): one realize PER BLOCK, as snapshot_state does (T4.112) -- one batched realize planned every block's NV-side copy
+    # of the snapshot into a single arena the size of the whole snapshot (3.06 GB for a 167k-token conversation), which does not fit
+    # beside the 262k KV cache + MTP: every restore of a long session OOM'd (Hermes, 10-30 19:03). Per block it is one slice.
     for b, bs in zip(self.blk, snap["blocks"]):
+      assigns: list[Tensor] = []
       if isinstance(b, GatedDeltaNetBlock):
         assigns.append(b.conv_state.assign(bs["conv_state"].to(b.conv_state.device)))
         assigns.append(b.recurrent_state.assign(bs["recurrent_state"].to(b.recurrent_state.device)))
@@ -2077,12 +2080,14 @@ class Transformer:
         if (bscale := bs.get("cache_kv_scale")) is not None:  # T6.1 KV_INT8 / T4.100 KV_INT4
           assigns.append(b.cache_kv_scale[:, :, :, :bscale.shape[3], :].assign(bscale.to(b.cache_kv_scale.device)))
       else: raise TypeError(f"restore_state: unhandled block type {type(b).__name__}")
+      Tensor.realize(*assigns)
+    assigns = []
     if (mk := snap.get("mtp_cache_kv")) is not None and self.mtp_head is not None:  # T4.66l -- see snapshot_state
       mtp_block = cast(TransformerBlock, self.mtp_head.block)
       assigns.append(mtp_block.cache_kv[:, :, :, :mk.shape[3], :].assign(mk.to(mtp_block.cache_kv.device)))
       if (mks := snap.get("mtp_cache_kv_scale")) is not None:  # T6.1 KV_INT8 / T4.100 KV_INT4
         assigns.append(mtp_block.cache_kv_scale[:, :, :, :mks.shape[3], :].assign(mks.to(mtp_block.cache_kv_scale.device)))
-    Tensor.realize(*assigns)
+    if assigns: Tensor.realize(*assigns)
     self._cached_tokens = list(snap["tokens"])
     self._rope_delta = snap.get("rope_delta", 0)  # T5.3 (pre-T5.3 snapshots: text only, 0)
 
