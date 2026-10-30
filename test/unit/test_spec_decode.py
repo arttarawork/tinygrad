@@ -1,4 +1,5 @@
 import contextlib, io, re, unittest
+from unittest import mock
 from dataclasses import replace
 import numpy as np
 from typing import cast
@@ -7,7 +8,7 @@ from tinygrad.helpers import Context
 from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
-  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits,
+  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits, spec_check_ids,
 )
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 from test.unit.test_llm_device_map import TEST_CONFIG
@@ -1136,6 +1137,57 @@ class TestSpecForwardMatchesDecode(unittest.TestCase):
       np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-5, atol=1e-7,
                                  err_msg=f"{pos=} {T=} recurrent")
       pos += T
+
+class TestSpecDebugAndIdGuard(unittest.TestCase):
+  """T4.132 (10-30): SPEC_DEBUG=1 prints one stderr line per iteration with the verify rows' NaN/inf counts, the verify argmax ids,
+  the chunk and the emitted ids; an id outside [0, vocab) (an argmax over a NaN row reads back as the row width) raises instead of
+  being emitted -- greedy and sampled, anchor and loop."""
+  DEBUG_RE = re.compile(r"^\[SPEC_DEBUG\] start_pos=(\d+) k_eff=(\d+) m=(\d+) chunk=(\[[^\]]*\]) verify_argmax=(\[[^\]]*\]) final=(\[[^\]]*\]) "
+                        r"nan_per_row=(\[[^\]]*\]) inf_per_row=(\[[^\]]*\])$")
+
+  def test_debug_lines_parse_and_are_clean_on_a_healthy_model(self):
+    model = _load_gdn_varied()
+    err = io.StringIO()
+    with Context(SPEC_DEBUG=1), contextlib.redirect_stderr(err):
+      got = [v for _, v in zip(range(9), model.speculative_generate(list(VARIED_PROMPT), k=3))]
+    lines = [line for line in err.getvalue().splitlines() if line.startswith("[SPEC_DEBUG]")]
+    self.assertGreater(len(lines), 0)
+    emitted = []
+    for line in lines:
+      m_ = self.DEBUG_RE.match(line)
+      self.assertIsNotNone(m_, f"debug line didn't parse: {line!r}")
+      _, k_eff, m, chunk, verify_argmax, final, nan_rows, inf_rows = m_.groups()
+      chunk_l, verify_l, final_l = eval(chunk), eval(verify_argmax), eval(final)  # noqa: S307 -- ints lists the test itself printed
+      self.assertEqual(len(chunk_l), int(k_eff) + 1)
+      self.assertEqual(verify_l, final_l, "greedy: the emitted candidates are the verify argmax ids")
+      self.assertEqual(eval(nan_rows), [0] * (int(k_eff) + 1))
+      self.assertEqual(eval(inf_rows), [0] * (int(k_eff) + 1))
+      emitted += chunk_l[1:1 + int(m)] + [final_l[int(m)]]
+    self.assertEqual(emitted[:len(got) - 1], got[1:])  # the lines describe exactly what was yielded after the anchor
+
+  def test_nan_verify_logits_raise_instead_of_emitting_ids(self):
+    for temperature in (0.0, 1.0):
+      model = _load_gdn_varied()
+      orig = Transformer.__call__
+      def nan_verify(self, tokens, start_pos, temperature, spec=False, *args, **kwargs):
+        out = orig(self, tokens, start_pos, temperature, spec, *args, **kwargs)
+        if spec and isinstance(tokens.shape[1], int) and tokens.shape[1] > 1:  # the loop's VERIFY (concrete, wider than one token)
+          return out[0] * float("nan"), out[1]
+        return out
+      err = io.StringIO()
+      with mock.patch.object(Transformer, "__call__", nan_verify), Context(SPEC_DEBUG=1), contextlib.redirect_stderr(err):
+        gen = model.speculative_generate(list(VARIED_PROMPT), k=3, temperature=temperature)
+        next(gen)  # the anchor comes from the prefill tail: still fine
+        with self.assertRaisesRegex(RuntimeError, "outside vocab 512") as ctx: next(gen)
+      self.assertIn("NaN logits upstream", str(ctx.exception))
+      lines = [line for line in err.getvalue().splitlines() if line.startswith("[SPEC_DEBUG]")]
+      self.assertEqual(len(lines), 1, err.getvalue())
+      self.assertIn("nan_per_row=[512, 512, 512, 512]", lines[0], f"{temperature=}: {lines[0]!r}")
+
+  def test_spec_check_ids(self):
+    spec_check_ids([0, 5, 511], 512, "ok")
+    for bad in ([512], [-1], [3, 512, 4]):
+      with self.assertRaisesRegex(RuntimeError, "outside vocab 512"): spec_check_ids(bad, 512, "bad")
 
 if __name__ == '__main__':
   unittest.main()

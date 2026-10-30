@@ -1,5 +1,5 @@
 from __future__ import annotations
-import enum, functools, itertools, math, pathlib, re, time
+import enum, functools, itertools, math, pathlib, re, sys, time
 from dataclasses import dataclass, replace
 from typing import Callable, cast, TYPE_CHECKING
 if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays numpy-free at import time -- the minimal
@@ -256,6 +256,18 @@ SPEC_STATS = ContextVar("SPEC_STATS", 0)
 #                       wall-clock between emitted tokens) -- that separates "the time is IN this function" from
 #                       "the time is somewhere else entirely" (serve.py, HTTP, scheduler contention).
 SPEC_TRACE = ContextVar("SPEC_TRACE", 0)
+
+# T4.132 (10-30): what VERIFY produced, per iteration, to stderr -- NaN/inf counts per row of the verify logits, the verify argmax
+# ids, the chunk (tok_last + the drafts), the accept length and the emitted ids -- so a card probe shows WHERE garbage enters (a wrong
+# draft is harmless; a NaN verify row or an id >= vocab is not). 0 (default): one `if` per iteration, nothing else; 1: one extra host
+# sync per iteration (the logits readback), after the loop's own.
+SPEC_DEBUG = ContextVar("SPEC_DEBUG", 0)
+
+def spec_check_ids(ids:list[int], vocab:int, where:str) -> None:
+  """T4.132 (10-30): an id outside [0, vocab) can only come from NaN logits (an argmax over a NaN row read back as the row width on
+  the card) -- never emit it; the server reports the error instead of streaming ids the tokenizer has no bytes for."""
+  if (bad := [v for v in ids if not 0 <= v < vocab]):
+    raise RuntimeError(f"speculative_generate: {where}: id(s) {bad} outside vocab {vocab} -- NaN logits upstream (SPEC_DEBUG=1 shows the rows)")
 
 def kv_cache_dtype() -> DType:
   """Attention/MLA KV cache dtype: fp16 by default (halves the cache that scales with max_context --
@@ -2382,7 +2394,10 @@ class Transformer:
     # real output and must be emitted now, same as generate()'s own drain loop emits it, or every later
     # position is off by one.
     tok_last = anchor_logits.argmax(-1) if greedy else sample_logits(anchor_logits[:, 0, :], temp_t, MIN_P)  # (B,1), on out_dev
-    tokens.append(int(tok_last.item()))
+    vocab = cast(int, anchor_logits.shape[-1])
+    anchor = int(tok_last.item())
+    spec_check_ids([anchor], vocab, f"anchor at position {prompt_len}")
+    tokens.append(anchor)
     self._cached_tokens = tokens[:-1]
     yield tokens[-1]
 
@@ -2391,6 +2406,7 @@ class Transformer:
     stats_iters = stats_drafted = stats_emitted = 0
     trace_on = bool(SPEC_TRACE.value)  # T4.66c: see SPEC_TRACE's own ContextVar docstring for the phase list/sync semantics
     trace_iter = 0
+    debug_on = bool(SPEC_DEBUG.value)  # T4.132: see SPEC_DEBUG
     try:
       while len(tokens) < self.max_context:
         if trace_on: iter_t0 = time.perf_counter()
@@ -2462,13 +2478,17 @@ class Transformer:
           final = verify_logits.argmax(-1)  # (1, n) ids
           m_t = (final[:, :k_eff] == drafts).cast(dtypes.int32).cumprod(-1).sum(-1) if k_eff else Tensor.zeros(1, dtype=dtypes.int32, device=out_dev)
         else:
-          vocab = cast(int, verify_logits.shape[-1])
           m_t, final = spec_accept_tensor(drafts, Tensor.stack(*q_logits, dim=1) if q_logits else verify_logits[:, :0], verify_logits, temperature,
                                           Tensor.rand(1, k_eff, device=out_dev), Tensor.rand(1, n, vocab, device=out_dev), min_p=MIN_P)
         readback_t = m_t.reshape(1).cat(chunk[0], final[0]).realize()  # (2n+1,) on out_dev
         readback = cast(list[int], readback_t.tolist())  # THE sync: draft chain + VERIFY + the accept test
         m, chunk_ids, final_ids = readback[0], readback[1:1 + n], readback[1 + n:]
         assert 0 <= m <= k_eff and len(chunk_ids) == len(final_ids) == n, f"{m=} {k_eff=} {n=}"
+        if debug_on:  # T4.132: a second sync, debug only -- what VERIFY actually produced for this chunk
+          lg = verify_logits.float()[0]
+          print(f"[SPEC_DEBUG] start_pos={start_pos} k_eff={k_eff} m={m} chunk={chunk_ids} verify_argmax={lg.argmax(-1).tolist()} final={final_ids} "
+                f"nan_per_row={(lg != lg).sum(-1).tolist()} inf_per_row={(lg.abs() == float('inf')).sum(-1).tolist()}", file=sys.stderr, flush=True)
+        spec_check_ids(chunk_ids + final_ids, vocab, f"start_pos={start_pos} m={m} chunk={chunk_ids} final={final_ids}")
         accepted = chunk_ids[1:1 + m] + [final_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
         # the next chain's anchor, device-side: a view of the REALIZED readback buffer, never a lazy slice of `final` -- the sampled
         # path's `final` carries this chain's own draft graph (draft_pos_i bound at this iteration's positions), and the next chain
