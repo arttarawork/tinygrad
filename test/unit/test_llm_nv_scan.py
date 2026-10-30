@@ -328,7 +328,8 @@ def _decode_sinks(tokens:int=1):
   channels = 2*k_heads*key_dim + heads*value_dim
   def ph(shape, dtype, slot): return UOp.placeholder(shape, dtype, slot=slot)
   conv = _gdn_conv_decode_kernel(ph((tokens, channels), dtypes.float32, 0), ph((1, 3, channels), dtypes.float16, 1),
-                                 ph((tokens, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), sp, start_pos=sp, tokens=tokens)
+                                 ph((tokens, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), sp,
+                                 start_pos=sp, tokens=tokens)
   step = _gdn_decode_kernel(ph((tokens, heads*value_dim), dtypes.float16, 0), ph((1, heads, value_dim, key_dim), dtypes.float32, 1),
     ph((tokens, channels), dtypes.float32, 2), ph((tokens, 2*heads), dtypes.float16, 3), ph((heads,), dtypes.float32, 4),
     ph((heads,), dtypes.float32, 5), ph((tokens, heads*value_dim, parts), dtypes.float32, 6), ph((value_dim,), dtypes.float32, 7), sp,
@@ -408,7 +409,7 @@ class TestGDNDecodeMatchesNumpy(unittest.TestCase):
         with self.subTest(tokens=T, start_pos=pos):
           qkv, gate, beta, alpha = f32(T, C, 3, scale=0.5), f32(T, H*V, 2), f32(T, H), f32(T, H)
           conv_state, state = Tensor(conv0).contiguous().realize(), Tensor(state0).contiguous().realize()
-          rows = lambda p: Tensor.custom_kernel(Tensor.empty(*p.shape), Tensor(p).realize(), fxn=_copy_kernel)[0].sum(-1).reshape(B, T, p.shape[1])
+          def rows(p): return Tensor.custom_kernel(Tensor.empty(*p.shape), Tensor(p).realize(), fxn=_copy_kernel)[0].sum(-1).reshape(B, T, p.shape[1])
           z = gdn_decode(rows(qkv), rows(gate), Tensor(np.concatenate([beta, alpha], -1)).reshape(B, T, 2*H), conv_state, state,
                          Tensor(conv_w), Tensor(norm_w), Tensor(dt_bias), Tensor(ssm_a), UOp.variable("start_pos", 0, 63).bind(pos),
                          k_heads=Hk, qk_eps=1e-6, norm_eps=1e-5)

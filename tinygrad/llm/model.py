@@ -2461,7 +2461,8 @@ class Transformer:
         else:
           vocab = cast(int, verify_logits.shape[-1])
           m_t, final = spec_accept_tensor(drafts, Tensor.stack(*q_logits, dim=1) if q_logits else verify_logits[:, :0], verify_logits, temperature,
-                                          Tensor.rand(1, k_eff, device=out_dev), Tensor.rand(1, n, vocab, device=out_dev), min_p=MIN_P)
+                                          Tensor.rand(1, k_eff, device=cast(str, out_dev)), Tensor.rand(1, n, vocab, device=cast(str, out_dev)),
+                                          min_p=MIN_P)
         readback_t = m_t.reshape(1).cat(chunk[0], final[0]).realize()  # (2n+1,) on out_dev
         readback = cast(list[int], readback_t.tolist())  # THE sync: draft chain + VERIFY + the accept test
         m, chunk_ids, final_ids = readback[0], readback[1:1 + n], readback[1 + n:]
