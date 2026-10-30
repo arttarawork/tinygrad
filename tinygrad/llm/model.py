@@ -1014,36 +1014,15 @@ class GatedDeltaNetBlock(FFNBlock):
     if self.config.dim % 128 == 0:
       self.nv_beta_alpha_weight = self.ssm_beta.weight.cat(self.ssm_alpha.weight, dim=0).cast(dtypes.float16).contiguous().realize()
 
-  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, capture:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:  # type: ignore[override]
+  def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, capture:bool=False) -> Tensor:
     # rope: unused, GDN has no positions (T5.3); kept so FFNBlock.__call__ can pass it positionally to every block type.
-    """capture=False (every caller except speculative_generate's VERIFY -- see GatedDeltaNetBlock.__call__)
-    is byte-identical to pre-T4.66b behavior: the retention branches below never run, nothing extra is ever
-    materialized. capture=True additionally returns (state_track, conv_window), which speculative_generate
-    uses to reconstruct the correct post-partial-accept state directly instead of a second ("REDO") forward
-    -- see SPEC_NOTES.md's REDO section (this replaces it) and speculative_generate's ACCEPT step.
-
-      state_track: (B,H,T_pad,V,K) -- state_track[:,:,t] is this block's recurrent_state exactly as it would
-      be immediately after consuming only this call's first t+1 real input rows (t=0..T_pad-1; t>=T is exact
-      no-op padding same as everywhere else here, so state_track[:,:,T-1] == the real final state whenever
-      T<=T_pad). The per-token loop below already computes every one of these intermediates on its way to
-      the final one -- retaining them (one more .stack(), the same way `outs` already gets stacked) is free:
-      this is the "can the scan cheaply expose per-position state" question T4.66b's task asked to
-      investigate, answered yes for this (the standing default) implementation. gdn_scan_wy's chunked/matmul
-      form is NOT free here: it only ever forms the chunk's LAST state (one (V,K) matmul over the whole
-      chunk, see its docstring's `final_state` line) -- exposing every prefix would need a cumsum-shaped
-      computation of comparable cost to the one WY already replaced the loop with, i.e. genuine extra work,
-      not retention of something already computed. The AMD fused kernel doesn't expose it either (one opaque
-      hardware-loop kernel; RDNA3 is also descoped for this fork -- CLAUDE.md). So capture=True forces the
-      plain per-token loop regardless of GDN_SCAN_IMPL/device -- correct everywhere, just not fused-kernel-
-      accelerated for the VERIFY call specifically. That's perf-neutral-or-better even on a WY-enabled build:
-      WY's own comment below already notes it has nothing to amortize at small T_pad and measured
-      pathologically slow at T_pad==1 -- VERIFY's chunk (k_eff+1 tokens, k_eff<=k, k defaulting to 3) is
-      exactly that regime.
-
-      conv_window: (B,ssm_conv_kernel-1+T_pad,conv_channels) -- this call's own conv window (already built
-      below regardless of capture). conv_window[:,p:p+ssm_conv_kernel-1] is this block's conv_state as it
-      would be after only the first p real input rows: the same slice the existing conv_state_store line
-      below already takes with p=T, generalized to an arbitrary prefix (see SPEC_NOTES.md)."""
+    """capture=True (speculative_generate's VERIFY: a concrete run of 2..GDN_DECODE_TOKENS tokens, see __call__) also writes the
+    conv window and the recurrent state after each of the call's first T-1 tokens into self.spec_track[0][t] / [1][t] -- a partial
+    accept of m < T-1 drafts makes slot m the live state (Transformer._adopt_step) instead of re-running the accepted tokens (T4.132;
+    replaces T4.66d's CHECKPOINT + REDO forward). The output and the final state are those of capture=False. On the card the two
+    gdn_decode kernels store the slots from values they already hold; elsewhere the per-token loop retains them (capture forces the
+    loop: WY and the fused prefill scan only ever form the run's last state). Slot t's conv rows are the window rows t+1..t+K-1 rounded
+    to conv_state's dtype -- what conv_state_store keeps for the final state."""
     B, T, _ = x.shape
     # bind ints to a variable so the reset flag stays a runtime value (it toggles when generation restarts at position 0)
     start_pos = start_pos if isinstance(start_pos, UOp) else UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
@@ -1055,8 +1034,8 @@ class GatedDeltaNetBlock(FFNBlock):
     # T4.123f+g: a decode token on the card is two kernels from the four projections (conv + conv_state shift, then norms/beta/alpha/
     # scan/ssm_norm/gate) instead of 13 small generic kernels around the fused scan -- kernels/nv.py's gdn_decode. Same gate as the
     # fused decode scan below; prefill (symbolic or T > GDN_DECODE_TOKENS) never comes here. T4.132: a concrete run of up to
-    # GDN_DECODE_TOKENS tokens (speculative decoding's VERIFY/REDO) takes the same two kernels, the tokens sequential inside them.
-    if not symbolic and T <= GDN_DECODE_TOKENS and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
+    # GDN_DECODE_TOKENS tokens (speculative decoding's VERIFY) takes the same two kernels, the tokens sequential inside them.
+    if not symbolic and T <= GDN_DECODE_TOKENS and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
       x = x.half()
       # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs on the same input -- fused into one over their load-time
       # concatenated weight (prepare_nv_decode) when that's ready; gdn_decode reads beta/alpha out of the one result
@@ -1065,7 +1044,8 @@ class GatedDeltaNetBlock(FFNBlock):
       beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B*T, self.config.dim), 2*self.num_v_heads).reshape(B, T, -1)
                     if self.nv_beta_alpha_weight is not None else self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
       z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
-                        *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps)
+                        *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps,
+                        track=self.spec_track if capture else None)
       return self.ssm_out(z)
 
     # input processing
@@ -1174,60 +1154,42 @@ class GatedDeltaNetBlock(FFNBlock):
         if capture: state_track = group_tracks[0].cat(*group_tracks[1:], dim=1) if len(group_tracks) > 1 else group_tracks[0]
 
       # store the updated recurrent state in place, then read the stacked outputs after the write
-      state_store = self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)
-      core = Tensor(stacked.contiguous().uop.after(state_store))
+      stores = [self.recurrent_state.uop.store(state.cast(self.recurrent_state.dtype).uop)]
+      if capture and T > 1:  # T4.132: the per-token states of slots 0..T-2 (see the docstring)
+        conv_t, rec_t = cast(tuple[Tensor, Tensor], self.spec_track)
+        assert state_track is not None and isinstance(T, int) and T - 1 <= rec_t.shape[0], f"{T=} {rec_t.shape=}"
+        # one store per slot: a single permuted store of all slots became a CPU kernel whose buffer slots had a gap (the T-th state
+        # unread) plus a THREAD core-id var, declared out of order with the runtime's argument order -- a segfault at the 35B's head
+        # geometry (test_gdn_scan_parity.py)
+        stores += [rec_t[t].uop.store(state_track[:, :, t].cast(rec_t.dtype).uop) for t in range(T-1)]
+        stores += [conv_t[t].uop.store(conv_window[:, t+1:t+self.ssm_conv_kernel].cast(conv_t.dtype).uop) for t in range(T-1)]
+      core = Tensor(stacked.contiguous().uop.after(*stores))
 
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
-    out = self.ssm_out(z.reshape(B, T, -1))
-    if not capture: return out
-    assert state_track is not None, "capture=True always takes the per-token-loop branch above (never the AMD-fused or WY path)"
-    return out, state_track.contiguous(), conv_window.contiguous()
+    return self.ssm_out(z.reshape(B, T, -1))
 
-  def __call__(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, spec:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:
+  spec_track: tuple[Tensor, Tensor]|None = None  # T4.132: (conv (S,B,K-1,C), recurrent (S,B,H,V,K)) -- a VERIFY run's per-token states
+  def __call__(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, spec:bool=False) -> Tensor:
     # rope (T5.3): passed positionally by Transformer.forward to every block; GDN has no positions, so it is ignored here -- it must
     # still be a named parameter, or forward()'s third argument would land in `spec`.
-    # T4.66b: spec=False (every caller except speculative_generate's VERIFY forward -- see there) is exactly
-    # FFNBlock.__call__, unchanged -- same _run closure, same single-Tensor return, zero extra tensors ever
-    # built. spec=True additionally threads this block's captured per-position GDN state history (see
-    # _attention's `capture`) out through _run's OWN return: the only way a value survives this
-    # @function(precompile=True)-wrapped closure being invoked repeatedly (SPEC_NOTES.md's own lesson --
-    # `x[:,-1:]` needing `.contiguous()` for exactly this reason). A side-channel instance attribute set
-    # inside `_attention` would NOT work here: nothing re-runs `_attention`'s python body on a later read,
-    # so any value not threaded through the traced return is invisible to a subsequent call.
+    # T4.132: spec=True (Transformer.forward's concrete multi-token spec call, i.e. VERIFY) also fills spec_track through _attention's
+    # `capture` -- stores into buffers made here, before the precompiled trace (nothing in it may touch a device), on first use (a model
+    # that never speculates never pays for them): GDN_DECODE_TOKENS-1 slots = the widest VERIFY's (spec_k_clamped) partial accepts.
     self._init_state(x)
+    if spec: self._init_spec_track()
     @function(precompile=True, allow_implicit=True)
-    def _run(x:Tensor, start_pos:int|UOp) -> Tensor|tuple[Tensor, Tensor, Tensor]:
-      if not spec:
-        attn_out = cast(Tensor, self._attention(self._normed_for_attention(x), start_pos))
-        return self._ffn_output(x, attn_out).contiguous()
-      attn_out, state_track, conv_window = cast(tuple[Tensor, Tensor, Tensor],
-                                                  self._attention(self._normed_for_attention(x), start_pos, capture=True))
-      out = self._ffn_output(x, attn_out).contiguous()
-      return out, state_track, conv_window
+    def _run(x:Tensor, start_pos:int|UOp) -> Tensor:
+      attn_out = self._attention(self._normed_for_attention(x), start_pos, capture=spec)
+      return self._ffn_output(x, attn_out).contiguous()
     return _run(x, start_pos)
 
-  spec_snap: tuple[Tensor, Tensor]|None = None  # T4.132: (conv_state, recurrent_state) checkpoint buffers -- see checkpoint()
-  def checkpoint(self, x:Tensor, restore:bool=False) -> None:
-    """T4.132: copy conv_state/recurrent_state into spec_snap (allocated on first use, so a model that never speculates never pays
-    for it) BEFORE this block's next call updates them in place; restore=True copies the other way (spec_snap back into the live
-    state) first -- speculative_generate's partial accept runs REDO as one graph that restores and re-feeds, no eager assigns.
-    A full accept leaves spec_snap unread.
-    The ordering edge lives on the STATE, not on the block's input: each live state Tensor becomes the view
-    AFTER(state, STORE(snap, state)) -- Tensor.assign's own STORE+AFTER idiom on the buffer being copied -- so every read of the
-    state inside the block's precompiled call depends on the copy kernel and the block's own in-place store supersedes it; the
-    realize maps the views back to the plain buffers (as it does for any assign). 10-30: the first form, AFTER(x, <snapshot
-    assigns>) on the input activation, is not an ordering edge in this scheduler -- a reader of an AFTER state depends only on that
-    AFTER's own CALL/END kernels (schedule/__init__.py create_schedule), and an AFTER wrapped around an input has none: the block
-    lost its dependency on x's producer and read an unwritten buffer (every VERIFY row wrong on the card, T=1 included), while the
-    copies ran first only by queue order. test_spec_decode.py::TestSpecForwardMatchesDecode pins it on a model whose ids vary."""
-    self._init_state(x)
-    if self.spec_snap is None:
-      conv, rec = self.conv_state, self.recurrent_state
-      self.spec_snap = (Tensor.empty(*conv.shape, dtype=conv.dtype, device=conv.device), Tensor.empty(*rec.shape, dtype=rec.dtype, device=rec.device))
-    for snap, live in zip(self.spec_snap, (self.conv_state, self.recurrent_state)):
-      live.uop = live.uop.after(live.uop.store(snap.uop) if restore else snap.uop.store(live.uop))
+  def _init_spec_track(self) -> None:
+    if self.spec_track is None:
+      conv, rec, S = self.conv_state, self.recurrent_state, GDN_DECODE_TOKENS - 1
+      self.spec_track = (Tensor.empty(S, *conv.shape, dtype=conv.dtype, device=conv.device),
+                         Tensor.empty(S, *rec.shape, dtype=rec.dtype, device=rec.device))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
@@ -1628,18 +1590,11 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
               vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
-              presence_penalty:Tensor|None=None, redo:bool=False) -> Tensor|tuple[Tensor, ...]:
+              presence_penalty:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
     # contract: temperature=None is the ONLY greedy trigger. it's a python-level check (not a value check) because it
     # picks which jit variant gets captured (with or without RNG kernels) -- a Tensor of value 0.0 still takes the
     # sampled path below. callers must normalize temp<=0 to None themselves (generate() already does this)
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
-    # T4.66d: no more per-GDN-block capture here (T4.66b's gdn_extra) -- speculative_generate's partial-accept
-    # fixup reverted to CHECKPOINT+REDO (measured ~10x cheaper on real METAL+NV hardware than the capture-based
-    # per-block assign this replaced -- see SPEC_FIXES_NOTES.md), which never reads gdn_extra, so every block
-    # (GDN or not) takes the same bare 2-arg call again. This also recovers the T_pad tax capture=True forced
-    # on every GDN block's scan (SPEC_PROFILE_NOTES.md SS3(c)) as a free side effect. GatedDeltaNetBlock's own
-    # `capture`/`spec` machinery (_attention, __call__) is untouched -- still there, still tested directly by
-    # test_gdn_scan_parity.py::TestGDNScanCapture -- just unreached from forward() now.
     # T5.3: rope_start (a bound Variable from generate()) is the rope position of tokens[0] when it differs from the cache position
     # (decode after images); None keeps the pre-T5.3 graph exactly. vis_e/vis_m/vis_pos make this an image-prompt chunk: (1, chunk, D)
     # visual embeddings replace the token embeddings where the (1, chunk) mask is set, and the (1, chunk, 3) int32 (t, h, w) rope
@@ -1650,16 +1605,14 @@ class Transformer:
       T = tokens.shape[1]
       x = vis_m[:, :T].to(x.device).unsqueeze(-1).where(vis_e[:, :T].to(x.device).float(), x)
       rope = vis_pos[:, :T]
-    # T4.132: a concrete-width spec call is speculative_generate's VERIFY (or REDO): checkpoint every GDN block's state inside this
-    # captured graph (96 copies at 27B geometry, launched from the jit, no eager schedule per iteration) so a partial accept can
-    # restore + REDO. The symbolic prefill-tail chunks never REDO and skip it. redo=True is that REDO: the graph first copies the
-    # checkpoint back into every GDN block's state (step 6 -- the 96 eager assigns per partial accept were ~0.5 s of dispatch on the card).
-    ckpt = spec and isinstance(tokens.shape[1], int)
+    # T4.132: a concrete multi-token spec call is speculative_generate's VERIFY: every GDN block also stores its state after each of the
+    # run's first T-1 tokens (GatedDeltaNetBlock.spec_track), which a partial accept adopts (_adopt_step) -- no checkpoint, no REDO
+    # forward. The symbolic prefill chunks (and T == 1) have no partial accept and skip it.
+    track = spec and isinstance(T_in := tokens.shape[1], int) and T_in > 1
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
     for block in self.blk:
-      xin = x.to(block.device)
-      if ckpt and isinstance(block, GatedDeltaNetBlock): block.checkpoint(xin, restore=redo)
-      x = cast(Tensor, block(xin, start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
+      xin, r = x.to(block.device), rope.to(block.device) if isinstance(rope, Tensor) else rope
+      x = cast(Tensor, block(xin, start_pos, r, True) if track and isinstance(block, GatedDeltaNetBlock) else block(xin, start_pos, r))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
@@ -1712,7 +1665,7 @@ class Transformer:
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
                vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
-               presence_penalty:Tensor|None=None, redo:bool=False) -> Tensor|tuple[Tensor, ...]:
+               presence_penalty:Tensor|None=None) -> Tensor|tuple[Tensor, ...]:
     is_prefill = bool(resolve(tokens.shape[1] != 1))
     # T4.12: a prefill/first-chunk call's `tokens` is a symbolic slice carrying the "toks" Variable, whose bound
     # range IS chunk_size -- captured into the jit graph. Keying only on (is_prefill, greedy) let a later
@@ -1728,15 +1681,13 @@ class Transformer:
     # active -- plain text/no-penalty keys stay the pre-T5.3 4-tuples. The two flags must stay POSITIONAL together, never each its
     # own independently-omitted single-True marker: omitting either on its own collapses "vision only" and "penalty only" onto the
     # identical (...,True) key, so a penalty-only decode step would replay a vision capture (wrong inputs) or vice versa.
-    # T4.132: a CONCRETE multi-token call (speculative_generate's VERIFY/REDO at width k_eff+1 <= k+1) keys on its own width, stored
+    # T4.132: a CONCRETE multi-token call (speculative_generate's VERIFY at width k_eff+1 <= k+1) keys on its own width, stored
     # NEGATED so it can never share a family with a symbolic chunk whose "toks" bound happens to equal it (on CPU the spec prefill
     # chunk is widened to exactly k+1). Every width is its own family with a static token count, so the <=4-token gemv, the prefill
     # attention tile and the small-T GDN decode kernels all cover it (a symbolic width covered none of them: TASKS.md T4.94's audit).
     chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), -cast(int, tokens.shape[1])) if is_prefill else None
     vision_on, penalty_on = rope_start is not None or vis_e is not None, presence_penalty is not None
-    # T4.132 (step 6): `redo` (the partial-accept REDO, its graph restoring the GDN checkpoint first) is its own family per width
-    key = (is_prefill, temperature is None, chunk_size, spec) + ((vision_on, penalty_on) if vision_on or penalty_on else ()) \
-      + (("redo",) if redo else ())
+    key = (is_prefill, temperature is None, chunk_size, spec) + ((vision_on, penalty_on) if vision_on or penalty_on else ())
     if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
       mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
       print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
@@ -1746,11 +1697,11 @@ class Transformer:
       # schedule can't plan the buffers custom kernels write into (Tensor.empty outputs count as held), so every block's partials
       # and q8 activations are alive at once -- at 262k that pass was the card's memory peak (within ~50 MB of OOM, 10-28/29). The
       # capture plans them; prune=True runs the input-independent first-call work (KV cache zero-fill) once instead of every replay.
-      # Not the spec (MTP verify/redo) families: captured first, their graphs differ from the eager ones by fp16 ulps
+      # Not the spec (MTP verify) families: captured first, their graphs differ from the eager ones by fp16 ulps
       # (test_generate_maintains_cache_and_snapshot_round_trips); the server never takes that path.
       if is_prefill and not spec: jit.cnt = 1
     return self.jit[key](
-      tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos, presence_penalty, redo)
+      tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos, presence_penalty)
 
   def _forward_step(self, *args) -> Tensor|tuple[Tensor, ...]:
     # T4.126: nv_quant.py's per-step sharing caches (q8 activations, fused q8, split-K partials) only serve calls inside ONE
@@ -1976,9 +1927,9 @@ class Transformer:
       v_sp = UOp.variable("start_pos", 0, self.max_context - 1)
       for w in range(1, spec_k + 2):
         for _ in range(2): self(Tensor([[0] * w], dtype="int32", device=self.blk[0].device), v_sp.bind(1), None, spec=True)
-      # step 6: the REDO families (widths 1..spec_k, each restoring the GDN checkpoint the VERIFY drives above just wrote)
-      for w in range(1, spec_k + 1):
-        for _ in range(2): self(Tensor([[0] * w], dtype="int32", device=self.blk[0].device), v_sp.bind(1), None, spec=True, redo=True)
+      # T4.132: the partial-accept adopt family (spec_track slot -> live GDN state; the VERIFY drives above made spec_track)
+      if self.has_recurrent_block:
+        for _ in range(2): self._spec_replay(("adopt",), self._adopt_step, UOp.variable("spec_m", 0, GDN_DECODE_TOKENS - 2).bind(0))
       self._cached_tokens = []  # those calls advanced the live state past what _cached_tokens describes: nothing may resume from it
       # T4.66g: unlike the main model's own blocks above (whose warmup residue in cache_kv/recurrent_state
       # is harmless -- a real request's own prefill legitimately rewrites position 0 onward before ever
@@ -2282,6 +2233,17 @@ class Transformer:
                                       Tensor.rand(1, n, vocab, device=chunk.device), min_p=MIN_P)
     return m_t.reshape(1).cat(chunk[0], final[0])
 
+  def _adopt_step(self, m:UOp) -> None:
+    """T4.132: a partial accept's GDN state -- every GDN block's live conv/recurrent state <- slot m of its spec_track (the state VERIFY
+    left after token m). One graph for every m (a bound Variable)."""
+    Tensor.realize(*(x for b in self.blk if isinstance(b, GatedDeltaNetBlock) and b.spec_track is not None
+                     for x in (b.conv_state.assign(b.spec_track[0][m]), b.recurrent_state.assign(b.spec_track[1][m]))))
+
+  def _spec_replay(self, key:tuple, fxn:Callable, *args):
+    """T4.132: speculative_generate's graphs, one TinyJit per key in self.spec_jit."""
+    if key not in self.spec_jit: self.spec_jit[key] = TinyJit(fxn)
+    return self.spec_jit[key](*args)
+
   def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int|None=None, temperature:float=0.0):
     """T4.64/T4.65: MTP speculative decoding -- drafts up to `k` tokens per iteration via self.mtp_head and
     verifies all of them in one extra main-model forward instead of paying one forward per token. See
@@ -2396,6 +2358,7 @@ class Transformer:
     # T4.66l: the MTP block's own prefill/rewrite width and slot Variables (see MTPHead.prefill): one precompiled
     # trace serves every prompt-chunk width 1..chunk_size and every accept rewrite 1..k (chunk_size >= k+1 above).
     v_mtp_toks, v_mtp_pos = UOp.variable("mtp_toks", 1, chunk_size), UOp.variable("mtp_pos", 0, self.max_context - 1)
+    v_adopt = UOp.variable("spec_m", 0, GDN_DECODE_TOKENS - 2)  # T4.132: the accepted-draft count a partial accept adopts (_adopt_step)
 
     # --- prefill: identical mechanics to generate() (same kind of v_start_pos/v_toks vars, same
     # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
@@ -2521,17 +2484,12 @@ class Transformer:
 
         # (b) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
         # start_pos, returning the per-position logits (what the real model actually predicts from every one of
-        # those positions) and the per-position hidden state. T4.66d: CHECKPOINT (every GDN block's conv/recurrent
-        # state copied aside) so a partial accept can restore-then-redo below -- GatedDeltaNet conv/recurrent state
-        # is a single read-modify-written accumulator, not a position-indexed cache, so once VERIFY mixes a wrong
-        # draft token into it there's no slice to discard (unlike attention KV, which needs no snapshot -- see the
-        # mask argument in SPEC_NOTES.md). T4.66b's alternative (read the corrected state directly off VERIFY's own
-        # per-position captures, no snapshot needed) measured ~10x MORE expensive on real METAL+NV hardware -- the
-        # captured state_track/conv_window this replaces is a 32x-inflated `.stack()` result (T_pad,
-        # SPEC_PROFILE_NOTES.md SS3(c)), unlike the clone's native-sized buffers -- see SPEC_FIXES_NOTES.md.
-        # T4.132: the checkpoint copies run INSIDE the captured VERIFY graph (forward's `ckpt`, GatedDeltaNetBlock
-        # .checkpoint -> spec_snap), not as 96 eager clone kernels scheduled here every iteration; VERIFY is the
-        # width-n family (concrete, its own jit key -- see Transformer.__call__).
+        # those positions) and the per-position hidden state. GatedDeltaNet conv/recurrent state is a single
+        # read-modify-written accumulator, not a position-indexed cache, so once VERIFY mixes a wrong draft token into
+        # it there's no slice to discard (unlike attention KV -- the mask argument in SPEC_NOTES.md). T4.132: VERIFY's
+        # GDN blocks also store their state after each token (spec_track; on the card from inside the gdn_decode
+        # kernels) and a partial accept adopts the right one below. VERIFY is the width-n family (concrete, its own jit
+        # key -- see Transformer.__call__).
         if trace_on: verify_t0 = time.perf_counter()
         verify_logits, verify_h = cast(tuple[Tensor, Tensor], self(buf, v_start_pos.bind(start_pos), None, spec=True))  # (1,n,vocab), (1,n,D)
         if trace_on: verify_dispatch_ms = (time.perf_counter() - verify_t0) * 1000
@@ -2562,34 +2520,14 @@ class Transformer:
         if trace_on: accept_ms = (time.perf_counter() - accept_t0) * 1000
 
         if trace_on: assign_t0 = time.perf_counter()
-        if m == k_eff:
-          # full accept: every input verify saw (tok_last, d0..d_{k_eff-1}) really was correct, so its forward
-          # legitimately advanced every state through position start_pos+k_eff -- nothing to roll back, and
-          # its own last-position hidden (T4.66b's per-position capture, free and unrelated to the expensive
-          # part reverted below) IS the next h_last. Same fast path the old (pre-T4.66b) code had.
-          h_last = fresh_copy(verify_h[:, m:m + 1])  # T4.132: the draft jits' input -- its own buffer, see fresh_copy
-        else:
-          # T4.66d: partial accept -- verify's forward also advanced GDN state through the wrong tokens
-          # d_m..d_{k_eff-1}. Roll GDN back to the CHECKPOINT above and redo exactly the m+1 confirmed-correct
-          # tokens as one small forward to rebuild the true state and get the next h_last -- this re-forward is
-          # the ~1.8s-measured cost T4.66b tried to remove; T4.66b's replacement (a per-GDN-block slice+assign
-          # off VERIFY's own captures, no re-forward) measured ~19.5s instead, ~10x worse on real METAL+NV
-          # hardware -- see SPEC_FIXES_NOTES.md. Attention KV needs no restore for the same reason it never
-          # needed a snapshot (SPEC_NOTES.md's mask argument): this redo overwrites positions
-          # [start_pos, start_pos+m+1) with the SAME values verify already wrote there (a harmless recompute),
-          # and the discarded wrong positions start_pos+m+1..start_pos+k_eff are never read before the next
-          # iteration overwrites them too. T4.132: REDO is the width-(m+1) family (m+1 <= k, one of the k+1 warmed
-          # widths), never VERIFY's own, so VERIFY's output buffers (verify_h, read by the MTP rewrite below, and
-          # tok_last above) survive it. Its input is uploaded from the host-known ids (the one readback above), NEVER
-          # a `buf[:, :m+1]` view of VERIFY's buffer: a concrete shrink view handed to a TinyJit is baked at capture
-          # (`.contiguous()` folds into the view, nothing is parametrized), so every later replay re-fed the capture
-          # call's ids -- the sampled state-integrity test caught it; greedy sequences repeating one token hid it
-          # (test_spec_decode.py's TestSpecKVConsistency pins the fix).
-          # RESTORE + REDO as one graph (step 6): the redo family's GDN blocks copy the checkpoint VERIFY's graph took (spec_snap)
-          # back into their live state before reading it (GatedDeltaNetBlock.checkpoint(restore=True))
-          buf2 = Tensor(chunk_ids[:m + 1], dtype="int32", device=dev).reshape(1, m + 1)
-          _, redo_h = cast(tuple[Tensor, Tensor], self(buf2, v_start_pos.bind(start_pos), None, spec=True, redo=True))
-          h_last = fresh_copy(redo_h[:, m:m + 1])  # T4.66i: positive slice, same reason as the anchor (T4.66h); T4.132: see fresh_copy
+        # h_last = VERIFY's hidden at position m: the last fed token of the accepted run (causal -- row m never saw a draft past it).
+        # T4.132: a partial accept (m < k_eff) also folded the wrong drafts d_m.. into every GDN block's state; each block's VERIFY
+        # stored its state after every token (spec_track), so slot m -- the state after exactly the accepted tokens -- becomes the live
+        # state: one replay of the adopt family (~150 MB of copies at the 27B's geometry), instead of T4.66d's CHECKPOINT + a REDO
+        # forward of the m+1 accepted tokens (the card's phase table: 43-79 ms per partial accept). Attention KV needs nothing (the
+        # discarded positions start_pos+m+1.. are never read before the next VERIFY overwrites them -- SPEC_NOTES.md section 2).
+        if m < k_eff and self.has_recurrent_block: self._spec_replay(("adopt",), self._adopt_step, v_adopt.bind(m))
+        h_last = fresh_copy(verify_h[:, m:m + 1])  # T4.132: the draft jits' input -- its own buffer, see fresh_copy
         # T4.66l: rewrite the MTP block's cache slots for the accepted positions with the TRUE per-position hidden
         # state. The draft chain wrote slots start_pos..start_pos+k_eff-1 from (h_last, chunk_ids[i]): token-correct
         # for i <= m, but h_last is position start_pos-1's hidden at EVERY step (see the DRAFT comment) -- so slot
