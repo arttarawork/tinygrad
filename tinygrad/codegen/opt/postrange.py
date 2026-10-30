@@ -15,6 +15,7 @@ class Scheduler:
   def __init__(self, ast:UOp, ren:Renderer):
     self.ast, self.ren = ast, ren
     self.dont_use_locals = self.ast.arg.dont_use_locals if self.ast.arg is not None else False
+    self.min_blocks = self.ast.arg.min_blocks if self.ast.arg is not None else 0  # T4.131: carried through like dont_use_locals
     self.applied_opts = list(self.ast.arg.applied_opts) if self.ast.arg is not None else []
     self.opt_range = count(start=max([x.arg[0] for x in self.rngs], default=0)+1)
 
@@ -55,7 +56,8 @@ class Scheduler:
       special_ops = [colored(str(x.vmax+1), "blue" if x.arg[0] == "g" else "cyan") for x in special_uops]
       name = k_type + colored('_', 'BLACK').join(['']+special_ops+[colored(x.src[0].render(), color) for x,color in zip(self.rngs, self.colors())])
     self.ast = graph_rewrite(self.ast, pm_flatten_range, name="flatten range")
-    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts), dont_use_locals=self.dont_use_locals), tag=1)
+    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts), dont_use_locals=self.dont_use_locals,
+                                           min_blocks=self.min_blocks), tag=1)
 
   def _output_rngs(self) -> list[UOp]:
     return flatten([[r for r in UOp.sink(*s.src[1:]).ranges if r.arg[-1] != AxisType.REDUCE] for s in self.ast.src if s.op is Ops.END])
