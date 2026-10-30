@@ -437,6 +437,26 @@ REDO 43/61/79 ms, the MTP rewrite 21 ms (the prompt's 128-wide family), draft_0 
   prefill family exists any more (forward(spec=True) at symbolic widths stays for extra/flip_rate.py).
 - `spec_track` holds `spec_k_clamped(k)` slots (k=2: 2 x 151 MB at 27B geometry); a larger k later reallocates and drops the VERIFY
   and adopt graphs bound to the old buffers.
-- Found on the way, pre-existing and not fixed: on CPU, generate() with GDN_CHUNK=2 (jitted, capture-first) leaves a different GDN
-  state from the eager run of the same chunks (tiny varied model, a 3-token prompt: state maxdiff ~ max|state|); chunk 1 (CPU's
-  default) and the card are unaffected as far as tested. The old spec prefill widened its chunk to k+1 and hid it.
+- *OOM at 262k, second step: VERIFY's eager first call* (all 16 attention blocks' prefill-attention partials and every other
+  unplanned intermediate alive at once). Every spec family now captures on its first call like the T4.128 prefill families:
+  the concrete-width VERIFY families (Transformer.__call__, prune=True), mtp_prefill (prune=True: the MTP block's KV zero-fill on the
+  first prompt runs once), adopt (no Tensor inputs: no prune), and the chain and accept graphs WITHOUT prune -- a pruned graph keeps
+  Tensor.rand's counter advance out of its replays (upstream semantics, see below), so their one-time work runs eagerly before the
+  loop instead (MTPHead.ready: the MTP block's cache/scale/rope table, the position buffers for widths 1..k, the device-local
+  embedding; the output device's RNG state). The symbolic-width spec families (extra/flip_rate.py's teacher-forced logits) stay
+  eager-first and unpruned: flip_rate perturbs weights between runs and pruning would freeze the weight-derived kernels. The old
+  exemption (fp16-ulp differences between captured-first and eager graphs, the KV zero-fill replayed) no longer applies:
+  test_generate_maintains_cache_and_snapshot_round_trips passes with VERIFY captured first.
+- *engine/jit.py prune_linear (fork fix): stale GDN conv window in every replayed prefill chunk.* Upstream's single pass kept a
+  kernel only if it touched an input or a buffer an EARLIER kept kernel touched. The kernel writing a GDN chunk's conv-window history
+  rows from conv_state reads no input and runs BEFORE the chunk's conv_state write, so it was pruned: every replayed prefill chunk
+  convolved arena garbage in its first conv_kernel-1 rows (tiny varied model at GDN_CHUNK=2: the jitted prefill's state differed from
+  the eager one by the state's own magnitude; SSM_CFG's test model fuses those kernels and never showed it). It has applied to the
+  card's prefill families since they became captured-first + pruned (T4.128) -- the flip gates run spec=True families, which were not
+  pruned. Now a kernel is kept if it touches an input or reads a buffer some kept kernel writes (a fixed point over the whole capture);
+  write-only inits, constant preprocessing and lazily initialized weights stay one-time.
+- *Pre-existing, NOT fixed: a pruned graph replays the capture's random numbers.* Tensor.rand's counter advance touches no input, so
+  prune runs it once: generate()'s captured-first prefill families sample every request's FIRST token with the same Gumbel noise (CPU,
+  near-uniform logits: 12/12 requests drew the same first token; decode-family tokens varied). Keeping in-place updates in replays
+  would fix it but re-runs lazily initialized random weights (the tests' Transformer(cfg) models). A fix belongs at the family: draw
+  the first token's noise outside the pruned graph, or feed the counter as an input.

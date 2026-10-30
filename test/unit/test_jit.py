@@ -409,6 +409,34 @@ class TestJitPrune(unittest.TestCase):
       np.testing.assert_allclose(out.tolist(), [x*2+y for x,y in zip(weights.tolist(), a.tolist())])
     assert_jit_cache_len(w2_prune, 1)
 
+  # T4.132 (fork): kernels a pruned capture must keep although no input reaches them
+  def test_prune_keeps_reads_of_state_a_kept_kernel_writes(self):
+    # a recurrent "window": out = state + x, then state <- x. The state read comes BEFORE its (input-dependent) write; the upstream
+    # single pass pruned it as input-independent and every replay read the capture-time state (a GDN conv window, T4.132)
+    state = Tensor.zeros(8).contiguous().realize()
+    def step(x):
+      out = (state * 2).contiguous().realize()
+      state.assign(x).realize()
+      return (out + x).realize()
+    f = TinyJit(step, prune=True)
+    f.cnt = 1
+    xs = [Tensor.full((8,), float(i)).contiguous().realize() for i in range(1, 5)]
+    got = [f(x).numpy()[0] for x in xs]
+    self.assertEqual(got, [1.0, 2*1 + 2.0, 2*2 + 3.0, 2*3 + 4.0])
+
+  def test_prune_still_runs_write_only_init_once(self):
+    # a KV-cache-style zero-fill (write-only) stays one-time: replays must not wipe what earlier calls wrote
+    cache: list[Tensor] = []
+    def step(x, pos):
+      if not cache: cache.append(Tensor.zeros(4).contiguous())
+      cache[0][pos:pos+1].assign(x).realize()
+      return cache[0].sum().reshape(1).realize()
+    f = TinyJit(step, prune=True)
+    f.cnt = 1
+    v = UOp.variable("pos", 0, 3)
+    got = [f(Tensor([float(i + 1)]).contiguous().realize(), v.bind(i)).item() for i in range(4)]
+    self.assertEqual(got, [1.0, 3.0, 6.0, 10.0])
+
 
 class TestJitInsideJit(unittest.TestCase):
   def test_jit_jit_error(self):
