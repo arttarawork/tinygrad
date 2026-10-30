@@ -36,7 +36,10 @@ decode step at the boundary, no special-casing needed):
 (T4.66b removed the CHECKPOINT step and the REDO forward pass this table used to have here — a
 device-side GDN-state clone every iteration, and a whole second main-model forward on every partial
 accept — replacing both with FIXUP: reading the correct post-partial-accept state directly out of
-data the VERIFY forward already computed, instead of rolling back and recomputing it. See §7.)
+data the VERIFY forward already computed, instead of rolling back and recomputing it. See §7.
+T4.66d reverted to CHECKPOINT+REDO; T4.132b brings FIXUP back as the **adopt** replay — VERIFY's GDN
+blocks store their state after each token into `spec_track` (on the card from inside the gdn_decode
+kernels), and slot `m` becomes the live state. See §9.)
 
 `verify_ids[i]` (i=0..k_eff) is the greedy id predicting the position *after* `chunk_ids[i]` was fed,
 so it lines up with draft `d_i == chunk_ids[i+1]` for `i<k_eff`; `verify_ids[k_eff]` has no draft
@@ -392,3 +395,30 @@ kernels (h_last copy + anchor upload, the chunk cat, REDO's / the rewrite's inpu
 96 eager restore assigns per partial accept, the accept math and the rewrite trace re-dispatched every iteration.
 `SPEC_DEBUG=1` prints per-iteration verify-row NaN/inf counts, argmax ids, chunk and emitted ids to stderr; an id outside
 [0, vocab) raises instead of being emitted (`spec_check_ids`).
+
+## 9. T4.132b (10-30) — the iteration as drafts + one VERIFY on the decode kernels
+
+The card's phase table (10-30, 2k fill, k=3): 195 ms/iteration for ~2 tokens vs 27 ms per plain decode token — VERIFY(4) 81 ms,
+REDO 43/61/79 ms, the MTP rewrite 21 ms (the prompt's 128-wide family), draft_0 19 ms (eager input realizes), ~17 ms other eager work.
+
+- **k clamped to 3** (`spec_k_clamped`, speculative_generate + warmup): VERIFY is k+1 tokens and the NV decode kernels (q8 gemv,
+  fused norms, gdn_decode) cover 4; width 5 fell to the generic dequant+matmul (~1.4 s/iteration).
+- **The q8 gemv reads each weight once for a multi-token call** (`nv_quant._decode_linear`): the +18 ms per extra VERIFY token was
+  the gemv, not GDN — the token was the outer block range, so every token re-streamed all 15.6 GB of weights. Tokens 2..4 are now a
+  Python loop inside the warp (group_dot's weight loads hash-cons to one). T == 1 renders byte-identically. (The GDN blocks were already
+  on gdn_decode at T <= 4: forward() never passed spec= to the blocks.)
+- **Adopt instead of CHECKPOINT+REDO**: `forward(spec=True)` at a concrete width > 1 calls the GDN blocks with spec=True; gdn_decode
+  (or, off the card, the per-token loop) stores the conv window / recurrent state after each of the first T-1 tokens into
+  `GatedDeltaNetBlock.spec_track` (3 slots: ~462 MB at 27B geometry, replacing spec_snap's ~152 MB). A partial accept replays
+  `spec_jit[("adopt",)]` (m a bound Variable): live state <- slot m. Bit-exact vs a fresh forward of the m+1 accepted tokens (what
+  REDO computed). Note: a multi-token run keeps its conv window fp32 while decode rounds conv_state to fp16 between steps, so VERIFY's
+  states differ from plain decode's by that rounding (pre-existing; REDO had it too).
+- **No eager work in a warm iteration**: `("chain", k_eff)` = all draft steps + VERIFY's input in one graph; `("accept", n, greedy)`
+  = the test + readback + the next anchor/h_last gathered at m on device (the next chain's inputs) + the MTP cache rewrite of all
+  k_eff slots at the k_eff-wide concrete width (slots past the accept are overwritten by the next chain before any read: draft at p
+  stores slot p before attending to <= p). Per warm iteration: chain, VERIFY, accept (+ adopt) replays and one readback.
+  TestSpecLaunchCensus: 0 eager schedules (step 6: 3 schedules / 5 kernels + 6 replays).
+- warmup(): dummy runs at every k_eff 1..spec_k and both temperatures, VERIFY widths 1..spec_k+1, the adopt family.
+- Two CPU codegen bugs worked around: a kernel with a buffer-slot gap plus a THREAD core-id var declares its params out of order with
+  the runtime's argument order (segfault; one store per slot avoids it); a gather fused onto a bool-cast index came out as INDEX by a
+  bool (verification error; m is materialized first).
