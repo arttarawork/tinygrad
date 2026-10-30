@@ -14,7 +14,7 @@ from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefil
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
   clear_step_caches
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
-from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
+from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
@@ -869,6 +869,8 @@ class TransformerBlock(FFNBlock):
     if self.config.sliding_window or hasattr(self, "attn_sinks"): return None
     if not nv_decode_attention_ok(q.device, self.config.head_dim, self.cache_kv): return None
     if isinstance(T, int) and T == 1: return nv_decode_attention(q, assigned_kv, assigned_scale, start_pos+T).cast(q.dtype)
+    # T4.134: a speculative VERIFY run (2..4 concrete tokens) on the decode kernel, whose cost barely moves with the fill
+    if (verify := nv_verify_attention(q, assigned_kv, assigned_scale, start_pos+T)) is not None: return verify.cast(q.dtype)
     if q.max_shape[2] > MAX_PREFILL_ROWS: return None
     return nv_prefill_attention(q, assigned_kv, assigned_scale, start_pos+T, start_pos).cast(q.dtype)
 

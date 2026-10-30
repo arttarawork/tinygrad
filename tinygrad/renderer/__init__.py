@@ -19,8 +19,10 @@ class Estimates:
   def simplify(self): return Estimates(ssimplify(self.ops), ssimplify(self.lds), ssimplify(self.mem))
   @staticmethod
   def from_uops(uops:tuple[UOp, ...], ignore_indexing=False) -> Estimates:
-    flops: sint = 0
-    lds: sint = 0
+    # T4.134 (fork): integer counts per loop multiplier, summed at the end -- added op by op, a symbolic multiplier (a bound grid or
+    # loop size) made the estimate a one-ADD-per-op chain that overflowed pickle's C stack in the compile pool on big kernels
+    flops: dict[sint, int] = {}
+    lds: dict[sint, int] = {}
     mem: dict[tuple[UOp, Ops], sint] = {}
     mults: sint = 1
     mult_stack: list[sint] = []
@@ -47,14 +49,14 @@ class Estimates:
       elif u.op is Ops.SPECIAL: mults *= cast(sint, u.src[0].ssimplify()) # NOTE: we don't push to the mult_stack here, you can't end these
       elif u.op is Ops.PARAM and u.arg.addrspace == AddrSpace.ALU and u.expr == 'core_id': mults *= int(u.vmax) + 1
       elif u.op is Ops.LOAD and u.src[0].addrspace != AddrSpace.REG:
-        lds += u.max_numel() * u.dtype.itemsize * mults
+        lds[mults] = lds.get(mults, 0) + u.max_numel() * u.dtype.itemsize
       elif u.op is Ops.STORE and u.src[0].addrspace != AddrSpace.REG:
-        lds += u.max_numel() * u.src[1].dtype.itemsize * mults
+        lds[mults] = lds.get(mults, 0) + u.max_numel() * u.src[1].dtype.itemsize
       elif u.op in GroupOp.ALU and u not in excluded:
-        flops += (mults * (2 if u.op is Ops.MULACC else 1)) * u.max_numel()
+        flops[mults] = flops.get(mults, 0) + (2 if u.op is Ops.MULACC else 1) * u.max_numel()
       elif u.op is Ops.WMMA and u not in excluded:
-        flops += 2 * prod(u.arg[0]) // u.arg[3] * mults
-    return Estimates(flops, lds, sum(mem.values()))
+        flops[mults] = flops.get(mults, 0) + 2 * prod(u.arg[0]) // u.arg[3]
+    return Estimates(sum(m * c for m, c in flops.items()), sum(m * c for m, c in lds.items()), sum(mem.values()))
 
 class Renderer:
   target: Target
