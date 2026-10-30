@@ -416,7 +416,7 @@ class TestGDNDecodeMatchesNumpy(unittest.TestCase):
         with self.subTest(tokens=T, start_pos=pos):
           qkv, gate, beta, alpha = f32(T, C, 3, scale=0.5), f32(T, H*V, 2), f32(T, H), f32(T, H)
           conv_state, state = Tensor(conv0).contiguous().realize(), Tensor(state0).contiguous().realize()
-          rows = lambda p: Tensor.custom_kernel(Tensor.empty(*p.shape), Tensor(p).realize(), fxn=_copy_kernel)[0].sum(-1).reshape(B, T, p.shape[1])
+          def rows(p): return Tensor.custom_kernel(Tensor.empty(*p.shape), Tensor(p).realize(), fxn=_copy_kernel)[0].sum(-1).reshape(B, T, p.shape[1])
           z = gdn_decode(rows(qkv), rows(gate), Tensor(np.concatenate([beta, alpha], -1)).reshape(B, T, 2*H), conv_state, state,
                          Tensor(conv_w), Tensor(norm_w), Tensor(dt_bias), Tensor(ssm_a), UOp.variable("start_pos", 0, 63).bind(pos),
                          k_heads=Hk, qk_eps=1e-6, norm_eps=1e-5)

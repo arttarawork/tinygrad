@@ -207,7 +207,7 @@ def request_presence_penalty(body:dict, thinking:bool) -> float:
 # T4.88: thinking budget. Qwen's thinking mode overthinks (2026-09-07: 45k reasoning tokens, 4 h, for one turn); Qwen's own
 # recipe is to cap the think block and force it closed with a short "answer now" sentence, then let the model continue from
 # its cached prefix. THINK_BUDGET (env, default 0 = unlimited) is the cap at reasoning_effort=medium; EFFORT_LEVELS (T4.91)
-# scales it per level. The plain generate() path only (MTP's speculative loop is not spliced).
+# scales it per level. T4.132: under --mtp too (run_model defers the injection to the end of a speculative batch).
 THINK_BUDGET = getenv("THINK_BUDGET", 0)
 THINK_CLOSE = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
 def thinking_budget(body:dict) -> int:
@@ -431,8 +431,9 @@ class Handler(HTTPRequestHandler):
     # T5.4: speculative_generate has no vision plumbing -- an image request always takes the plain generate() path.
     # T4.92: presence_penalty is plumbed to the plain generate() path only -- speculative_generate's accept/resample math
     # (Leviathan et al., see model.py's spec_accept) has its own correctness proof that a logit bias would need to thread
-    # through carefully, out of scope here, so a --mtp request never applies one (T4.92's own task note).
-    use_spec = self.server.mtp and model.mtp_head is not None and vision is None
+    # through carefully. T4.132: so a request with a nonzero presence_penalty takes plain generate() even on a --mtp server
+    # (it used to be silently dropped there).
+    use_spec = self.server.mtp and model.mtp_head is not None and vision is None and not presence_penalty
     # T4.95: list(ids), not ids -- generate()/speculative_generate() append every token they yield straight into
     # the list they're given (model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). `ids` here is the SAME
     # object as do_POST's `record`/self.server.last and inject()'s `ids + out` below, so an uncopied `ids` would
@@ -448,7 +449,8 @@ class Handler(HTTPRequestHandler):
       it = iter(gen)
       def inject(text:str):
         # T4.88/T4.89: feed `text` as if the model wrote it, then continue the same request from ids+out (the live cached
-        # prefix -- only `text`'s few tokens prefill).
+        # prefix -- only `text`'s few tokens prefill). T4.132: with speculative_generate again under --mtp, which resumes from the
+        # live cache the same way (get_start_pos) and prefills the MTP head's cache for the new tokens.
         nonlocal gen, it
         gen.close()
         for t in tok.encode(text):
@@ -458,9 +460,11 @@ class Handler(HTTPRequestHandler):
             yield chunk({field:delta})
         # T4.92: presence_penalty carries over -- generate() resets its own mask per call, so without this an active
         # penalty would silently vanish for the rest of the response after a loop-breaker/think-budget injection.
-        gen = model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
+        gen = model.speculative_generate(ids + out, k=self.server.spec_k, temperature=temperature) if use_spec else \
+          model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
         it = iter(gen)
-      loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS and not use_spec else None), 0
+      loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS else None), 0
+      pending: str|None = None  # T4.132: a triggered injection (loop nudge / think close) waiting for a consistent state
       while (next_id := next(it, None)) is not None:
         if len(out) == 0:
           stderr_log(f"prefill:{(prompt_tokens-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
@@ -488,16 +492,24 @@ class Handler(HTTPRequestHandler):
         if max_tokens is not None and len(out) >= max_tokens:
           finish_reason = "length"
           break
-        if hit is not None and router.mode == "reasoning":
-          nudges += 1
-          msg = f"reasoning loop x{LOOP_REPEATS} ({hit[:48]!r}) -- nudge {nudges}/{LOOP_NUDGES}"
-          stderr_log(f"{colored(msg, 'yellow')}  {colored('--', 'BLACK')}  ")
-          yield from inject(LOOP_NUDGE if nudges <= LOOP_NUDGES else THINK_CLOSE)
-        elif think_budget and not use_spec and router.mode == "reasoning" and len(out) >= think_budget:
-          # T4.88: budget hit -- close the think block with Qwen's own "answer now" sentence. Once per request.
-          stderr_log(f"{colored(f'think budget {think_budget} hit -- closing the think block', 'yellow')}  {colored('--', 'BLACK')}  ")
-          yield from inject(THINK_CLOSE)
-          think_budget = 0
+        if pending is None and router.mode == "reasoning":
+          if hit is not None:
+            nudges += 1
+            msg = f"reasoning loop x{LOOP_REPEATS} ({hit[:48]!r}) -- nudge {nudges}/{LOOP_NUDGES}"
+            stderr_log(f"{colored(msg, 'yellow')}  {colored('--', 'BLACK')}  ")
+            pending = LOOP_NUDGE if nudges <= LOOP_NUDGES else THINK_CLOSE
+          elif think_budget and len(out) >= think_budget:
+            # T4.88: budget hit -- close the think block with Qwen's own "answer now" sentence. Once per request.
+            stderr_log(f"{colored(f'think budget {think_budget} hit -- closing the think block', 'yellow')}  {colored('--', 'BLACK')}  ")
+            pending, think_budget = THINK_CLOSE, 0
+        # T4.132: inject only where the model state is exactly ids+out minus the last (not yet fed) token, so the restart extends
+        # the live cache. Plain generate() is there at every token (it sets _cached_tokens = tokens[:-1] per yield): immediate,
+        # as before. speculative_generate commits a whole accepted batch before yielding it (_cached_tokens = everything but the
+        # batch's LAST token), so mid-batch the cache is ahead of ids+out and a restart would re-prefill from 0: the injection
+        # waits for the batch's last token -- at most k more real tokens. A think block that closes meanwhile drops it.
+        if pending is not None and (not use_spec or model._cached_tokens == ids + out[:-1]):
+          if router.mode == "reasoning": yield from inject(pending)
+          pending = None
       for field, delta in router.route(dec(), final=True):
         if slog is not None: slog.write(field, delta)
         yield chunk({field:delta})

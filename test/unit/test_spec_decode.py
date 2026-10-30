@@ -54,7 +54,8 @@ def _run(model:Transformer, prompt:list[int], n:int, spec:bool, k:int=3) -> list
   gen = model.speculative_generate(list(prompt), k=k) if spec else model.generate(list(prompt), temperature=0.0)
   return [v for _, v in zip(range(n), gen)]
 
-def _wrong_logits(target:int) -> Tensor: return Tensor([[[100.0 if i == target else -100.0 for i in range(VOCAB)]]])
+def _wrong_logits_v(target:int, vocab:int) -> Tensor: return Tensor([[[100.0 if i == target else -100.0 for i in range(vocab)]]])
+def _wrong_logits(target:int) -> Tensor: return _wrong_logits_v(target, VOCAB)
 
 # T4.71: sized for CI -- the fork's 2-core ubuntu runners run these model tests ~3x slower than the M3 they
 # were written on, and the full matrix (k x prompts x N_GEN, a fresh model PAIR per combo) blew both the
@@ -1167,7 +1168,8 @@ class TestSpecForwardMatchesDecode(unittest.TestCase):
           np.testing.assert_array_equal(ft[0][t].numpy(), gt[0][t].numpy(), err_msg=f"slot {t} conv fused vs generic")
           np.testing.assert_allclose(ft[1][t].numpy(), gt[1][t].numpy(), rtol=1e-5, atol=1e-7, err_msg=f"slot {t} recurrent")
           for b, (c0, r0) in ((fresh, pre[0]),):
-            b.conv_state.assign(Tensor(c0)).realize(); b.recurrent_state.assign(Tensor(r0)).realize()
+            b.conv_state.assign(Tensor(c0)).realize()
+            b.recurrent_state.assign(Tensor(r0)).realize()
             with decode_gate(): cast(Tensor, b(x[:, :t + 1].contiguous(), pos)).realize()
             np.testing.assert_array_equal(ft[0][t].numpy(), b.conv_state.numpy(), err_msg=f"slot {t} conv vs a {t+1}-token run")
             np.testing.assert_array_equal(ft[1][t].numpy(), b.recurrent_state.numpy(), err_msg=f"slot {t} recurrent vs a {t+1}-token run")

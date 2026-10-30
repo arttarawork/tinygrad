@@ -453,7 +453,7 @@ NV_SMALL_T = 4
 def spec_k_clamped(k:int) -> int:
   """T4.132: speculative_generate's draft count, capped so VERIFY (k+1 tokens) stays on the NV_SMALL_T-token decode kernels -- at k=4 the
   width-5 VERIFY fell to the generic dequant+matmul path (~1.4 s per iteration on the card). Warns once per k."""
-  if k > NV_SMALL_T - 1: print(f"warning: speculative k={k} clamped to {NV_SMALL_T - 1} (VERIFY is k+1 tokens; the decode kernels cover {NV_SMALL_T})")
+  if k > NV_SMALL_T - 1: print(f"warning: speculative k={k} clamped to {NV_SMALL_T - 1} (VERIFY = k+1 tokens; decode kernels cover {NV_SMALL_T})")
   return min(k, NV_SMALL_T - 1)
 
 def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Linear) -> Tensor:

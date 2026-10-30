@@ -262,6 +262,7 @@ def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor, conv_state:Tensor
                                   fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes, tokens=tokens))[0]
   z = Tensor.empty(batch*tokens, heads*value_dim, dtype=dtypes.float16, device=device)
   z = Tensor.custom_kernel(z, state, conv_out, beta_alpha.reshape(batch*tokens, 2*heads), dt_bias, ssm_a,
-                           _split_k_partials(out_gate), norm_weight, *state_track, bound, fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads,
-                           qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes, tokens=tokens))[0]
+                           _split_k_partials(out_gate), norm_weight, *state_track, bound,
+                           fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads, qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes,
+                                                 tokens=tokens))[0]
   return z.reshape(batch, tokens, heads*value_dim)
