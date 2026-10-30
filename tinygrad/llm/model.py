@@ -1045,6 +1045,7 @@ class GatedDeltaNetBlock(FFNBlock):
       z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
                         *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps,
                         track=self.spec_track if capture else None)
+      assert not capture or T - 1 <= cast(tuple[Tensor, Tensor], self.spec_track)[1].shape[0], f"{T=}: more tokens than spec_track slots"
       return self.ssm_out(z)
 
     # input processing
@@ -1170,23 +1171,23 @@ class GatedDeltaNetBlock(FFNBlock):
     return self.ssm_out(z.reshape(B, T, -1))
 
   spec_track: tuple[Tensor, Tensor]|None = None  # T4.132: (conv (S,B,K-1,C), recurrent (S,B,H,V,K)) -- a VERIFY run's per-token states
-  def __call__(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, spec:bool=False) -> Tensor:
+  def __call__(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, spec:int=0) -> Tensor:
     # rope (T5.3): passed positionally by Transformer.forward to every block; GDN has no positions, so it is ignored here -- it must
     # still be a named parameter, or forward()'s third argument would land in `spec`.
     # T4.132: spec=True (Transformer.forward's concrete multi-token spec call, i.e. VERIFY) also fills spec_track through _attention's
     # `capture` -- stores into buffers made here, before the precompiled trace (nothing in it may touch a device), on first use (a model
-    # that never speculates never pays for them): GDN_DECODE_TOKENS-1 slots = the widest VERIFY's (spec_k_clamped) partial accepts.
+    # that never speculates never pays for them). spec = the slot count (Transformer.spec_slots: spec_k_clamped(k)); True = the most.
     self._init_state(x)
-    if spec: self._init_spec_track()
+    if spec: self._init_spec_track(GDN_DECODE_TOKENS - 1 if spec is True else spec)
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp) -> Tensor:
-      attn_out = self._attention(self._normed_for_attention(x), start_pos, capture=spec)
+      attn_out = self._attention(self._normed_for_attention(x), start_pos, capture=bool(spec))
       return self._ffn_output(x, attn_out).contiguous()
     return _run(x, start_pos)
 
-  def _init_spec_track(self) -> None:
+  def _init_spec_track(self, S:int=GDN_DECODE_TOKENS - 1) -> None:
     if self.spec_track is None:
-      conv, rec, S = self.conv_state, self.recurrent_state, GDN_DECODE_TOKENS - 1
+      conv, rec = self.conv_state, self.recurrent_state
       self.spec_track = (Tensor.empty(S, *conv.shape, dtype=conv.dtype, device=conv.device),
                          Tensor.empty(S, *rec.shape, dtype=rec.dtype, device=rec.device))
 
@@ -1414,7 +1415,7 @@ class MTPHead:
     e = self._local_token_embd(tok_ids.to(dev)).float()
     return self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
 
-  def prefill(self, owner:Transformer, h:Tensor, tok_next:list[int], start_pos:int, v_toks:UOp, v_pos:UOp) -> Tensor:
+  def prefill(self, owner:Transformer, h:Tensor, tok_next:list[int], start_pos:int, v_toks:UOp, v_pos:UOp) -> None:
     """T4.66l: fill `block`'s KV cache for T consecutive MTP steps at once -- what draft() does for one step, minus
     the head. h: (1,T,dim) the main model's pre-output_norm hidden at positions p..p+T-1; tok_next: the T tokens
     actually at positions p+1..p+T; start_pos = p+1, the cache slot of the first step (draft()'s own
@@ -1439,10 +1440,13 @@ class MTPHead:
     # card); one TinyJit per `bound` replays it -- the two symbolic views above are its inputs (shrinks of realized buffers, the
     # variables unbound in the input signature), so every width 1..bound and every slot replay one graph
     if (key := ("mtp_prefill", bound)) not in owner.spec_jit: owner.spec_jit[key] = TinyJit(functools.partial(self._prefill_body, owner))
-    return cast(Tensor, owner.spec_jit[key](hs, ts, v_pos.bind(start_pos)))
+    owner.spec_jit[key](hs, ts, v_pos.bind(start_pos))
 
-  def _prefill_body(self, owner:Transformer, hs:Tensor, ts:Tensor, pos:UOp) -> Tensor:
-    return cast(Tensor, self.block(self._block_in(owner, hs, ts), pos))
+  def _prefill_body(self, owner:Transformer, hs:Tensor, ts:Tensor, pos:UOp) -> None:
+    # T4.132: realized for its K/V store and dropped, never a jit output: a returned block output stays the precompiled call's lazy
+    # GETTUPLE graph for as long as the jit lives, and every later realize walks every live Tensor's graph (_apply_map_to_tensors) --
+    # on the card ~57k nodes per plain decode step after warmup(spec_k=3) (27.0 -> 34.6 ms/token)
+    cast(Tensor, self.block(self._block_in(owner, hs, ts), pos)).realize()
 
 def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, temperature:float|Tensor, u_accept:Tensor, u_sample:Tensor,
                        min_p:float=0.0) -> tuple[Tensor, Tensor]:
@@ -1586,6 +1590,7 @@ class Transformer:
     # + readback + the next chain's inputs + the MTP cache rewrite, ("adopt",) a partial accept's GDN state, ("mtp_prefill", bound)
     # the prompt's MTP cache fill (MTPHead.prefill) -- kept apart from self.jit, whose keys are Transformer.__call__'s families
     self.spec_jit: dict[tuple, Callable[..., Tensor|tuple[Tensor, ...]]] = {}
+    self.spec_slots = 0  # T4.132: GatedDeltaNetBlock.spec_track's slot count, see _spec_track_slots
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
               vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
@@ -1608,10 +1613,11 @@ class Transformer:
     # run's first T-1 tokens (GatedDeltaNetBlock.spec_track), which a partial accept adopts (_adopt_step) -- no checkpoint, no REDO
     # forward. The symbolic prefill chunks (and T == 1) have no partial accept and skip it.
     track = spec and isinstance(T_in := tokens.shape[1], int) and T_in > 1
+    slots = self.spec_slots or GDN_DECODE_TOKENS - 1  # see _spec_track_slots
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
     for block in self.blk:
       xin, r = x.to(block.device), rope.to(block.device) if isinstance(rope, Tensor) else rope
-      x = cast(Tensor, block(xin, start_pos, r, True) if track and isinstance(block, GatedDeltaNetBlock) else block(xin, start_pos, r))
+      x = cast(Tensor, block(xin, start_pos, r, slots) if track and isinstance(block, GatedDeltaNetBlock) else block(xin, start_pos, r))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
@@ -1657,9 +1663,16 @@ class Transformer:
     # Tensor (T4.105), so its graph carries both the argmax and the Gumbel sampler and picks at runtime: temperature <= 0 = greedy.
     # The unused branch costs a vocab-sized argmax/softmax per token (~1 % of a decode step); it buys one jit family instead of two.
     greedy = logits.argmax(-1, keepdim=True)
-    if temperature is None: return greedy
-    temperature = temperature.to(logits.device)
-    return (temperature > 0).reshape(1, 1).where(sample_logits(logits, temperature, MIN_P), greedy)
+    if temperature is None: tok = greedy
+    else:
+      temperature = temperature.to(logits.device)
+      tok = (temperature > 0).reshape(1, 1).where(sample_logits(logits, temperature, MIN_P), greedy)
+    # T4.132: with an MTP head every plain call also returns its per-position pre-norm hidden (B,T,D) -- MTPHead.prefill's input -- so
+    # speculative_generate's prompt prefill replays generate()'s own families (the prefill family captured first and pruned: the T4.128
+    # memory path; at a 1-token chunk width, CPU's, the decode family) instead of keeping two more 128-wide spec families. The token is
+    # unchanged; x is already the last block's materialized output, so the cost is that buffer staying a held jit output (2.6 MB per
+    # 128-token chunk at 27B geometry, 20 KB per decode step).
+    return (tok, x.contiguous()) if self.mtp_head is not None else tok
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
                vis_e:Tensor|None=None, vis_m:Tensor|None=None, vis_pos:Tensor|None=None,
@@ -1901,8 +1914,8 @@ class Transformer:
     # warm both the greedy and sampled jit pairs, so a request doesn't pay a mid-request capture for whichever it hits first
     for temperature in (0.0, 1.0):
       for _ in range(2): list(zip(range(2), self.generate([0], temperature=temperature)))
-    # T4.66e: the above only ever calls generate() -- speculative_generate's own spec=True keys (the prefill
-    # tail's, and VERIFY's, see speculative_generate's own comment) were otherwise first captured at
+    # T4.66e: the above only ever calls generate() -- speculative_generate's own keys (VERIFY's and its spec_jit graphs; T4.132: its
+    # prompt prefill replays generate()'s families just warmed above, no spec=True prefill family exists) were otherwise first captured at
     # REQUEST time (the T4.65 gap SPEC_PROFILE_NOTES.md/SPEC_FIXES_NOTES.md both flagged, recommended fix in
     # T4.72). Only when MTP is actually active: `for _ in range(2):`, exactly mirroring the generate() loop
     # just above and for the identical reason (engine/jit.py _TinyJit.__call__): a jit key's FIRST-EVER call
@@ -1913,6 +1926,7 @@ class Transformer:
     # full outer iteration: DRAFT touches every mtp_head.block position variable) -- 4 tokens total, cheap.
     if self.mtp_head is not None:
       spec_k = spec_k_clamped(spec_k)  # T4.132: only the widths speculative_generate can reach
+      self._spec_track_slots(spec_k)  # sized for spec_k before the dummy runs' narrower VERIFYs allocate it
       # T4.66l: a 2-token dummy prompt (not [0]) so the MTP prefill's own precompiled trace (MTPHead.prefill -- one
       # trace for every prompt-chunk width) is warmed here too, not on the first real request.
       # T4.132: both temperatures, like generate()'s loop above -- the draft-chain families serve both, the accept family is per
@@ -2157,12 +2171,12 @@ class Transformer:
       n_toks = min(chunk_size, virtual_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
       inp = t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out
-      if plan is None: out = cast(Tensor, self(inp, sp, temp, presence_penalty=penalty)).realize()
+      if plan is None: res = self(inp, sp, temp, presence_penalty=penalty)
       elif start_pos < prompt_len:
         e, m, p3 = plan.chunk(start_pos, n_toks)
-        out = cast(Tensor, self(inp, sp, temp, vis_e=e, vis_m=m, vis_pos=p3, presence_penalty=penalty)).realize()
-      else:
-        out = cast(Tensor, self(inp, sp, temp, rope_start=v_rope_start.bind(start_pos - plan.delta), presence_penalty=penalty)).realize()
+        res = self(inp, sp, temp, vis_e=e, vis_m=m, vis_pos=p3, presence_penalty=penalty)
+      else: res = self(inp, sp, temp, rope_start=v_rope_start.bind(start_pos - plan.delta), presence_penalty=penalty)
+      out = (res[0] if isinstance(res, tuple) else res).realize()  # T4.132: an MTP model's prefill chunk also returns its hidden
       start_pos += n_toks
       # chunked prefill: keep processing until all prompt tokens are consumed
       if start_pos < virtual_len: continue
@@ -2189,7 +2203,12 @@ class Transformer:
         # below, a stop token anywhere in the batch makes the caller break before the extras after it are ever
         # appended/yielded -- self._cached_tokens and the returned `tokens` list end exactly at what was
         # actually consumed. The only cost is up to drain_every-1 already-computed, now-wasted device steps.
-        for v in cast(list[list[int]], Tensor.cat(*pending, dim=1).tolist())[0]:
+        # T4.132: a lone jit output (drain_every 1, the server's) is read straight from its buffer: `.tolist()` scheduled a contiguous
+        # copy kernel per token -- an eager realize, whose _apply_map_to_tensors walks every live Tensor's graph
+        drained = Tensor.cat(*pending, dim=1) if len(pending) > 1 else pending[0]
+        vals = drained.uop.buffer.as_memoryview().cast(drained.dtype.fmt).tolist() if drained.uop.has_buffer_identity() and \
+          isinstance(drained.device, str) else cast(list[list[int]], drained.tolist())[0]
+        for v in vals:
           tokens.append(int(v))
           self._cached_tokens = tokens[:-1]
           yield tokens[-1]
@@ -2226,8 +2245,8 @@ class Transformer:
     """The accept test (speculative_generate's ACCEPT) as one graph. Returns the (2n+1,) int readback [m, chunk ids, final ids] -- final[i]
     is the id emitted if the accept length is i (greedy: VERIFY's argmax; sampled: spec_accept_tensor's residual resample / bonus) --
     then, gathered at m on device (T4.132), the next iteration's draft-chain inputs: the anchor final[m] (1,1) and h_last =
-    verify_h[:, m] (1,1,D), and the MTP rewrite's output (realized for its KV store). One family per (n, greedy): the sampled one draws
-    its uniforms inside the graph.
+    verify_h[:, m] (1,1,D); the graph also realizes the MTP cache rewrite below. One family per (n, greedy): the sampled one draws its
+    uniforms inside the graph.
     The MTP rewrite (T4.66l) refills mtp_head.block's cache slots start_pos+1..start_pos+k_eff (mtp_pos = start_pos+1) from the TRUE
     per-position hidden: the draft chain wrote slot start_pos+i from (h_last, chunk[i]) -- the right token, but h_last is position
     start_pos-1's hidden at every step -- while slot t+1 belongs to (h_t, tok_{t+1}) = (verify_h[:, j], chunk[j+1]) for t = start_pos+j.
@@ -2255,8 +2274,22 @@ class Transformer:
     outs: tuple[Tensor, ...] = (m_t.reshape(1).cat(chunk[0], final[0]), anchor, h_next)
     if k_eff:
       assert self.mtp_head is not None
-      outs += (self.mtp_head.block(self.mtp_head._block_in(self, verify_h[:, :k_eff], drafts), mtp_pos),)
+      # realized here, not returned -- see MTPHead._prefill_body: a returned block output keeps its whole lazy graph alive
+      cast(Tensor, self.mtp_head.block(self.mtp_head._block_in(self, verify_h[:, :k_eff], drafts), mtp_pos)).realize()
     return outs
+
+  def _spec_track_slots(self, k:int) -> None:
+    """T4.132: every GDN block's spec_track holds k slots -- the widest VERIFY (k+1 tokens) has k partial accepts -- not the most the
+    kernels allow (k=2: 2 x 151 MB at 27B geometry instead of 3). Growing it reallocates the buffers on the next VERIFY, so the graphs
+    that captured the old ones (every concrete-width VERIFY family and the adopt family) are dropped and recapture. Called outside any
+    capture: speculative_generate and warmup, before their VERIFYs."""
+    if k <= self.spec_slots: return
+    if self.spec_slots:
+      for b in self.blk:
+        if isinstance(b, GatedDeltaNetBlock): b.spec_track = None
+      for key in [key for key in self.jit if key[3] and isinstance(key[2], int) and key[2] < 0]: del self.jit[key]
+      self.spec_jit.pop(("adopt",), None)
+    self.spec_slots = k
 
   def _adopt_step(self, m:UOp) -> None:
     """T4.132: a partial accept's GDN state -- every GDN block's live conv/recurrent state <- slot m of its spec_track (the state VERIFY
@@ -2309,6 +2342,7 @@ class Transformer:
     assert self.mtp_head is not None, "speculative_generate needs an MTP-enabled model (Transformer.from_gguf under MTP=1)"
     assert k >= 1, "k=0 has nothing to draft -- use generate() directly"
     k = spec_k_clamped(k)
+    self._spec_track_slots(k)
     assert len(tokens) < self.max_context, \
       f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
       "-- raise it via Transformer.from_gguf(max_context=...)"
@@ -2318,14 +2352,10 @@ class Transformer:
     # request's prompt prefills in the same chunks (and the same warmed spec prefill family) as a plain one; explicit widths
     # (mtp_bench.py, tests) are unchanged.
     chunk_size = chunk_size or PREFILL_CHUNK.value
-    # T4.55: same recurrent-chunk cap generate() applies (see there), then widened to at least k+1 tokens.
-    # This widening used to also be what let VERIFY/REDO's own chunk (1..k+1 tokens) share the prefill
-    # loop's v_toks bound below; T4.66e gives VERIFY/REDO their own narrower bound instead (verify_chunk,
-    # just below), so this line now only sizes the PREFILL loop's own chunks -- left unchanged (do not touch
-    # the prefill path) so any caller that already relied on it sees byte-identical prefill behavior.
+    # T4.55: same recurrent-chunk cap generate() applies (see there). T4.132: exactly generate()'s width (no more widening to k+1, which
+    # only the old MTP rewrite through the prefill family needed), so the prompt prefill replays generate()'s own family.
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device):
       chunk_size = min(chunk_size, gdn_chunk_for(self.token_embd.weight.device))
-    chunk_size = max(chunk_size, k + 1)
     dev = self.blk[0].device
     # T4.66f: where the DRAFT chain's own tokens live -- MTPHead.draft's return is always forced onto
     # owner.output.weight.device (see its own last line), so draft_tensors below is ALWAYS this device,
@@ -2383,75 +2413,44 @@ class Transformer:
     v_mtp_toks, v_mtp_pos = UOp.variable("mtp_toks", 1, chunk_size), UOp.variable("mtp_pos", 0, self.max_context - 1)
     v_adopt = UOp.variable("spec_m", 0, GDN_DECODE_TOKENS - 2)  # T4.132: the accepted-draft count a partial accept adopts (_adopt_step)
 
-    # --- prefill: identical mechanics to generate() (same kind of v_start_pos/v_toks vars, same
-    # zero-padded token buffer, same get_start_pos cache reuse) -- generate() itself is never called or
-    # modified; this is a self-contained copy of just its chunking loop, small enough not to be worth
-    # threading through a shared helper. Only the FINAL chunk asks for spec=True, to also recover the
-    # pre-norm hidden state at the last prompt position (h_last) beside the per-position logits.
+    # --- prefill: generate()'s own chunking loop (same v_start_pos/v_toks vars, same zero-padded token buffer, same get_start_pos
+    # cache reuse) -- generate() itself is never called; this is a self-contained copy of just its chunking loop. T4.132: every chunk
+    # replays generate()'s OWN prefill family (same key: temperature Tensor on the last block's device, no penalty, the same chunk
+    # width on the card), which with an MTP head also returns the chunk's per-position hidden (forward's tail): each chunk fills the
+    # MTP block's cache from it, the last chunk's token is the anchor and its last hidden row h_last. Before, every chunk ran a
+    # spec=True family (logits for every position): two more 128-wide families, each run eagerly on its first call -- the T4.128
+    # memory peak, OOM at 262k on the card (10-30).
     prompt_len = len(tokens)
     t = Tensor(tokens + [0] * (self.max_context - prompt_len), dtype="int32", device=dev).reshape(1, self.max_context)
+    temp_pf = Tensor([temperature], device=self.blk[-1].device)  # generate()'s temperature input (its device: part of the family's key)
     start_pos = self.get_start_pos(tokens)
     # T5.3: this path has no rope_start/vision plumbing -- a cached prefix that contains images would decode at the wrong rope positions
     if start_pos > 0 and self._rope_delta: start_pos = 0
     if start_pos == 0: self._rope_delta = 0
-    tok_all: Tensor|None = None
+    tok_last: Tensor|None = None
     h_last: Tensor|None = None
     while start_pos < prompt_len:
       n_toks = min(chunk_size, prompt_len - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      # T4.66l: EVERY chunk runs spec=True now (it used to be the final chunk only, the rest spec=False): the MTP
-      # prefill below needs each chunk's per-position hidden state. ponytail: every chunk thereby also pays the full
-      # per-position output projection (~2% of prefill on Qwen3.8-27B) for logits only the final chunk reads; a
-      # hidden-only spec mode (a third jit key, plus its warmup) would save it.
-      prefill_result = cast(tuple[Tensor, ...], self(t[:, sp:sp + nt], sp, None, spec=True))
+      tok_pf, hidden = cast(tuple[Tensor, Tensor], self(t[:, sp:sp + nt], sp, temp_pf))
       if start_pos + n_toks >= prompt_len:
-        # T4.66b: forward(spec=True) now returns the FULL per-position hidden state (B,T,D), not just the
-        # last position -- the prefill anchor only ever wanted the last one (same value as before).
-        # T4.66h: index the last REAL position with the host-known `n_toks` (positive slice), never `-1:`
-        # (negative -- needs the tensor's own reported length). This call's jit key ((True, True, chunk_size,
-        # True), keyed on chunk_size/verify_chunk, NOT on this call's own bound `nt`) is shared by every
-        # prefill-tail call of any width up to chunk_size -- e.g. warmup()'s dummy speculative_generate([0])
-        # call (a real, un-skippable side effect of warming this exact key/graph, see warmup()'s own T4.66e
-        # comment) always binds nt=1. Per _TinyJit.__call__ (engine/jit.py), only the SECOND-ever call to a
-        # key actually captures; every call from then on (capture included) returns the SAME frozen Tensor
-        # object, whose lazy shape still carries THAT capture call's own bound value -- confirmed by printing
-        # prefill_result[*].shape[1]'s UOp: after warmup (which captures this key at nt=1), a real multi-token
-        # prompt's own replay reports shape[1]'s bound CONST as 1, not its own nt. `-1:` on such a tensor
-        # silently resolves against that stale length instead of raising (T4.66j: VERIFY's own `.pad_to(...)`
-        # read a few hundred lines down had the same hole -- it padded from the stale length, surfacing pad
-        # zeros as verify ids -- and now reads through the same host-known-width shape, `[:, :n]`).
-        # Reproduced without any state-cache/get_start_pos involvement at all
-        # (get_start_pos returned 0, no splice): a warm model's own real request read back WARMUP's own
-        # single-token anchor instead of its own last real position. `n_toks` is this iteration's real width
-        # (the loop only assigns tok_all/h_last on its last iteration, so it's exactly right here); the
-        # underlying buffer's DATA is always correct at every position (confirmed per-position, only the
-        # NEGATIVE INDEX's resolution was stale) -- see test_spec_decode.py's TestWarmupAnchorShift.
-        tok_all, h_last = prefill_result[0], fresh_copy(prefill_result[1][:, n_toks - 1:n_toks])  # T4.132: a jit input, see fresh_copy
-      # T4.66l: MTP prefill -- fill mtp_head.block's cache for this chunk's MTP steps t = start_pos.. from (h_t,
-      # tok_{t+1}) into slots t+1 (MTPHead.prefill). The last prompt position's step needs tok_{prompt_len} -- the
-      # anchor, drawn only below -- so that one is draft()'s own first call, not ours: hence the prompt_len-1 clip.
-      # Host-known widths only (`[:, :n_mtp]`, T4.66h/j): prefill_result[1] is a replayed key's frozen output, and
-      # this is realized (dispatched, same device as that output -- from_gguf places mtp_head on the last block's
-      # device, so the queue keeps it ordered) BEFORE the next chunk's replay of the same key overwrites that buffer.
+        # T4.66h: index the last REAL position with the host-known `n_toks` (positive slice), never `-1:` -- a replayed family's
+        # frozen output reports its capture call's width (TestWarmupAnchorShift). fresh_copy: a jit input of its own.
+        tok_last, h_last = tok_pf, fresh_copy(hidden[:, n_toks - 1:n_toks])
+      # T4.66l: MTP prefill -- fill mtp_head.block's cache for this chunk's MTP steps t = start_pos.. from (h_t, tok_{t+1}) into slots
+      # t+1 (MTPHead.prefill). The last prompt position's step needs tok_{prompt_len} -- the anchor -- so that one is the first draft
+      # step's, not ours: hence the prompt_len-1 clip. Host-known widths only (`[:, :n_mtp]`, T4.66h/j); dispatched before the next
+      # chunk's replay of the same family overwrites `hidden` (same device queue).
       n_mtp = min(n_toks, prompt_len - 1 - start_pos)
       if n_mtp > 0:
-        self.mtp_head.prefill(self, prefill_result[1][:, :n_mtp], tokens[start_pos + 1:start_pos + 1 + n_mtp], start_pos + 1,
-                              v_mtp_toks, v_mtp_pos).realize()
+        self.mtp_head.prefill(self, hidden[:, :n_mtp], tokens[start_pos + 1:start_pos + 1 + n_mtp], start_pos + 1, v_mtp_toks, v_mtp_pos)
       start_pos += n_toks
-    # get_start_pos always returns < prompt_len (a fresh/attention model can reuse at most prompt_len-1
-    # positions -- tokens[:-1] -- and a recurrent one's cache-hit branch requires it strictly), so the loop
-    # above always runs >=1 time and both are set; the assert is only for mypy's narrowing.
-    assert tok_all is not None and h_last is not None
-    # T4.66h: n_toks (not -1:) -- see this same fix's own comment a few lines up (the prefill_result[1] slice).
-    anchor_logits = tok_all[:, n_toks - 1:n_toks, :]  # (B,1,vocab): forward(spec=True) returns logits now, not ids (T4.65)
-    # the first post-prompt token: no draft/accept here, it's a plain (greedy or sampled) draw from the real
-    # model's own distribution -- exactly the token generate() itself would yield first (its own
-    # last-prefill-chunk sample). It's about to become chunk_ids[0]/the draft anchor below, but it's ALSO
-    # real output and must be emitted now, same as generate()'s own drain loop emits it, or every later
-    # position is off by one.
-    # (B,1) on out_dev, realized: the first chain's input (lazy, its graph would carry the prefill's "toks" view into VERIFY's key)
-    tok_last = (anchor_logits.argmax(-1) if greedy else sample_logits(anchor_logits[:, 0, :], temp_t, MIN_P)).realize()
-    vocab = cast(int, anchor_logits.shape[-1])
+    # get_start_pos always returns < prompt_len, so the loop above always runs >=1 time; the assert is only for mypy's narrowing.
+    assert tok_last is not None and h_last is not None
+    # the first post-prompt token: the prefill family's own greedy / sampled (temperature, MIN_P) draw at the last position -- exactly
+    # the token generate() itself would yield first. It is about to become chunk[0]/the draft anchor, but it is ALSO real output and is
+    # emitted now. A buffer of the prefill family: the first chain reads it before any later prefill replay could overwrite it.
+    vocab = cast(int, self.output.out_features)
     anchor = int(tok_last.item())
     spec_check_ids([anchor], vocab, f"anchor at position {prompt_len}")
     tokens.append(anchor)

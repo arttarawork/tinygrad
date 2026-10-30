@@ -639,6 +639,8 @@ class TestSpecWarmup(unittest.TestCase):
     self.assertTrue(any(key[0] == "mtp_prefill" for key in model.spec_jit), sorted(model.spec_jit, key=str))
     for key, jit in model.spec_jit.items(): self.assertIsNotNone(cast(TinyJit, jit).captured, f"spec_jit[{key}] never captured")
     self.assertEqual(model._cached_tokens, [], "warmup's direct verify calls advanced the live state: nothing may resume from it")
+    # T4.132: the prompt prefill replays generate()'s own families -- no spec=True prefill (symbolic chunk) family exists
+    self.assertEqual([key for key in spec_keys if isinstance(key[2], int) and key[2] > 0], [])
 
   def test_warmup_without_mtp_head_adds_no_spec_keys(self):
     # a plain Transformer (mtp_head unset, same as _load()'s own model MINUS its Context(MTP=1) --
@@ -959,7 +961,7 @@ class TestMTPPrefill(unittest.TestCase):
     a, b = _split(ref), _split(ref)
     _, h = _spec_call(a, prompt, nt=n, bound=n)  # eager (cnt=0): concrete (1, n, D)
     v_t, v_p = UOp.variable("mtp_toks", 1, 8), UOp.variable("mtp_pos", 0, 63)
-    a.mtp_head.prefill(a, h[:, :n - 1], prompt[1:], 1, v_t, v_p).realize()
+    a.mtp_head.prefill(a, h[:, :n - 1], prompt[1:], 1, v_t, v_p)
     v_d = UOp.variable("draft_pos_0", 0, 63)
     for t in range(n - 1): b.mtp_head.draft(b, h[:, t:t + 1], Tensor([[prompt[t + 1]]], dtype="int32"), v_d.bind(t + 1)).realize()
     ca, cb = (m.mtp_head.block.cache_kv[:, :, :, :n + 1, :].float().numpy() for m in (a, b))
@@ -999,7 +1001,7 @@ class TestMTPPrefill(unittest.TestCase):
     r = _split(ref)
     _, h = _spec_call(r, tokens, nt=L - 1, bound=L - 1)
     v_t, v_p = UOp.variable("mtp_toks", 1, L), UOp.variable("mtp_pos", 0, 63)
-    r.mtp_head.prefill(r, h[:, :L - 2], tokens[1:L - 1], 1, v_t, v_p).realize()
+    r.mtp_head.prefill(r, h[:, :L - 2], tokens[1:L - 1], 1, v_t, v_p)
     live = m.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
     oracle = r.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
     np.testing.assert_allclose(live[:, :, :, 1:L - 1], oracle[:, :, :, 1:L - 1], rtol=1e-3, atol=1e-4)
@@ -1116,7 +1118,7 @@ class TestSpecForwardMatchesDecode(unittest.TestCase):
         np.testing.assert_array_equal(gr, wr, err_msg=f"{m=} gdn {i} recurrent")
       if m == 0:
         self.model.restore_state(self.snap)
-        self.model.forward(Tensor([[self.first]]), self.pos, None).realize()
+        Tensor.realize(*cast(tuple[Tensor, Tensor], self.model.forward(Tensor([[self.first]]), self.pos, None)))  # (token, hidden)
         for i, ((gc, gr), (wc, wr)) in enumerate(zip(got, self._gdn_states())):
           np.testing.assert_array_equal(gc, wc, err_msg=f"gdn {i} conv vs decode")
           np.testing.assert_array_equal(gr, wr, err_msg=f"gdn {i} recurrent vs decode")
@@ -1264,6 +1266,64 @@ class TestSpecLaunchCensus(unittest.TestCase):
         # the chain, VERIFY, the accept (+ the adopt on a partial accept)
         self.assertIn(len(launches), (3, 4), f"{temperature=}: {launches}")
       self.assertTrue(any(len(launches) == 4 for launches in iters), f"{temperature=}: no partial accept exercised the adopt: {iters}")
+
+class TestSpecTrackSlots(unittest.TestCase):
+  """T4.132: spec_track holds spec_k_clamped(k) slots (k=2: 2 per GDN block, ~300 MB at 27B geometry instead of ~460); a later request
+  at a larger k grows it and drops the graphs bound to the old buffers (VERIFY families, adopt), which recapture -- still token-identical."""
+  def test_slots_follow_k_and_grow_safely(self):
+    model = _load_gdn_varied()
+    model.warmup(spec_k=2)
+    gdn = [b for b in model.blk if isinstance(b, GatedDeltaNetBlock)]
+    self.assertEqual({cast(tuple, b.spec_track)[1].shape[0] for b in gdn}, {2})
+    ref = _run(_load_gdn_varied(), VARIED_PROMPT, 12, spec=False)
+    self.assertEqual(_run(model, VARIED_PROMPT, 12, spec=True, k=2), ref)
+    self.assertEqual(_run(model, VARIED_PROMPT, 12, spec=True, k=3), ref)
+    self.assertEqual({cast(tuple, b.spec_track)[1].shape[0] for b in gdn}, {3})
+
+class TestLiveGraphsAfterSpec(unittest.TestCase):
+  """T4.132 (10-30 card): plain decode slowed 27.0 -> 34.6 ms/token after warmup(spec_k=3) in the same process. Every eager realize
+  walks every live Tensor's graph (tensor.py _apply_map_to_tensors), and the MTP block's output -- returned by the ("accept", n, greedy)
+  and ("mtp_prefill", bound) jits -- stayed a live lazy GETTUPLE graph of the whole precompiled block for as long as each jit lived
+  (on this model ~420 nodes each, 2124 live nodes in all vs 219; ~57k on the card). Those outputs are now realized inside their graphs
+  and dropped, and generate() reads each decoded token straight from the jit's output buffer (no per-token eager copy kernel)."""
+  def _live(self) -> dict[int, int]:
+    import gc
+    from tinygrad.tensor import all_tensors
+    gc.collect()
+    return {id(t): len(t.uop.toposort()) for r in list(all_tensors) if (t := r()) is not None}
+
+  def _decode_walks(self, model:Transformer) -> tuple[int, int]:
+    import tinygrad.tensor as tensor_mod
+    calls, nodes = [0], [0]
+    orig_apply, orig_topo = tensor_mod._apply_map_to_tensors, UOp.topovisit
+    def apply(m, name):
+      calls[0] += 1
+      return orig_apply(m, name)
+    def topo(self, visitor, cache):
+      n0 = len(cache)
+      r = orig_topo(self, visitor, cache)
+      nodes[0] += len(cache) - n0
+      return r
+    gen = model.generate(list(VARIED_PROMPT), temperature=0.0)
+    for _ in range(2): next(gen)
+    tensor_mod._apply_map_to_tensors, UOp.topovisit = apply, topo
+    try:
+      for _ in range(8): next(gen)
+    finally: tensor_mod._apply_map_to_tensors, UOp.topovisit = orig_apply, orig_topo
+    gen.close()
+    return calls[0], nodes[0]
+
+  def test_spec_warmup_leaves_no_lazy_graphs(self):
+    model = _load_gdn_varied()
+    for temperature in (0.0, 1.0):
+      for _ in range(2): list(zip(range(2), model.generate([0], temperature=temperature)))
+    self.assertEqual(self._decode_walks(model), (0, 0), "a plain decode step schedules nothing eagerly (no live-graph walk)")
+    before = self._live()
+    model.warmup(spec_k=3)
+    new = {k: n for k, n in self._live().items() if k not in before}
+    self.assertLessEqual(max(new.values()), 20, "a Tensor the spec warmup left alive still carries a lazy graph")
+    self.assertLess(sum(new.values()), 600, f"{len(new)} new live tensors, {sum(new.values())} nodes")
+    self.assertEqual(self._decode_walks(model), (0, 0))
 
 if __name__ == '__main__':
   unittest.main()
