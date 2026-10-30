@@ -2484,7 +2484,8 @@ class Transformer:
     self._cached_tokens = tokens[:-1]
     # T4.132: the chain / accept graphs capture on their first call without pruning -- their one-time work happens here, eagerly, once
     self.mtp_head.ready(self, k)
-    if out_dev not in Tensor._device_seeds: Tensor.realize(*Tensor._next_counter(cast(str, out_dev), 0), Tensor._device_rng_counters[out_dev])
+    if (rng_dev := cast(str, out_dev)) not in Tensor._device_seeds:
+      Tensor.realize(*Tensor._next_counter(rng_dev, 0), Tensor._device_rng_counters[rng_dev])
     yield tokens[-1]
 
     stats_on = bool(SPEC_STATS.value)
