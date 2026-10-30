@@ -168,7 +168,7 @@ def _decode_mma_ok(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None) -> boo
 
 @functools.cache
 def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, valid_kv_len:int|UOp, max_kv_len:int, warps:int,
-                       k_tiles:int) -> UOp:
+                       k_tiles:int, tokens:int=1) -> UOp:
   """T4.129: _decode_partial_kernel's contract -- (acc, m, l) per (batch, q head, slot) for _merge_partials -- for a KV_INT4 cache, on
   the tensor cores. Grid: (batch x kv head) x slot blocks of `warps` warps; each warp is one slot and walks chunks slot, slot+S,
   slot+2S, ... of KS = 16*k_tiles keys (S = live slots = min(ceil(valid/KS), out.shape[2])); lane is AxisType.WARP (threadIdx.x,
@@ -187,12 +187,19 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   scale block: A = (nibble-8)*sv in fp16 (the prefill kernel's V rounding). C of O^T is (dims, heads 2t/2t+1): the rescale
   needs alpha of heads 2t and 2t+1, two shuffles from lanes 8t, 8t+4. Stored m is natural-log (the merge's convention).
   Numerics vs the T4.107a kernel: q rounded to int8 per 32-block (llama.cpp's q8 x q4 K); P and V*sv rounded to fp16 for the PV
-  mma (fp32 accumulate); softmax state in fp32."""
+  mma (fp32 accumulate); softmax state in fp32.
+  T4.134: tokens = T > 1 is a speculative VERIFY run. q/out/stats arrive as (B, H*T, ...) views (_decode_mma_attention), head-major,
+  so a kv head's G = heads x T ROWS are this kernel's "heads" (G <= 32): row group k = rows 8k..8k+7 is S m-tile k//2's rows g
+  (k even) / g+8 (k odd) -- the A fragment's g+8 half T == 1 leaves zero -- and the P.V n-tile k (P never moves: C rows g+8 of an
+  S tile are the B fragment of the next n-tile). K/V words, their dequant and the int8 B fragments are shared by every row group.
+  Row r is token r % T and sees keys < valid_kv_len - (T-1) + r % T: one compare per (row group, score) replaces the shared key
+  mask (a select, no branch); the loads keep the shared valid_kv_len mask. T == 1 builds exactly the T4.129 graph."""
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, D = cast(tuple[int, int, int, int], q.shape)
   G, slots, KS, blocks, run = H // H_KV, cast(int, out.shape[2]), 16 * k_tiles, D // 32, D // 64  # run = V words per row group
-  assert M == 1 and 2 <= G <= 8 and H % H_KV == 0 and D in (64, 128, 256) and max_kv_len == N and N % KS == 0
+  RG = -(-G // 8)  # T4.134: 8-row groups (1 at T == 1)
+  assert M == 1 and 2 <= G <= 32 and G % tokens == 0 and H % H_KV == 0 and D in (64, 128, 256) and max_kv_len == N and N % KS == 0
   assert cache_kv.dtype == dtypes.uint32 and cache_kv.shape[4] * 8 == D, "the int4 cache arrives as uint32 words (_decode_mma_attention)"
   live = (valid_kv_len + KS - 1) // KS
   S = min(live, slots) if isinstance(live, int) else live.minimum(slots)
@@ -206,29 +213,39 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   # prologue: this lane's A fragments (head g, dims 32*blk+8t..+7) and the per-(head, block) scales, q8_quantize's rounding
   from tinygrad.llm.kernels.nv_gemm import _i8x4
   from tinygrad.llm.kernels.nv_quant import _q8_pack
-  head = kvh * G + g
-  head_ok = g < G
+  rows = [g] + [g + 8 * k for k in range(1, RG)]  # T4.134: this lane's row in each row group
+  heads = [kvh * G + row for row in rows]
+  head_oks = [row < G for row in rows]
   # A masked index component is gated on the `dim` (or key) component, never on the head: the index lowering substitutes what a gate
   # pins (oh < 2 pins t = 0) into the gated component and then drops a gate whose ranges no longer appear in it
   # (schedule/indexing.py's reshape rewrite, pm_drop_and_clauses) -- a head-gated store rendered unconditional at G in {2, 3}
   zeros = (UOp.const(0, dtypes.int8),) * 4
-  afrags, sqs = [], []
-  for blk in range(blocks):
-    qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
-    amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
-    amax = amax.maximum(_shfl(amax, lane ^ 1))
-    amax = amax.maximum(_shfl(amax, lane ^ 2))
-    sq = (amax / 127).maximum(1e-8)
-    afrags.append(UOp.stack(*_i8x4(_q8_pack(tuple(qv[0::2]), sq)), *zeros, *_i8x4(_q8_pack(tuple(qv[1::2]), sq)), *zeros))
-    # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
-    sqs.append((amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D)))
-  row_max, row_sum = _reg((1,), 1, SENTINEL, block), _reg((1,), 2, 0, block)
-  o_acc = tuple(_reg((4,), 10 + j, 0, block) for j in range(D // 16))  # O^T m-tile j: (dim rows g, g+8) x (heads 2t, 2t+1)
+  qfrags:list[list[tuple[tuple[UOp, ...], tuple[UOp, ...]]]] = []  # per row group, per block: (even dims, odd dims) as int8
+  sqs:list[list[UOp]] = []
+  for head, head_ok in zip(heads, head_oks):
+    qfrags.append([]); sqs.append([])
+    for blk in range(blocks):
+      qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
+      amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
+      amax = amax.maximum(_shfl(amax, lane ^ 1))
+      amax = amax.maximum(_shfl(amax, lane ^ 2))
+      sq = (amax / 127).maximum(1e-8)
+      qfrags[-1].append((_i8x4(_q8_pack(tuple(qv[0::2]), sq)), _i8x4(_q8_pack(tuple(qv[1::2]), sq))))
+      # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
+      sqs[-1].append((amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D)))
+  def half(k:int, blk:int, odd:int) -> tuple[UOp, ...]: return qfrags[k][blk][odd] if k < RG else zeros
+  # m-tile mt's A: rows g = row group 2mt, rows g+8 = row group 2mt+1 (zero past the last group: always at T == 1)
+  afrags = [[UOp.stack(*half(2 * mt, blk, 0), *half(2 * mt + 1, blk, 0), *half(2 * mt, blk, 1), *half(2 * mt + 1, blk, 1))
+             for blk in range(blocks)] for mt in range(-(-RG // 2))]
+  row_max, row_sum = _reg((RG,), 1, SENTINEL, block), _reg((RG,), 2, 0, block)
+  # O^T m-tile j x row group k: (dim rows g, g+8) x (rows 2t, 2t+1 of the group)
+  o_acc = [tuple(_reg((4,), 10 + k * (D // 16) + j, 0, block) for j in range(D // 16)) for k in range(RG)]
   steps = (live + S - 1) // S
   step = UOp.range(steps, 100, AxisType.REDUCE)
   base = (slot + step * S) * KS
   def unsign(x:UOp) -> UOp: return (x + 0x78787878) ^ 0x80808080  # 4 nibbles (one per byte) -> 4 int8 nibble-8, T4.126
-  scores, oks, tiles = [], [], []
+  scores:list[list[UOp]] = [[] for _ in range(RG)]
+  oks, tiles = [], []
   for kt in range(k_tiles):
     keys = [base + 16 * kt + 8 * nt + 2 * t + i for nt in range(2) for i in range(2)]  # this lane's C keys = its PV k 2t, 2t+1, +8, +9
     key_ok = [key < valid_kv_len for key in keys]
@@ -237,25 +254,33 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
       kb = kb.valid(kb < valid_kv_len)
       sks = [[scale[0, b, kvh, key.valid(ok), blk].load().float() for blk in range(blocks)]
              for key, ok in zip(keys[2*nt:2*nt+2], key_ok[2*nt:2*nt+2])]
-      s = [UOp.const(0, dtypes.float), UOp.const(0, dtypes.float)]
+      s = [[UOp.const(0, dtypes.float), UOp.const(0, dtypes.float)] for _ in range(RG)]
       for blk in range(blocks):
         word = cache_kv[0, b, kvh, kb, 4 * blk + t].load()
         bfrag = UOp.stack(*_i8x4(unsign(word & 0x0F0F0F0F)), *_i8x4(unsign((word >> 4) & 0x0F0F0F0F)))
-        c = (UOp.wmma(afrags[blk], bfrag, UOp.const((0,) * 4, dtypes.int32), *DEC_IMMA_ARG) + MAGIC).bitcast(dtypes.float32)
-        # (c - 1.5*2**23) * d, never (c + s) - 1.5*2**23: the symbolic pass reassociates a constant out of an add chain
-        s = [s[i] + (c[i] - 12582912.0) * (sqs[blk] * sks[i][blk]) for i in range(2)]
-      scores += s
+        for mt, afrag in enumerate(afrags):
+          c = (UOp.wmma(afrag[blk], bfrag, UOp.const((0,) * 4, dtypes.int32), *DEC_IMMA_ARG) + MAGIC).bitcast(dtypes.float32)
+          # (c - 1.5*2**23) * d, never (c + s) - 1.5*2**23: the symbolic pass reassociates a constant out of an add chain
+          for k in range(2 * mt, min(2 * mt + 2, RG)):  # C rows g (c0, c1) = row group 2mt, rows g+8 (c2, c3) = 2mt+1
+            s[k] = [s[k][i] + (c[2 * (k % 2) + i] - 12582912.0) * (sqs[k][blk] * sks[i][blk]) for i in range(2)]
+      for k in range(RG): scores[k] += s[k]
     oks += key_ok
     tiles.append(keys)
-  prev_max, prev_sum = row_max.after(step)[0].load(), row_sum.after(step)[0].load()
-  tile_max = functools.reduce(lambda a, x: a.maximum(x), (ok.where(sc, SENTINEL) for sc, ok in zip(scores, oks)))
-  tile_max = tile_max.maximum(_shfl(tile_max, lane ^ 1))
-  tile_max = tile_max.maximum(_shfl(tile_max, lane ^ 2))  # head g's max over the step's keys (the 4 lanes of row g)
-  new_max = prev_max.maximum(tile_max)
-  alpha = (prev_max - new_max).exp2()
-  ps = [ok.where((sc - new_max).exp2(), 0.0) for sc, ok in zip(scores, oks)]
-  new_sum = prev_sum * alpha + functools.reduce(lambda a, x: a + x, ps)  # this lane's keys only: the 4 lanes are summed at the end
-  alphas = (_shfl(alpha, 8 * t), _shfl(alpha, 8 * t + 4))  # O^T's columns are heads 2t, 2t+1 = S rows of lanes 8t, 8t+4
+  # T4.134: the score mask per row group -- row r (token r % T) sees keys < valid_kv_len - (T-1) + r % T; T == 1: the load mask
+  row_oks = [oks] if tokens == 1 else \
+    [[key < valid_kv_len + (row % tokens - (tokens - 1)) for key in (key for keys in tiles for key in keys)] for row in rows]
+  ps, alphas, row_stores = [], [], []
+  for k in range(RG):
+    prev_max, prev_sum = row_max.after(step)[k].load(), row_sum.after(step)[k].load()
+    tile_max = functools.reduce(lambda a, x: a.maximum(x), (ok.where(sc, SENTINEL) for sc, ok in zip(scores[k], row_oks[k])))
+    tile_max = tile_max.maximum(_shfl(tile_max, lane ^ 1))
+    tile_max = tile_max.maximum(_shfl(tile_max, lane ^ 2))  # row g's max over the step's keys (the 4 lanes of row g)
+    new_max = prev_max.maximum(tile_max)
+    alpha = (prev_max - new_max).exp2()
+    ps.append([ok.where((sc - new_max).exp2(), 0.0) for sc, ok in zip(scores[k], row_oks[k])])
+    new_sum = prev_sum * alpha + functools.reduce(lambda a, x: a + x, ps[k])  # this lane's keys only: the 4 lanes are summed at the end
+    alphas.append((_shfl(alpha, 8 * t), _shfl(alpha, 8 * t + 4)))  # O^T's columns are rows 2t, 2t+1 = S rows of lanes 8t, 8t+4
+    row_stores += [row_max[k].store(new_max), row_sum[k].store(new_sum)]
   # V: per tile key, this lane's run of row group g (D/16 bytes) and its block's scale, as fp16
   vruns = [[[cache_kv[1, b, kvh, key.valid(ok), run * g + w].load() for w in range(run)] for key, ok in zip(keys, key_ok)]
            for keys, key_ok in zip(tiles, [oks[4*kt:4*kt+4] for kt in range(k_tiles)])]
@@ -264,47 +289,71 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
     # dim row of byte j (high nibble: row g+8) of tile key k, (nibble - 8) * sv in fp16: 0x6400|n is 1024+n exactly
     nib = (vruns[kt][k][j // 4] >> (8 * (j % 4) + 4 * high)) & 0xF
     return ((nib | 0x6400).cast(dtypes.uint16).bitcast(dtypes.float16) - 1032.0) * svs[kt][k]
-  pfrags = [UOp.stack(*(p.cast(dtypes.float16) for p in ps[4*kt:4*kt+4])) for kt in range(k_tiles)]
+  pfrags = [[UOp.stack(*(p.cast(dtypes.float16) for p in ps[k][4*kt:4*kt+4])) for kt in range(k_tiles)] for k in range(RG)]
   o_stores = []
-  for j, acc in enumerate(o_acc):
-    prev = acc.after(step)
-    o = UOp.stack(*(prev[i].load() * alphas[i % 2] for i in range(4)))
-    for kt in range(k_tiles):
-      # A e0..e7 = (rows g, g+8) x (k 2t, 2t+1, 2t+8, 2t+9) in the m16n8k16 order: A[g][2t], A[g][2t+1], A[g+8][2t], A[g+8][2t+1], ...
-      afrag = UOp.stack(*(vval(kt, 2 * kh + kk, j, high) for kh in range(2) for high in range(2) for kk in range(2)))
-      o = UOp.wmma(afrag, pfrags[kt], o, *DEC_HMMA_ARG)
-    o_stores.append(acc.store(o))
-  update = UOp.group(*o_stores, row_max[0].store(new_max), row_sum[0].store(new_sum)).end(step)
-  m_fin, l_fin = row_max.after(update)[0].load(), row_sum.after(update)[0].load()
-  l_fin = l_fin + _shfl(l_fin, lane ^ 1)
-  l_fin = l_fin + _shfl(l_fin, lane ^ 2)
-  stat_head = head.valid(t.eq(0) & head_ok)  # head keeps g (G >= 2: `g < G` pins nothing, eq is not parsed), so the gate survives
-  stores = [stats[b, stat_head, slot, 0].store(m_fin * (1 / LOG2E)), stats[b, stat_head, slot, 1].store(l_fin)]
-  for j, acc in enumerate(o_acc):
-    vals = acc.after(update)
-    for i in range(4):
-      oh = 2 * t + i % 2
-      stores.append(out[b, kvh * G + oh, slot, ((D // 8) * g + 2 * j + i // 2).valid(oh < G)].store(vals[i].load()))
+  for j in range(D // 16):
+    # A e0..e7 = (rows g, g+8) x (k 2t, 2t+1, 2t+8, 2t+9) in the m16n8k16 order: A[g][2t], A[g][2t+1], A[g+8][2t], A[g+8][2t+1], ...
+    vfrags = [UOp.stack(*(vval(kt, 2 * kh + kk, j, high) for kh in range(2) for high in range(2) for kk in range(2))) for kt in range(k_tiles)]
+    for k in range(RG):  # T4.134: one V^T fragment, every row group's P
+      prev = o_acc[k][j].after(step)
+      o = UOp.stack(*(prev[i].load() * alphas[k][i % 2] for i in range(4)))
+      for kt in range(k_tiles): o = UOp.wmma(vfrags[kt], pfrags[k][kt], o, *DEC_HMMA_ARG)
+      o_stores.append(o_acc[k][j].store(o))
+  update = UOp.group(*o_stores, *row_stores).end(step)
+  stores = []
+  for k in range(RG):
+    m_fin, l_fin = row_max.after(update)[k].load(), row_sum.after(update)[k].load()
+    l_fin = l_fin + _shfl(l_fin, lane ^ 1)
+    l_fin = l_fin + _shfl(l_fin, lane ^ 2)
+    # head keeps g (G >= 2: `g < G` pins nothing, eq is not parsed), so the gate survives. T4.134: a last row group of ONE row
+    # (G = 9: `g + 8 < 9` pins g = 0) takes eq
+    stat_head = heads[k].valid(t.eq(0) & (g.eq(0) if G - 8 * k == 1 else head_oks[k]))
+    stores += [stats[b, stat_head, slot, 0].store(m_fin * (1 / LOG2E)), stats[b, stat_head, slot, 1].store(l_fin)]
+  for k in range(RG):
+    for j, acc in enumerate(o_acc[k]):
+      vals = acc.after(update)
+      for i in range(4):
+        oh = 2 * t + i % 2 + 8 * k if k else 2 * t + i % 2
+        stores.append(out[b, kvh * G + oh, slot, ((D // 8) * g + 2 * j + i // 2).valid(oh < G)].store(vals[i].load()))
   ends = (lane, warp, block) if warps > 1 else (lane, block)
   return UOp.group(*stores).end(*ends).sink(arg=KernelInfo(name="flash_decode_mma_nv", opts_to_apply=()))
 
 def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, valid_kv_len:int|UOp) -> Tensor:
   B, H, D, N = cast(int, cache_kv.shape[1]), cast(int, q.shape[1]), cast(int, q.shape[3]), cast(int, cache_kv.shape[3])
+  T = cast(int, q.shape[2])  # T4.134: 1, or a VERIFY run (nv_verify_attention): the kernel's rows are heads x tokens, head-major
   k_tiles = NV_ATTN_DEC_KTILES.value
   assert BLOCK_N % (16 * k_tiles) == 0, f"NV_ATTN_DEC_KTILES={k_tiles} must divide {BLOCK_N // 16}"
   slots = min(NV_ATTN_DEC_SLOTS.value, N // (16 * k_tiles))
-  partial = Tensor.empty(B, H, slots, D, dtype="float32", device=q.device)
-  stats = Tensor.empty(B, H, slots, 2, dtype="float32", device=q.device)
+  partial = Tensor.empty(B, H * T, slots, D, dtype="float32", device=q.device)
+  stats = Tensor.empty(B, H * T, slots, 2, dtype="float32", device=q.device)
   # Tensor.custom_kernel's call by hand so the int4 cache's parameter is uint32 words over the same uint8 buffer (a kernel argument
   # is a pointer: no view, no copy -- a Tensor-level bitcast of the stored cache would schedule a full copy every step)
-  srcs = (partial, stats, q.contiguous(), cache_kv, cache_kv_scale)
+  srcs = (partial, stats, q.contiguous() if T == 1 else q.reshape(B, H * T, 1, D).contiguous(), cache_kv, cache_kv_scale)
   params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
   params[3] = UOp.placeholder((2, B, cast(int, cache_kv.shape[2]), N, D // 8), dtypes.uint32, slot=3)
-  kernel = _decode_mma_kernel(*params, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles)
+  kernel = _decode_mma_kernel(*params, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles,
+                              tokens=T)
   call = kernel.call(*(s.uop for s in srcs))
   partial, stats = Tensor(partial.uop.after(call)), Tensor(stats.uop.after(call))
   # live slots = ceil(valid / KS): _merge_partials counts ceil(valid' / BLOCK_N), so hand it valid' = valid * BLOCK_N / KS
-  return _merge_partials(partial, stats, valid_kv_len * (BLOCK_N // (16 * k_tiles))).unsqueeze(2)
+  out = _merge_partials(partial, stats, valid_kv_len * (BLOCK_N // (16 * k_tiles)))
+  return out.unsqueeze(2) if T == 1 else out.reshape(B, H, T, D)
+
+# ******** T4.134: speculative VERIFY runs on the decode kernel ********
+# VERIFY (2..k+1 query tokens) took the prefill kernel: every query head padded to a 16-row m-tile, 64 slots -- its cost grew with the
+# fill (card, 10-30: VERIFY(3) 29.1 ms at 2k, ~60 at 131k vs plain decode 27.0 / 32.0). The decode kernel above takes the run as
+# G*T rows per kv head instead (2 m-tiles at G = 6, T = 3), keeping its split-KV slots, so the cost tracks decode's.
+NV_ATTN_DEC_MMA_T = ContextVar("NV_ATTN_DEC_MMA_T", 1)  # 1 = runs of 2..MAX_VERIFY_TOKENS on _decode_mma_kernel; 0 = nv_prefill_attention (A/B)
+MAX_VERIFY_TOKENS = 4  # G*T <= 32 rows (two m-tiles) at the model's G = 6 .. 8
+
+def nv_verify_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, valid_kv_len:int|UOp) -> Tensor|None:
+  """q (B,H,T,D) for a concrete 2 <= T <= MAX_VERIFY_TOKENS run whose keys are already stored (valid_kv_len = start_pos + T; token t
+  sees keys < start_pos + t + 1, nv_prefill_attention's causal limit) on the decode mma kernel; (B,H,T,D) float32, or None when the
+  run, the cache or the device doesn't fit it (the caller takes nv_prefill_attention)."""
+  T = q.shape[2]
+  if not NV_ATTN_DEC_MMA_T.value or not isinstance(T, int) or not 2 <= T <= MAX_VERIFY_TOKENS: return None
+  if not _decode_mma_ok(q, cache_kv, cache_kv_scale): return None
+  return _decode_mma_attention(q, cache_kv, cast(Tensor, cache_kv_scale), valid_kv_len)
 
 # ******** T4.107b: prefill chunks ********
 
