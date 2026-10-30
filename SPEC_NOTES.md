@@ -364,3 +364,31 @@ built directly a la `test_gdn_scan_parity.py::make_block`, no GGUF needed) and
 drafted position of every chain and wrong about every later one, forcing a genuine mid-chain partial accept
 (`0 < m < k_eff`) deterministically every iteration (confirmed via SPEC_STATS, not just inferred) — greedy
 output still matches `generate()` exactly.
+
+## 8. T4.132 (10-30) — the checkpoint ordering bug on the card, and the loop as graph replays
+
+**Root cause of "every VERIFY row wrong on the card, T=1 included, under every kernel knob" (bisect2.log).** Step 1's
+`GatedDeltaNetBlock.checkpoint` returned the block's INPUT as `AFTER(x, <snapshot assigns>)`. In this scheduler
+(`schedule/__init__.py create_schedule`) an AFTER's trailing srcs are the CALL/END kernels that write its buffer (plus join
+deps for THOSE kernels); a reader of an AFTER state depends only on that AFTER's own kernels. An AFTER wrapped around an
+input has none, so the block's call lost its RAW dependency on x's producer and read an unwritten buffer (deterministic
+garbage on the card, NaN on a NaN-poisoned CPU allocator), and the snapshot copies ran first only by queue order. The CPU
+tests never saw it: `_load`/`_load_gdn`'s greedy streams are one repeating id and CPU allocations are zero-filled.
+Fix: the ordering edge lives on the STATE — each live state Tensor becomes `AFTER(state, STORE(snap, state))` for the call
+(Tensor.assign's own STORE+AFTER idiom on the copied buffer); the block's reads depend on the copy kernel, its in-place
+store supersedes it, the realize maps the views back to plain buffers. `restore=True` copies the other way (REDO).
+Pinned by `TestSpecForwardMatchesDecode` on `_load_gdn_varied` (6 blocks, 12 distinct greedy ids): generate() vs
+forward(spec=True) one token at a time vs widths 1..4, row by row.
+
+**Loop graphs (step 6).** `Transformer.spec_jit`: `("draft", i)` one TinyJit per draft step (h_last, the previous id, the bound
+`draft_pos_i`, temp; greedy/sampled decided in-graph), `("accept", n, greedy)` the accept test + readback, `("mtp_prefill",
+bound)` MTPHead.prefill's block call (symbolic width, shared by the prompt fill and the accept-time rewrite); REDO is its own
+`__call__` family per width (`key + ("redo",)`) whose GDN blocks restore the checkpoint inside the graph. Jit inputs are
+`fresh_copy`'d (a view of a jit output or an unpadded tensor folds `.contiguous()` away and changes the input signature:
+JitError "args mismatch"); the next anchor is uploaded from the readback id, never a view with a baked offset. A draft
+patched onto the MTPHead INSTANCE (the forced-accept test oracles) runs eagerly. Per warm iteration on the tiny model
+(`TestSpecLaunchCensus`): replays = k drafts + VERIFY + accept + (rewrite | REDO) [+ rewrite], eager launches 3–4 of 1–2
+kernels (h_last copy + anchor upload, the chunk cat, REDO's / the rewrite's input prep). Before: ~93 eager draft launches,
+96 eager restore assigns per partial accept, the accept math and the rewrite trace re-dispatched every iteration.
+`SPEC_DEBUG=1` prints per-iteration verify-row NaN/inf counts, argmax ids, chunk and emitted ids to stderr; an id outside
+[0, vocab) raises instead of being emitted (`spec_check_ids`).
