@@ -9,6 +9,7 @@ from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
   Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits, spec_check_ids,
+  spec_k_clamped,
 )
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 from test.unit.test_llm_device_map import TEST_CONFIG
@@ -594,6 +595,13 @@ class TestVerifyConcreteWidth(unittest.TestCase):
     loop_keys = [key for key in _spec_keys(model) if key[2] != 32]
     allowed = {_verify_key(w) for w in range(1, k + 2)} | {_verify_key(w, redo=True) for w in range(1, k + 1)}
     self.assertTrue(all(key in allowed for key in loop_keys), loop_keys)
+
+  def test_k_above_the_decode_kernels_is_clamped(self):
+    # T4.132: k+1 > NV_SMALL_T would run VERIFY on the generic dequant+matmul path (k=4: ~1.4 s per iteration on the card)
+    self.assertEqual([spec_k_clamped(k) for k in (1, 3, 4, 7)], [1, 3, 3, 3])
+    model = _load_gdn(seed=0, max_context=64)
+    self.assertEqual(_run(model, [1, 2, 3], 8, spec=True, k=5), _run(_load_gdn(seed=0, max_context=64), [1, 2, 3], 8, spec=False))
+    self.assertTrue(all(key[2] is None or key[2] >= -4 for key in _spec_keys(model)), _spec_keys(model))
 
   def test_each_width_is_one_family_captured_once_and_replayed(self):
     # widths 1..k+1 driven directly: the second call of a width captures its family, every later call replays it (cnt grows,

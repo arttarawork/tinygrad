@@ -450,6 +450,13 @@ class TransformerConfig:
 # run the GDN decode kernels cover (GDN_DECODE_TOKENS) -- i.e. a decode step (1) or speculative decoding's VERIFY/REDO (<= k+1).
 NV_SMALL_T = 4
 
+@functools.cache
+def spec_k_clamped(k:int) -> int:
+  """T4.132: speculative_generate's draft count, capped so VERIFY (k+1 tokens) stays on the NV_SMALL_T-token decode kernels -- at k=4 the
+  width-5 VERIFY fell to the generic dequant+matmul path (~1.4 s per iteration on the card). Warns once per k."""
+  if k > NV_SMALL_T - 1: print(f"warning: speculative k={k} clamped to {NV_SMALL_T - 1} (VERIFY is k+1 tokens; the decode kernels cover {NV_SMALL_T})")
+  return min(k, NV_SMALL_T - 1)
+
 def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Linear) -> Tensor:
   """norm(x) -- T4.125b: on the NV decode path (concrete T <= NV_SMALL_T, `weight` = norm's fp32 copy prepared at load, every consumer
   an NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
@@ -1956,6 +1963,7 @@ class Transformer:
     # real capture cost onto the first live request. Each of the 2 calls pulls 2 tokens (prefill anchor + one
     # full outer iteration: DRAFT touches every mtp_head.block position variable) -- 4 tokens total, cheap.
     if self.mtp_head is not None:
+      spec_k = spec_k_clamped(spec_k)  # T4.132: only the widths speculative_generate can reach
       # T4.66l: a 2-token dummy prompt (not [0]) so the MTP prefill's own precompiled trace (MTPHead.prefill -- one
       # trace for every width, shared with the accept rewrite) is warmed here too, not on the first real request.
       # T4.132 (step 6): both temperatures, like generate()'s loop above -- the draft-step families serve both, the accept family is
@@ -2315,6 +2323,7 @@ class Transformer:
     """
     assert self.mtp_head is not None, "speculative_generate needs an MTP-enabled model (Transformer.from_gguf under MTP=1)"
     assert k >= 1, "k=0 has nothing to draft -- use generate() directly"
+    k = spec_k_clamped(k)
     assert len(tokens) < self.max_context, \
       f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
       "-- raise it via Transformer.from_gguf(max_context=...)"
