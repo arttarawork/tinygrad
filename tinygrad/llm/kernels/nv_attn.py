@@ -149,9 +149,11 @@ NV_ATTN_DEC_MMA = ContextVar("NV_ATTN_DEC_MMA", 1)       # 0 = the T4.107a kerne
 NV_ATTN_DEC_SLOTS = ContextVar("NV_ATTN_DEC_SLOTS", 256)  # partial slots per (batch, q head) at most (= warps per kv head)
 NV_ATTN_DEC_WARPS = ContextVar("NV_ATTN_DEC_WARPS", 4)    # warps (each its own slot) per block
 NV_ATTN_DEC_KTILES = ContextVar("NV_ATTN_DEC_KTILES", 1)  # 16-key tiles per loop step (one softmax rescale per step); divides 8
-# T4.134: head_dim parts per slot (adjacent blocks: each keeps D/parts of O and reads its share of V, S is recomputed per part) --
-# O^T is D/16 x 4 fp32 per row group per lane, 192 registers for VERIFY(3) at the model's G = 6; a card knob, divides head_dim/64
-NV_ATTN_DEC_DSPLIT = ContextVar("NV_ATTN_DEC_DSPLIT", 1)
+# T4.134: VERIFY runs only -- head_dim parts per slot (adjacent blocks: each keeps D/parts of O and reads its share of V, S is
+# recomputed per part); divides head_dim/64. O^T is D/16 x 4 fp32 per row group per lane: 192 registers at VERIFY(3), G = 6. sm_86
+# cubins (nvrtc lane, 10-30; registers + spill stack bytes): T == 1 194 + 0 (never split); VERIFY(3) at 1: 255 + 1120, 2: 255 + 160,
+# 4: 250 + 0; VERIFY(2) at 1: 255 + 112, 2: 224 + 0; VERIFY(4) at 2: 255 + 272, 4: 255 + 80. A card knob (1 / 2 / 4)
+NV_ATTN_DEC_DSPLIT = ContextVar("NV_ATTN_DEC_DSPLIT", 2)
 DEC_IMMA_ARG = ((WMMA_N, WMMA_M, 32), 'CUDA', WARP_SIZE)  # m16n8k32 s8 -> s32 ('CUDA': the PYTHON emulator's fragment model; the
 DEC_HMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)  # renderer ignores the string) and m16n8k16 f16 -> f32
 MAGIC = 0x4B400000  # bitcast(MAGIC + c) = 1.5*2**23 + c exactly for |c| < 2**22 (T4.126): int32 -> fp32 without an I2F
@@ -340,7 +342,7 @@ def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, vali
   srcs = (partial, stats, q.contiguous() if T == 1 else q.reshape(B, H * T, 1, D).contiguous(), cache_kv, cache_kv_scale)
   params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
   params[3] = UOp.placeholder((2, B, cast(int, cache_kv.shape[2]), N, D // 8), dtypes.uint32, slot=3)
-  d_split = max(NV_ATTN_DEC_DSPLIT.value, 1)
+  d_split = max(NV_ATTN_DEC_DSPLIT.value, 1) if T > 1 else 1
   if (D // 64) % d_split: d_split = 1  # T4.134: whole V words per part (head_dim 64: no split)
   kernel = _decode_mma_kernel(*params, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles,
                               tokens=T, d_split=d_split)

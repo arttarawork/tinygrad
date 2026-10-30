@@ -759,14 +759,14 @@ class TestVerifyMMAKernel(unittest.TestCase):
     # slots, P.V per row group, stats, _merge_partials) on the PYTHON emulator against an fp64 numpy causal softmax with q rounded as the
     # kernel rounds it: G = 2, 3, 6, 8 (G*T = 4..32 rows: one to four row groups, a last group of one row at 9), fills ending mid-tile
     # and straddling tiles/slots (a slot holding no key some row sees), start 0 and 1 (fewer keys than slots), several steps per slot,
-    # 1/2 warps, 1/2 key tiles, D = 64 / 128, two kv heads, a bound symbolic start_pos; NV_ATTN_DEC_DSPLIT=2 (head_dim halves in
-    # adjacent blocks) for VERIFY and for T == 1 (through nv_decode_attention), and its no-op fallback at D = 64
+    # 1/2 warps, 1/2 key tiles, D = 64 / 128, two kv heads, a bound symbolic start_pos; NV_ATTN_DEC_DSPLIT 1 and 2 (head_dim halves in
+    # adjacent blocks), its no-op fallback at D = 64, and T == 1 under the knob (nv_decode_attention: never split)
     from tinygrad.llm.kernels import nv_gemm
     configs = [(2, 2, 64, 128, 2, 35, 2, 1, 1, False, 1), (1, 2, 64, 128, 4, 13, 2, 2, 1, False, 1), (2, 3, 64, 128, 3, 14, 2, 1, 1, False, 1),
                (1, 3, 64, 128, 2, 0, 4, 1, 1, False, 1), (1, 6, 64, 128, 2, 31, 2, 2, 1, False, 1), (1, 6, 64, 128, 3, 98, 2, 2, 2, False, 1),
                (1, 6, 128, 128, 4, 1, 2, 1, 1, False, 1), (1, 6, 64, 128, 3, 34, 2, 1, 1, True, 1), (1, 8, 64, 128, 4, 57, 3, 2, 1, False, 1),
-               (1, 6, 128, 128, 3, 98, 2, 2, 1, False, 2), (2, 3, 128, 128, 3, 14, 2, 1, 2, False, 2), (1, 6, 128, 128, 1, 99, 2, 2, 1, False, 2),
-               (1, 6, 64, 128, 3, 40, 2, 1, 1, False, 2)]
+               (1, 6, 128, 128, 3, 98, 2, 2, 1, False, 2), (2, 3, 128, 128, 3, 14, 2, 1, 2, False, 2), (1, 6, 128, 128, 2, 97, 2, 2, 1, False, 2),
+               (1, 6, 64, 128, 3, 40, 2, 1, 1, False, 2), (1, 6, 128, 128, 1, 99, 2, 2, 1, False, 2)]
     rng = np.random.default_rng(5)
     for kvh, G, Dh, N, T, start, slots, warps, k_tiles, symbolic, d_split in configs:
       with self.subTest(kvh=kvh, G=G, D=Dh, T=T, start=start, slots=slots, warps=warps, k_tiles=k_tiles, symbolic=symbolic, d_split=d_split):
@@ -790,6 +790,26 @@ class TestVerifyMMAKernel(unittest.TestCase):
             ref[h, t] = p @ kvd[1, h // G, :lim] / p.sum()
         self.assertFalse(np.isnan(got).any())
         np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
+
+  def test_compiles_on_the_nvrtc_lane(self):
+    # VERIFY(3) at the model's geometry and the default knobs through the real compiler (on macOS the docker nvrtc lane, as the server;
+    # skipped when it cannot start): the sm_86 cubin's register count and spill stack (EIATTR_REGCOUNT / EIATTR_MIN_STACK_SIZE, what
+    # ops_nv reads). Unsplit, VERIFY(3) spilled 1120 bytes per thread (more than L1 holds at two blocks per SM); d_split 2: 160
+    import struct
+    from tinygrad.runtime.support.compiler_cuda import NVRTCCompiler
+    from tinygrad.runtime.support.elf import elf_loader
+    _, src = _lower_sm86(_mma_sink(262144, UOp.variable("start_pos", 0, 262144 - 3) + 3, T=3, d_split=nv_attn.NV_ATTN_DEC_DSPLIT.value))
+    try: lib = NVRTCCompiler("sm_86", ptx=False, cache_key="nv").compile(src)
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    attrs = {}
+    for sh in elf_loader(lib, force_section_align=128)[1]:
+      off = 0
+      while sh.name == ".nv.info" and off < sh.header.sh_size:
+        typ, param, sz = struct.unpack_from("BBH", sh.content, off)
+        if typ == 0x4 and sz >= 8: attrs[param] = struct.unpack_from("II", sh.content, off + 4)[1]
+        off += (sz if typ == 0x4 else 0) + 4
+    self.assertLessEqual(attrs[0x2f], 255)   # EIATTR_REGCOUNT
+    self.assertLessEqual(attrs[0x12], 256)   # EIATTR_MIN_STACK_SIZE: the spill stack, bytes per thread
 
   def test_dispatch(self):
     # graph-level, on CPU with the sm_80 check mocked: a concrete 2..4-token run on a KV_INT4 cache takes the mma kernel over H*T rows;
@@ -817,15 +837,18 @@ class TestVerifyMMAKernel(unittest.TestCase):
     self.assertIsNone(run(kv_dtype=dtypes.float16))
     self.assertIsNone(run(wmma_ok=False))
     self.assertIsNone(run(wmma_ok=None))  # CPU: no CUDA renderer
-    # NV_ATTN_DEC_DSPLIT reaches the kernel: P.V mmas per step = (D/16/d_split) x 3 row groups; it falls back to 1 where it doesn't
-    # divide head_dim/64 (whole V words per part)
-    def pv_mmas(Dh:int=D, **ctx) -> int:
+    # NV_ATTN_DEC_DSPLIT (default 2) reaches the VERIFY kernel: P.V mmas per step = (D/16/d_split) x 3 row groups; it falls back to 1
+    # where it doesn't divide head_dim/64 (whole V words per part), and T == 1 never splits (16 P.V mmas: the T4.129 kernel)
+    def pv_mmas(Dh:int=D, T:int=3, **ctx) -> int:
       kv, scale = Tensor.zeros(2, 1, 2, 4096, Dh // 2, dtype=dtypes.uint8), Tensor.ones(2, 1, 2, 4096, Dh // 32, dtype=dtypes.float16)
+      q = Tensor.ones(1, 12, T, Dh, dtype=dtypes.float16)
       with Context(**ctx), patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True):
-        out = nv_attn.nv_verify_attention(Tensor.ones(1, 12, 3, Dh, dtype=dtypes.float16), kv, scale, 103)
+        out = nv_attn.nv_verify_attention(q, kv, scale, 100 + T) if T > 1 else nv_attn.nv_decode_attention(q, kv, scale, 101)
       return sum(u.op is Ops.WMMA and u.arg[0] == (8, 16, 16) for u in out.uop.toposort())
+    self.assertEqual(pv_mmas(), 24)
     self.assertEqual([pv_mmas(NV_ATTN_DEC_DSPLIT=d) for d in (1, 2, 4, 3)], [48, 24, 12, 48])
-    self.assertEqual(pv_mmas(64, NV_ATTN_DEC_DSPLIT=2), 12)
+    self.assertEqual(pv_mmas(64), 12)
+    self.assertEqual(pv_mmas(T=1), 16)
 
   def test_model_routes_verify(self):
     # TransformerBlock._nv_attn: T == 1 -> the decode kernel, a concrete 2..4-token run -> the decode kernel over its rows,
