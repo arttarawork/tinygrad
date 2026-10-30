@@ -422,3 +422,21 @@ REDO 43/61/79 ms, the MTP rewrite 21 ms (the prompt's 128-wide family), draft_0 
 - Two CPU codegen bugs worked around: a kernel with a buffer-slot gap plus a THREAD core-id var declares its params out of order with
   the runtime's argument order (segfault; one store per slot avoids it); a gather fused onto a bool-cast index came out as INDEX by a
   bool (verification error; m is materialized first).
+
+**Blockers fixed after the first card runs (10-30):**
+- *Plain decode slowed 27.0 -> 34.6 ms/token after warmup(spec_k=3).* Every eager realize walks every live Tensor's graph
+  (`_apply_map_to_tensors`). The MTP block's output returned by the `("accept", n, greedy)` and `("mtp_prefill", bound)` jits stayed a
+  live lazy GETTUPLE graph of the whole precompiled block (tiny model: ~420 nodes each, 2124 live nodes vs 219 before the spec
+  warmup; card ~57k). Those block outputs are now realized inside their graphs and dropped (333 live nodes after the spec warmup).
+  And generate() reads each decoded token straight from the jit's output buffer: no per-token eager copy kernel or graph walk at all
+  (tiny model on CPU: 2.27 -> 1.57 ms/step). `TestLiveGraphsAfterSpec` pins both.
+- *OOM at 262k in warmup.* The spec=True 128-wide prompt-prefill families (greedy + sampled) ran their first call eagerly (the T4.128
+  memory peak). speculative_generate's prompt prefill now replays generate()'s own families at generate()'s chunk width: with an MTP
+  head every plain forward also returns its per-position hidden (the last block's output, already materialized: 2.6 MB per 128-token
+  chunk / 20 KB per decode step held as a jit output, tokens unchanged); the last chunk's own token is the anchor. No spec=True
+  prefill family exists any more (forward(spec=True) at symbolic widths stays for extra/flip_rate.py).
+- `spec_track` holds `spec_k_clamped(k)` slots (k=2: 2 x 151 MB at 27B geometry); a larger k later reallocates and drops the VERIFY
+  and adopt graphs bound to the old buffers.
+- Found on the way, pre-existing and not fixed: on CPU, generate() with GDN_CHUNK=2 (jitted, capture-first) leaves a different GDN
+  state from the eager run of the same chunks (tiny varied model, a 3-token prompt: state maxdiff ~ max|state|); chunk 1 (CPU's
+  default) and the card are unaffected as far as tested. The old spec prefill widened its chunk to k+1 and hid it.
