@@ -1208,6 +1208,33 @@ class TestPrefixSnapshot(unittest.TestCase):
     cold_out2 = list(cold_h.run_model(ids2, "m", messages=msgs2, render=self._render))
     self.assertEqual(self._content(out2), self._content(cold_out2))     # same output as a genuinely cold run
 
+  def test_mtp_server_pins_the_prefix_too(self):
+    # T4.132: a --mtp server used to skip the prefix snapshot (prefill_only ran generate()'s loop, which leaves the MTP draft
+    # cache empty); prefill_only now runs the speculative prefill when an MTP head is loaded, so the same block applies
+    import tinygrad.llm.serve as srv_mod
+    from tinygrad.llm.serve import Handler, LLMServer
+    class MTPModel(self.FakeModel):
+      mtp_head = object()
+      def speculative_generate(self, ids, k=3, temperature=0.0, chunk_size=None): yield from self.generate(ids)
+    sys_msg = {"role": "system", "content": "you are a helpful assistant with a long fixed system prompt"}
+    msgs1 = [sys_msg, {"role": "user", "content": "hello there"}]
+    msgs2 = [sys_msg, {"role": "user", "content": "totally different question"}]
+    prefix_ids = [ord(c) for c in self._render([sys_msg], False)]
+    ids1, ids2 = ([ord(c) for c in self._render(m, True)] for m in (msgs1, msgs2))
+    srv = LLMServer(("127.0.0.1", 0), model=MTPModel(), model_name="tiny", tok=self._tok(), template=None, state_cache_mb=1, mtp=True)
+    self.addCleanup(srv.server_close)
+    h = Handler.__new__(Handler)
+    h.server = srv
+    log: list[str] = []
+    with patch.object(srv_mod, "PREFIX_SNAPSHOT_MIN", 1), patch.object(srv_mod, "stderr_log", log.append):
+      list(h.run_model(ids1, "m", messages=msgs1, render=self._render))
+      self.assertEqual(srv.model.prefill_calls, [prefix_ids])
+      self.assertIn(tuple(prefix_ids), srv.snapshots)
+      log.clear()
+      list(h.run_model(ids2, "m", messages=msgs2, render=self._render))
+      from tinygrad.helpers import ansistrip
+      self.assertIn(f"in:{len(prefix_ids):5d}", ansistrip("".join(log)))   # the second session resumed at the prefix
+
   def test_no_user_message_is_a_no_op(self):
     from tinygrad.llm.serve import Handler
     import tinygrad.llm.serve as srv_mod

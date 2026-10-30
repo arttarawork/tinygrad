@@ -25,7 +25,8 @@ from tinygrad.llm.kernels.nv_quant import (
   Q8_0, Q4_0, Q4_1, IQ4_NL, NV_QUANT_TYPES, NV_CUSTOM_QUANT, nv_quant_supported, _quant_decode_kernel, _nv_byte_perm,
   nv_q8_linear, q8_quantize, split_k_partials, _ffn_act_q8_kernel, ffn_act_q8,
 )
-from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, nv_fused_norm
+from tinygrad.llm.model import FFNBlock, GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, nv_fused_norm, NV_SMALL_T, \
+  Transformer, MTPHead
 from test.helpers import check_schedule
 from test.unit.test_llm_nv_norm import np_add_rmsnorm_q8
 
@@ -893,13 +894,13 @@ class TestFFNActivationFusion(unittest.TestCase):
     with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
       self.assertIs(block._feed_forward(x).uop, self._old_formula(block, x).uop)
 
-  def test_t_greater_than_one_keeps_the_contiguous_path_even_with_the_nv_gate_open(self):
-    # T4.123c is decode-only (T==1 concrete) -- nv_q8_linear itself covers tokens<=4, but this fusion must not
-    # take the fast path for a 1<T<=4 concrete call or a symbolic chunk bound at 1 (neither is T==1 concrete)
+  def test_t_greater_than_small_t_keeps_the_contiguous_path_even_with_the_nv_gate_open(self):
+    # T4.123c covers a concrete T <= NV_SMALL_T (T4.132: a speculative VERIFY run too; was T==1 only) -- this fusion must not take
+    # the fast path for a wider concrete call (nv_q8_linear's gemv cap) or a symbolic chunk bound at 1 (not concrete)
     block = self._ffn_block()
     with Context(NV_CUSTOM_QUANT=1), mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
-      x4 = Tensor.randn(1, 4, self.DIM)
-      self.assertIs(block._feed_forward(x4).uop, self._old_formula(block, x4).uop)
+      x5 = Tensor.randn(1, NV_SMALL_T + 1, self.DIM)
+      self.assertIs(block._feed_forward(x5).uop, self._old_formula(block, x5).uop)
       xsym = Tensor.randn(1, 8, self.DIM)[:, :UOp.variable("toks", 1, 8).bind(1), :]
       self.assertIs(block._feed_forward(xsym).uop, self._old_formula(block, xsym).uop)
 
@@ -1009,15 +1010,15 @@ class TestFFNNormSiteFusion(unittest.TestCase):
     x, attn_out = self._inputs()
     self.assertIs(block._ffn_output(x, attn_out).uop, self._old_formula(block, x, attn_out).uop)
 
-  def test_t_greater_than_one_is_byte_identical_even_with_the_gate_open(self):
-    # decode-only (T==1 concrete); mocking only model.py's own nv_quant_supported (not kernels/nv_quant.py's)
-    # keeps Linear.__call__ on the generic path, so `is` identity is meaningful here (a real nv_q8_linear
-    # dispatch allocates a fresh output buffer every call, which breaks hash-cons `is` regardless of this task --
-    # TestFFNActivationFusion's own T>1 test uses the same one-sided mock for the same reason)
+  def test_t_greater_than_small_t_is_byte_identical_even_with_the_gate_open(self):
+    # a concrete T <= NV_SMALL_T only (T4.132: a speculative VERIFY run too; was T==1); mocking only model.py's own
+    # nv_quant_supported (not kernels/nv_quant.py's) keeps Linear.__call__ on the generic path, so `is` identity is meaningful
+    # here (a real nv_q8_linear dispatch allocates a fresh output buffer every call, which breaks hash-cons `is` regardless of
+    # this task -- TestFFNActivationFusion's own T>NV_SMALL_T test uses the same one-sided mock for the same reason)
     block = self._ffn_block()
-    x4, attn_out4 = self._inputs(T=4)
+    x5, attn_out5 = self._inputs(T=NV_SMALL_T + 1)
     with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
-      self.assertIs(block._ffn_output(x4, attn_out4).uop, self._old_formula(block, x4, attn_out4).uop)
+      self.assertIs(block._ffn_output(x5, attn_out5).uop, self._old_formula(block, x5, attn_out5).uop)
 
   def test_moe_and_tp_blocks_keep_the_old_path(self):
     # the dense-only guard (hasattr ffn_gate_exps/ffn_gate_tp) must close even with the NV gate open and T==1 --
@@ -1085,23 +1086,24 @@ class TestGDNAttnNormSiteFusion(unittest.TestCase):
     with Context(DEBUG=0): x = Tensor.randn(1, 1, self.DIM).contiguous().realize()
     self.assertIs(block._normed_for_attention(x).uop, block.attn_norm(x).uop)
 
-  def test_t_greater_than_one_is_byte_identical_even_with_the_gate_open(self):
+  def test_t_greater_than_small_t_is_byte_identical_even_with_the_gate_open(self):
+    # T4.132: a concrete T <= NV_SMALL_T fuses (a speculative VERIFY run); wider stays the plain norm
     block = self._gdn_block()
-    with Context(DEBUG=0): x4 = Tensor.randn(1, 4, self.DIM).contiguous().realize()
+    with Context(DEBUG=0): x5 = Tensor.randn(1, NV_SMALL_T + 1, self.DIM).contiguous().realize()
     with mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True):
-      self.assertIs(block._normed_for_attention(x4).uop, block.attn_norm(x4).uop)
+      self.assertIs(block._normed_for_attention(x5).uop, block.attn_norm(x5).uop)
 
-def _decode_census(t:Tensor) -> list[str]:
+def _decode_census(t:Tensor, *more:Tensor) -> list[str]:
   """T4.125b: every kernel the scheduler launches to realize t (really scheduled via linear_with_vars, never executed): a custom
   kernel by its own name, a generic one as 'reduce|elementwise <out dtype>[numel] <- <in dtypes>[numel],...'."""
-  lin, _ = t.linear_with_vars()
+  lin, _ = t.linear_with_vars(*more)
   census = []
   for call in (u for u in lin.src if u.op is Ops.CALL):
     ast = call.src[0]
     if isinstance(ast.arg, KernelInfo) and ast.arg.opts_to_apply == ():
       census.append(ast.arg.name)
       continue
-    bufs = [f"{b.dtype.name}[{b.max_numel()}]" for b in call.src[1:] if b.dtype.name != "int"]  # skip bound Variables
+    bufs = [f"{b.dtype.name}[{b.max_numel()}]" for b in call.src[1:] if b.dtype not in dtypes.weaks]  # skip bound Variables, keep int buffers
     census.append(f"{'reduce' if any(u.op is Ops.REDUCE for u in ast.toposort()) else 'elementwise'} {bufs[0]} <- {','.join(bufs[1:])}")
   return census
 
@@ -1139,7 +1141,8 @@ class TestDecodeStepCensus(unittest.TestCase):
     w = np.random.default_rng(seed).standard_normal(n).astype(np.float32)
     return ggml_data_to_tensor(Tensor(w.view(np.uint8)).realize(), n, 0).cast(dtypes.float16)
 
-  def _step(self, b:FFNBlock) -> list[str]:
+  def _step(self, b:FFNBlock, T:int=1) -> list[str]:
+    # T4.132: T > 1 is a speculative VERIFY/REDO run (concrete T <= NV_SMALL_T) -- the same fused sites, one block per token
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights
     D, W = self.DIM, self.WIDE
     b.ffn_gate, b.ffn_up, b.ffn_down = self._q4_0(D, W, 3), self._q4_0(D, W, 4), self._q4_0(W, D, 5)
@@ -1149,12 +1152,12 @@ class TestDecodeStepCensus(unittest.TestCase):
       b.prepare_nv_norms()
       if isinstance(b, GatedDeltaNetBlock): b.prepare_nv_decode()
       with Context(DEBUG=0):
-        x = Tensor.randn(1, 1, D).contiguous().realize()
+        x = Tensor.randn(1, T, D).contiguous().realize()
         b._init_state(x)
         Tensor.realize(*[t for t in (getattr(b, n, None) for n in ("conv_state", "recurrent_state", "cache_kv", "freqs_cis")) if t is not None])
       # the blocks' _run body (spec=False), without the @function wrapper
       census = _decode_census(b._ffn_output(x, b._attention(b._normed_for_attention(x), 5)).contiguous())
-    print(f"\n{type(b).__name__} decode step: {len(census)} kernels", sorted(census))
+    print(f"\n{type(b).__name__} decode step (T={T}): {len(census)} kernels", sorted(census))
     self.assertEqual(census.count("add_rmsnorm_q8_nv"), 2, "one kernel per fused norm site (attn_norm, ffn_norm)")
     self.assertEqual(census.count("ffn_act_q8_nv"), 1, "T4.127a: ffn_down's input (SiLU(gate)*up + its quantize) is one kernel")
     conversions = [k for k in census if (ins := k.partition(" <- ")[2]).startswith("unsigned char[") and "," not in ins]
@@ -1171,12 +1174,17 @@ class TestDecodeStepCensus(unittest.TestCase):
     for i, lin in enumerate((b.ssm_beta, b.ssm_alpha)):
       nn.state.load_state_dict(lin, {"weight": self._gguf_f32(8 * D, 6 + i).reshape(8, D)}, verbose=False, realize=False)
     b.ssm_norm.weight = self._gguf_f32(W // 8, 12)
-    census = self._step(b)
-    self.assertNotIn(f"elementwise half[{D}] <- half[{D}]", census, "the f16 gemvs read the fused fp16 output in place")
-    # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only ssm_out's q8_quantize_nv remains
-    self.assertEqual(census.count("q8_quantize_nv"), 1, "attn_qkv/attn_gate's is the fused kernel's; ffn_down's is ffn_act_q8_nv's")
-    # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs -- are now the one combined gemv (dim 256 is 128-aligned)
-    self.assertEqual(census.count("linear_f16_gemv_nv"), 1, "ssm_beta/ssm_alpha's two gemvs are now the combined one")
+    for T in (1, NV_SMALL_T):  # T4.132: a 4-token VERIFY run schedules exactly the decode step's kernels (one block per token each)
+      census = self._step(b, T)
+      self.assertNotIn(f"elementwise half[{T*D}] <- half[{T*D}]", census, "the f16 gemvs read the fused fp16 output in place")
+      # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only ssm_out's q8_quantize_nv remains
+      self.assertEqual(census.count("q8_quantize_nv"), 1, "attn_qkv/attn_gate's is the fused kernel's; ffn_down's is ffn_act_q8_nv's")
+      # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs -- are now the one combined gemv (dim 256 is 128-aligned)
+      self.assertEqual(census.count("linear_f16_gemv_nv"), 1, "ssm_beta/ssm_alpha's two gemvs are now the combined one")
+      self.assertEqual([k for k in census if k.startswith("gdn_")], ["gdn_conv_decode_nv", "gdn_decode_nv"])
+      if T == 1: t1 = census
+    def kinds(c): return sorted(k.partition(" ")[0] for k in c)  # a generic kernel by kind only: its buffer sizes scale with T
+    self.assertEqual(kinds(census), kinds(t1), "the T=4 run is the T=1 step's kernel list")
 
   def test_attention_decode_step(self):
     D, W = self.DIM, self.WIDE
@@ -1185,10 +1193,12 @@ class TestDecodeStepCensus(unittest.TestCase):
     b = TransformerBlock(config)
     b.attn_q, b.attn_k, b.attn_v, b.attn_output = self._q4_0(D, 4096, 0), self._q4_0(D, 128, 1), self._q4_0(D, 128, 2), self._q4_0(W, D, 6)
     b.attn_q_norm.weight, b.attn_k_norm.weight = self._gguf_f32(128, 12), self._gguf_f32(128, 13)
-    census = self._step(b)
-    self.assertNotIn(f"reduce float[1] <- float[{D}]", census, "attn_norm's sum of squares runs inside add_rmsnorm_q8")
-    # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only attn_output's q8_quantize_nv remains
-    self.assertEqual(census.count("q8_quantize_nv"), 1, "q/k/v's quantize is the fused kernel's; ffn_down's is ffn_act_q8_nv's; left: attn_output's")
+    for T in (1, NV_SMALL_T):  # T4.132: a 4-token VERIFY run: the same fused sites around the prefill attention tile
+      census = self._step(b, T)
+      self.assertNotIn(f"reduce float[{T}] <- float[{T*D}]", census, "attn_norm's sum of squares runs inside add_rmsnorm_q8")
+      # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only attn_output's q8_quantize_nv remains
+      self.assertEqual(census.count("q8_quantize_nv"), 1, "q/k/v's quantize is the fused kernel's, ffn_down's is ffn_act_q8_nv's: attn_output's left")
+      self.assertEqual(sum(1 for k in census if k.startswith("flash_")), 1, "one attention kernel: decode at T=1, the prefill tile at T=4")
 
   def test_output_norm_feeds_the_head_directly(self):
     head, norm = self._q4_0(self.DIM, 64, 7), nn.RMSNorm(self.DIM, 1e-5)
@@ -1202,13 +1212,94 @@ class TestDecodeStepCensus(unittest.TestCase):
   def test_nv_fused_norm_off_the_decode_path_is_plain_norm(self):
     head, norm = self._q4_0(self.DIM, 64, 8), nn.RMSNorm(self.DIM, 1e-5)
     weight = norm.weight.float().contiguous().realize()
-    x1, x4 = Tensor.randn(1, 1, self.DIM), Tensor.randn(1, 4, self.DIM)
+    x1, x5 = Tensor.randn(1, 1, self.DIM), Tensor.randn(1, NV_SMALL_T + 1, self.DIM)
     self.assertIs(nv_fused_norm(norm, weight, x1, head).uop, norm(x1).uop, "NV gate closed")
     plain = Linear(self.DIM, 64, bias=False)
     with _nv_gates_open():
-      self.assertIs(nv_fused_norm(norm, weight, x4, head).uop, norm(x4).uop, "T > 1")
+      self.assertIs(nv_fused_norm(norm, weight, x5, head).uop, norm(x5).uop, "T > NV_SMALL_T")  # T4.132: <= NV_SMALL_T fuses
       self.assertIs(nv_fused_norm(norm, None, x1, head).uop, norm(x1).uop, "weight not prepared at load")
       self.assertIs(nv_fused_norm(norm, weight, x1, plain).uop, norm(x1).uop, "a consumer that isn't NV-quantized")
+
+class TestSpecIterationCensus(unittest.TestCase):
+  """T4.132: the kernels of ONE speculative iteration (k=3, full accept) on the tiny mocked-NV config -- TestDecodeStepCensus's two
+  block kinds as a 2-block Transformer plus an MTP head -- scheduled on CPU as ONE linear program, the way the loop dispatches them
+  between its single host sync per iteration: the greedy draft chain (3 MTP-block steps: the attention decode step + the head each),
+  VERIFY (the main model's spec forward at width 4: every block the decode step's kernel list, the GDN checkpoint copies, the fused
+  head norm) and the greedy accept test. No generic dequant gemm, no fused prefill scan, every projection one dp4a gemv launch."""
+  DIM, WIDE, VOCAB = 256, 2048, 64
+
+  def _model(self) -> Transformer:
+    from tinygrad.llm.kernels.nv_dense import prepare_dense_weights
+    D, W, V = self.DIM, self.WIDE, self.VOCAB
+    q4, f32, seed = TestDecodeStepCensus._q4_0, TestDecodeStepCensus._gguf_f32, itertools.count()
+    config = TransformerConfig(num_blocks=2, dim=D, hidden_dim=W, n_heads=16, n_kv_heads=1, norm_eps=1e-5, vocab_size=V, head_dim=128,
+                               rope_theta=10000.0, rope_dim=64, v_head_dim=128, max_context=128, qk_norm=128, attn_output_gate=True,
+                               ssm_layers=(True, False), ssm=SSMConfig(conv_kernel=4, state_size=32, group_count=1, time_step_rank=8, inner_size=W))
+    model = Transformer(config)
+    model.mtp_head = MTPHead(config, TransformerBlock)
+    for b in (*model.blk, model.mtp_head.block):  # TestDecodeStepCensus's two setups
+      b.ffn_gate, b.ffn_up, b.ffn_down = q4(D, W, next(seed)), q4(D, W, next(seed)), q4(W, D, next(seed))
+      b.attn_norm.weight, b.ffn_norm.weight = f32(D, next(seed)), f32(D, next(seed))
+      if isinstance(b, GatedDeltaNetBlock):
+        b.attn_qkv, b.attn_gate, b.ssm_out = q4(D, b.conv_channels, next(seed)), q4(D, W, next(seed)), q4(W, D, next(seed))
+        for lin in (b.ssm_beta, b.ssm_alpha):
+          nn.state.load_state_dict(lin, {"weight": f32(8 * D, next(seed)).reshape(8, D)}, verbose=False, realize=False)
+        b.ssm_norm.weight = f32(W // 8, next(seed))
+      else:
+        b.attn_q, b.attn_k, b.attn_v, b.attn_output = q4(D, 4096, next(seed)), q4(D, 128, next(seed)), q4(D, 128, next(seed)), q4(W, D, next(seed))
+        b.attn_q_norm.weight, b.attn_k_norm.weight = f32(128, next(seed)), f32(128, next(seed))
+    model.mtp_head.eh_proj, model.output, model.output_norm.weight = q4(2 * D, D, next(seed)), q4(D, V, next(seed)), f32(D, next(seed))
+    with Context(DEBUG=0): model.token_embd.weight = Tensor.randn(V, D).contiguous().realize()
+    prepare_dense_weights(model)  # from_gguf's load-time steps, in its order
+    for b in (*model.blk, model.mtp_head.block):
+      b.prepare_nv_norms()
+      if isinstance(b, GatedDeltaNetBlock): b.prepare_nv_decode()
+    model.nv_output_norm_weight = model.output_norm.weight.float().contiguous().realize()
+    with Context(DEBUG=0):
+      x = Tensor.randn(1, 1, D).contiguous().realize()
+      for b in (*model.blk, model.mtp_head.block):
+        b._init_state(x)
+        Tensor.realize(*[t for t in (getattr(b, n, None) for n in ("conv_state", "recurrent_state", "cache_kv", "freqs_cis")) if t is not None])
+    return model
+
+  def test_one_iteration(self):
+    k, D = 3, self.DIM
+    with _nv_gates_open():
+      model = self._model()
+      with Context(DEBUG=0): h_last, tok_last = Tensor.randn(1, 1, D).contiguous().realize(), Tensor([[1]], dtype="int32").realize()
+      v_sp, v_draft = UOp.variable("start_pos", 0, 127), [UOp.variable(f"draft_pos_{i}", 0, 127) for i in range(k)]
+      def chain() -> Tensor:  # the greedy DRAFT chain, lazily: [tok_last, d0..d_{k-1}] (built twice: a census marks its graph realized)
+        dtok, drafts = tok_last, []
+        for i in range(k):
+          dtok = model.mtp_head.draft(model, h_last, dtok, v_draft[i].bind(5 + i)).argmax(-1)
+          drafts.append(dtok)
+        return tok_last.cat(*drafts, dim=1).contiguous()
+      draft = _decode_census(chain())
+      # speculative_generate's iteration as one program: DRAFT -> VERIFY (forward() itself: the jit would realize) -> ACCEPT
+      chunk = chain()
+      logits, hid = cast(tuple[Tensor, Tensor], model._forward_step(chunk, v_sp.bind(5), None, True, None, None, None, None, None))
+      final = logits.argmax(-1)
+      m_t = (final[:, :k] == chunk[:, 1:]).cast(dtypes.int32).cumprod(-1).sum(-1)
+      whole = _decode_census(m_t.reshape(1).cat(chunk[0], final[0]), hid)
+      # VERIFY alone: the same forward from an already-realized chunk (the loop's VERIFY input is a realized buffer)
+      with Context(DEBUG=0): host_chunk = Tensor([[1, 2, 3, 4]], dtype="int32").realize()
+      verify = _decode_census(*cast(tuple[Tensor, Tensor], model._forward_step(host_chunk, v_sp.bind(5), None, True, None, None, None, None, None)))
+    for name, c in (("draft chain", draft), ("VERIFY", verify), ("whole iteration", whole)):
+      print(f"\nspeculative {name} (k={k}, VERIFY width {k + 1}): {len(c)} kernels", sorted(c))
+    def generic_gemm(c): return [x for x in c if x.startswith("reduce") and "unsigned char[" in x]  # a dequant+matmul reduces over weight bytes
+    # VERIFY at width 4 = the decode step's kernel list per block (TestDecodeStepCensus's T=4 rows) + the GDN checkpoint + the head
+    self.assertNotIn("gated_delta_prefill_nv", verify, "VERIFY must not pay the fused prefill scan")
+    self.assertEqual([x for x in verify if x.startswith("gdn_")], ["gdn_conv_decode_nv", "gdn_decode_nv"], "the GDN block: the two decode kernels")
+    self.assertEqual(generic_gemm(verify), [], "no generic dequant gemm")
+    self.assertEqual(verify.count("linear_q4_0_nv"), 6 + 7 + 1, "every projection one dp4a gemv: GDN block 6, attention block 7, the head")
+    self.assertEqual(sum(1 for x in verify if x.startswith("flash_")), 1, "the prefill attention tile")
+    self.assertEqual(verify.count("add_rmsnorm_q8_nv"), 2 + 2 + 1, "two fused norm sites per block + the head's")
+    self.assertEqual(sum(1 for x in verify if x.startswith("elementwise half[6336]")), 1, "the GDN checkpoint: conv_state copied aside")
+    # the draft chain: k attention decode steps of the MTP block + eh_proj + the head, no generic gemm
+    self.assertEqual(generic_gemm(draft), [])
+    self.assertEqual(draft.count("linear_q4_0_nv"), k * (7 + 1 + 1))
+    self.assertEqual(sum(1 for x in draft if x.startswith("flash_decode")), k)
+    self.assertLessEqual(len(whole), len(draft) + len(verify) + 12, "the accept test is a handful of elementwise/argmax kernels")
 
 class TestSplitKPartials(unittest.TestCase):
   """T4.125b: nv_q8_linear's summed result maps back to its kernel's un-summed split-K partials (split_k_partials), which

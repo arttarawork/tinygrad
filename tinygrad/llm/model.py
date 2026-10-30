@@ -9,14 +9,14 @@ from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
-  gdn_decode as nv_gdn_decode
+  gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
   clear_step_caches
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve, Ops
-from tinygrad.helpers import ContextVar, next_power2, DEBUG, GlobalCounters
+from tinygrad.uop.ops import resolve, Ops, GroupOp
+from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
 import traceback
 
 # T4.55: prefill chunk width for recurrent models on devices without a fused scan kernel (see generate). 0 = auto: 32 on the GPU
@@ -231,32 +231,24 @@ SPEC_STATS = ContextVar("SPEC_STATS", 0)
 #
 # SYNC SEMANTICS (read before trusting a number here -- tinygrad dispatch is async, so wall-clock measured at a
 # non-sync point is queuing time, not execution time; every phase below says which kind it is):
-#   draft_ms           REAL SYNC at the end (chunk_ids' .tolist() in greedy mode; the last drafted position's
-#                       own .numpy() in sampled mode). Spans all k_eff mtp_head.draft calls plus that final
-#                       pull-to-host, so this is the one number that reflects actual DEVICE time for the whole
-#                       draft chain -- execution AND any cross-device copies -- not just Python dispatch.
-#   draft_dispatch_ms  DISPATCH-ONLY in greedy mode: sum of each drafted position's own call latency. No
-#                       .tolist()/.numpy()/.item() runs inside the loop there, so this is pure Python/graph-
-#                       construction overhead (see tinygrad/function.py's _function.__call__, which reruns its
-#                       traced python body every call -- mtp_head.draft's block is never TinyJit-wrapped), not
-#                       device execution. In SAMPLED mode each drafted id needs a REAL SYNC instead (an
-#                       ancestral sample off an actual .numpy() pull -- see the sampled-DRAFT comment below), so
-#                       there draft_dispatch_ms already includes device time and draft_ms-draft_dispatch_ms is
-#                       just the tail cat+tolist. In GREEDY mode, draft_ms-draft_dispatch_ms isolates whatever's
-#                       invisible until the tail sync: device execution and any cross-device copies MTPHead.draft's
-#                       token-embedding hop makes (see SPEC_PROFILE_NOTES.md).
-#   verify_dispatch_ms DISPATCH-ONLY. Covers building the VERIFY input buffer and the self(...) call that
-#                       launches the main-model forward; nothing here calls .tolist()/.numpy()/.item(), so this
-#                       never actually waits for the forward to run -- it only measures how long it takes to
-#                       BUILD and QUEUE that work.
-#   accept_ms          REAL SYNC at the start (verify_ids/verify_np pulled to host), then the host-side
-#                       accept-length compare loop, then h_last's slice+.contiguous() (a cheap dispatch, no
-#                       further sync). The one number that reflects VERIFY's actual device time.
+#   draft_ms           DISPATCH-ONLY since T4.132 (both modes): all k_eff mtp_head.draft calls plus the realize of
+#                       VERIFY's input that dispatches the chain (no .tolist()/.numpy()/.item() -- the drafted ids
+#                       stay on device). Python/graph-construction overhead (tinygrad/function.py's
+#                       _function.__call__ reruns its traced python body every call -- mtp_head.draft's block is
+#                       never TinyJit-wrapped) plus the chain's schedule build; its device time lands in accept_ms.
+#   draft_dispatch_ms  the sum of each drafted position's own call latency (the per-call python retrace), a
+#                       sub-interval of draft_ms; draft_ms-draft_dispatch_ms is the chain's schedule build/dispatch.
+#   verify_dispatch_ms DISPATCH-ONLY. The self(...) call that launches the main-model forward (a jit replay once
+#                       warm); nothing here calls .tolist()/.numpy()/.item(), so this never actually waits for the
+#                       forward to run -- it only measures how long it takes to QUEUE that work.
+#   accept_ms          the iteration's ONE REAL SYNC (T4.132): the device-side accept test's readback -- [m, chunk
+#                       ids, final ids] -- waits for the draft chain, VERIFY and the accept math to finish; then the
+#                       host-side assembly of the accepted ids. The one number that reflects the iteration's actual
+#                       device time (draft chain + VERIFY + accept).
 #   state_assign_ms    DISPATCH-ONLY, always. Tensor.realize() defaults to wait=False (engine/realize.py's
-#                       run_linear), so this SCHEDULES the partial-accept GDN-state fixup but does not block --
-#                       its real device cost lands wherever the next real sync happens to fall (typically next
-#                       iteration's draft_ms or accept_ms). Reads ~0 whenever m==k_eff (full accept, nothing to
-#                       fix up) -- one timer, no separate branch needed, since the FIXUP block itself is a no-op then.
+#                       run_linear), so this SCHEDULES the partial-accept restore + REDO and the MTP cache rewrite
+#                       but does not block -- their real device cost lands at the next iteration's accept_ms.
+#                       Small whenever m==k_eff (full accept: only the rewrite).
 #   total_ms           Independently measured wall-clock for the whole iteration body (top of the loop to just
 #                       before this line prints), NOT computed as the sum of the phases above. Compare the two:
 #                       a gap means some host round-trip in the loop escaped the phases above. Also compare
@@ -437,13 +429,18 @@ class TransformerConfig:
   # override that never needed to reach FFNBlock.__init__ at all).
   tp: tuple[tuple[str, float], ...] = ()
 
+# T4.132: the NV decode fusions below (the fused norm/residual/activation kernels, one block per token) serve a concrete run of up to
+# this many tokens -- nv_q8_linear's dp4a gemv batch cap (kernels/nv_quant.py: tokens > 4 take the gemm/generic path), the same
+# run the GDN decode kernels cover (GDN_DECODE_TOKENS) -- i.e. a decode step (1) or speculative decoding's VERIFY/REDO (<= k+1).
+NV_SMALL_T = 4
+
 def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Linear) -> Tensor:
-  """norm(x) -- T4.125b: on the NV decode path (concrete T==1, `weight` = norm's fp32 copy prepared at load, every consumer an
-  NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
+  """norm(x) -- T4.125b: on the NV decode path (concrete T <= NV_SMALL_T, `weight` = norm's fp32 copy prepared at load, every consumer
+  an NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
   register_fused_q8 hands that quantize the kernel's (q, scale), so the RMSNorm graph returned here is never read -- _ffn_output's
   trick at the attention blocks' attn_norm (q/k/v) and at output_norm (the head). Anything else: plain norm(x), byte-identical."""
   T, dim = x.shape[1], x.shape[-1]
-  if not (isinstance(T, int) and T == 1 and isinstance(dim, int) and dim % 256 == 0 and weight is not None
+  if not (isinstance(T, int) and T <= NV_SMALL_T and isinstance(dim, int) and dim % 256 == 0 and weight is not None
           and nv_quant_supported(weight.device) and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
   tokens = T * cast(int, x.shape[0])
   _, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), weight, norm.eps)
@@ -556,7 +553,7 @@ class FFNBlock:
     # launches/step on the 27B (T4.123 profile, P3). Every other path (generic dequant+matmul, AMD, prefill,
     # symbolic T) keeps the contiguous: this task must not change their kernels or numerics.
     T = x.shape[1]
-    if (isinstance(T, int) and T == 1 and nv_quant_supported(self.ffn_gate.weight.device)
+    if (isinstance(T, int) and T <= NV_SMALL_T and nv_quant_supported(self.ffn_gate.weight.device)
         and self.ffn_gate.ggml_type in NV_QUANT_TYPES and self.ffn_up.ggml_type in NV_QUANT_TYPES):
       gate, up = self.ffn_gate(x), self.ffn_up(x)
       # T4.127a: when ffn_down will actually read it through nv_q8_linear (same build-only-if-consumed guard
@@ -589,7 +586,7 @@ class FFNBlock:
     lowered. Every other path (MoE, tensor-parallel FFN, symbolic T, non-NV, ggml_type not yet probed or not
     NV-quantized, norm weights not prepared by prepare_nv_norms) keeps the original two-step byte-identical form."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
+    if (isinstance(T, int) and T <= NV_SMALL_T and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
         and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
         and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
       tokens = T * cast(int, x.shape[0])
@@ -968,7 +965,7 @@ class GatedDeltaNetBlock(FFNBlock):
     q8_quantize_nv per GDN block per step) -- register_fused_q8 hands them the kernel's own (q, scale), quantized from
     the fp32 normed value instead of its fp16 rounding (a small numerics change); ssm_beta/ssm_alpha keep the fp16 copy."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T == 1 and dim % 256 == 0 and self.nv_norm_weights is not None
+    if (isinstance(T, int) and T <= NV_SMALL_T and dim % 256 == 0 and self.nv_norm_weights is not None
         and nv_quant_supported(self.nv_norm_weights[0].device)):
       tokens = T * cast(int, x.shape[0])
       _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
@@ -1034,14 +1031,15 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # T4.123f+g: a decode token on the card is two kernels from the four projections (conv + conv_state shift, then norms/beta/alpha/
     # scan/ssm_norm/gate) instead of 13 small generic kernels around the fused scan -- kernels/nv.py's gdn_decode. Same gate as the
-    # fused decode scan below; prefill (symbolic or T > 1) never comes here.
-    if not symbolic and T == 1 and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
+    # fused decode scan below; prefill (symbolic or T > GDN_DECODE_TOKENS) never comes here. T4.132: a concrete run of up to
+    # GDN_DECODE_TOKENS tokens (speculative decoding's VERIFY/REDO) takes the same two kernels, the tokens sequential inside them.
+    if not symbolic and T <= GDN_DECODE_TOKENS and not capture and self.nv_decode_weights is not None and nv_decode_kernel_supported(x.device):
       x = x.half()
       # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs on the same input -- fused into one over their load-time
       # concatenated weight (prepare_nv_decode) when that's ready; gdn_decode reads beta/alpha out of the one result
       # (beta at [:heads], alpha at [heads:]). Falls back to the two separate calls (dim not a multiple of 128 --
-      # prepare_nv_decode's own comment) with the same (B,1,2*heads) shape via one concat.
-      beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B, self.config.dim), 2*self.num_v_heads)
+      # prepare_nv_decode's own comment) with the same (B,T,2*heads) shape via one concat.
+      beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B*T, self.config.dim), 2*self.num_v_heads).reshape(B, T, -1)
                     if self.nv_beta_alpha_weight is not None else self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
       z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
                         *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps)
@@ -1186,6 +1184,23 @@ class GatedDeltaNetBlock(FFNBlock):
       out = self._ffn_output(x, attn_out).contiguous()
       return out, state_track, conv_window
     return _run(x, start_pos)
+
+  spec_snap: tuple[Tensor, Tensor]|None = None  # T4.132: (conv_state, recurrent_state) checkpoint buffers -- see checkpoint()
+  def checkpoint(self, x:Tensor) -> Tensor:
+    """T4.132: copy conv_state/recurrent_state into spec_snap (allocated on first use, so a model that never speculates never pays
+    for it) and return x ordered AFTER those copies -- every kernel of this block's own update reads x, so the copies see the state
+    as it was before the update (the explicit UOp.after edge _sdpa_default uses; the in-place stores are raw STOREs inside the
+    block's precompiled call, which the scheduler's ASSIGN ordering never sees). speculative_generate's partial accept assigns
+    spec_snap back (RESTORE) before REDO; a full accept leaves it unread."""
+    self._init_state(x)
+    if self.spec_snap is None:
+      conv, rec = self.conv_state, self.recurrent_state
+      self.spec_snap = (Tensor.empty(*conv.shape, dtype=conv.dtype, device=conv.device), Tensor.empty(*rec.shape, dtype=rec.dtype, device=rec.device))
+    stores = [snap.assign(live) for snap, live in zip(self.spec_snap, (self.conv_state, self.recurrent_state))]
+    # an AFTER's base must be buffer-like (uop/spec.py): a block's output already is (its call's AFTER); block 0's embedding reduce
+    # gets the contiguous it would be realized through anyway
+    base = x if x.uop.op in GroupOp.Movement or x.uop.op in (Ops.AFTER, Ops.CONTIGUOUS) or x.uop.has_buffer_identity() else x.contiguous()
+    return Tensor(base.uop.after(*(s.uop for s in stores)))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
@@ -1434,33 +1449,27 @@ class MTPHead:
     ts = Tensor([tok_next + [0] * (bound - T)], dtype="int32", device=dev)[:, :v_toks.bind(T)]
     return self.block(self._block_in(owner, hs, ts), v_pos.bind(start_pos))
 
-def _softmax_np(logits:np.ndarray, temperature:float) -> np.ndarray:
-  """Numerically-stable softmax(logits/temperature), float64. speculative_generate's sampled path (T4.65)
-  pulls model logits to host and does all its acceptance math in numpy (the vectors are tiny -- at most
-  k_eff+1 rows of vocab_size floats per iteration); float64 gives rng.choice's sum-to-1 tolerance headroom
-  a fp16/fp32 model output doesn't reliably leave it."""
-  import numpy as np
-  z = logits.astype(np.float64) / temperature
-  z = z - z.max(axis=-1, keepdims=True)
-  e = np.exp(z)
-  return e / e.sum(axis=-1, keepdims=True)
+def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, temperature:float, u_accept:Tensor, u_sample:Tensor,
+                       min_p:float=0.0) -> tuple[Tensor, Tensor]:
+  """Leviathan et al. ("Fast Inference from Transformers via Speculative Decoding", 2023) speculative-sampling accept/resample
+  test -- on device, batched over a leading dim (T4.132; T4.65's host-side numpy form before it) -- speculative_generate's
+  temperature>0 path (see SPEC_NOTES.md section 6 for how this wires into the position ledger).
 
-def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng:np.random.Generator) -> tuple[list[int], int]:
-  """Leviathan et al. ("Fast Inference from Transformers via Speculative Decoding", 2023) speculative-sampling
-  accept/resample test -- pure, host-side (numpy; see _softmax_np), used by speculative_generate's
-  temperature>0 path (T4.65 -- see SPEC_NOTES.md §6 for how this wires into the position ledger).
+  draft_ids (B,k) int: the drafted ids. THE CALLER must have drawn them by ancestral sampling from q (draft_ids[i] ~
+  softmax(q_logits[i]/temperature)) -- this function only implements the accept/reject/resample test; the proof below assumes it.
+  q_logits (B,k,V): the draft logits at each drafted position. p_logits (B,k+1,V): the verify (main-model) logits at each of the
+  k+1 verify positions, row k being the "bonus" position. u_accept (B,k), u_sample (B,k+1,V): uniforms in [0,1) -- Tensor.rand
+  (seeded for a test).
 
-  draft_ids: the k_eff drafted token ids. THE CALLER must have drawn them by ancestral sampling from
-  q_probs (draft_ids[i] ~ q_probs[i]) -- this function only implements the accept/reject/resample test; the
-  distribution-preservation proof below assumes, but does not check, that draft_ids came from q_probs.
-  q_probs: (k_eff, vocab) draft softmax at each drafted position, softmax(draft_logits/temperature).
-  p_probs: (k_eff+1, vocab) verify (main-model) softmax at each of the k_eff+1 verify positions,
-  softmax(verify_logits/temperature) -- row k_eff is the "bonus" position, sampled only on full accept.
-
-  Returns (accepted_ids, m): m in 0..k_eff is how many drafted tokens were accepted; accepted_ids has length
-  m+1 (== draft_ids[:m] + one more token): on full accept (m==k_eff) that extra token is a fresh sample from
-  p_probs[k_eff] (the bonus position); on rejection at position m (m<k_eff) it's a resample from
-  normalize(max(0, p_probs[m]-q_probs[m])) (the "residual" distribution) instead of the rejected draft_ids[m].
+  Returns (m, final): m (B,) int in 0..k is how many drafted tokens are accepted; final (B,k+1) int holds, at i < k, the token
+  emitted if the first rejection is at i -- a sample from normalize(max(0, p_i-q_i)), the "residual" distribution -- and at k the
+  bonus, a fresh sample from p_k. The caller emits draft_ids[:m] + [final[m]] (m+1 tokens). Accept drafted token i with probability
+  min(1, p_i[d]/q_i[d]): u < min(1, p/q) <=> log u < log p - log q (u < 1 always), so both sides are log-softmaxes -- nothing is
+  normalized over the vocabulary on the host. Every sample is a Gumbel-max draw, argmax(log r + g) with g = -log(-log u), a sample
+  from r/sum(r) (sample_logits' own transform); log 0 = -inf keeps an excluded token out, and an all-zero residual row (p == q
+  exactly) falls back to argmax p, as the numpy form did. min_p > 0 (T4.132: generate()'s MIN_P tail cut, sample_logits) is applied
+  to p and q alike before the softmax, so the emitted marginal is generate(temperature, MIN_P)'s truncated p (the proof holds for
+  any p/q; the caller must have drawn draft_ids from the same truncated q).
 
   Proof this reproduces p exactly (Leviathan et al., Theorem 1): accept x with probability min(1,p(x)/q(x)),
   so P(emit x, accepted) = q(x)*min(1,p(x)/q(x)) = min(p(x),q(x)). P(reject) = 1 - sum_y min(p(y),q(y)), and
@@ -1470,19 +1479,26 @@ def spec_accept(draft_ids:list[int], q_probs:np.ndarray, p_probs:np.ndarray, rng
   p(x)+0, or p(x)>q(x), giving q(x)+(p(x)-q(x))) -- true for every x regardless of q, which is why draft
   quality only ever affects the acceptance RATE, never correctness. test_spec_decode.py's statistical test
   checks this empirically since it's the theorem the whole sampled path's correctness rests on."""
-  import numpy as np
-  assert q_probs.shape[0] == len(draft_ids) and p_probs.shape[0] == len(draft_ids) + 1, "q_probs/p_probs row count must match draft_ids"
-  k_eff = len(draft_ids)
-  for m in range(k_eff):
-    d = draft_ids[m]
-    accept_prob = min(1.0, p_probs[m, d] / max(q_probs[m, d], 1e-12))
-    if rng.random() < accept_prob: continue
-    residual = np.clip(p_probs[m] - q_probs[m], 0, None)
-    total = residual.sum()
-    correction = int(rng.choice(len(residual), p=residual / total)) if total > 0 else int(np.argmax(p_probs[m]))
-    return draft_ids[:m] + [correction], m
-  bonus = int(rng.choice(p_probs.shape[1], p=p_probs[k_eff]))
-  return draft_ids + [bonus], k_eff
+  B, k = cast(int, draft_ids.shape[0]), cast(int, draft_ids.shape[1])
+  def gumbel(u:Tensor) -> Tensor: return u.maximum(1e-12).log().neg().log().neg()
+  def log_dist(logits:Tensor) -> Tensor:  # log softmax(logits/temperature), the min-p tail cut first (sample_logits' own mask)
+    scaled = logits / temperature
+    if min_p > 0: scaled = (scaled >= scaled.max(-1, keepdim=True) + math.log(min_p)).where(scaled, float("-inf"))
+    return scaled.log_softmax(-1)
+  lp = log_dist(p_logits)                                                                  # (B,k+1,V)
+  bonus = (lp[:, k] + gumbel(u_sample[:, k])).argmax(-1, keepdim=True)                      # (B,1) ~ p_k
+  if k == 0: return Tensor.zeros(B, dtype=dtypes.int32, device=draft_ids.device), bonus
+  lq = log_dist(q_logits)                                                                  # (B,k,V)
+  idx = draft_ids.unsqueeze(-1)
+  # <= not <: a fp32 uniform can round to exactly 1.0 (log 0) and p == q (lp - lq == 0) must accept it as any u < 1 would
+  accept = u_accept.maximum(1e-12).log() <= lp[:, :k].gather(-1, idx).squeeze(-1) - lq.gather(-1, idx).squeeze(-1)  # (B,k)
+  m = accept.cast(dtypes.int32).cumprod(-1).sum(-1)                                        # the first rejection's index, or k
+  residual = (lp[:, :k].exp() - lq.exp()).relu()                                           # (B,k,V) max(0, p-q)
+  resample = (residual.log() + gumbel(u_sample[:, :k])).argmax(-1)                         # (B,k) ~ residual/sum(residual)
+  correction = (residual.sum(-1) > 0).where(resample, lp[:, :k].argmax(-1))
+  # .contiguous() before the cat: an argmax over rows holding -inf fused straight into a cat/stack came back out of range (id == V)
+  # on CPU (tinygrad, 10-29) -- materialized first, the ids are right (TestSpecAcceptTensor pins the resample distribution)
+  return m, correction.contiguous().cat(bonus.contiguous(), dim=-1)
 
 MIN_P = getenv("MIN_P", 0.0)  # T4.85: min-p tail cut for sampled decoding (0 = off, byte-identical to the plain Gumbel-max sampler)
 
@@ -1596,8 +1612,15 @@ class Transformer:
       T = tokens.shape[1]
       x = vis_m[:, :T].to(x.device).unsqueeze(-1).where(vis_e[:, :T].to(x.device).float(), x)
       rope = vis_pos[:, :T]
+    # T4.132: a concrete-width spec call is speculative_generate's VERIFY (or REDO): checkpoint every GDN block's state inside this
+    # captured graph (96 copies at 27B geometry, launched from the jit, no eager schedule per iteration) so a partial accept can
+    # restore + REDO. The symbolic prefill-tail chunks never REDO and skip it.
+    ckpt = spec and isinstance(tokens.shape[1], int)
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
-    for block in self.blk: x = cast(Tensor, block(x.to(block.device), start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
+    for block in self.blk:
+      xin = x.to(block.device)
+      if ckpt and isinstance(block, GatedDeltaNetBlock): xin = block.checkpoint(xin)
+      x = cast(Tensor, block(xin, start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to
       # check a chained MTP draft against what the main model actually says there) and (b) the pre-output_norm
@@ -1630,7 +1653,8 @@ class Transformer:
       # since-reverted partial-accept path -- see SPEC_NOTES.md/SPEC_FIXES_NOTES.md). T4.66d's partial-accept
       # REDO call (spec=True, same as this one) also uses this return shape; it wants only its own last position
       # too. Callers that only ever wanted the last position (the prefill tail) slice `[:, -1:]` themselves.
-      return self.output(self.output_norm(x)), x.contiguous()  # (B,T,vocab) logits, (B,T,D) hidden
+      # T4.132: the head's norm fused with its q8 quantize at a concrete small width (nv_fused_norm gates; symbolic T = plain norm)
+      return self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x, self.output)), x.contiguous()  # (B,T,vocab), (B,T,D)
     # only run the output projection on the last token
     logits = self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x[:, -1:], self.output))[:, -1, :]  # T4.125b
     # T4.92: presence penalty -- self.penalty_mask is a (1,vocab) 0/1 buffer, reset in place at the start of generate() and
@@ -1665,7 +1689,11 @@ class Transformer:
     # active -- plain text/no-penalty keys stay the pre-T5.3 4-tuples. The two flags must stay POSITIONAL together, never each its
     # own independently-omitted single-True marker: omitting either on its own collapses "vision only" and "penalty only" onto the
     # identical (...,True) key, so a penalty-only decode step would replay a vision capture (wrong inputs) or vice versa.
-    chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), None) if is_prefill else None
+    # T4.132: a CONCRETE multi-token call (speculative_generate's VERIFY/REDO at width k_eff+1 <= k+1) keys on its own width, stored
+    # NEGATED so it can never share a family with a symbolic chunk whose "toks" bound happens to equal it (on CPU the spec prefill
+    # chunk is widened to exactly k+1). Every width is its own family with a static token count, so the <=4-token gemv, the prefill
+    # attention tile and the small-T GDN decode kernels all cover it (a symbolic width covered none of them: TASKS.md T4.94's audit).
+    chunk_size = next((cast(int, v.vmax) for v in tokens.uop.variables() if v.expr == "toks"), -cast(int, tokens.shape[1])) if is_prefill else None
     vision_on, penalty_on = rope_start is not None or vis_e is not None, presence_penalty is not None
     key = (is_prefill, temperature is None, chunk_size, spec) + ((vision_on, penalty_on) if vision_on or penalty_on else ())
     if key not in self.jit and DEBUG >= 1:  # T5.5: each new jit family costs a planned arena on its devices -- name them as they appear
@@ -1879,32 +1907,31 @@ class Transformer:
       model.nv_output_norm_weight = model.output_norm.weight.float().contiguous().realize()  # T4.125b: as prepare_nv_norms
     return model, kv
 
-  def warmup(self, vision:bool=False):
+  def warmup(self, vision:bool=False, spec_k:int=3):
     # warm both the greedy and sampled jit pairs, so a request doesn't pay a mid-request capture for whichever it hits first
     for temperature in (0.0, 1.0):
       for _ in range(2): list(zip(range(2), self.generate([0], temperature=temperature)))
     # T4.66e: the above only ever calls generate() -- speculative_generate's own spec=True keys (the prefill
-    # tail's, and VERIFY/REDO's dedicated verify_chunk one, see speculative_generate's own comment) were
-    # otherwise first captured at REQUEST time (the T4.65 gap SPEC_PROFILE_NOTES.md/SPEC_FIXES_NOTES.md both
-    # flagged, recommended fix in T4.72). Only when MTP is actually active: `for _ in range(2):`, exactly
-    # mirroring the generate() loop just above and for the identical reason (engine/jit.py
-    # _TinyJit.__call__): a jit key's FIRST-EVER call (cnt=0) just runs forward() eagerly, no capture at
-    # all; the CAPTURE that actually pays off on every later replay only happens on that SAME key's SECOND
-    # call (cnt=1) -- so calling speculative_generate ONCE would leave every spec key exactly as
-    # uncaptured as never warming it at all, silently moving the real capture cost onto the first live
-    # request. Each of the 2 calls pulls 2 tokens (prefill anchor + one full outer iteration: DRAFT
-    # touches every mtp_head.block position variable; VERIFY reaches its own dedicated key) -- 4 tokens
-    # total, still cheap, and enough to guarantee 2 calls to BOTH the prefill-tail key (hit once per
-    # speculative_generate call, at its own start) and the VERIFY/REDO key (hit at least once per outer
-    # iteration -- REDO, on a partial accept, would even be the SECOND call within a single first pass,
-    # capturing it in one; a full accept just pushes that second call to the second pass instead, which
-    # this loop already provides either way). REDO never needs separately warming beyond this: it reuses
-    # VERIFY's exact jit key (see speculative_generate's own REDO comment), so once that key has been
-    # called twice by ANY combination of VERIFY/REDO calls, both replay the same captured slot.
+    # tail's, and VERIFY/REDO's, see speculative_generate's own comment) were otherwise first captured at
+    # REQUEST time (the T4.65 gap SPEC_PROFILE_NOTES.md/SPEC_FIXES_NOTES.md both flagged, recommended fix in
+    # T4.72). Only when MTP is actually active: `for _ in range(2):`, exactly mirroring the generate() loop
+    # just above and for the identical reason (engine/jit.py _TinyJit.__call__): a jit key's FIRST-EVER call
+    # (cnt=0) just runs forward() eagerly, no capture at all; the CAPTURE that actually pays off on every
+    # later replay only happens on that SAME key's SECOND call (cnt=1) -- so calling speculative_generate
+    # ONCE would leave every spec key exactly as uncaptured as never warming it at all, silently moving the
+    # real capture cost onto the first live request. Each of the 2 calls pulls 2 tokens (prefill anchor + one
+    # full outer iteration: DRAFT touches every mtp_head.block position variable) -- 4 tokens total, cheap.
     if self.mtp_head is not None:
       # T4.66l: a 2-token dummy prompt (not [0]) so the MTP prefill's own precompiled trace (MTPHead.prefill -- one
       # trace for every width, shared with the accept rewrite) is warmed here too, not on the first real request.
-      for _ in range(2): list(zip(range(2), self.speculative_generate([0, 0])))
+      for _ in range(2): list(zip(range(2), self.speculative_generate([0, 0], k=spec_k)))
+      # T4.132: VERIFY/REDO are one concrete-width family per width 1..spec_k+1 (speculative_generate's k_eff+1 and m+1) -- the
+      # dummy run above only reaches the widths its random accepts happen to produce, so drive every width directly, twice.
+      # spec_k is the server's SPEC_TOKENS (cli.py); a request at a larger k captures its extra widths on its first iterations.
+      v_sp = UOp.variable("start_pos", 0, self.max_context - 1)
+      for w in range(1, spec_k + 2):
+        for _ in range(2): self(Tensor([[0] * w], dtype="int32", device=self.blk[0].device), v_sp.bind(1), None, spec=True)
+      self._cached_tokens = []  # those calls advanced the live state past what _cached_tokens describes: nothing may resume from it
       # T4.66g: unlike the main model's own blocks above (whose warmup residue in cache_kv/recurrent_state
       # is harmless -- a real request's own prefill legitimately rewrites position 0 onward before ever
       # attending to it), mtp_head.block is never "prefilled": draft() only ever runs from a real request's
@@ -2044,8 +2071,12 @@ class Transformer:
     (Transformer._attention's `initial = start_pos.eq(0)` mask -- the same one a genuinely cold prefill hits) already
     zeros a GatedDeltaNetBlock's conv_state/recurrent_state whenever `tokens` doesn't already extend this model's
     CURRENT _cached_tokens (get_start_pos returns 0 in exactly that case); if it does happen to extend it, reusing
-    that live state is exactly correct, not a bug -- get_start_pos's own prefix-reuse rule, unchanged here."""
-    it = self.generate(list(tokens), chunk_size=chunk_size, temperature=0.0)
+    that live state is exactly correct, not a bug -- get_start_pos's own prefix-reuse rule, unchanged here.
+    T4.132: with an MTP head loaded this runs speculative_generate's own prefill instead (the same loop, plus MTPHead.prefill
+    per chunk filling the draft block's cache -- the context every later draft attends over, and part of snapshot_state), so a
+    --mtp server's prefix snapshots (serve.py, T4.111) restore a complete state; its anchor yield sets _cached_tokens the same way."""
+    it = self.speculative_generate(list(tokens), k=1, chunk_size=chunk_size) if self.mtp_head is not None \
+      else self.generate(list(tokens), chunk_size=chunk_size, temperature=0.0)
     next(it, None)
     it.close()
 
@@ -2166,8 +2197,7 @@ class Transformer:
           yield tokens[-1]
         pending = []
 
-  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int=32, temperature:float=0.0,
-                            rng:np.random.Generator|None=None):
+  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int|None=None, temperature:float=0.0):
     """T4.64/T4.65: MTP speculative decoding -- drafts up to `k` tokens per iteration via self.mtp_head and
     verifies all of them in one extra main-model forward instead of paying one forward per token. See
     SPEC_NOTES.md for the full position ledger, the causal-mask argument for why neither the main model's
@@ -2181,14 +2211,14 @@ class Transformer:
     forced-perfect tests).
 
     temperature>0 (T4.65): distribution-preserving SAMPLED speculative decoding (Leviathan et al., "Fast
-    Inference from Transformers via Speculative Decoding", 2023 -- see spec_accept). Draft tokens are drawn
-    by ancestral sampling from the draft model's own softmax(logits/temperature) ("q"), then accepted or
+    Inference from Transformers via Speculative Decoding", 2023 -- see spec_accept_tensor). Draft tokens are
+    drawn by ancestral sampling from the draft model's own softmax(logits/temperature) ("q"), then accepted or
     resampled against the main model's softmax(logits/temperature) ("p") so the marginal distribution of
     every emitted token equals p exactly (test_spec_decode.py verifies this empirically -- it's the theorem
     the whole path relies on). The output is distribution-equal to generate(temperature=t) but NOT
     sequence-equal to any particular generate() run -- it's a different (also p-distributed) sample, not a
-    reproduction. `rng` defaults to a fresh np.random.default_rng() when omitted; pass a seeded one for
-    reproducible/testable sampling.
+    reproduction. T4.132: every draw is on device (Tensor.rand -- seed with Tensor.manual_seed), so the
+    sampled path has the greedy path's one host sync per iteration.
 
     Mirrors generate()'s own bookkeeping exactly (the `tokens` list, self._cached_tokens, one token
     yielded at a time) -- generate() itself is untouched by this; see Transformer.__call__'s optional
@@ -2211,13 +2241,12 @@ class Transformer:
     assert len(tokens) < self.max_context, \
       f"prompt has {len(tokens)} tokens but max_context={self.max_context} leaves no room to generate " \
       "-- raise it via Transformer.from_gguf(max_context=...)"
-    # temperature<=0 is greedy, same convention generate() itself uses (see there). rng is unused on that
-    # path but still materialized here unconditionally (cheap -- one object per REQUEST, not per token) so
-    # every branch below can rely on it being a concrete Generator, never None (mypy narrows this cleanly;
-    # threading `rng: Generator|None = None` through per-branch asserts instead would be more code for it).
+    # temperature<=0 is greedy, same convention generate() itself uses (see there)
     greedy = temperature <= 0
-    import numpy as np  # lazy (function-local): the numpy-less CI lanes import this MODULE but never call this method
-    if rng is None: rng = np.random.default_rng()
+    # T4.132: chunk_size None resolves to PREFILL_CHUNK like generate() (T4.124a) -- the server's prefill chunk, so a --mtp
+    # request's prompt prefills in the same chunks (and the same warmed spec prefill family) as a plain one; explicit widths
+    # (mtp_bench.py, tests) are unchanged.
+    chunk_size = chunk_size or PREFILL_CHUNK.value
     # T4.55: same recurrent-chunk cap generate() applies (see there), then widened to at least k+1 tokens.
     # This widening used to also be what let VERIFY/REDO's own chunk (1..k+1 tokens) share the prefill
     # loop's v_toks bound below; T4.66e gives VERIFY/REDO their own narrower bound instead (verify_chunk,
@@ -2240,29 +2269,16 @@ class Transformer:
     # map (assert_all_same_devices) the FIRST time a partial accept (m<k_eff) is followed by another
     # iteration -- see test_spec_decode.py's TestSpecDeviceMap for the reproduction.
     out_dev = self.output.weight.device
+    temp_t = Tensor([temperature], device=out_dev)  # T4.132: the sampled path's draws (sample_logits) run on device, from this
 
     v_start_pos = UOp.variable("start_pos", 0, self.max_context - 1)
     v_toks = UOp.variable("toks", 1, chunk_size)
-    # T4.66e: VERIFY (and REDO, which deliberately reuses its key -- see REDO's own comment below) used to
-    # share v_toks above, padding every k_eff+1 (~4) real tokens out to chunk_size (32) in the GDN scan --
-    # an ~8x tax, the still-open width half of SPEC_PROFILE_NOTES.md's candidate #2 (T4.66d already closed
-    # its forced-loop half). verify_chunk is sized off `k`, this call's own FIXED draft length -- never
-    # k_eff, which can only shrink near max_context (see the loop below) -- so one bound covers n<=k+1 for
-    # every iteration's VERIFY and every partial accept's REDO in this whole call. v_toks_verify is named
-    # "toks" like v_toks on purpose: Transformer.__call__ keys its jit dict on whatever Variable named
-    # "toks" a call's tokens carry, so this alone gives VERIFY/REDO their own key
-    # (True, True, verify_chunk, True), distinct from the prefill tail's (True, True, chunk_size, True).
-    # next_power2 isn't a hard requirement (see SPEC_VERIFY_NOTES.md: neither the per-token loop nor
-    # gdn_scan_wy's doubling-based triangular inverse need any particular width, and the one %32-alignment
-    # assert in this codebase -- kernels/amd.py's fused RDNA3 scan -- is unreachable off AMD hardware, which
-    # this fork doesn't target); it's just a tidy, conventional size. Rebinding v_toks_verify a second time
-    # for REDO IS a real instance of the T4.66a live-rebind hazard (one Variable bound to two values
-    # reachable from one later schedule walk) -- ACCEPT's own host sync (verify_ids' .tolist()) drains
-    # verify_LOGITS before REDO rebinds, but NOT the lazy `tok_last = verify_ids_tensor[:, m:m+1]` slice a
-    # few lines below (kept lazy on purpose, like generate()'s own `out` chaining) -- see the fix and its
-    # full writeup at this same partial-accept branch's own comment, a few lines further down.
-    verify_chunk = next_power2(k + 1)
-    v_toks_verify = UOp.variable("toks", 1, verify_chunk)
+    # T4.132: VERIFY and REDO run at CONCRETE widths (k_eff+1 and m+1, each width 1..k+1 its own jit family -- Transformer.__call__
+    # keys a concrete multi-token call on its width) instead of T4.66e's one symbolic family bound at next_power2(k+1): a symbolic
+    # width kept every hand-written NV kernel off VERIFY (the <=4-token gemv, the prefill attention tile, the GDN decode kernels
+    # all need a static token count -- TASKS.md T4.94's audit), which is why the loop lost 16-27x to plain decode. The T4.66e/j
+    # "toks" bind-mismatch and stale-capture-width hazards (two calls of one family at different widths) are gone with it: every
+    # family only ever sees its own width, so a replay's output shape is always this call's real shape.
     # T4.66: a drafted position never repeats across a speculative_generate() run, so passing MTPHead.draft's
     # start_pos as a plain python int (pre-T4.66) baked a fresh literal into mtp_head.block's
     # @function(precompile=True) trace every DRAFT call -- confirmed (test_spec_decode.py's schedule-cache
@@ -2362,11 +2378,7 @@ class Transformer:
     # last-prefill-chunk sample). It's about to become chunk_ids[0]/the draft anchor below, but it's ALSO
     # real output and must be emitted now, same as generate()'s own drain loop emits it, or every later
     # position is off by one.
-    if greedy:
-      tok_last = anchor_logits.argmax(-1)  # (B,1)
-    else:
-      anchor_probs = _softmax_np(anchor_logits.numpy()[0, 0], temperature)  # (vocab,)
-      tok_last = Tensor([[int(rng.choice(len(anchor_probs), p=anchor_probs))]], dtype="int32", device=dev)
+    tok_last = anchor_logits.argmax(-1) if greedy else sample_logits(anchor_logits[:, 0, :], temp_t, MIN_P)  # (B,1), on out_dev
     tokens.append(int(tok_last.item()))
     self._cached_tokens = tokens[:-1]
     yield tokens[-1]
@@ -2392,113 +2404,75 @@ class Transformer:
         # a richer per-step hidden (threading the block's own pre-norm output between calls) is a quality-only
         # lever for later, not something this task's gate depends on.
         #
-        # T4.65 sampled path: draft_ids[i] must be an ANCESTRAL SAMPLE from q_i = softmax(draft_logits/temp),
-        # not argmax -- spec_accept's distribution-preservation proof assumes this (see its docstring). That
-        # needs the actual q_i vector on host to sample from (rng is a seeded np.random.Generator, not a
-        # device RNG, precisely so this is reproducible/testable), so the sampled chain pulls one small
-        # (vocab,) logits vector to host per drafted token instead of the greedy chain's single batched pull
-        # below. ponytail: k is small (default 3) and this only runs when temperature>0, so k_eff extra host
-        # round-trips per iteration is a fine trade for keeping the sampling host-side/seedable; revisit only
-        # if a real serving benchmark ever shows --mtp sampled mode is sync-bound.
+        # T4.132: the drafted ids stay on device -- the greedy argmax, or (temperature>0) a Gumbel-max sample from
+        # softmax(logits/temperature) (sample_logits: the exact ancestral draw spec_accept_tensor's proof assumes; the
+        # draft logits are kept for its accept test) -- and chain lazily into VERIFY's input: no host sync in this
+        # phase (T4.65's sampled chain pulled one vocab-wide row to the host per drafted token).
         if trace_on: draft_t0, draft_dispatch_ms = time.perf_counter(), 0.0
         dtok, dpos = tok_last, start_pos
-        draft_ids: list[int] = []
         draft_tensors: list[Tensor] = []
-        q_list: list[np.ndarray] = []
+        q_logits: list[Tensor] = []
         for i in range(k_eff):
           if trace_on: call_t0 = time.perf_counter()
           dlogits = self.mtp_head.draft(self, h_last, dtok, v_draft_pos[i].bind(dpos))  # (B,1,vocab)
-          if greedy:
-            # T4.66b: no per-step .realize() anymore -- v_draft_pos[i] is a DISTINCT Variable per draft-chain
-            # position (see its own definition above), so all k_eff of these stay lazy and merge into ONE
-            # schedule, dispatched by chunk_ids' batched .tolist() below (T4.66's own realize existed only
-            # because back then every step rebound the SAME name, which one merged schedule can't do twice).
-            dtok = dlogits.argmax(-1)  # (B,1)
-            draft_tensors.append(dtok)
-          else:
-            q_i = _softmax_np(dlogits[:, -1, :].numpy()[0], temperature)  # (vocab,)
-            d_i = int(rng.choice(len(q_i), p=q_i))
-            draft_ids.append(d_i)
-            q_list.append(q_i)
-            dtok = Tensor([[d_i]], dtype="int32", device=dev)
+          dtok = dlogits.argmax(-1) if greedy else sample_logits(dlogits[:, -1, :], temp_t, MIN_P)  # (B,1); MIN_P: the same q the accept uses
+          draft_tensors.append(dtok)
+          if not greedy: q_logits.append(dlogits[:, -1, :])
           if trace_on: draft_dispatch_ms += (time.perf_counter() - call_t0) * 1000
           dpos += 1
-        chunk_ids: list[int]
-        if greedy:
-          # one host round-trip for tok_last + every drafted id (mirrors generate()'s own batched-drain sync
-          # a few lines up) -- chunk_ids[0] is tok_last (already-confirmed real), chunk_ids[1:] are the drafts.
-          chunk_ids = cast(list[list[int]], (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).tolist())[0]
-        else:
-          chunk_ids = [int(tok_last.item())] + draft_ids  # draft_ids were already pulled to host per-step above
+        n = k_eff + 1
+        chunk = (tok_last.cat(*draft_tensors, dim=1) if draft_tensors else tok_last).contiguous()  # (1, n) on out_dev: [tok_last, d0..]
+        # ONE realize dispatches the whole draft chain (async, no sync) and makes chunk + the draft logits real buffers: everything
+        # below views those buffers -- a lazy view of `chunk` would re-run the chain in ACCEPT's schedule (a second Tensor.rand draw
+        # on the sampled path: ids the readback reports that VERIFY never saw). VERIFY's own input (a jit input) is a realized buffer too.
+        Tensor.realize(chunk, *q_logits)
+        buf = chunk.to(dev)
         if trace_on: draft_ms = (time.perf_counter() - draft_t0) * 1000
-        n = len(chunk_ids)  # k_eff + 1
 
         # (b) VERIFY: one main-model forward of the whole chunk [tok_last, d0..d_{k_eff-1}] at the current
         # start_pos, returning the per-position logits (what the real model actually predicts from every one of
-        # those positions) and the per-position hidden state. T4.66d: CHECKPOINT is back (a device-side clone
-        # of every GDN block's conv/recurrent state -- the OLD, pre-T4.66b design) so a partial accept can
-        # restore-then-redo below -- GatedDeltaNet conv/recurrent state is a single read-modify-written
-        # accumulator, not a position-indexed cache, so once VERIFY mixes a wrong draft token into it there's no
-        # slice to discard (unlike attention KV, which needs no snapshot -- see the mask argument in
-        # SPEC_NOTES.md). T4.66b's alternative (read the corrected state directly off VERIFY's own per-position
-        # captures, no snapshot needed) measured ~10x MORE expensive on real METAL+NV hardware -- the captured
-        # state_track/conv_window this replaces is a 32x-inflated `.stack()` result (T_pad, SPEC_PROFILE_NOTES.md
-        # SS3(c)), unlike this clone's native-sized buffers -- see SPEC_FIXES_NOTES.md. Timed as part of
-        # verify_dispatch_ms below: like that phase's own buf/bind setup, this is real host CPU + dispatch-only
-        # device work (Tensor.realize() defaults to wait=False -- engine/realize.py), not a second device sync.
+        # those positions) and the per-position hidden state. T4.66d: CHECKPOINT (every GDN block's conv/recurrent
+        # state copied aside) so a partial accept can restore-then-redo below -- GatedDeltaNet conv/recurrent state
+        # is a single read-modify-written accumulator, not a position-indexed cache, so once VERIFY mixes a wrong
+        # draft token into it there's no slice to discard (unlike attention KV, which needs no snapshot -- see the
+        # mask argument in SPEC_NOTES.md). T4.66b's alternative (read the corrected state directly off VERIFY's own
+        # per-position captures, no snapshot needed) measured ~10x MORE expensive on real METAL+NV hardware -- the
+        # captured state_track/conv_window this replaces is a 32x-inflated `.stack()` result (T_pad,
+        # SPEC_PROFILE_NOTES.md SS3(c)), unlike the clone's native-sized buffers -- see SPEC_FIXES_NOTES.md.
+        # T4.132: the checkpoint copies run INSIDE the captured VERIFY graph (forward's `ckpt`, GatedDeltaNetBlock
+        # .checkpoint -> spec_snap), not as 96 eager clone kernels scheduled here every iteration; VERIFY is the
+        # width-n family (concrete, its own jit key -- see Transformer.__call__).
         if trace_on: verify_t0 = time.perf_counter()
-        gdn_snap = [(b, b.conv_state.clone(), b.recurrent_state.clone()) for b in gdn_blocks]
-        if gdn_snap: Tensor.realize(*(s for _, c, r in gdn_snap for s in (c, r)))
-        # T4.66e: sized to verify_chunk (this call's own dedicated bound), not chunk_size -- see
-        # verify_chunk's own comment above.
-        buf = Tensor(chunk_ids + [0] * (verify_chunk - n), dtype="int32", device=dev).reshape(1, verify_chunk)
-        sp, nt = v_start_pos.bind(start_pos), v_toks_verify.bind(n)
-        verify_logits, verify_h = cast(tuple[Tensor, Tensor], self(buf[:, :nt], sp, None, spec=True))
+        verify_logits, verify_h = cast(tuple[Tensor, Tensor], self(buf, v_start_pos.bind(start_pos), None, spec=True))  # (1,n,vocab), (1,n,D)
         if trace_on: verify_dispatch_ms = (time.perf_counter() - verify_t0) * 1000
 
-        # (c) ACCEPT: how many of the k_eff drafts hold up (m, 0..k_eff), and the one extra token this
-        # iteration emits beyond them -- either the greedy exact-match bonus/correction id, or (T4.65,
-        # temperature>0) a sampled accept/resample per spec_accept. Both branches produce `accepted`
-        # (== chunk_ids[1:1+m] + [that extra token], always m+1 long) and `tok_last` (the new chain anchor).
+        # (c) ACCEPT, on device (T4.132): how many of the k_eff drafts hold up (m, 0..k_eff) and the one extra token
+        # this iteration emits beyond them -- `final[i]` is what gets emitted if the accept length is i: greedy, the
+        # main model's own id at position i (the bonus at i == k_eff, the correction below it); temperature>0,
+        # spec_accept_tensor's residual resample / bonus sample. Then the iteration's ONE host sync reads back
+        # [m, the chunk's ids, final] -- 2n+1 ints -- and the accepted tokens are assembled on the host. verify_ids[i]
+        # predicts the position AFTER chunk[i] was fed, so it is compared with draft d_i == chunk[i+1] (chunk[0] is
+        # tok_last, already confirmed real); m = the longest matching prefix.
         if trace_on: accept_t0 = time.perf_counter()
-        # T4.66j: every host read of VERIFY's outputs goes through ONE view bounded by the host-known `n`, never
-        # by the tensors' own reported length. verify_logits/verify_h are a REPLAYED jit key's frozen return
-        # objects (see the T4.66h comment on the prefill tail above): their symbolic "toks" dim stays bound to
-        # whatever width the key's CAPTURE call had -- REDO on warmup()'s own first partial accept captures it at
-        # m+1 (1..k) -- while the buffer underneath is sized to the bound (verify_chunk) and holds this call's own
-        # n real positions. The old `argmax(-1).pad_to((1, verify_chunk)).tolist()[0][:n]` idiom padded FROM that
-        # stale length, so every position >= the capture width came back as a pad ZERO: emitted as the bonus/
-        # correction token (id 0 -- Qwen's "!" -- laced through the hardware essay) and never matching a draft
-        # (the accept length capped at the capture width). Reproduced on CPU:0/CPU:1 with the key captured at
-        # width 1 (test_spec_decode.py's TestStaleReplayShape). `[:, :n]` is a concrete-shaped shrink whose data
-        # offsets never involve "toks" (batch is 1) -- the same host-known-int shape the T4.66h/i slice fixes use.
-        verify_logits_n = verify_logits[:, :n]  # (1, n, vocab), concrete shape
+        drafts = chunk[:, 1:]  # (1, k_eff)
         if greedy:
-          verify_ids_tensor = verify_logits_n.argmax(-1)  # (1, n) ids
-          verify_ids: list[int] = cast(list[list[int]], verify_ids_tensor.tolist())[0]  # [i] predicts start_pos+1+i
-          assert len(verify_ids) == n, f"{len(verify_ids)=} != {n=}"  # every emitted id below comes from this n-bounded read
-          # verify_ids[i] predicts the position AFTER chunk_ids[i] was fed, so it's comparable to draft
-          # d_i == chunk_ids[i+1] (chunk_ids[0] is tok_last, which needs no verifying -- it's already a
-          # confirmed-real token from a previous iteration or the prefill above). m = length of the longest
-          # matching prefix, 0..k_eff.
-          m = 0
-          while m < k_eff and chunk_ids[m + 1] == verify_ids[m]: m += 1
-          accepted = chunk_ids[1:1 + m] + [verify_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
-          tok_last = verify_ids_tensor[:, m:m + 1]  # kept lazy/device-side, like generate()'s own `out` chaining
+          final = verify_logits.argmax(-1)  # (1, n) ids
+          m_t = (final[:, :k_eff] == drafts).cast(dtypes.int32).cumprod(-1).sum(-1) if k_eff else Tensor.zeros(1, dtype=dtypes.int32, device=out_dev)
         else:
-          # same n-bounded view as the greedy branch (T4.66j -- the old `.pad_to((1, verify_chunk, vocab))` read
-          # had the identical stale-length hole: all-zero logits, i.e. a UNIFORM p, at every position past the
-          # capture width), but here we need the full per-position distributions, not just the argmax.
-          vocab = int(verify_logits.shape[-1])  # never symbolic (only the T axis is) -- int() just satisfies mypy's sint=int|UOp
-          verify_np = verify_logits_n.numpy()[0]  # (n, vocab)
-          p_probs = _softmax_np(verify_np, temperature)
-          q_probs = np.stack(q_list) if q_list else np.empty((0, vocab))
-          accepted, m = spec_accept(draft_ids, q_probs, p_probs, rng)  # accepted == chunk_ids[1:1+m] + [extra], len m+1
-          # T4.66f: out_dev, not dev -- see out_dev's own comment above (this rebuild must match draft_tensors'
-          # device, the same requirement the greedy partial-accept rebuild below has).
-          tok_last = Tensor([[accepted[-1]]], dtype="int32", device=out_dev)
-
+          vocab = cast(int, verify_logits.shape[-1])
+          m_t, final = spec_accept_tensor(drafts, Tensor.stack(*q_logits, dim=1) if q_logits else verify_logits[:, :0], verify_logits, temperature,
+                                          Tensor.rand(1, k_eff, device=out_dev), Tensor.rand(1, n, vocab, device=out_dev), min_p=MIN_P)
+        readback_t = m_t.reshape(1).cat(chunk[0], final[0]).realize()  # (2n+1,) on out_dev
+        readback = cast(list[int], readback_t.tolist())  # THE sync: draft chain + VERIFY + the accept test
+        m, chunk_ids, final_ids = readback[0], readback[1:1 + n], readback[1 + n:]
+        assert 0 <= m <= k_eff and len(chunk_ids) == len(final_ids) == n, f"{m=} {k_eff=} {n=}"
+        accepted = chunk_ids[1:1 + m] + [final_ids[m]]  # d0..d_{m-1} plus the bonus/correction token: m+1 total
+        # the next chain's anchor, device-side: a view of the REALIZED readback buffer, never a lazy slice of `final` -- the sampled
+        # path's `final` carries this chain's own draft graph (draft_pos_i bound at this iteration's positions), and the next chain
+        # rebinds those names: one schedule can't hold both (T4.66's "bind mismatch on draft_pos", SPEC_NOTES.md section 4)
+        tok_last = readback_t[1 + n + m:2 + n + m].reshape(1, 1)
         if trace_on: accept_ms = (time.perf_counter() - accept_t0) * 1000
+
         if trace_on: assign_t0 = time.perf_counter()
         if m == k_eff:
           # full accept: every input verify saw (tok_last, d0..d_{k_eff-1}) really was correct, so its forward
@@ -2516,72 +2490,28 @@ class Transformer:
           # needed a snapshot (SPEC_NOTES.md's mask argument): this redo overwrites positions
           # [start_pos, start_pos+m+1) with the SAME values verify already wrote there (a harmless recompute),
           # and the discarded wrong positions start_pos+m+1..start_pos+k_eff are never read before the next
-          # iteration overwrites them too. spec=True reuses VERIFY's own warmed jit key (same
-          # is_prefill/greedy/chunk_size/spec tuple), so this never pays a fresh capture.
-          #
-          # T4.66e: on greedy, tok_last must be REBUILT from host data here (mirroring the sampled
-          # branch's own `Tensor([[accepted[-1]]], ...)` a few lines up), not left as the lazy
-          # verify_ids_tensor slice a few lines above -- a T4.66a-class bind-mismatch hazard (see
-          # v_toks_verify's own comment above), reproduced as RuntimeError: bind mismatch on toks, 1 != 3
-          # on test_draft_reuses_schedule_across_positions. Mechanism, pinned down empirically (two fixes
-          # that look plausible from SPEC_NOTES.md's own SS3 "any jit output read after another replay
-          # must be a real owned buffer" lesson do NOT work here -- confirmed by trying each before this
-          # one): v_toks_verify's key starts cold every process lifetime, and a cold TinyJit key's first
-          # two calls are special (engine/jit.py _TinyJit.__call__): call 1 (cnt=0) just runs forward()
-          # eagerly and lazily, no jit bookkeeping; call 2 (cnt=1) is the real CAPTURE, and from then on
-          # every call (capture or replay) returns the SAME frozen ret object -- only the buffer's DATA
-          # changes per replay. VERIFY is always this key's cnt=0 (eager) call; REDO, the first time this
-          # key ever sees a partial accept, is cnt=1 (the capture) -- so `verify_ids_tensor[:, m:m+1]`
-          # (tied to VERIFY's own eager-call graph, "toks"=n) and h_last's `redo_h[:, -1:]` below (tied to
-          # REDO's own capture-call graph, "toks"=m+1) are two INDEPENDENT lazy graphs pinned to two
-          # different concrete "toks" values, both feeding the very next outer iteration's DRAFT chain --
-          # its sync must resolve both together and can't reconcile them. (1) `.realize()`-ing the slice
-          # first does NOT help: it dispatches the compute but doesn't rewrite the tensor's own uop, so a
-          # LATER schedule walk still re-encounters the same "toks" bind node (confirmed by inspecting
-          # `has_buffer_identity()` -- still False right after `.realize()`). (2) `.contiguous()`-ing the
-          # slice (h_last's own pattern here, and SPEC_NOTES.md SS3's fix for a DIFFERENT bug -- silent
-          # buffer-aliasing across replays, not this scheduler-level crash) doesn't help either: the copy
-          # kernel it inserts still needs "toks" to know the source offset into verify_ids_tensor's own
-          # (1, verify_chunk)-shaped buffer, so the dependency travels right through it (confirmed by
-          # trying it: same crash, values just swapped -- "3 != 1"). Only a tensor with NO ancestry in
-          # verify_ids_tensor at all sidesteps this, which is exactly what the sampled branch already
-          # builds -- `accepted[-1]` (computed above, host-side) equals `verify_ids[m]`, the same value
-          # `tok_last` would otherwise hold. h_last needs no equivalent fix: once REDO's capture exists,
-          # every future VERIFY/REDO call (this iteration's REDO included) returns that same captured
-          # object, and it always gets drained by the very next DRAFT sync (a required mtp_head.draft
-          # input) before any later VERIFY/REDO replay could rebind it again -- the same pattern that
-          # already makes h_last safe on the far-more-common full-accept path, and safe here from the
-          # second partial accept of this key's lifetime onward. tok_last is the one value this pattern
-          # doesn't cover, because it comes from a DIFFERENT call (VERIFY) than h_last (REDO). Cheap: one
-          # tiny (1,1) host->device upload, only on the partial-accept branch -- the full-accept path's own
-          # `tok_last` stays exactly as lazy as before.
-          #
-          # T4.66f: device=out_dev, not dev -- see out_dev's own comment above. This rebuild used to hardcode
-          # `dev` (blk[0].device), which matches the VERIFY/REDO buffers a few lines below but NOT
-          # draft_tensors (always owner.output.weight.device, forced by MTPHead.draft's own return line) --
-          # invisible on every existing test (single-device: dev==out_dev there) but fatal on a real
-          # multi-device map, where the NEXT iteration's greedy `tok_last.cat(*draft_tensors, dim=1)` fuses a
-          # `dev` tensor with `out_dev` tensors into one kernel with no copy between them: RuntimeError: all
-          # buffers must be on the same device (schedule/__init__.py's assert_all_same_devices). Reproduced
-          # and fixed here -- see test_spec_decode.py's TestSpecDeviceMap.
-          if greedy: tok_last = Tensor([[accepted[-1]]], dtype="int32", device=out_dev)
-          if gdn_snap: Tensor.realize(*(x for b, c, r in gdn_snap for x in (b.conv_state.assign(c), b.recurrent_state.assign(r))))
-          redo_ids = chunk_ids[:m + 1]
-          # T4.66e: verify_chunk/v_toks_verify, same as VERIFY above -- this is exactly what makes REDO
-          # replay VERIFY's own jit slot instead of paying a fresh capture (see the comment below).
-          buf2 = Tensor(redo_ids + [0] * (verify_chunk - len(redo_ids)), dtype="int32", device=dev).reshape(1, verify_chunk)
-          sp2, nt2 = v_start_pos.bind(start_pos), v_toks_verify.bind(len(redo_ids))
-          _, redo_h = cast(tuple[Tensor, Tensor], self(buf2[:, :nt2], sp2, None, spec=True))
-          h_last = redo_h[:, len(redo_ids) - 1:len(redo_ids)].contiguous()  # T4.66i: positive slice, same reason as the anchor (T4.66h)
+          # iteration overwrites them too. T4.132: REDO is the width-(m+1) family (m+1 <= k, one of the k+1 warmed
+          # widths), never VERIFY's own, so VERIFY's output buffers (verify_h, read by the MTP rewrite below, and
+          # tok_last above) survive it. Its input is uploaded from the host-known ids (the one readback above), NEVER
+          # a `buf[:, :m+1]` view of VERIFY's buffer: a concrete shrink view handed to a TinyJit is baked at capture
+          # (`.contiguous()` folds into the view, nothing is parametrized), so every later replay re-fed the capture
+          # call's ids -- the sampled state-integrity test caught it; greedy sequences repeating one token hid it
+          # (test_spec_decode.py's TestSpecKVConsistency pins the fix).
+          # RESTORE: the checkpoint VERIFY's own graph took (GatedDeltaNetBlock.checkpoint -> spec_snap)
+          if gdn_blocks: Tensor.realize(*(x for b in gdn_blocks for x in (b.conv_state.assign(cast(tuple, b.spec_snap)[0]),
+                                                                           b.recurrent_state.assign(cast(tuple, b.spec_snap)[1]))))
+          buf2 = Tensor(chunk_ids[:m + 1], dtype="int32", device=dev).reshape(1, m + 1)
+          _, redo_h = cast(tuple[Tensor, Tensor], self(buf2, v_start_pos.bind(start_pos), None, spec=True))
+          h_last = redo_h[:, m:m + 1].contiguous()  # T4.66i: positive slice, same reason as the anchor (T4.66h)
         # T4.66l: rewrite the MTP block's cache slots for the accepted positions with the TRUE per-position hidden
         # state. The draft chain wrote slots start_pos..start_pos+k_eff-1 from (h_last, chunk_ids[i]): token-correct
         # for i <= m, but h_last is position start_pos-1's hidden at EVERY step (see the DRAFT comment) -- so slot
         # start_pos (step start_pos-1) is already right, while slots start_pos+1..start_pos+m (steps start_pos..
-        # start_pos+m-1) need h_{start_pos+j} = verify_h[:, j], j < m: what VERIFY holds after a full accept, and what
-        # REDO -- same jit key, hence the SAME frozen object, its replay having just rewritten positions 0..m -- holds
-        # after a partial one; paired with the tokens chunk_ids[1..m] == accepted[:m]. m == k_eff also fills the bonus
-        # token's slot start_pos+k_eff, which no draft ever wrote. Nothing to do at m == 0. Dispatch-only (counted in
-        # state_assign_ms); the device queue orders it before the next DRAFT chain's reads of the cache.
+        # start_pos+m-1) need h_{start_pos+j} = verify_h[:, j], j < m: what VERIFY holds after a full accept, and
+        # (causal: position j < m never saw a wrong draft) after a partial one too; paired with the tokens
+        # chunk_ids[1..m] == accepted[:m]. m == k_eff also fills the bonus token's slot start_pos+k_eff, which no
+        # draft ever wrote. Nothing to do at m == 0. Dispatch-only (counted in state_assign_ms); the device queue
+        # orders it before the next DRAFT chain's reads of the cache.
         if m > 0:
           self.mtp_head.prefill(self, verify_h[:, :m], chunk_ids[1:m + 1], start_pos + 1, v_mtp_toks, v_mtp_pos).realize()
         if trace_on: state_assign_ms = (time.perf_counter() - assign_t0) * 1000
@@ -2601,9 +2531,16 @@ class Transformer:
                 f"state_assign_ms={state_assign_ms:.2f} total_ms={total_ms:.2f}")
 
         start_pos += m + 1
+        # T4.132: the state is committed through accepted[:-1] BEFORE the first yield (VERIFY/REDO fed the drafts d0..d_{m-1};
+        # accepted[-1] is the model's own prediction, not fed yet) and _cached_tokens says so at once -- not tokens[:-1] per
+        # yield, which a caller stopping at a stop token inside this batch (serve.py's is_end) would read as "the state is
+        # exactly my tokens" and resume a recurrent state that is 1..m tokens ahead of it. get_start_pos reuses the live
+        # cache only when the next prompt extends _cached_tokens exactly; otherwise it re-prefills (or serve.py restores a
+        # state-cache snapshot) -- test_spec_decode.py's test_stop_mid_batch_then_generate_matches_fresh_gdn.
+        committed = tokens + accepted[:-1]
         for v in accepted:
           tokens.append(v)
-          self._cached_tokens = tokens[:-1]
+          self._cached_tokens = committed
           yield tokens[-1]
     finally:
       # T4.66b: SPEC_STATS instrumentation -- see its own ContextVar docstring. Fires once, whichever way this

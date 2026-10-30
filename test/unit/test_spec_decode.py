@@ -1,14 +1,13 @@
 import contextlib, io, re, unittest
 from dataclasses import replace
-from unittest.mock import Mock
 import numpy as np
 from typing import cast
 from tinygrad import Tensor, nn, UOp
-from tinygrad.helpers import Context, next_power2
+from tinygrad.helpers import Context
 from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
-  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept,
+  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits,
 )
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 from test.unit.test_llm_device_map import TEST_CONFIG
@@ -165,17 +164,20 @@ class TestSpeculativeGenerate(unittest.TestCase):
     # in place -- exercising the KV/GDN-cache-reuse path) against a from-scratch greedy generate() on a
     # FRESH model with the same weights (same seed), given the resulting prefix as its prompt: if
     # speculative_generate had left any stale/incorrect state behind, these would diverge.
-    rng = np.random.default_rng(12345)
+    Tensor.manual_seed(12345)  # T4.132: every draw is on device
     for k in (1, 2, 3):
       for seed, prompt in enumerate(PROMPTS):
         model_a = _load(seed=seed)
         tokens_so_far = list(prompt)
-        got_first = [v for _, v in zip(range(15), model_a.speculative_generate(tokens_so_far, k=k, temperature=1.0, rng=rng))]
+        got_first = [v for _, v in zip(range(15), model_a.speculative_generate(tokens_so_far, k=k, temperature=1.0))]
         self.assertEqual(len(got_first), 15, f"{k=} {seed=} {prompt=}")
         self.assertTrue(all(0 <= tid < VOCAB for tid in got_first), f"{k=} {seed=} {prompt=}")
         self.assertEqual(len(tokens_so_far), len(prompt) + 15, f"{k=} {seed=} {prompt=}")
-        # bookkeeping invariant generate() maintains too (see its own tokens.append/self._cached_tokens lines)
-        self.assertEqual(model_a._cached_tokens, tokens_so_far[:-1], f"{k=} {seed=} {prompt=}")
+        # T4.132: _cached_tokens is the COMMITTED state -- tokens[:-1] at a batch boundary, up to k tokens further inside one
+        # (the drafts VERIFY already fed; see speculative_generate's yield loop) -- always extending tokens[:-1]
+        cached = model_a._cached_tokens
+        self.assertEqual(cached[:len(tokens_so_far) - 1], tokens_so_far[:-1], f"{k=} {seed=} {prompt=}")
+        self.assertLessEqual(len(cached) - (len(tokens_so_far) - 1), k, f"{k=} {seed=} {prompt=}")
 
         # snapshot BEFORE calling generate() on either model: generate() mutates its `tokens` list argument
         # in place (appends as it yields, same as speculative_generate) -- model_a and model_b must each
@@ -267,6 +269,27 @@ class TestSpeculativeGenerate(unittest.TestCase):
 
         full_ref = _run(_load_gdn(seed=seed), prompt, 18, spec=False)
         self.assertEqual(got_first + got_second, full_ref, f"{k=} {seed=} {prompt=}")
+
+  def test_stop_mid_batch_then_generate_matches_fresh_gdn(self):
+    # T4.132: a caller that stops INSIDE an accepted batch (serve.py at a stop token) must still continue correctly: the
+    # recurrent state is already ahead of what it has seen (VERIFY fed the whole batch), _cached_tokens says so, and the
+    # follow-up generate() re-prefills instead of resuming a state that is 1..m tokens ahead. A perfect draft at k=3 makes
+    # every batch 4 tokens: 1 (anchor) + 4 + 2 stops two tokens into the second batch.
+    k = 3
+    for seed, prompt in enumerate(PROMPTS):
+      ref = _run(_load_gdn(seed=seed), prompt, 24, spec=False)
+      ref_tokens = list(prompt) + ref
+      def fake_draft(owner, h, tok_ids, start_pos, _ref=ref_tokens):
+        pos = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
+        return _wrong_logits(_ref[pos + 1])
+      model = _load_gdn(seed=seed)
+      model.mtp_head.draft = fake_draft
+      toks = list(prompt)
+      got = [v for _, v in zip(range(7), model.speculative_generate(toks, k=k))]
+      self.assertEqual(got, ref[:7], f"{seed=} {prompt=}")
+      self.assertEqual(model._cached_tokens, ref_tokens[:len(prompt) + 8], "committed through the batch's last draft, 2 past the yields")
+      got_more = [v for _, v in zip(range(6), model.generate(toks, temperature=0.0))]
+      self.assertEqual(got + got_more, ref[:13], f"{seed=} {prompt=}")
 
 class TestSpecTrace(unittest.TestCase):
   """T4.66c: SPEC_TRACE=0 (default, zero overhead) is exercised implicitly by every test above running
@@ -417,128 +440,188 @@ class TestSpecDeviceMap(unittest.TestCase):
         got = _run(model, prompt, N_GEN, spec=True, k=k)  # pre-fix: RuntimeError at the 2nd outer iteration
         self.assertEqual(got, ref, f"{k=} {seed=} {prompt=}")
 
-class TestSpecAccept(unittest.TestCase):
-  """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-
-  sampling accept/reject/resample test T4.65 wires into speculative_generate's temperature>0 path."""
+class TestSpecAcceptTensor(unittest.TestCase):
+  """spec_accept_tensor (T4.132: on device, batched; T4.65's host-side numpy spec_accept before it) -- Leviathan et al.'s
+  speculative-sampling accept/reject/resample test speculative_generate's temperature>0 path wires in. The uniforms are explicit
+  inputs, so every case below is deterministic; the statistical test batches its trials over the leading dim."""
+
+  @staticmethod
+  def _logits(*rows:list[float]) -> Tensor:
+    # log p (clipped: a 0 becomes exp(-60), ~1e-26) as the logits, so softmax(logits) recovers p -- (1, len(rows), V)
+    return Tensor(np.log(np.array(rows, dtype=np.float64)).clip(-60, None).astype(np.float32)).unsqueeze(0)
 
   def test_identical_distributions_always_accept(self):
-    # q==p exactly -> accept_prob=min(1,p/q)=1 everywhere -> ALWAYS accept, regardless of the random draw
-    # (rng.random() in [0,1) is always < 1.0). Stress it with the draw pushed right up against 1.
-    probs = np.array([0.1, 0.5, 0.1, 0.2, 0.1])
-    q_probs, p_probs = np.stack([probs, probs]), np.stack([probs, probs, probs])  # k_eff=2, +1 bonus row
-    rng = Mock()
-    rng.random = Mock(return_value=0.999999999)
-    rng.choice = Mock(return_value=4)  # only consulted for the bonus token, on full accept
-    accepted, m = spec_accept([1, 3], q_probs, p_probs, rng)
-    self.assertEqual((accepted, m), ([1, 3, 4], 2))
-    rng.choice.assert_called_once()
-    args, kwargs = rng.choice.call_args
-    self.assertEqual(args[0], 5)
-    np.testing.assert_allclose(kwargs["p"], probs)  # bonus sampled straight from p_probs[k_eff] (== probs here)
+    # q==p exactly -> accept_prob=min(1,p/q)=1 everywhere -> ALWAYS accept, regardless of the draw (u in [0,1) is always < 1).
+    # Stress it with the draw pushed right up against 1.
+    probs = [0.1, 0.5, 0.1, 0.2, 0.1]
+    q, p = self._logits(probs, probs), self._logits(probs, probs, probs)  # k=2, +1 bonus row
+    m, final = spec_accept_tensor(Tensor([[1, 3]]), q, p, 1.0, Tensor([[0.999999999, 0.999999999]]), Tensor.full((1, 3, 5), 0.5))
+    self.assertEqual(m.item(), 2)
+    self.assertEqual(final.shape, (1, 3))
+    self.assertEqual(final.tolist()[0][2], 1)  # the bonus: equal noise everywhere -> the Gumbel-max is argmax p_k (0.5 at id 1)
 
   def test_excluded_token_always_rejects_with_correct_resample_support(self):
-    # q puts mass on token 0, p excludes it entirely (p[0]=0) -> ratio=0 -> ALWAYS reject regardless of the
-    # random draw (rng.random() in [0,1) is never < 0) -- and the resample distribution passed to rng.choice
-    # must equal EXACTLY normalize(max(0, p-q)), not just "excludes token 0".
-    q0 = np.array([0.5, 0.3, 0.1, 0.1, 0.0])
-    p0 = np.array([0.0, 0.4, 0.2, 0.2, 0.2])
-    q_probs, p_probs = q0[None, :], np.stack([p0, np.full(5, 0.2)])  # k_eff=1; bonus row unused here
-    rng = Mock()
-    rng.random = Mock(return_value=1e-9)  # smallest-possible draw -- still must reject (ratio is exactly 0)
-    rng.choice = Mock(return_value=4)
-    accepted, m = spec_accept([0], q_probs, p_probs, rng)
-    self.assertEqual((accepted, m), ([4], 0))
-    residual = np.clip(p0 - q0, 0, None)
+    # q puts mass on token 0, p excludes it entirely (p[0]=0) -> ratio=0 -> ALWAYS reject regardless of the random draw --
+    # and the resample must be distributed EXACTLY as normalize(max(0, p-q)), not just "excludes token 0"
+    q0 = [0.5, 0.3, 0.1, 0.1, 0.0]
+    p0 = [0.0, 0.4, 0.2, 0.2, 0.2]
+    B = 20000
+    Tensor.manual_seed(7)
+    q, p = self._logits(q0).expand(B, 1, 5), self._logits(p0, [0.2] * 5).expand(B, 2, 5)  # k=1; the bonus row is unused here
+    m, final = spec_accept_tensor(Tensor.zeros(B, 1, dtype="int32"), q, p, 1.0, Tensor.full((B, 1), 1e-9), Tensor.rand(B, 2, 5))
+    self.assertEqual(m.numpy().max(), 0)  # smallest-possible draw -- still rejects (the ratio is exactly 0)
+    residual = np.clip(np.array(p0) - np.array(q0), 0, None)
     expected = residual / residual.sum()  # the docstring's exact formula, computed independently here
     self.assertEqual(expected[0], 0.0)  # token 0 (excluded by p) must never get resample mass
-    args, kwargs = rng.choice.call_args
-    self.assertEqual(args[0], 5)
-    np.testing.assert_allclose(kwargs["p"], expected)
+    counts = np.bincount(final.numpy()[:, 0], minlength=5) / B
+    self.assertEqual(counts[0], 0.0)
+    np.testing.assert_allclose(counts, expected, atol=0.02)
 
   def test_zero_drafts_samples_bonus_directly(self):
-    # k_eff=0 (speculative_generate's max_context boundary degrades to this, see SPEC_NOTES.md's position
-    # ledger): no drafts to test at all, straight to a bonus sample from p_probs[0] -- rng.random() (the
-    # accept test) is never even called.
-    p0 = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
-    rng = Mock()
-    rng.choice = Mock(return_value=3)
-    accepted, m = spec_accept([], np.empty((0, 5)), p0[None, :], rng)
-    self.assertEqual((accepted, m), ([3], 0))
-    rng.random.assert_not_called()
+    # k_eff=0 (speculative_generate's max_context boundary degrades to this, see SPEC_NOTES.md's position ledger): no drafts
+    # to test at all, straight to a bonus sample from p[0] -- a flat p, so the Gumbel-max picks the largest uniform (id 3)
+    m, final = spec_accept_tensor(Tensor.zeros(1, 0, dtype="int32"), Tensor.zeros(1, 0, 5), self._logits([0.2] * 5), 1.0,
+                                  Tensor.zeros(1, 0), Tensor([[[0.1, 0.2, 0.3, 0.9, 0.4]]]))
+    self.assertEqual((m.tolist(), final.tolist()), ([0], [[3]]))
+
+  def test_min_p_truncates_p_and_q(self):
+    # T4.132: min_p (generate()'s MIN_P tail cut) keeps only ids with p >= min_p * max(p), on p and q alike: a draft outside p's
+    # cut is always rejected (lp = -inf), the resample is distributed as the truncated residual, token 4 (q's mode) never emitted
+    p0, q0 = [0.50, 0.30, 0.15, 0.04, 0.01], [0.01, 0.04, 0.15, 0.30, 0.50]
+    B = 20000
+    Tensor.manual_seed(5)
+    q, p = self._logits(q0).expand(B, 1, 5), self._logits(p0, p0).expand(B, 2, 5)
+    m, final = spec_accept_tensor(Tensor.full((B, 1), 4, dtype="int32"), q, p, 1.0, Tensor.full((B, 1), 1e-9), Tensor.rand(B, 2, 5), min_p=0.1)
+    self.assertEqual(m.numpy().max(), 0)  # draft 4: p=0.01 < 0.1*0.5 -> cut from p -> rejected even with the smallest draw
+    def cut(d): return (t := np.where(np.array(d) >= 0.1 * max(d), d, 0.0)) / t.sum()
+    residual = np.clip(cut(p0) - cut(q0), 0, None)
+    counts = np.bincount(final.numpy()[:, 0], minlength=5) / B
+    np.testing.assert_allclose(counts, residual / residual.sum(), atol=0.02)
 
   def test_statistical_marginal_matches_p(self):
-    # the theorem spec_accept's whole correctness rests on (Leviathan et al., Theorem 1): if draft_ids are
-    # drawn by ancestral sampling from q, the emitted token at that drafted position is marginally
-    # distributed as p -- REGARDLESS of q (draft quality only ever affects the accept RATE). Checked
-    # empirically over ~20k trials on a 5-token vocab, since this is exactly the guarantee the sampled
-    # speculative-decoding path (and its "distribution-equal to generate(temperature=t)" claim) relies on.
-    rng = np.random.default_rng(42)
-    q = np.array([0.10, 0.50, 0.05, 0.30, 0.05])
-    p = np.array([0.40, 0.10, 0.20, 0.05, 0.25])
-    q_probs = q[None, :]                                    # k_eff=1
-    p_probs = np.stack([p, np.full(5, 0.2)])                # + an (unused-here) valid bonus row
-    n_trials = 20000
-    counts = np.zeros(5)
-    for _ in range(n_trials):
-      d = int(rng.choice(5, p=q))                           # ancestral draft sample: d ~ q
-      accepted, _m = spec_accept([d], q_probs, p_probs, rng)
-      counts[accepted[0]] += 1                               # accepted[0] is the token AT the drafted position
-    empirical = counts / n_trials
-    np.testing.assert_allclose(empirical, p, atol=0.02)      # loose: ~7 sigma even at p's largest entry (0.40)
+    # the theorem spec_accept_tensor's whole correctness rests on (Leviathan et al., Theorem 1): if draft_ids are drawn by
+    # ancestral sampling from q, the emitted token at that drafted position is marginally distributed as p -- REGARDLESS of q
+    # (draft quality only ever affects the accept RATE). Checked empirically over 20k trials on a 5-token vocab (one batched call),
+    # since this is exactly the guarantee the sampled speculative-decoding path (and its "distribution-equal to
+    # generate(temperature=t)" claim) relies on. The drafts come from sample_logits, the draw speculative_generate itself uses.
+    Tensor.manual_seed(42)
+    B = 20000
+    q = [0.10, 0.50, 0.05, 0.30, 0.05]
+    p = [0.40, 0.10, 0.20, 0.05, 0.25]
+    q_logits, p_logits = self._logits(q).expand(B, 1, 5), self._logits(p, [0.2] * 5).expand(B, 2, 5)  # k=1, + an unused bonus row
+    drafts = sample_logits(q_logits[:, 0], Tensor([1.0]))  # (B,1): ancestral draft samples d ~ q
+    m, final = spec_accept_tensor(drafts, q_logits, p_logits, 1.0, Tensor.rand(B, 1), Tensor.rand(B, 2, 5))
+    emitted = (m.reshape(B, 1) == 1).where(drafts, final[:, :1])  # the token AT the drafted position: the draft if accepted, else the correction
+    empirical = np.bincount(emitted.numpy().ravel(), minlength=5) / B
+    np.testing.assert_allclose(empirical, p, atol=0.02)  # loose: ~7 sigma even at p's largest entry (0.40)
 
-class TestVerifyNativeWidth(unittest.TestCase):
-  """T4.66e: VERIFY (and REDO) get their own dedicated jit key + Variable (v_toks_verify, "verify_chunk" =
-  next_power2(k+1)) instead of sharing the prefill loop's wide (chunk_size, default 32) v_toks -- see
-  model.py's comments at v_toks_verify's own definition, and SPEC_VERIFY_NOTES.md for the full T_pad
-  derivation this test checks end to end (x.max_shape[1] inside GatedDeltaNetBlock._attention, which is
-  exactly the "toks" Variable's declared range once bound -- see uop/ops.py's to_max_shape/UOp.bind)."""
+class TestOneSyncPerIteration(unittest.TestCase):
+  """T4.132: the loop's only host round-trip per outer iteration is ACCEPT's readback, greedy and sampled alike (before: the greedy
+  chain synced after DRAFT and again after VERIFY, the sampled one pulled a vocab-wide row to the host per drafted token)."""
 
-  def test_verify_forward_gdn_scan_uses_verify_chunk_width(self):
+  def _syncs_per_iteration(self, temperature:float) -> tuple[int, int]:
+    model = _load_gdn(seed=0, max_context=64)  # a real GDN block: the partial-accept restore + REDO path runs too
+    syncs: list[str] = []
+    orig = {name: getattr(Tensor, name) for name in ("tolist", "numpy", "item")}
+    def wrap(name):
+      def f(t, *a, **kw):
+        syncs.append(name)
+        return orig[name](t, *a, **kw)
+      return f
+    for name in orig: setattr(Tensor, name, wrap(name))
+    try:
+      buf = io.StringIO()
+      with Context(SPEC_STATS=1), contextlib.redirect_stdout(buf):
+        gen = model.speculative_generate([1, 2, 3], k=3, temperature=temperature)
+        next(gen)  # prefill + the anchor's own .item()
+        del syncs[:]
+        for _ in range(14): next(gen)
+        gen.close()  # SPEC_STATS prints: iters = completed outer iterations (an iteration's syncs all precede its yields)
+    finally:
+      for name, f in orig.items(): setattr(Tensor, name, f)
+    iters = int(cast(re.Match, re.search(r"iters=(\d+)", buf.getvalue())).group(1))
+    return len(syncs), iters
+
+  def test_greedy(self):
+    syncs, iters = self._syncs_per_iteration(0.0)
+    self.assertGreater(iters, 3)
+    self.assertEqual(syncs, iters)
+
+  def test_sampled(self):
+    Tensor.manual_seed(3)
+    syncs, iters = self._syncs_per_iteration(1.0)
+    self.assertGreater(iters, 3)
+    self.assertEqual(syncs, iters)
+
+def _spec_keys(model:Transformer) -> list[tuple]:
+  return [key for key in model.jit if key[3]]  # spec=True is the 4th (is_prefill, greedy, chunk_size, spec) slot
+
+def _verify_key(width:int) -> tuple:
+  """T4.132: the jit key of a concrete width-`width` VERIFY/REDO call (Transformer.__call__: a 1-token call is decode-shaped, a wider
+  one stores its width negated in the chunk_size slot so it never collides with a symbolic chunk's "toks" bound)."""
+  return (width > 1, True, -width if width > 1 else None, True)
+
+class TestVerifyConcreteWidth(unittest.TestCase):
+  """T4.132: VERIFY (and REDO) run at CONCRETE widths -- k_eff+1 and m+1, each width its own jit family keyed on the width
+  (Transformer.__call__) -- so the static-token-count NV kernels cover them. T4.66e's one symbolic family (a "toks" Variable
+  bound at next_power2(k+1), T_pad = the bound) is gone: GatedDeltaNetBlock._attention sees a plain int token axis equal to
+  the call's real width, never the prefill chunk_size (32) nor a padded bound."""
+
+  def test_verify_forward_runs_at_its_own_concrete_width(self):
     k = 3
     model = _load_gdn(seed=0, max_context=64)
-    t_pads: list[int] = []
+    widths: list = []
     orig_attention = GatedDeltaNetBlock._attention
     def spy(self, x, start_pos, capture=False):
-      t_pads.append(x.max_shape[1])  # the exact expression _attention itself uses to compute T_pad
+      widths.append(x.shape[1])
       return orig_attention(self, x, start_pos, capture=capture)
     GatedDeltaNetBlock._attention = spy
     try:
-      # GDN_CHUNK=32 pins the prefill chunk width to the same 32 CLAUDE.md's real METAL/NV device maps
-      # auto-select (gdn_chunk_for's own default there) -- on the bare-CPU test device, gdn_chunk_for()
-      # would otherwise auto-narrow the PREFILL chunk to 1 (T4.55's non-GPU fallback), which happens to
-      # collapse chunk_size down to k+1 too and hide the very gap (32 vs verify_chunk) this test exists
-      # to check.
+      # GDN_CHUNK=32 pins the prefill chunk width to the 32 the real NV map auto-selects, so a (symbolic) prefill chunk
+      # width could still leak into the loop's calls and be caught below
       with Context(GDN_CHUNK=32):
         gen = model.speculative_generate([1, 2, 3], k=k)
-        next(gen)  # prefill only -- its own tail chunk legitimately runs the GDN scan at chunk_size=32
-        t_pads.clear()  # only care about what happens from here: the outer loop's own VERIFY/REDO calls
+        next(gen)  # prefill only -- its own tail chunk legitimately runs the GDN scan at the symbolic chunk_size=32
+        widths.clear()  # only care about what happens from here: the outer loop's own VERIFY/REDO calls
         next(gen)  # one full outer iteration: DRAFT + VERIFY (+ REDO on a partial accept), both spec=True
     finally:
       GatedDeltaNetBlock._attention = orig_attention
-    verify_chunk = next_power2(k + 1)
-    self.assertGreater(len(t_pads), 0, "VERIFY's forward should have run the GDN block's _attention at least once")
-    self.assertIn(verify_chunk, t_pads, f"expected a GDN scan at VERIFY_CHUNK={verify_chunk}, saw {sorted(set(t_pads))}")
-    self.assertNotIn(32, t_pads, "VERIFY/REDO must not still pad the GDN scan to the prefill chunk_size (32)")
+    self.assertGreater(len(widths), 0, "VERIFY's forward should have run the GDN block's _attention at least once")
+    self.assertTrue(all(isinstance(w, int) and 1 <= w <= k + 1 for w in widths), f"not concrete / out of 1..k+1: {widths}")
+    self.assertIn(k + 1, widths, f"the first iteration's VERIFY is at the full width k_eff+1={k+1}, saw {widths}")
+    loop_keys = [key for key in _spec_keys(model) if key[2] != 32]
+    self.assertTrue(all(key in {_verify_key(w) for w in range(1, k + 2)} for key in loop_keys), loop_keys)
+
+  def test_each_width_is_one_family_captured_once_and_replayed(self):
+    # widths 1..k+1 driven directly: the second call of a width captures its family, every later call replays it (cnt grows,
+    # no new key), and a different width never shares the family
+    k = 3
+    model = _load_gdn(seed=0, max_context=64)
+    v_sp = UOp.variable("start_pos", 0, 63)
+    for w in range(1, k + 2):
+      for _ in range(3): model(Tensor([[1] * w], dtype="int32"), v_sp.bind(w), None, spec=True)
+      self.assertIn(_verify_key(w), model.jit)
+      self.assertIsNotNone(model.jit[_verify_key(w)].captured)
+      self.assertEqual(model.jit[_verify_key(w)].cnt, 3)
+    self.assertEqual(sorted(_spec_keys(model), key=str), sorted({_verify_key(w) for w in range(1, k + 2)}, key=str))
 
 class TestSpecWarmup(unittest.TestCase):
   """T4.66e deliverable 2: Transformer.warmup() only ever drove generate()'s own jit keys pre-T4.66e --
-  speculative_generate's spec=True keys (the prefill tail's, and VERIFY/REDO's own dedicated verify_chunk
-  one) were captured at REQUEST time instead (the T4.65 gap; recommended fix in T4.72). See warmup()'s own
-  comment for why each key needs calling TWICE (engine/jit.py _TinyJit.__call__: a key's first-ever call
-  just runs eagerly, no capture at all -- the capture that actually pays off on every later replay is the
-  SAME key's second call)."""
+  speculative_generate's spec=True keys (the prefill tail's and VERIFY/REDO's) were captured at REQUEST time
+  instead (the T4.65 gap; recommended fix in T4.72). See warmup()'s own comment for why each key needs calling
+  TWICE (engine/jit.py _TinyJit.__call__: a key's first-ever call just runs eagerly, no capture at all -- the
+  capture that actually pays off on every later replay is the SAME key's second call). T4.132: every concrete
+  VERIFY/REDO width 1..spec_k+1 is its own family and warmup drives each directly."""
 
   def test_warmup_captures_spec_keys_when_mtp_present(self):
     model = _load_gdn(seed=0, max_context=64)
     self.assertEqual(model.jit, {}, "nothing should be captured before warmup runs")
-    model.warmup()
-    spec_keys = [key for key in model.jit if key[3]]  # spec=True is the 4th (is_prefill, greedy, chunk_size, spec) slot
-    self.assertGreater(len(spec_keys), 0, "warmup should capture at least one spec=True jit key once mtp_head is set")
-    verify_chunk = next_power2(3 + 1)  # speculative_generate's own default k=3, matching warmup's own self.speculative_generate([0]) call
-    self.assertTrue(any(key[2] == verify_chunk for key in spec_keys),
-                    f"expected a captured spec key at chunk_size=verify_chunk={verify_chunk}, got {spec_keys}")
+    model.warmup(spec_k=3)
+    spec_keys = _spec_keys(model)
+    for w in range(1, 3 + 2): self.assertIn(_verify_key(w), spec_keys, f"VERIFY/REDO width {w} not warmed: {spec_keys}")
     for key in spec_keys:
       self.assertIsNotNone(model.jit[key].captured, f"jit[{key}] was called but never actually captured (still cnt<=1)")
+    self.assertEqual(model._cached_tokens, [], "warmup's direct verify calls advanced the live state: nothing may resume from it")
 
   def test_warmup_without_mtp_head_adds_no_spec_keys(self):
     # a plain Transformer (mtp_head unset, same as _load()'s own model MINUS its Context(MTP=1) --
@@ -801,6 +884,49 @@ class TestStaleReplayShape(unittest.TestCase):
     # the stale reported length, made visible: -1: on the replay is position 0, not the real last position
     self.assertGreater(float(np.abs(r_h[:, -1:].numpy() - f_h[:, 3:4].numpy()).max()), 1e-3)
 
+class TestSpecKVConsistency(unittest.TestCase):
+  """T4.132: after a speculative run the main model's state must be exactly the state of the tokens it yielded: every attention
+  block's KV at positions 0..len(tokens)-2 and every GDN block's conv/recurrent state equal a from-scratch forward over tokens[:-1]
+  (tok_last, the last yield, is not fed yet). blk0's K/V at a position are a function of that position's token alone, so this is the
+  direct check that VERIFY/REDO fed the ids the loop reported. Caught: REDO's input built as a `buf[:, :m+1]` view of VERIFY's chunk
+  buffer -- a concrete shrink view handed to a TinyJit is baked at capture (`.contiguous()` folds into the view, nothing is
+  parametrized), so every later REDO re-fed the capture call's ids. The token-identity tests never saw it: their tiny models repeat
+  one token, so the baked id was the right id."""
+
+  def _assert_state_of(self, model:Transformer, ref:Transformer, toks:list[int], label:str):
+    L = len(toks) - 1
+    Tensor.realize(*_spec_call(ref, toks, nt=L, bound=L))  # eager (cnt=0), concrete: the state after exactly tokens[:-1]
+    for i, (a, b) in enumerate(zip(model.blk, ref.blk)):
+      if isinstance(a, GatedDeltaNetBlock):
+        np.testing.assert_allclose(a.conv_state.numpy(), b.conv_state.numpy(), rtol=1e-2, atol=1e-2, err_msg=f"{label} blk{i} conv_state")
+        np.testing.assert_allclose(a.recurrent_state.numpy(), b.recurrent_state.numpy(), rtol=1e-2, atol=1e-2, err_msg=f"{label} blk{i} recurrent")
+      else:
+        np.testing.assert_allclose(a.cache_kv[:, :, :, :L].float().numpy(), b.cache_kv[:, :, :, :L].float().numpy(), rtol=1e-2, atol=1e-2,
+                                   err_msg=f"{label} blk{i} cache_kv")
+
+  def test_sampled_run_leaves_the_state_of_its_tokens(self):
+    # the sampled path's token stream varies (greedy on these tiny models repeats one id); k=1 so most iterations REDO at width 1.
+    # token_embd.weight is realized on both sides: MTPHead._block_in realizes it in place on the first draft (a numerics-only shift)
+    for seed in (0, 1):
+      Tensor.manual_seed(seed)
+      model, ref = _load(seed=seed), _load(seed=seed)
+      model.token_embd.weight.realize(), ref.token_embd.weight.realize()
+      toks = [7]
+      list(zip(range(15), model.speculative_generate(toks, k=1, temperature=1.0)))
+      self.assertGreater(len(set(toks)), 3, f"{toks=}: the sampled stream repeated itself, this run proves nothing")
+      self._assert_state_of(model, ref, toks, f"{seed=} {toks=}")
+
+  def test_greedy_redo_with_an_alternating_stream_gdn(self):
+    # deterministic: _load_gdn(seed=0) on [5, 2, 3, 4] alternates two ids (TestStaleReplayShape's sequence); an always-wrong draft
+    # forces m=0 and a width-1 REDO every iteration, so the REDO inputs alternate -- a baked REDO input re-feeds one of them
+    for k in (1, 3):
+      model = _load_gdn(seed=0)
+      model.mtp_head.draft = lambda owner, h, tok_ids, start_pos: _wrong_logits(VOCAB - 1)
+      toks = [5, 2, 3, 4]
+      list(zip(range(12), model.speculative_generate(toks, k=k)))
+      self.assertGreater(len(set(toks[4:])), 1, f"{toks=}")
+      self._assert_state_of(model, _load_gdn(seed=0), toks, f"{k=} {toks=}")
+
 class TestMTPPrefill(unittest.TestCase):
   """T4.66l: mtp_head.block's KV cache holds the prompt's MTP context (MTPHead.prefill, run chunk by chunk beside the
   main prefill) and every accepted position's TRUE-hidden entry (the accept-time rewrite) -- the semantics the nextn
@@ -868,6 +994,20 @@ class TestMTPPrefill(unittest.TestCase):
     m.restore_state(snap)
     back = m.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
     np.testing.assert_array_equal(back[:, :, :, :snap["pos"]], live[:, :, :, :snap["pos"]])
+
+  def test_prefill_only_fills_the_mtp_cache(self):
+    # T4.132: with an MTP head loaded prefill_only runs speculative_generate's prefill, so the draft block's cache holds the
+    # prompt's context (slots 1..n-1) exactly as a speculative_generate call's own prefill leaves it -- what a --mtp server's
+    # prefix snapshot (serve.py, T4.111) carries -- and _cached_tokens is the prompt, as with generate()
+    prompt = [5, 2, 3, 4, 9, 1, 7]
+    a, b = _load_gdn(seed=0), _load_gdn(seed=0)
+    a.prefill_only(prompt)
+    self.assertEqual(a._cached_tokens, prompt)
+    next(b.speculative_generate(list(prompt), k=1))
+    n = len(prompt)
+    ca, cb = (m.mtp_head.block.cache_kv[:, :, :, :n, :].float().numpy() for m in (a, b))
+    np.testing.assert_array_equal(ca, cb)
+    self.assertGreater(float(np.abs(ca[:, :, :, 1:n]).max()), 0.0)
 
 if __name__ == '__main__':
   unittest.main()

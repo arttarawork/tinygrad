@@ -387,11 +387,11 @@ class Handler(HTTPRequestHandler):
     # session sharing this request's FIXED PREFIX (everything before its first user message -- a system prompt +
     # tool schemas, byte-stable per client) pays the same cold prefill unless SOMEONE'S request snapshots the
     # prefix on its own; do that here, once, on the first request that has one worth it. Skipped for a vision
-    # request (one_shot -- store_snapshot never caches those) and for the MTP path (prefill_only mirrors plain
-    # generate()'s chunked loop, not speculative_generate's).
+    # request (one_shot -- store_snapshot never caches those). T4.132: the MTP path too -- prefill_only runs
+    # speculative_generate's own prefill when an MTP head is loaded (the draft block's cache is part of the snapshot).
     prefix_len = 0
     if (boundary and cache_start_pos == 0 and self.server.state_cache_mb > 0 and vision is None
-        and not (self.server.mtp and model.mtp_head is not None) and messages is not None and render is not None):
+        and messages is not None and render is not None):
       first_user = next((i for i, m in enumerate(messages) if m.get("role") == "user"), None)
       # 09-16: `first_user == 0` (no system prompt) is an EMPTY prefix -- the chat template raises "No messages provided" on
       # an empty list, which killed every system-less request since T4.111 went live (Hermes/dsh always send one; a bare
