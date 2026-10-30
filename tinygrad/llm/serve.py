@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 # T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag. T4.132: speculative_generate and
 # warmup cap it at 3 (model.py spec_k_clamped: VERIFY's k+1 tokens must stay on the 4-token NV decode kernels).
 SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
+# T4.132: --mtp speculates only while the request's prompt is shorter than this many tokens (0 = always). VERIFY's attention runs the
+# 16-row prefill kernel, whose cost grows with the fill: on the card (10-30, k=2) 1.47x plain at 2k, 1.04x at 131k -- plain decode above.
+SPEC_MAX_CONTEXT = getenv("SPEC_MAX_CONTEXT", 65536)
 # T4.67: MB cap for the cross-session prefill state cache (LLMServer.snapshots) when enabled -- see
 # LLMServer.store_snapshot and cli.py's --state-cache flag. Mirrors SPEC_TOKENS/--mtp above: this constant is
 # only the MAGNITUDE: LLMServer.__init__'s own default is 0 (off), so a caller who doesn't ask for this
@@ -433,7 +436,8 @@ class Handler(HTTPRequestHandler):
     # (Leviathan et al., see model.py's spec_accept) has its own correctness proof that a logit bias would need to thread
     # through carefully. T4.132: so a request with a nonzero presence_penalty takes plain generate() even on a --mtp server
     # (it used to be silently dropped there).
-    use_spec = self.server.mtp and model.mtp_head is not None and vision is None and not presence_penalty
+    use_spec = self.server.mtp and model.mtp_head is not None and vision is None and not presence_penalty \
+      and (not SPEC_MAX_CONTEXT or len(ids) < SPEC_MAX_CONTEXT)
     # T4.95: list(ids), not ids -- generate()/speculative_generate() append every token they yield straight into
     # the list they're given (model.py's `tokens.append(int(v)); ...; yield tokens[-1]`). `ids` here is the SAME
     # object as do_POST's `record`/self.server.last and inject()'s `ids + out` below, so an uncopied `ids` would
