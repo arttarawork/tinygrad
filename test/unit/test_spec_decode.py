@@ -1167,7 +1167,8 @@ class TestSpecForwardMatchesDecode(unittest.TestCase):
           np.testing.assert_array_equal(ft[0][t].numpy(), gt[0][t].numpy(), err_msg=f"slot {t} conv fused vs generic")
           np.testing.assert_allclose(ft[1][t].numpy(), gt[1][t].numpy(), rtol=1e-5, atol=1e-7, err_msg=f"slot {t} recurrent")
           for b, (c0, r0) in ((fresh, pre[0]),):
-            b.conv_state.assign(Tensor(c0)).realize(); b.recurrent_state.assign(Tensor(r0)).realize()
+            b.conv_state.assign(Tensor(c0)).realize()
+            b.recurrent_state.assign(Tensor(r0)).realize()
             with decode_gate(): cast(Tensor, b(x[:, :t + 1].contiguous(), pos)).realize()
             np.testing.assert_array_equal(ft[0][t].numpy(), b.conv_state.numpy(), err_msg=f"slot {t} conv vs a {t+1}-token run")
             np.testing.assert_array_equal(ft[1][t].numpy(), b.recurrent_state.numpy(), err_msg=f"slot {t} recurrent vs a {t+1}-token run")
