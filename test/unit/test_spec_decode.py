@@ -1,6 +1,5 @@
 import contextlib, io, re, unittest
 from dataclasses import replace
-from unittest.mock import Mock
 import numpy as np
 from typing import cast
 from tinygrad import Tensor, nn, UOp
@@ -8,7 +7,7 @@ from tinygrad.helpers import Context
 from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
-  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept,
+  Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits,
 )
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 from test.unit.test_llm_device_map import TEST_CONFIG
@@ -165,12 +164,12 @@ class TestSpeculativeGenerate(unittest.TestCase):
     # in place -- exercising the KV/GDN-cache-reuse path) against a from-scratch greedy generate() on a
     # FRESH model with the same weights (same seed), given the resulting prefix as its prompt: if
     # speculative_generate had left any stale/incorrect state behind, these would diverge.
-    rng = np.random.default_rng(12345)
+    Tensor.manual_seed(12345)  # T4.132: every draw is on device
     for k in (1, 2, 3):
       for seed, prompt in enumerate(PROMPTS):
         model_a = _load(seed=seed)
         tokens_so_far = list(prompt)
-        got_first = [v for _, v in zip(range(15), model_a.speculative_generate(tokens_so_far, k=k, temperature=1.0, rng=rng))]
+        got_first = [v for _, v in zip(range(15), model_a.speculative_generate(tokens_so_far, k=k, temperature=1.0))]
         self.assertEqual(len(got_first), 15, f"{k=} {seed=} {prompt=}")
         self.assertTrue(all(0 <= tid < VOCAB for tid in got_first), f"{k=} {seed=} {prompt=}")
         self.assertEqual(len(tokens_so_far), len(prompt) + 15, f"{k=} {seed=} {prompt=}")
@@ -417,74 +416,104 @@ class TestSpecDeviceMap(unittest.TestCase):
         got = _run(model, prompt, N_GEN, spec=True, k=k)  # pre-fix: RuntimeError at the 2nd outer iteration
         self.assertEqual(got, ref, f"{k=} {seed=} {prompt=}")
 
-class TestSpecAccept(unittest.TestCase):
-  """spec_accept is pure host-side numpy (no model/Tensor involved) -- Leviathan et al.'s speculative-
-  sampling accept/reject/resample test T4.65 wires into speculative_generate's temperature>0 path."""
+class TestSpecAcceptTensor(unittest.TestCase):
+  """spec_accept_tensor (T4.132: on device, batched; T4.65's host-side numpy spec_accept before it) -- Leviathan et al.'s
+  speculative-sampling accept/reject/resample test speculative_generate's temperature>0 path wires in. The uniforms are explicit
+  inputs, so every case below is deterministic; the statistical test batches its trials over the leading dim."""
+
+  @staticmethod
+  def _logits(*rows:list[float]) -> Tensor:
+    # log p (clipped: a 0 becomes exp(-60), ~1e-26) as the logits, so softmax(logits) recovers p -- (1, len(rows), V)
+    return Tensor(np.log(np.array(rows, dtype=np.float64)).clip(-60, None).astype(np.float32)).unsqueeze(0)
 
   def test_identical_distributions_always_accept(self):
-    # q==p exactly -> accept_prob=min(1,p/q)=1 everywhere -> ALWAYS accept, regardless of the random draw
-    # (rng.random() in [0,1) is always < 1.0). Stress it with the draw pushed right up against 1.
-    probs = np.array([0.1, 0.5, 0.1, 0.2, 0.1])
-    q_probs, p_probs = np.stack([probs, probs]), np.stack([probs, probs, probs])  # k_eff=2, +1 bonus row
-    rng = Mock()
-    rng.random = Mock(return_value=0.999999999)
-    rng.choice = Mock(return_value=4)  # only consulted for the bonus token, on full accept
-    accepted, m = spec_accept([1, 3], q_probs, p_probs, rng)
-    self.assertEqual((accepted, m), ([1, 3, 4], 2))
-    rng.choice.assert_called_once()
-    args, kwargs = rng.choice.call_args
-    self.assertEqual(args[0], 5)
-    np.testing.assert_allclose(kwargs["p"], probs)  # bonus sampled straight from p_probs[k_eff] (== probs here)
+    # q==p exactly -> accept_prob=min(1,p/q)=1 everywhere -> ALWAYS accept, regardless of the draw (u in [0,1) is always < 1).
+    # Stress it with the draw pushed right up against 1.
+    probs = [0.1, 0.5, 0.1, 0.2, 0.1]
+    q, p = self._logits(probs, probs), self._logits(probs, probs, probs)  # k=2, +1 bonus row
+    m, final = spec_accept_tensor(Tensor([[1, 3]]), q, p, 1.0, Tensor([[0.999999999, 0.999999999]]), Tensor.full((1, 3, 5), 0.5))
+    self.assertEqual(m.item(), 2)
+    self.assertEqual(final.shape, (1, 3))
+    self.assertEqual(final.tolist()[0][2], 1)  # the bonus: equal noise everywhere -> the Gumbel-max is argmax p_k (0.5 at id 1)
 
   def test_excluded_token_always_rejects_with_correct_resample_support(self):
-    # q puts mass on token 0, p excludes it entirely (p[0]=0) -> ratio=0 -> ALWAYS reject regardless of the
-    # random draw (rng.random() in [0,1) is never < 0) -- and the resample distribution passed to rng.choice
-    # must equal EXACTLY normalize(max(0, p-q)), not just "excludes token 0".
-    q0 = np.array([0.5, 0.3, 0.1, 0.1, 0.0])
-    p0 = np.array([0.0, 0.4, 0.2, 0.2, 0.2])
-    q_probs, p_probs = q0[None, :], np.stack([p0, np.full(5, 0.2)])  # k_eff=1; bonus row unused here
-    rng = Mock()
-    rng.random = Mock(return_value=1e-9)  # smallest-possible draw -- still must reject (ratio is exactly 0)
-    rng.choice = Mock(return_value=4)
-    accepted, m = spec_accept([0], q_probs, p_probs, rng)
-    self.assertEqual((accepted, m), ([4], 0))
-    residual = np.clip(p0 - q0, 0, None)
+    # q puts mass on token 0, p excludes it entirely (p[0]=0) -> ratio=0 -> ALWAYS reject regardless of the random draw --
+    # and the resample must be distributed EXACTLY as normalize(max(0, p-q)), not just "excludes token 0"
+    q0 = [0.5, 0.3, 0.1, 0.1, 0.0]
+    p0 = [0.0, 0.4, 0.2, 0.2, 0.2]
+    B = 20000
+    Tensor.manual_seed(7)
+    q, p = self._logits(q0).expand(B, 1, 5), self._logits(p0, [0.2] * 5).expand(B, 2, 5)  # k=1; the bonus row is unused here
+    m, final = spec_accept_tensor(Tensor.zeros(B, 1, dtype="int32"), q, p, 1.0, Tensor.full((B, 1), 1e-9), Tensor.rand(B, 2, 5))
+    self.assertEqual(m.numpy().max(), 0)  # smallest-possible draw -- still rejects (the ratio is exactly 0)
+    residual = np.clip(np.array(p0) - np.array(q0), 0, None)
     expected = residual / residual.sum()  # the docstring's exact formula, computed independently here
     self.assertEqual(expected[0], 0.0)  # token 0 (excluded by p) must never get resample mass
-    args, kwargs = rng.choice.call_args
-    self.assertEqual(args[0], 5)
-    np.testing.assert_allclose(kwargs["p"], expected)
+    counts = np.bincount(final.numpy()[:, 0], minlength=5) / B
+    self.assertEqual(counts[0], 0.0)
+    np.testing.assert_allclose(counts, expected, atol=0.02)
 
   def test_zero_drafts_samples_bonus_directly(self):
-    # k_eff=0 (speculative_generate's max_context boundary degrades to this, see SPEC_NOTES.md's position
-    # ledger): no drafts to test at all, straight to a bonus sample from p_probs[0] -- rng.random() (the
-    # accept test) is never even called.
-    p0 = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
-    rng = Mock()
-    rng.choice = Mock(return_value=3)
-    accepted, m = spec_accept([], np.empty((0, 5)), p0[None, :], rng)
-    self.assertEqual((accepted, m), ([3], 0))
-    rng.random.assert_not_called()
+    # k_eff=0 (speculative_generate's max_context boundary degrades to this, see SPEC_NOTES.md's position ledger): no drafts
+    # to test at all, straight to a bonus sample from p[0] -- a flat p, so the Gumbel-max picks the largest uniform (id 3)
+    m, final = spec_accept_tensor(Tensor.zeros(1, 0, dtype="int32"), Tensor.zeros(1, 0, 5), self._logits([0.2] * 5), 1.0,
+                                  Tensor.zeros(1, 0), Tensor([[[0.1, 0.2, 0.3, 0.9, 0.4]]]))
+    self.assertEqual((m.tolist(), final.tolist()), ([0], [[3]]))
 
   def test_statistical_marginal_matches_p(self):
-    # the theorem spec_accept's whole correctness rests on (Leviathan et al., Theorem 1): if draft_ids are
-    # drawn by ancestral sampling from q, the emitted token at that drafted position is marginally
-    # distributed as p -- REGARDLESS of q (draft quality only ever affects the accept RATE). Checked
-    # empirically over ~20k trials on a 5-token vocab, since this is exactly the guarantee the sampled
-    # speculative-decoding path (and its "distribution-equal to generate(temperature=t)" claim) relies on.
-    rng = np.random.default_rng(42)
-    q = np.array([0.10, 0.50, 0.05, 0.30, 0.05])
-    p = np.array([0.40, 0.10, 0.20, 0.05, 0.25])
-    q_probs = q[None, :]                                    # k_eff=1
-    p_probs = np.stack([p, np.full(5, 0.2)])                # + an (unused-here) valid bonus row
-    n_trials = 20000
-    counts = np.zeros(5)
-    for _ in range(n_trials):
-      d = int(rng.choice(5, p=q))                           # ancestral draft sample: d ~ q
-      accepted, _m = spec_accept([d], q_probs, p_probs, rng)
-      counts[accepted[0]] += 1                               # accepted[0] is the token AT the drafted position
-    empirical = counts / n_trials
-    np.testing.assert_allclose(empirical, p, atol=0.02)      # loose: ~7 sigma even at p's largest entry (0.40)
+    # the theorem spec_accept_tensor's whole correctness rests on (Leviathan et al., Theorem 1): if draft_ids are drawn by
+    # ancestral sampling from q, the emitted token at that drafted position is marginally distributed as p -- REGARDLESS of q
+    # (draft quality only ever affects the accept RATE). Checked empirically over 20k trials on a 5-token vocab (one batched call),
+    # since this is exactly the guarantee the sampled speculative-decoding path (and its "distribution-equal to
+    # generate(temperature=t)" claim) relies on. The drafts come from sample_logits, the draw speculative_generate itself uses.
+    Tensor.manual_seed(42)
+    B = 20000
+    q = [0.10, 0.50, 0.05, 0.30, 0.05]
+    p = [0.40, 0.10, 0.20, 0.05, 0.25]
+    q_logits, p_logits = self._logits(q).expand(B, 1, 5), self._logits(p, [0.2] * 5).expand(B, 2, 5)  # k=1, + an unused bonus row
+    drafts = sample_logits(q_logits[:, 0], Tensor([1.0]))  # (B,1): ancestral draft samples d ~ q
+    m, final = spec_accept_tensor(drafts, q_logits, p_logits, 1.0, Tensor.rand(B, 1), Tensor.rand(B, 2, 5))
+    emitted = (m.reshape(B, 1) == 1).where(drafts, final[:, :1])  # the token AT the drafted position: the draft if accepted, else the correction
+    empirical = np.bincount(emitted.numpy().ravel(), minlength=5) / B
+    np.testing.assert_allclose(empirical, p, atol=0.02)  # loose: ~7 sigma even at p's largest entry (0.40)
+
+class TestOneSyncPerIteration(unittest.TestCase):
+  """T4.132: the loop's only host round-trip per outer iteration is ACCEPT's readback, greedy and sampled alike (before: the greedy
+  chain synced after DRAFT and again after VERIFY, the sampled one pulled a vocab-wide row to the host per drafted token)."""
+
+  def _syncs_per_iteration(self, temperature:float) -> tuple[int, int]:
+    model = _load_gdn(seed=0, max_context=64)  # a real GDN block: the partial-accept restore + REDO path runs too
+    syncs: list[str] = []
+    orig = {name: getattr(Tensor, name) for name in ("tolist", "numpy", "item")}
+    def wrap(name):
+      def f(t, *a, **kw):
+        syncs.append(name)
+        return orig[name](t, *a, **kw)
+      return f
+    for name in orig: setattr(Tensor, name, wrap(name))
+    try:
+      buf = io.StringIO()
+      with Context(SPEC_STATS=1), contextlib.redirect_stdout(buf):
+        gen = model.speculative_generate([1, 2, 3], k=3, temperature=temperature)
+        next(gen)  # prefill + the anchor's own .item()
+        del syncs[:]
+        for _ in range(14): next(gen)
+        gen.close()  # SPEC_STATS prints: iters = completed outer iterations (an iteration's syncs all precede its yields)
+    finally:
+      for name, f in orig.items(): setattr(Tensor, name, f)
+    iters = int(cast(re.Match, re.search(r"iters=(\d+)", buf.getvalue())).group(1))
+    return len(syncs), iters
+
+  def test_greedy(self):
+    syncs, iters = self._syncs_per_iteration(0.0)
+    self.assertGreater(iters, 3)
+    self.assertEqual(syncs, iters)
+
+  def test_sampled(self):
+    Tensor.manual_seed(3)
+    syncs, iters = self._syncs_per_iteration(1.0)
+    self.assertGreater(iters, 3)
+    self.assertEqual(syncs, iters)
 
 def _spec_keys(model:Transformer) -> list[tuple]:
   return [key for key in model.jit if key[3]]  # spec=True is the 4th (is_prefill, greedy, chunk_size, spec) slot
