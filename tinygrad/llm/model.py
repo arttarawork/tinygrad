@@ -1449,7 +1449,8 @@ class MTPHead:
     ts = Tensor([tok_next + [0] * (bound - T)], dtype="int32", device=dev)[:, :v_toks.bind(T)]
     return self.block(self._block_in(owner, hs, ts), v_pos.bind(start_pos))
 
-def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, temperature:float, u_accept:Tensor, u_sample:Tensor) -> tuple[Tensor, Tensor]:
+def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, temperature:float, u_accept:Tensor, u_sample:Tensor,
+                       min_p:float=0.0) -> tuple[Tensor, Tensor]:
   """Leviathan et al. ("Fast Inference from Transformers via Speculative Decoding", 2023) speculative-sampling accept/resample
   test -- on device, batched over a leading dim (T4.132; T4.65's host-side numpy form before it) -- speculative_generate's
   temperature>0 path (see SPEC_NOTES.md section 6 for how this wires into the position ledger).
@@ -1466,7 +1467,9 @@ def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, tempe
   min(1, p_i[d]/q_i[d]): u < min(1, p/q) <=> log u < log p - log q (u < 1 always), so both sides are log-softmaxes -- nothing is
   normalized over the vocabulary on the host. Every sample is a Gumbel-max draw, argmax(log r + g) with g = -log(-log u), a sample
   from r/sum(r) (sample_logits' own transform); log 0 = -inf keeps an excluded token out, and an all-zero residual row (p == q
-  exactly) falls back to argmax p, as the numpy form did.
+  exactly) falls back to argmax p, as the numpy form did. min_p > 0 (T4.132: generate()'s MIN_P tail cut, sample_logits) is applied
+  to p and q alike before the softmax, so the emitted marginal is generate(temperature, MIN_P)'s truncated p (the proof holds for
+  any p/q; the caller must have drawn draft_ids from the same truncated q).
 
   Proof this reproduces p exactly (Leviathan et al., Theorem 1): accept x with probability min(1,p(x)/q(x)),
   so P(emit x, accepted) = q(x)*min(1,p(x)/q(x)) = min(p(x),q(x)). P(reject) = 1 - sum_y min(p(y),q(y)), and
@@ -1477,18 +1480,25 @@ def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, tempe
   quality only ever affects the acceptance RATE, never correctness. test_spec_decode.py's statistical test
   checks this empirically since it's the theorem the whole sampled path's correctness rests on."""
   B, k = cast(int, draft_ids.shape[0]), cast(int, draft_ids.shape[1])
-  gumbel = lambda u: u.maximum(1e-12).log().neg().log().neg()
-  lp = (p_logits / temperature).log_softmax(-1)                                            # (B,k+1,V)
+  def gumbel(u:Tensor) -> Tensor: return u.maximum(1e-12).log().neg().log().neg()
+  def log_dist(logits:Tensor) -> Tensor:  # log softmax(logits/temperature), the min-p tail cut first (sample_logits' own mask)
+    scaled = logits / temperature
+    if min_p > 0: scaled = (scaled >= scaled.max(-1, keepdim=True) + math.log(min_p)).where(scaled, float("-inf"))
+    return scaled.log_softmax(-1)
+  lp = log_dist(p_logits)                                                                  # (B,k+1,V)
   bonus = (lp[:, k] + gumbel(u_sample[:, k])).argmax(-1, keepdim=True)                      # (B,1) ~ p_k
   if k == 0: return Tensor.zeros(B, dtype=dtypes.int32, device=draft_ids.device), bonus
-  lq = (q_logits / temperature).log_softmax(-1)                                            # (B,k,V)
+  lq = log_dist(q_logits)                                                                  # (B,k,V)
   idx = draft_ids.unsqueeze(-1)
-  accept = u_accept.maximum(1e-12).log() < lp[:, :k].gather(-1, idx).squeeze(-1) - lq.gather(-1, idx).squeeze(-1)  # (B,k)
+  # <= not <: a fp32 uniform can round to exactly 1.0 (log 0) and p == q (lp - lq == 0) must accept it as any u < 1 would
+  accept = u_accept.maximum(1e-12).log() <= lp[:, :k].gather(-1, idx).squeeze(-1) - lq.gather(-1, idx).squeeze(-1)  # (B,k)
   m = accept.cast(dtypes.int32).cumprod(-1).sum(-1)                                        # the first rejection's index, or k
   residual = (lp[:, :k].exp() - lq.exp()).relu()                                           # (B,k,V) max(0, p-q)
   resample = (residual.log() + gumbel(u_sample[:, :k])).argmax(-1)                         # (B,k) ~ residual/sum(residual)
   correction = (residual.sum(-1) > 0).where(resample, lp[:, :k].argmax(-1))
-  return m, correction.cat(bonus, dim=-1)
+  # .contiguous() before the cat: an argmax over rows holding -inf fused straight into a cat/stack came back out of range (id == V)
+  # on CPU (tinygrad, 10-29) -- materialized first, the ids are right (TestSpecAcceptTensor pins the resample distribution)
+  return m, correction.contiguous().cat(bonus.contiguous(), dim=-1)
 
 MIN_P = getenv("MIN_P", 0.0)  # T4.85: min-p tail cut for sampled decoding (0 = off, byte-identical to the plain Gumbel-max sampler)
 
@@ -2360,7 +2370,7 @@ class Transformer:
     # last-prefill-chunk sample). It's about to become chunk_ids[0]/the draft anchor below, but it's ALSO
     # real output and must be emitted now, same as generate()'s own drain loop emits it, or every later
     # position is off by one.
-    tok_last = anchor_logits.argmax(-1) if greedy else sample_logits(anchor_logits[:, 0, :], temp_t)  # (B,1), on out_dev
+    tok_last = anchor_logits.argmax(-1) if greedy else sample_logits(anchor_logits[:, 0, :], temp_t, MIN_P)  # (B,1), on out_dev
     tokens.append(int(tok_last.item()))
     self._cached_tokens = tokens[:-1]
     yield tokens[-1]
@@ -2397,7 +2407,7 @@ class Transformer:
         for i in range(k_eff):
           if trace_on: call_t0 = time.perf_counter()
           dlogits = self.mtp_head.draft(self, h_last, dtok, v_draft_pos[i].bind(dpos))  # (B,1,vocab)
-          dtok = dlogits.argmax(-1) if greedy else sample_logits(dlogits[:, -1, :], temp_t)  # (B,1)
+          dtok = dlogits.argmax(-1) if greedy else sample_logits(dlogits[:, -1, :], temp_t, MIN_P)  # (B,1); MIN_P: the same q the accept uses
           draft_tensors.append(dtok)
           if not greedy: q_logits.append(dlogits[:, -1, :])
           if trace_on: draft_dispatch_ms += (time.perf_counter() - call_t0) * 1000
@@ -2443,7 +2453,7 @@ class Transformer:
         else:
           vocab = cast(int, verify_logits.shape[-1])
           m_t, final = spec_accept_tensor(drafts, Tensor.stack(*q_logits, dim=1) if q_logits else verify_logits[:, :0], verify_logits, temperature,
-                                          Tensor.rand(1, k_eff, device=out_dev), Tensor.rand(1, n, vocab, device=out_dev))
+                                          Tensor.rand(1, k_eff, device=out_dev), Tensor.rand(1, n, vocab, device=out_dev), min_p=MIN_P)
         readback_t = m_t.reshape(1).cat(chunk[0], final[0]).realize()  # (2n+1,) on out_dev
         readback = cast(list[int], readback_t.tolist())  # THE sync: draft chain + VERIFY + the accept test
         m, chunk_ids, final_ids = readback[0], readback[1:1 + n], readback[1 + n:]
@@ -2474,11 +2484,16 @@ class Transformer:
           # and the discarded wrong positions start_pos+m+1..start_pos+k_eff are never read before the next
           # iteration overwrites them too. T4.132: REDO is the width-(m+1) family (m+1 <= k, one of the k+1 warmed
           # widths), never VERIFY's own, so VERIFY's output buffers (verify_h, read by the MTP rewrite below, and
-          # tok_last above) survive it; its input is a view of VERIFY's own realized buffer (no host upload).
+          # tok_last above) survive it. Its input is uploaded from the host-known ids (the one readback above), NEVER
+          # a `buf[:, :m+1]` view of VERIFY's buffer: a concrete shrink view handed to a TinyJit is baked at capture
+          # (`.contiguous()` folds into the view, nothing is parametrized), so every later replay re-fed the capture
+          # call's ids -- the sampled state-integrity test caught it; greedy sequences repeating one token hid it
+          # (test_spec_decode.py's TestSpecKVConsistency pins the fix).
           # RESTORE: the checkpoint VERIFY's own graph took (GatedDeltaNetBlock.checkpoint -> spec_snap)
           if gdn_blocks: Tensor.realize(*(x for b in gdn_blocks for x in (b.conv_state.assign(cast(tuple, b.spec_snap)[0]),
                                                                            b.recurrent_state.assign(cast(tuple, b.spec_snap)[1]))))
-          _, redo_h = cast(tuple[Tensor, Tensor], self(buf[:, :m + 1], v_start_pos.bind(start_pos), None, spec=True))
+          buf2 = Tensor(chunk_ids[:m + 1], dtype="int32", device=dev).reshape(1, m + 1)
+          _, redo_h = cast(tuple[Tensor, Tensor], self(buf2, v_start_pos.bind(start_pos), None, spec=True))
           h_last = redo_h[:, m:m + 1].contiguous()  # T4.66i: positive slice, same reason as the anchor (T4.66h)
         # T4.66l: rewrite the MTP block's cache slots for the accepted positions with the TRUE per-position hidden
         # state. The draft chain wrote slots start_pos..start_pos+k_eff-1 from (h_last, chunk_ids[i]): token-correct
@@ -2508,9 +2523,16 @@ class Transformer:
                 f"state_assign_ms={state_assign_ms:.2f} total_ms={total_ms:.2f}")
 
         start_pos += m + 1
+        # T4.132: the state is committed through accepted[:-1] BEFORE the first yield (VERIFY/REDO fed the drafts d0..d_{m-1};
+        # accepted[-1] is the model's own prediction, not fed yet) and _cached_tokens says so at once -- not tokens[:-1] per
+        # yield, which a caller stopping at a stop token inside this batch (serve.py's is_end) would read as "the state is
+        # exactly my tokens" and resume a recurrent state that is 1..m tokens ahead of it. get_start_pos reuses the live
+        # cache only when the next prompt extends _cached_tokens exactly; otherwise it re-prefills (or serve.py restores a
+        # state-cache snapshot) -- test_spec_decode.py's test_stop_mid_batch_then_generate_matches_fresh_gdn.
+        committed = tokens + accepted[:-1]
         for v in accepted:
           tokens.append(v)
-          self._cached_tokens = tokens[:-1]
+          self._cached_tokens = committed
           yield tokens[-1]
     finally:
       # T4.66b: SPEC_STATS instrumentation -- see its own ContextVar docstring. Fires once, whichever way this
