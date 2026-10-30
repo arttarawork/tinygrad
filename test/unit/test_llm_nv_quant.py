@@ -1268,8 +1268,9 @@ class TestSpecIterationCensus(unittest.TestCase):
   """T4.132: the kernels of ONE speculative iteration (k=3, full accept) on the tiny mocked-NV config -- TestDecodeStepCensus's two
   block kinds as a 2-block Transformer plus an MTP head -- scheduled on CPU as ONE linear program, the way the loop dispatches them
   between its single host sync per iteration: the greedy draft chain (3 MTP-block steps: the attention decode step + the head each),
-  VERIFY (the main model's spec forward at width 4: every block the decode step's kernel list, the GDN checkpoint copies, the fused
-  head norm) and the greedy accept test. No generic dequant gemm, no fused prefill scan, every projection one dp4a gemv launch."""
+  VERIFY (the main model's spec forward at width 4: every block the decode step's kernel list, the fused head norm; T4.132b: no GDN
+  checkpoint copies -- gdn_decode itself writes the per-token states a partial accept adopts) and the greedy accept test. No generic
+  dequant gemm, no fused prefill scan, every projection one dp4a gemv launch (each reading its weights once for all 4 tokens)."""
   DIM, WIDE, VOCAB = 256, 2048, 64
 
   def _model(self) -> Transformer:
@@ -1331,14 +1332,16 @@ class TestSpecIterationCensus(unittest.TestCase):
     for name, c in (("draft chain", draft), ("VERIFY", verify), ("whole iteration", whole)):
       print(f"\nspeculative {name} (k={k}, VERIFY width {k + 1}): {len(c)} kernels", sorted(c))
     def generic_gemm(c): return [x for x in c if x.startswith("reduce") and "unsigned char[" in x]  # a dequant+matmul reduces over weight bytes
-    # VERIFY at width 4 = the decode step's kernel list per block (TestDecodeStepCensus's T=4 rows) + the GDN checkpoint + the head
+    # VERIFY at width 4 = the decode step's kernel list per block (TestDecodeStepCensus's T=4 rows) + the head
     self.assertNotIn("gated_delta_prefill_nv", verify, "VERIFY must not pay the fused prefill scan")
     self.assertEqual([x for x in verify if x.startswith("gdn_")], ["gdn_conv_decode_nv", "gdn_decode_nv"], "the GDN block: the two decode kernels")
     self.assertEqual(generic_gemm(verify), [], "no generic dequant gemm")
     self.assertEqual(verify.count("linear_q4_0_nv"), 6 + 7 + 1, "every projection one dp4a gemv: GDN block 6, attention block 7, the head")
     self.assertEqual(sum(1 for x in verify if x.startswith("flash_")), 1, "the prefill attention tile")
     self.assertEqual(verify.count("add_rmsnorm_q8_nv"), 2 + 2 + 1, "two fused norm sites per block + the head's")
-    self.assertEqual(sum(1 for x in verify if x.startswith("elementwise half[6336]")), 1, "the GDN checkpoint: conv_state copied aside")
+    self.assertEqual(sum(1 for x in verify if x.startswith("elementwise half[6336]")), 0, "no GDN checkpoint copy (T4.132b)")
+    gdn = next(b for b in model.blk if isinstance(b, GatedDeltaNetBlock))
+    self.assertIsNotNone(gdn.spec_track, "VERIFY's GDN block stores its per-token states (spec_track) from inside gdn_decode")
     # the draft chain: k attention decode steps of the MTP block + eh_proj + the head, no generic gemm
     self.assertEqual(generic_gemm(draft), [])
     self.assertEqual(draft.count("linear_q4_0_nv"), k * (7 + 1 + 1))
