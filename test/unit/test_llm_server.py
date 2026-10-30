@@ -360,6 +360,23 @@ class TestRecurrentChunkedPrefill(unittest.TestCase):
     for a, b in zip(s1, s4): np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
     self.assertIn((True, False, 4, False), m4.jit)  # the prefill jit really was captured at the chunk width
 
+  def test_jitted_chunks_match_eager_chunks(self):
+    # T4.132: the prefill family is captured on its first call and pruned (T4.128). The upstream prune dropped the kernel that reads
+    # the GDN conv_state into a chunk's conv window (it touches no input; the conv_state write comes later in the same chunk), so every
+    # replayed chunk convolved arena garbage -- a different first token and state from the eager run of the same chunks. On this
+    # model those two kernels don't fuse (SSM_CFG's do, which is why the test above never saw it).
+    from test.unit.test_spec_decode import _load_gdn_varied, VARIED_PROMPT
+    from tinygrad.llm.model import GatedDeltaNetBlock
+    got = {}
+    for jit in (0, 1):
+      with Context(GDN_CHUNK=2, JIT=jit):
+        m = _load_gdn_varied()
+        m.mtp_head = None
+        out = [t for _, t in zip(range(3), m.generate(list(VARIED_PROMPT), chunk_size=2, temperature=0.0))]
+        got[jit] = (out, [b.recurrent_state.numpy() for b in m.blk if isinstance(b, GatedDeltaNetBlock)])
+    self.assertEqual(got[1][0], got[0][0])
+    for a, b in zip(got[0][1], got[1][1]): np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
+
   def test_auto_chunk_is_device_aware(self):
     # auto (GDN_CHUNK=0): 32 only on the GPU backends it was measured on; CPU keeps the one-token-per-step prefill (x86 clang 18
     # crashes on the unrolled 32-step scan kernel -- CI's Test LLM job); an explicit GDN_CHUNK wins everywhere. T4.124a:

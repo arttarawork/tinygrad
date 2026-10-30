@@ -3,7 +3,7 @@ import functools
 from tinygrad.tensor import Tensor, all_tensors
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, JIT, JIT_BATCH_SIZE, dedup, pluralize, VIZ, disable_gc
 from tinygrad.device import Buffer, Compiled, Device, MultiBuffer, DepsTracker
-from tinygrad.dtype import DType
+from tinygrad.dtype import DType, AddrSpace
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, sym_infer, Ops, buffers, rewrite_group, graph_rewrite
 from tinygrad.renderer import Estimates
 from tinygrad.engine.realize import capturing, compile_linear, link_linear, run_linear, graph_cache, estimate_uop, get_runtime
@@ -13,15 +13,40 @@ from tinygrad.nn.state import get_parameters
 from tinygrad.uop.movement import mop_cleanup
 from dataclasses import dataclass
 
+def _kernel_rw(si:UOp) -> tuple[set[UOp], set[UOp]]:
+  """(buffers read, buffers written) by one captured CALL; anything but a plain kernel or a copy counts as reading and writing all"""
+  args, ast = si.src[1:], si.src[0]
+  def bufs(i:int) -> set[UOp]: return set(_collect_bufs(args[i])) if i < len(args) else set()
+  if ast.op is Ops.COPY: return bufs(1), bufs(0)
+  if ast.op is not Ops.SINK:
+    every = {b for a in args for b in _collect_bufs(a)}
+    return every, every
+  def slot(u:UOp) -> int|None:
+    while u.op is not Ops.PARAM and u.src: u = u.src[0]
+    return u.arg.slot if u.op is Ops.PARAM and u.arg.addrspace is AddrSpace.GLOBAL else None
+  targets = {u.src[0] for u in ast.toposort() if u.op is Ops.STORE}
+  stored, loaded = {slot(t) for t in targets}, {slot(u) for u in ast.toposort() if u.op is Ops.INDEX and u not in targets}
+  return {b for i in loaded if i is not None for b in bufs(i)}, {b for i in stored if i is not None for b in bufs(i)}
+
 def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
-  kept, onetime = [], []
-  for si in linear.src:
-    si_bufs = {b for src in si.src[1:] for b in _collect_bufs(src)}
-    if not si_bufs.isdisjoint(needed):
-      kept.append(si)
-      needed |= si_bufs
-    else: onetime.append(si)
-  return linear.replace(src=tuple(kept)), linear.replace(src=tuple(onetime))
+  # T4.132 (fork): a kernel stays in every replay if it touches an input buffer (the upstream rule) or reads a buffer some kept kernel
+  # writes -- persistent state that changes per call, wherever in the order its writer runs (a GDN chunk's conv-window history read from
+  # conv_state BEFORE that chunk's own conv_state store). The upstream single pass only knew buffers touched by EARLIER kept kernels: it
+  # ran that read once at capture and every replayed prefill chunk convolved a stale window (arena garbage). What stays one-time:
+  # write-only inits (KV cache zero-fill, arange), anything computed only from constant buffers (weight preprocessing, lazily
+  # initialized weights) -- and, as upstream, Tensor.rand's counter advance: a pruned graph replays the capture's random numbers.
+  rw = [_kernel_rw(si) for si in linear.src]
+  touches = [{b for src in si.src[1:] for b in _collect_bufs(src)} for si in linear.src]
+  keep, changing = [False] * len(linear.src), set(needed)
+  while True:
+    grew = False
+    for i, ((reads, writes), bufs) in enumerate(zip(rw, touches)):
+      if keep[i] or (bufs.isdisjoint(needed) and reads.isdisjoint(changing)): continue
+      keep[i], grew = True, True
+      changing |= writes
+    if not grew: break
+  return linear.replace(src=tuple(si for si, k in zip(linear.src, keep) if k)), \
+    linear.replace(src=tuple(si for si, k in zip(linear.src, keep) if not k))
 
 def create_graph_call(batch:list[UOp]) -> UOp:
   # all external inputs are PARAMs

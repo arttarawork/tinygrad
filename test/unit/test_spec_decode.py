@@ -613,7 +613,7 @@ class TestVerifyConcreteWidth(unittest.TestCase):
       for _ in range(3): model(Tensor([[1] * w], dtype="int32"), v_sp.bind(w), None, spec=True)
       self.assertIn(_verify_key(w), model.jit)
       self.assertIsNotNone(model.jit[_verify_key(w)].captured)
-      self.assertEqual(model.jit[_verify_key(w)].cnt, 3)
+      self.assertEqual(model.jit[_verify_key(w)].cnt, 4)  # T4.132: captured on its first call (cnt starts at 1)
     self.assertEqual(sorted(_spec_keys(model), key=str), sorted({_verify_key(w) for w in range(1, k + 2)}, key=str))
 
 class TestSpecWarmup(unittest.TestCase):
@@ -1279,6 +1279,35 @@ class TestSpecTrackSlots(unittest.TestCase):
     self.assertEqual(_run(model, VARIED_PROMPT, 12, spec=True, k=2), ref)
     self.assertEqual(_run(model, VARIED_PROMPT, 12, spec=True, k=3), ref)
     self.assertEqual({cast(tuple, b.spec_track)[1].shape[0] for b in gdn}, {3})
+
+class TestSpecCaptureFirst(unittest.TestCase):
+  """T4.132 (262k OOM, 10-30): every family the loop replays captures on its FIRST call -- an eager first call schedules every
+  intermediate unplanned at once (VERIFY: all attention blocks' partials). The chain and the accept test capture unpruned (their sampled
+  draws need Tensor.rand's counter advance in every replay), so their one-time work must already be done (MTPHead.ready): a 1-token
+  prompt never runs MTPHead.prefill, and the chain's capture would otherwise hold the MTP block cache's zero-fill and replay it."""
+  def test_families_capture_first_and_the_mtp_cache_survives(self):
+    for temperature in (0.0, 1.0):
+      model = _load_gdn_varied()
+      gen = model.speculative_generate([7], k=3, temperature=temperature)
+      for _ in range(12): next(gen)
+      gen.close()
+      for key, jit in [*model.spec_jit.items(), *((k, j) for k, j in model.jit.items() if k[3])]:
+        self.assertIsNotNone(cast(TinyJit, jit).captured, f"{temperature=}: {key} not captured")
+      calls = {key: cast(TinyJit, j).cnt for key, j in model.spec_jit.items()}
+      self.assertTrue(all(c >= 2 for c in calls.values()), f"captured on the first call: cnt starts at 1 ({calls})")
+      kv = cast(Tensor, model.mtp_head.block.cache_kv).float().numpy()
+      written = len(model._cached_tokens)
+      self.assertTrue(all(np.abs(kv[:, :, :, s]).max() > 0 for s in range(1, written)), f"{temperature=}: an MTP cache slot was wiped")
+
+  def test_sampled_replays_draw_fresh_numbers(self):
+    model = _load_gdn_varied()
+    gen = model.speculative_generate(list(VARIED_PROMPT), k=3, temperature=1.0)
+    for _ in range(4): next(gen)
+    dev = cast(str, model.output.weight.device)
+    before = Tensor._device_rng_counters[dev].tolist()
+    for _ in range(6): next(gen)
+    self.assertNotEqual(Tensor._device_rng_counters[dev].tolist(), before, "the chain/accept replays did not advance the RNG counter")
+    gen.close()
 
 class TestLiveGraphsAfterSpec(unittest.TestCase):
   """T4.132 (10-30 card): plain decode slowed 27.0 -> 34.6 ms/token after warmup(spec_k=3) in the same process. Every eager realize

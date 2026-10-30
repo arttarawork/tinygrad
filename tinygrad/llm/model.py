@@ -7,6 +7,7 @@ if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays nump
 # functions that actually need it; annotations are lazy via `from __future__ import annotations`.
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
+from tinygrad.device import Buffer
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
@@ -1408,12 +1409,27 @@ class MTPHead:
     tok_ids (B,T); the shared front half of draft() (T=1) and prefill() (T symbolic). See draft()'s T4.66d note on
     _local_token_embd."""
     dev = self.block.device
+    e = self.local_embedding(owner)(tok_ids.to(dev)).float()
+    return self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
+
+  def local_embedding(self, owner:Transformer) -> nn.Embedding:
+    """the owner's token embedding on self.block's device (T4.66d), copied once on first use"""
     if not hasattr(self, "_local_token_embd"):
       local = nn.Embedding.__new__(nn.Embedding)
-      local.weight = owner.token_embd.weight.to(dev).realize()
+      local.weight = owner.token_embd.weight.to(self.block.device).realize()
       self._local_token_embd = local
-    e = self._local_token_embd(tok_ids.to(dev)).float()
-    return self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
+    return self._local_token_embd
+
+  def ready(self, owner:Transformer, max_width:int) -> None:
+    """T4.132: everything a draft step / the accept's cache rewrite (widths 1..max_width) would create or realize on its first call, done
+    now: those graphs capture on their FIRST call without pruning (their sampled draws need Tensor.rand's counter advance in every
+    replay), so first-call one-time work would replay every iteration -- the KV cache's zero-fill above all (a 1-token prompt never runs
+    MTPHead.prefill, which otherwise creates it). The block's cache, scale and rope table, the position buffers, the local embedding."""
+    dev = self.block.device
+    self.block._init_state(Tensor.empty(1, 1, owner.token_embd.weight.shape[-1], device=dev))
+    Tensor.realize(*(t for a in ("cache_kv", "cache_kv_scale", "freqs_cis") if isinstance(t := getattr(self.block, a, None), Tensor)))
+    for w in range(1, max_width + 1): positions(self.block.config.max_context + w, dev)
+    self.local_embedding(owner)
 
   def prefill(self, owner:Transformer, h:Tensor, tok_next:list[int], start_pos:int, v_toks:UOp, v_pos:UOp) -> None:
     """T4.66l: fill `block`'s KV cache for T consecutive MTP steps at once -- what draft() does for one step, minus
@@ -1439,8 +1455,7 @@ class MTPHead:
     # T4.132: the block's precompiled trace was re-run in python on every call (the 27B's full-accept state_assign_ms, ~0.5 s on the
     # card); one TinyJit per `bound` replays it -- the two symbolic views above are its inputs (shrinks of realized buffers, the
     # variables unbound in the input signature), so every width 1..bound and every slot replay one graph
-    if (key := ("mtp_prefill", bound)) not in owner.spec_jit: owner.spec_jit[key] = TinyJit(functools.partial(self._prefill_body, owner))
-    owner.spec_jit[key](hs, ts, v_pos.bind(start_pos))
+    owner._spec_replay(("mtp_prefill", bound), functools.partial(self._prefill_body, owner), hs, ts, v_pos.bind(start_pos), prune=True)
 
   def _prefill_body(self, owner:Transformer, hs:Tensor, ts:Tensor, pos:UOp) -> None:
     # T4.132: realized for its K/V store and dropped, never a jit output: a returned block output stays the precompiled call's lazy
@@ -1589,7 +1604,7 @@ class Transformer:
     # T4.132: speculative_generate's own captured graphs -- ("chain", k_eff) the draft chain, ("accept", n, greedy) the accept test
     # + readback + the next chain's inputs + the MTP cache rewrite, ("adopt",) a partial accept's GDN state, ("mtp_prefill", bound)
     # the prompt's MTP cache fill (MTPHead.prefill) -- kept apart from self.jit, whose keys are Transformer.__call__'s families
-    self.spec_jit: dict[tuple, Callable[..., Tensor|tuple[Tensor, ...]]] = {}
+    self.spec_jit: dict[tuple, Callable[..., Tensor|tuple[Tensor, ...]|None]] = {}
     self.spec_slots = 0  # T4.132: GatedDeltaNetBlock.spec_track's slot count, see _spec_track_slots
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor|None, spec:bool=False, rope_start:int|UOp|None=None,
@@ -1703,14 +1718,19 @@ class Transformer:
       mem = " ".join(f"{d}={v/2**30:.2f}GiB" for d, v in sorted(GlobalCounters.mem_used_per_device.items()))
       print(f"[jit family] {key}  from {traceback.extract_stack()[-3].name}  rope_delta={getattr(self, '_rope_delta', 0)}  mem_used: {mem}")
     if key not in self.jit:
-      self.jit[key] = jit = TinyJit(self._forward_step, prune=is_prefill and not spec)
+      # T4.132: VERIFY = a spec call at a concrete width (speculative_generate's); a symbolic-width spec call is extra/flip_rate.py's
+      # teacher-forced logits, which perturbs weights between runs -- pruning would freeze the weight-derived kernels, so it stays as was
+      verify = spec and isinstance(tokens.shape[1], int)
+      self.jit[key] = jit = TinyJit(self._forward_step, prune=(is_prefill and not spec) or verify)
       # T4.128: a prefill family captures on its FIRST call. TinyJit's default first call runs the forward eagerly, and an eager
       # schedule can't plan the buffers custom kernels write into (Tensor.empty outputs count as held), so every block's partials
       # and q8 activations are alive at once -- at 262k that pass was the card's memory peak (within ~50 MB of OOM, 10-28/29). The
       # capture plans them; prune=True runs the input-independent first-call work (KV cache zero-fill) once instead of every replay.
-      # Not the spec (MTP verify) families: captured first, their graphs differ from the eager ones by fp16 ulps
-      # (test_generate_maintains_cache_and_snapshot_round_trips); the server never takes that path.
-      if is_prefill and not spec: jit.cnt = 1
+      # T4.132: the VERIFY families too (each concrete width): VERIFY's eager first call holding every attention block's partials at
+      # once OOMed at 262k (10-30). Their old exemption (fp16-ulp differences between captured-first and eager graphs, the KV
+      # zero-fill being replayed) no longer holds: test_generate_maintains_cache_and_snapshot_round_trips passes with them captured
+      # first, and prune runs the zero-fill once.
+      if (is_prefill and not spec) or verify: jit.cnt = 1
     return self.jit[key](
       tokens.contiguous(), start_pos, temperature, spec, rope_start, vis_e, vis_m, vis_pos, presence_penalty)
 
@@ -2206,8 +2226,9 @@ class Transformer:
         # T4.132: a lone jit output (drain_every 1, the server's) is read straight from its buffer: `.tolist()` scheduled a contiguous
         # copy kernel per token -- an eager realize, whose _apply_map_to_tensors walks every live Tensor's graph
         drained = Tensor.cat(*pending, dim=1) if len(pending) > 1 else pending[0]
-        vals = drained.uop.buffer.as_memoryview().cast(drained.dtype.fmt).tolist() if drained.uop.has_buffer_identity() and \
-          isinstance(drained.device, str) else cast(list[list[int]], drained.tolist())[0]
+        # (a memoryview of the int32 ids, not Buffer.numpy(): the minimal CI lanes have no numpy -- see the imports)
+        vals = cast(Buffer, drained.uop.buffer).as_memoryview().cast("i").tolist() if drained.uop.has_buffer_identity() and \
+          isinstance(drained.device, str) and drained.dtype == dtypes.int32 else cast(list[list[int]], drained.tolist())[0]
         for v in vals:
           tokens.append(int(v))
           self._cached_tokens = tokens[:-1]
@@ -2297,9 +2318,15 @@ class Transformer:
     Tensor.realize(*(x for b in self.blk if isinstance(b, GatedDeltaNetBlock) and b.spec_track is not None
                      for x in (b.conv_state.assign(b.spec_track[0][m]), b.recurrent_state.assign(b.spec_track[1][m]))))
 
-  def _spec_replay(self, key:tuple, fxn:Callable, *args):
-    """T4.132: speculative_generate's graphs, one TinyJit per key in self.spec_jit."""
-    if key not in self.spec_jit: self.spec_jit[key] = TinyJit(fxn)
+  def _spec_replay(self, key:tuple, fxn:Callable, *args, prune:bool=False):
+    """T4.132: speculative_generate's graphs, one TinyJit per key in self.spec_jit, each captured on its FIRST call (the prefill families'
+    T4.128 rule: an eager first call schedules every intermediate unplanned at once -- the card's memory peak). prune=True runs the first
+    call's one-time work once (MTPHead.prefill: the MTP block's KV zero-fill on the first prompt). The chain and the accept test do NOT
+    prune: pruning keeps Tensor.rand's counter advance out of the replay (engine/jit.py) and every sampled draw would repeat; their
+    one-time work is done beforehand instead (MTPHead.ready, the RNG state in speculative_generate). adopt has no Tensor inputs."""
+    if key not in self.spec_jit:
+      self.spec_jit[key] = jit = TinyJit(fxn, prune=prune)
+      jit.cnt = 1
     return self.spec_jit[key](*args)
 
   def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int|None=None, temperature:float=0.0):
@@ -2450,11 +2477,14 @@ class Transformer:
     # the first post-prompt token: the prefill family's own greedy / sampled (temperature, MIN_P) draw at the last position -- exactly
     # the token generate() itself would yield first. It is about to become chunk[0]/the draft anchor, but it is ALSO real output and is
     # emitted now. A buffer of the prefill family: the first chain reads it before any later prefill replay could overwrite it.
-    vocab = cast(int, self.output.out_features)
+    vocab = self.output.out_features
     anchor = int(tok_last.item())
     spec_check_ids([anchor], vocab, f"anchor at position {prompt_len}")
     tokens.append(anchor)
     self._cached_tokens = tokens[:-1]
+    # T4.132: the chain / accept graphs capture on their first call without pruning -- their one-time work happens here, eagerly, once
+    self.mtp_head.ready(self, k)
+    if out_dev not in Tensor._device_seeds: Tensor.realize(*Tensor._next_counter(cast(str, out_dev), 0), Tensor._device_rng_counters[out_dev])
     yield tokens[-1]
 
     stats_on = bool(SPEC_STATS.value)
