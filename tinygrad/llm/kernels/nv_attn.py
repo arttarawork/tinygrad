@@ -232,7 +232,8 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   qfrags:list[list[tuple[tuple[UOp, ...], tuple[UOp, ...]]]] = []  # per row group, per block: (even dims, odd dims) as int8
   sqs:list[list[UOp]] = []
   for head, head_ok in zip(heads, head_oks):
-    qfrags.append([]); sqs.append([])
+    qfrags.append([])
+    sqs.append([])
     for blk in range(blocks):
       qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
       amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
