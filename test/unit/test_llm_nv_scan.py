@@ -340,7 +340,8 @@ def _render_cuda(sink:UOp) -> str:
   from tinygrad.codegen import full_rewrite_to_sink, pm_to_program, ProgramInfo
   from tinygrad.uop.ops import PatternMatcher, graph_rewrite
   from tinygrad.renderer.cstyle import CUDARenderer
-  renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+  # T4.132: no compiler process either -- on macOS the renderer's NVRTCCompiler starts the docker nvrtc server in __init__
+  with mock.patch("tinygrad.runtime.support.compiler_cuda._get_server", return_value=None): renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
   full = full_rewrite_to_sink(sink, renderer)
   prg = UOp(Ops.PROGRAM, src=(full,), arg=ProgramInfo.from_sink(full, renderer.target))
   prg = graph_rewrite(prg, PatternMatcher([pat for pat in pm_to_program.patterns if pat[1].__name__ != "do_compile"]), ctx=renderer)

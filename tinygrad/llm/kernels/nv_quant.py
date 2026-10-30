@@ -84,20 +84,27 @@ def _decode_linear(out:UOp, xq:UOp, xd:UOp, out_features:int, group_count:int, g
   R = rows_per_warp if out_features % rows_per_warp == 0 else 1  # fall back when R doesn't divide out_features
   row_groups = out_features // R
   chunks = (group_count+31)//32
-  token_output_chunk, lane = UOp.range(out.shape[0]*row_groups*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  # T4.132: tokens > 1 (speculative decoding's VERIFY, <= 4 tokens) are a Python loop inside the warp, not a range: each warp dots its
+  # weight rows with every token's activation, so the weights stream from DRAM once per call instead of once per token (a width-4
+  # VERIFY cost ~4 decode steps on the card: +18 ms per extra token). group_dot's weight loads/unpack don't depend on the token, so the
+  # T copies hash-cons to one load. tokens == 1 builds exactly the graph it always did.
+  tokens = cast(int, out.shape[0])
+  token_output_chunk, lane = UOp.range((tokens if tokens == 1 else 1)*row_groups*chunks, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, output, chunk = token_output_chunk // (row_groups*chunks), (token_output_chunk//chunks) % row_groups, token_output_chunk % chunks
   group = lane+chunk*32
   safe_group = group if group_count % 32 == 0 else group.minimum(group_count-1)
   # the activation (xwords/xs) depends only on (token, group), never on the output row -- load it once per lane and
   # reuse it for all R rows below, instead of reloading it inside group_dot once per row (R=1: identical load, same
   # clamped safe_group the original inline ternary passed into group_dot, just hoisted one level up).
-  xwords, xs = _nv_load(xq[token, safe_group, 0], 8), xd[token, safe_group]
-  def value(row:UOp) -> UOp:
-    dot = group_dot(token, row, safe_group, xwords, xs)
+  def value(tok:UOp|int, row:UOp, xwords:UOp, xs:UOp) -> UOp:
+    dot = group_dot(tok, row, safe_group, xwords, xs)
     return dot if group_count % 32 == 0 else (group < group_count).where(dot, UOp.const(0, dtypes.float32))
   rows = tuple(output if R == 1 else output*R + r for r in range(R))  # R==1: no extra output*1+0 node -- bit-for-bit the old row index
-  totals = tuple(warp_reduce(value(row), full_wave=True) for row in rows)
-  stores = tuple(out[token, row, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)) for row, total in zip(rows, totals))
+  stores = []
+  for tok in ((token,) if tokens == 1 else range(tokens)):
+    xwords, xs = _nv_load(xq[tok, safe_group, 0], 8), xd[tok, safe_group]
+    totals = tuple(warp_reduce(value(tok, row, xwords, xs), full_wave=True) for row in rows)
+    stores += [out[tok, row, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)) for row, total in zip(rows, totals)]
   return UOp.group(*stores).end(token_output_chunk, lane).sink(arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
