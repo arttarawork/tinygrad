@@ -2270,8 +2270,8 @@ class Transformer:
     else:
       vocab = cast(int, verify_logits.shape[-1])
       q = Tensor.stack(*[ql[:, -1, :] for ql in q_logits], dim=1) if q_logits else verify_logits[:, :0]  # (1, k_eff, vocab)
-      m_t, final = spec_accept_tensor(drafts, q, verify_logits, temp, Tensor.rand(1, k_eff, device=chunk.device),
-                                      Tensor.rand(1, n, vocab, device=chunk.device), min_p=MIN_P)
+      m_t, final = spec_accept_tensor(drafts, q, verify_logits, temp, Tensor.rand(1, k_eff, device=cast(str, chunk.device)),
+                                      Tensor.rand(1, n, vocab, device=cast(str, chunk.device)), min_p=MIN_P)
     return m_t.reshape(1).cat(chunk[0], final[0])
 
   def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int|None=None, temperature:float=0.0):
