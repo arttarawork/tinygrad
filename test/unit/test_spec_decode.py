@@ -995,5 +995,19 @@ class TestMTPPrefill(unittest.TestCase):
     back = m.mtp_head.block.cache_kv[:, :, :, :L, :].float().numpy()
     np.testing.assert_array_equal(back[:, :, :, :snap["pos"]], live[:, :, :, :snap["pos"]])
 
+  def test_prefill_only_fills_the_mtp_cache(self):
+    # T4.132: with an MTP head loaded prefill_only runs speculative_generate's prefill, so the draft block's cache holds the
+    # prompt's context (slots 1..n-1) exactly as a speculative_generate call's own prefill leaves it -- what a --mtp server's
+    # prefix snapshot (serve.py, T4.111) carries -- and _cached_tokens is the prompt, as with generate()
+    prompt = [5, 2, 3, 4, 9, 1, 7]
+    a, b = _load_gdn(seed=0), _load_gdn(seed=0)
+    a.prefill_only(prompt)
+    self.assertEqual(a._cached_tokens, prompt)
+    next(b.speculative_generate(list(prompt), k=1))
+    n = len(prompt)
+    ca, cb = (m.mtp_head.block.cache_kv[:, :, :, :n, :].float().numpy() for m in (a, b))
+    np.testing.assert_array_equal(ca, cb)
+    self.assertGreater(float(np.abs(ca[:, :, :, 1:n]).max()), 0.0)
+
 if __name__ == '__main__':
   unittest.main()

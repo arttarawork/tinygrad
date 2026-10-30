@@ -2071,8 +2071,12 @@ class Transformer:
     (Transformer._attention's `initial = start_pos.eq(0)` mask -- the same one a genuinely cold prefill hits) already
     zeros a GatedDeltaNetBlock's conv_state/recurrent_state whenever `tokens` doesn't already extend this model's
     CURRENT _cached_tokens (get_start_pos returns 0 in exactly that case); if it does happen to extend it, reusing
-    that live state is exactly correct, not a bug -- get_start_pos's own prefix-reuse rule, unchanged here."""
-    it = self.generate(list(tokens), chunk_size=chunk_size, temperature=0.0)
+    that live state is exactly correct, not a bug -- get_start_pos's own prefix-reuse rule, unchanged here.
+    T4.132: with an MTP head loaded this runs speculative_generate's own prefill instead (the same loop, plus MTPHead.prefill
+    per chunk filling the draft block's cache -- the context every later draft attends over, and part of snapshot_state), so a
+    --mtp server's prefix snapshots (serve.py, T4.111) restore a complete state; its anchor yield sets _cached_tokens the same way."""
+    it = self.speculative_generate(list(tokens), k=1, chunk_size=chunk_size) if self.mtp_head is not None \
+      else self.generate(list(tokens), chunk_size=chunk_size, temperature=0.0)
     next(it, None)
     it.close()
 
@@ -2193,7 +2197,7 @@ class Transformer:
           yield tokens[-1]
         pending = []
 
-  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int=32, temperature:float=0.0):
+  def speculative_generate(self, tokens:list[int], k:int=3, chunk_size:int|None=None, temperature:float=0.0):
     """T4.64/T4.65: MTP speculative decoding -- drafts up to `k` tokens per iteration via self.mtp_head and
     verifies all of them in one extra main-model forward instead of paying one forward per token. See
     SPEC_NOTES.md for the full position ledger, the causal-mask argument for why neither the main model's
@@ -2239,6 +2243,10 @@ class Transformer:
       "-- raise it via Transformer.from_gguf(max_context=...)"
     # temperature<=0 is greedy, same convention generate() itself uses (see there)
     greedy = temperature <= 0
+    # T4.132: chunk_size None resolves to PREFILL_CHUNK like generate() (T4.124a) -- the server's prefill chunk, so a --mtp
+    # request's prompt prefills in the same chunks (and the same warmed spec prefill family) as a plain one; explicit widths
+    # (mtp_bench.py, tests) are unchanged.
+    chunk_size = chunk_size or PREFILL_CHUNK.value
     # T4.55: same recurrent-chunk cap generate() applies (see there), then widened to at least k+1 tokens.
     # This widening used to also be what let VERIFY/REDO's own chunk (1..k+1 tokens) share the prefill
     # loop's v_toks bound below; T4.66e gives VERIFY/REDO their own narrower bound instead (verify_chunk,
