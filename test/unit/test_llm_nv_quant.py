@@ -6,6 +6,7 @@ spec (mirrors test_llm_nv_scan.py's T6.2 pattern) -- never via an actual NV devi
 against gguf.py's ggml_data_to_tensor with pure-numpy transcriptions of what group_dot does, since the kernel
 itself can't run here. Numeric hardware parity (does the compiled kernel produce the right numbers on a real
 3090) is NOT covered by this file -- see the final report for exactly what must still be run on NV."""
+import functools
 import itertools
 import re
 import sys
@@ -294,8 +295,8 @@ class TestKernelGraphAndRender(unittest.TestCase):
     if ggml_type == Q6_K: return (total // 2,), dtypes.uint16  # T4.125a: likewise for Q6_K
     return (total,), dtypes.uint8
 
-  def _build(self, ggml_type:int, out_features:int, rows_per_warp:int=1):
-    in_features, tokens = self.IN_FEATURES, 1
+  def _build(self, ggml_type:int, out_features:int, rows_per_warp:int=1, tokens:int=1):
+    in_features = self.IN_FEATURES
     group_count, chunks = in_features // 32, (in_features//32 + 31)//32
     raw_shape, raw_dtype = self._raw_shape(ggml_type, out_features, in_features)
     out = UOp.placeholder((tokens, out_features, chunks), dtypes.float32, slot=0)
@@ -378,6 +379,49 @@ class TestKernelGraphAndRender(unittest.TestCase):
         r1 = self._build(ggml_type, out_features, rows_per_warp=1)
         r4 = self._build(ggml_type, out_features, rows_per_warp=4)
         self.assertEqual(self._render(r1), self._render(r4))
+
+  def test_multi_token_reads_each_weight_once(self):
+    # T4.132: tokens 2..4 (speculative VERIFY) loop inside the warp -- the rendered kernel references the weight buffer exactly as often as
+    # the one-token kernel (one load per weight word, shared by every token), and the one-token render is untouched (md5s at 3811344b7)
+    t1_md5 = {Q4_0: "953355762dd38195a36991f8bb4223b8", Q6_K: "d5ffd00d4473e5e782fe8f02bd85d376", Q4_K: "3a5ec5652acf125bb7440b61db00c0ef"}
+    from test.unit.test_llm_nv_scan import _render_cuda
+    import hashlib
+    for ggml_type, digest in t1_md5.items():
+      t1 = _render_cuda(self._build(ggml_type, self.SHAPES[0], rows_per_warp=4))
+      with self.subTest(ggml_type=ggml_type):
+        self.assertEqual(hashlib.md5(t1.encode()).hexdigest(), digest)
+        for tokens in (2, 4):
+          src = _render_cuda(self._build(ggml_type, self.SHAPES[0], rows_per_warp=4, tokens=tokens))
+          self.assertEqual(src.count("data1_"), t1.count("data1_"), f"{tokens=}: the weight is loaded more than once per warp")
+          self.assertEqual(src.count("__shfl_xor_sync"), tokens * t1.count("__shfl_xor_sync"))
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_multi_token_rows_equal_one_token_runs_on_python_emulator(self):
+    # T4.132: each token's row of a 4-token call == the one-token kernel run on that token alone, bit for bit (same per-lane dot, same
+    # butterfly) -- executed on the PYTHON emulator with __dp4a emulated in UOps
+    def emu_dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
+      def sbytes(x:UOp) -> list[UOp]: return [(((x.cast(dtypes.uint32) >> (8*i)) & 0xff).cast(dtypes.int32) ^ 0x80) - 0x80 for i in range(4)]
+      return c + sum((p*q for p, q in zip(sbytes(a), sbytes(b))), UOp.const(0, dtypes.int32))
+    in_features, out_features, tokens = 256, 8, 4
+    rng = np.random.default_rng(7)
+    for ggml_type in (Q4_0, Q8_0, Q6_K, Q4_K):
+      shape, dtype = self._raw_shape(ggml_type, out_features, in_features)
+      raw = rng.integers(0, 256, int(np.prod(shape)) * dtype.itemsize, dtype=np.uint8)
+      raw[1::2] &= 0x3b  # keep the fp16 scales finite
+      groups = in_features // 32
+      xq = rng.integers(0, 2**32, (tokens, groups, 8), dtype=np.uint32)
+      xd = rng.standard_normal((tokens, groups)).astype(np.float32)
+      def run(xq_:np.ndarray, xd_:np.ndarray) -> np.ndarray:
+        fxn = functools.partial(nv_quant._quant_decode_kernel.__wrapped__, out_features=out_features, in_features=in_features,
+                                ggml_type=ggml_type, rows_per_warp=4)
+        out = Tensor.empty(xq_.shape[0], out_features, 1, device="PYTHON")
+        w = Tensor(raw, device="PYTHON").bitcast(dtype).reshape(shape)
+        return Tensor.custom_kernel(out, w, Tensor(xq_, device="PYTHON"), Tensor(xd_, device="PYTHON"), fxn=fxn)[0].numpy()
+      with self.subTest(ggml_type=ggml_type), mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce_one_warp), \
+           mock.patch.object(nv_quant, "_nv_dp4a", emu_dp4a):
+        multi = run(xq, xd)
+        for t in range(tokens): np.testing.assert_array_equal(multi[t], run(xq[t:t+1], xd[t:t+1])[0], err_msg=f"token {t}")
+        self.assertTrue(np.isfinite(multi).all() and np.abs(multi).max() > 0)
 
 # T4.127a: an emulated single-warp reduce for _ffn_act_q8_kernel's PYTHON-emulator execution test below -- simpler
 # than test_llm_nv_norm.py's _emulated_warp_reduce (add_rmsnorm_q8's multi-warp blocks need a `warp*32+lane` tid to
@@ -1224,8 +1268,9 @@ class TestSpecIterationCensus(unittest.TestCase):
   """T4.132: the kernels of ONE speculative iteration (k=3, full accept) on the tiny mocked-NV config -- TestDecodeStepCensus's two
   block kinds as a 2-block Transformer plus an MTP head -- scheduled on CPU as ONE linear program, the way the loop dispatches them
   between its single host sync per iteration: the greedy draft chain (3 MTP-block steps: the attention decode step + the head each),
-  VERIFY (the main model's spec forward at width 4: every block the decode step's kernel list, the GDN checkpoint copies, the fused
-  head norm) and the greedy accept test. No generic dequant gemm, no fused prefill scan, every projection one dp4a gemv launch."""
+  VERIFY (the main model's spec forward at width 4: every block the decode step's kernel list, the fused head norm; T4.132b: no GDN
+  checkpoint copies -- gdn_decode itself writes the per-token states a partial accept adopts) and the greedy accept test. No generic
+  dequant gemm, no fused prefill scan, every projection one dp4a gemv launch (each reading its weights once for all 4 tokens)."""
   DIM, WIDE, VOCAB = 256, 2048, 64
 
   def _model(self) -> Transformer:
@@ -1287,14 +1332,16 @@ class TestSpecIterationCensus(unittest.TestCase):
     for name, c in (("draft chain", draft), ("VERIFY", verify), ("whole iteration", whole)):
       print(f"\nspeculative {name} (k={k}, VERIFY width {k + 1}): {len(c)} kernels", sorted(c))
     def generic_gemm(c): return [x for x in c if x.startswith("reduce") and "unsigned char[" in x]  # a dequant+matmul reduces over weight bytes
-    # VERIFY at width 4 = the decode step's kernel list per block (TestDecodeStepCensus's T=4 rows) + the GDN checkpoint + the head
+    # VERIFY at width 4 = the decode step's kernel list per block (TestDecodeStepCensus's T=4 rows) + the head
     self.assertNotIn("gated_delta_prefill_nv", verify, "VERIFY must not pay the fused prefill scan")
     self.assertEqual([x for x in verify if x.startswith("gdn_")], ["gdn_conv_decode_nv", "gdn_decode_nv"], "the GDN block: the two decode kernels")
     self.assertEqual(generic_gemm(verify), [], "no generic dequant gemm")
     self.assertEqual(verify.count("linear_q4_0_nv"), 6 + 7 + 1, "every projection one dp4a gemv: GDN block 6, attention block 7, the head")
     self.assertEqual(sum(1 for x in verify if x.startswith("flash_")), 1, "the prefill attention tile")
     self.assertEqual(verify.count("add_rmsnorm_q8_nv"), 2 + 2 + 1, "two fused norm sites per block + the head's")
-    self.assertEqual(sum(1 for x in verify if x.startswith("elementwise half[6336]")), 1, "the GDN checkpoint: conv_state copied aside")
+    self.assertEqual(sum(1 for x in verify if x.startswith("elementwise half[6336]")), 0, "no GDN checkpoint copy (T4.132b)")
+    gdn = next(b for b in model.blk if isinstance(b, GatedDeltaNetBlock))
+    self.assertIsNotNone(gdn.spec_track, "VERIFY's GDN block stores its per-token states (spec_track) from inside gdn_decode")
     # the draft chain: k attention decode steps of the MTP block + eh_proj + the head, no generic gemm
     self.assertEqual(generic_gemm(draft), [])
     self.assertEqual(draft.count("linear_q4_0_nv"), k * (7 + 1 + 1))

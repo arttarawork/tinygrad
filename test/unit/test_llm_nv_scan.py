@@ -321,19 +321,22 @@ class TestGDNDecodeKernelSource(unittest.TestCase):
             self.assertIn("__syncthreads()", src)  # the rms block reduction
           self.assertTrue(next(u.arg for u in prg.src if u.op is Ops.BINARY).startswith(b"\x7fELF"))
 
-def _decode_sinks(tokens:int=1):
-  """both kernels' sinks at the 27B geometry (heads 48, k-heads 16, K=V=128, 5 split-K parts) for a run of `tokens` rows"""
+def _decode_sinks(tokens:int=1, track:bool=False):
+  """both kernels' sinks at the 27B geometry (heads 48, k-heads 16, K=V=128, 5 split-K parts) for a run of `tokens` rows; track=True
+  adds T4.132's per-token state outputs (3 slots, before the bound start_pos as gdn_decode passes them)"""
   sp = kernel_var(UOp.variable("start_pos", 0, 262143))
   heads, key_dim, value_dim, k_heads, parts = 48, 128, 128, 16, 5
   channels = 2*k_heads*key_dim + heads*value_dim
   def ph(shape, dtype, slot): return UOp.placeholder(shape, dtype, slot=slot)
+  conv_track = (ph((3, 1, 3, channels), dtypes.float16, 4),) if track else ()
+  state_track = (ph((3, 1, heads, value_dim, key_dim), dtypes.float32, 8),) if track else ()
   conv = _gdn_conv_decode_kernel(ph((tokens, channels), dtypes.float32, 0), ph((1, 3, channels), dtypes.float16, 1),
-                                 ph((tokens, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), sp,
+                                 ph((tokens, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), *conv_track, sp,
                                  start_pos=sp, tokens=tokens)
   step = _gdn_decode_kernel(ph((tokens, heads*value_dim), dtypes.float16, 0), ph((1, heads, value_dim, key_dim), dtypes.float32, 1),
     ph((tokens, channels), dtypes.float32, 2), ph((tokens, 2*heads), dtypes.float16, 3), ph((heads,), dtypes.float32, 4),
-    ph((heads,), dtypes.float32, 5), ph((tokens, heads*value_dim, parts), dtypes.float32, 6), ph((value_dim,), dtypes.float32, 7), sp,
-    start_pos=sp, k_heads=k_heads, qk_eps=1e-6, norm_eps=1e-6, tokens=tokens)
+    ph((heads,), dtypes.float32, 5), ph((tokens, heads*value_dim, parts), dtypes.float32, 6), ph((value_dim,), dtypes.float32, 7),
+    *state_track, sp, start_pos=sp, k_heads=k_heads, qk_eps=1e-6, norm_eps=1e-6, tokens=tokens)
   return conv, step
 
 def _render_cuda(sink:UOp) -> str:
@@ -341,7 +344,8 @@ def _render_cuda(sink:UOp) -> str:
   from tinygrad.codegen import full_rewrite_to_sink, pm_to_program, ProgramInfo
   from tinygrad.uop.ops import PatternMatcher, graph_rewrite
   from tinygrad.renderer.cstyle import CUDARenderer
-  renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+  # T4.132: no compiler process either -- on macOS the renderer's NVRTCCompiler starts the docker nvrtc server in __init__
+  with mock.patch("tinygrad.runtime.support.compiler_cuda._get_server", return_value=None): renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
   full = full_rewrite_to_sink(sink, renderer)
   prg = UOp(Ops.PROGRAM, src=(full,), arg=ProgramInfo.from_sink(full, renderer.target))
   prg = graph_rewrite(prg, PatternMatcher([pat for pat in pm_to_program.patterns if pat[1].__name__ != "do_compile"]), ctx=renderer)
@@ -363,12 +367,15 @@ class TestGDNDecodeSmallT(unittest.TestCase):
 
   def test_small_t_renders(self):
     for tokens in range(2, GDN_DECODE_TOKENS + 1):
-      conv, step = _decode_sinks(tokens)
-      with self.subTest(tokens=tokens):
-        conv_src, step_src = _render_cuda(conv), _render_cuda(step)
-        self.assertEqual([int(n) for n in re.findall(r"threadIdx\.[xyz]; /\* (\d+) \*/", step_src)], [32, 16])  # same block shape as T == 1
-        self.assertEqual(step_src.count("__syncthreads()"), tokens)  # one rms block reduction per token
-        self.assertEqual(conv_src.count("__syncthreads()"), 0)
+      for track in (False, True):  # T4.132: the per-token state outputs of a speculative VERIFY
+        conv, step = _decode_sinks(tokens, track)
+        with self.subTest(tokens=tokens, track=track):
+          conv_src, step_src = _render_cuda(conv), _render_cuda(step)
+          self.assertEqual([int(n) for n in re.findall(r"threadIdx\.[xyz]; /\* (\d+) \*/", step_src)], [32, 16])  # same block shape as T == 1
+          self.assertEqual(step_src.count("__syncthreads()"), tokens)  # one rms block reduction per token
+          self.assertEqual(conv_src.count("__syncthreads()"), 0)
+          self.assertEqual("data4_92160" in conv_src, track)  # (3,1,3,10240) fp16 conv slots
+          self.assertEqual("data8_2359296" in step_src, track)  # (3,1,48,128,128) fp32 state slots
 
 class TestGDNDecodeMatchesNumpy(unittest.TestCase):
   """nv.gdn_decode's two kernels in their CPU form (lanes=1: the same graphs minus shuffles and shared memory) against
@@ -409,7 +416,7 @@ class TestGDNDecodeMatchesNumpy(unittest.TestCase):
         with self.subTest(tokens=T, start_pos=pos):
           qkv, gate, beta, alpha = f32(T, C, 3, scale=0.5), f32(T, H*V, 2), f32(T, H), f32(T, H)
           conv_state, state = Tensor(conv0).contiguous().realize(), Tensor(state0).contiguous().realize()
-          def rows(p): return Tensor.custom_kernel(Tensor.empty(*p.shape), Tensor(p).realize(), fxn=_copy_kernel)[0].sum(-1).reshape(B, T, p.shape[1])
+          rows = lambda p: Tensor.custom_kernel(Tensor.empty(*p.shape), Tensor(p).realize(), fxn=_copy_kernel)[0].sum(-1).reshape(B, T, p.shape[1])
           z = gdn_decode(rows(qkv), rows(gate), Tensor(np.concatenate([beta, alpha], -1)).reshape(B, T, 2*H), conv_state, state,
                          Tensor(conv_w), Tensor(norm_w), Tensor(dt_bias), Tensor(ssm_a), UOp.variable("start_pos", 0, 63).bind(pos),
                          k_heads=Hk, qk_eps=1e-6, norm_eps=1e-5)

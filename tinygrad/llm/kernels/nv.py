@@ -133,13 +133,20 @@ def _added(xs) -> UOp: return functools.reduce(lambda a, b: a + b, xs)  # left t
 # slots. tokens == 1 builds the exact graph it always did (the row helpers index with `b` alone there, not `b*1 + 0`): the T == 1
 # render is pinned by test_llm_nv_scan.py's md5.
 GDN_DECODE_TOKENS = 4
+# T4.132: a speculative VERIFY run (tokens > 1) may also hand both kernels a `track` buffer: the conv window / recurrent state after each
+# of its first tokens-1 tokens, (S, B, ...) with S >= tokens-1 -- what a partial accept of m < tokens-1 drafts adopts as the live state
+# (model.py's GatedDeltaNetBlock.spec_track / Transformer._adopt_step) instead of re-running the accepted tokens. Written from values the
+# kernels already hold (the window rows, the state in registers); omitted, the graphs are unchanged.
 
 def _token_row(b:UOp, tokens:int): return (lambda t: b) if tokens == 1 else (lambda t: b*tokens + t)  # (batch b, token t) -> flat row
 
 @functools.cache
-def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, _bound:UOp, start_pos:UOp, lanes:int=32, tokens:int=1) -> UOp:
+def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, *track_bound:UOp, start_pos:UOp, lanes:int=32,
+                            tokens:int=1) -> UOp:
   """conv_out (B*tokens,C) fp32: row (b,t) = SiLU(sum_i weight[c,i] * window[t+i]) with window = [conv_state rows (zero at start_pos 0) |
-  sum_p qkv[(b,t),c,p] per token]; conv_state (B,taps-1,C) <- window[tokens:] in place."""
+  sum_p qkv[(b,t),c,p] per token]; conv_state (B,taps-1,C) <- window[tokens:] in place. T4.132: track (S,B,taps-1,C) <- window[t+1:t+taps]
+  for t < tokens-1, the conv state after token t. The bound start_pos rides last (see gdn_decode): a scalar src, not a buffer slot."""
+  *track, _ = track_bound
   batch, history, channels = conv_state.shape
   parts = qkv.shape[-1]
   assert all(isinstance(s, int) for s in (batch, history, channels, parts)) and channels % lanes == 0 and weight.shape == (channels, history+1)
@@ -153,11 +160,12 @@ def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, _
   outs = [conv_out[row(t), c].store(_added(x*weight[c, i].load() for i,x in enumerate(window[t:t+history+1])).silu()) for t in range(tokens)]
   # the old rows all feed the outs, so storing the shifted window through conv_state.after(outs) orders every load before every store
   shifts = [conv_state.after(*outs)[b, i, c].store(window[tokens+i].cast(conv_state.dtype)) for i in range(history)]
+  shifts += [tr[t, b, i, c].store(window[t+1+i].cast(tr.dtype)) for tr in track for t in range(tokens-1) for i in range(history)]
   ends = tuple(r for r in (lane, block) if r.op is Ops.RANGE)
   return UOp.group(*outs, *shifts).end(*ends).sink(arg=KernelInfo(name="gdn_conv_decode_nv", opts_to_apply=()))
 
 @functools.cache
-def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, _bound:UOp,
+def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, *track_bound:UOp,
                        start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float, lanes:int=32, row_tile:int=8, tokens:int=1) -> UOp:
   """model.py's decode graph from conv_out on, per (b, v-head h): q/k = conv_out's k-head h % k_heads l2-normalized (q * key_dim^-0.5),
   v = conv_out's v channels, beta = sigmoid(beta) in its own dtype, alpha = exp(softplus(alpha + dt_bias) * ssm_a), the fused scan's
@@ -166,7 +174,8 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
   (model.py's GatedDeltaNetBlock.prepare_nv_decode/nv_f16_gemv_raw) -- beta at column h, alpha at column heads+h,
   plain indexing into the one buffer (no copy kernel).
   T4.132: `tokens` sequential rows (conv_out/beta_alpha/gate/z are (B*tokens, ...)): the state runs through the tokens in registers
-  and is stored once; each token's rms reduction uses its own LOCAL slots."""
+  and is stored once; each token's rms reduction uses its own LOCAL slots. track (S,B,H,V,K) <- the state after token t, t < tokens-1."""
+  *track, _ = track_bound
   batch, heads, value_dim, key_dim = state.shape
   parts = gate.shape[-1]
   assert all(isinstance(s, int) for s in (batch, heads, value_dim, key_dim, parts)) and heads % k_heads == 0
@@ -204,6 +213,7 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
       delta = (conv_out[r, 2*q_dim + h*value_dim + row].load() - dot(prev, k)*av) * bv
       previous[row] = tuple(x*av + delta*y for x,y in zip(prev, k))
       outs.append(dot(prev, q)*av + delta*kq)
+      if t < tokens-1: z_stores += [tr[t, b, h, row, c].store(x) for tr in track for x,c in zip(previous[row], cols)]
     squares = _added(o*o for o in outs)  # this warp's rows (warp_reduce leaves every lane the same sums)
     if partial is not None:
       slot = (wave if tokens == 1 else t*waves + wave).valid(lane.eq(0))
@@ -228,27 +238,30 @@ def _split_k_partials(t:Tensor) -> Tensor:
   return t.reshape(-1, t.shape[-1], 1)  # T4.132: (B*T, F, 1) for a T-token run too
 
 def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor, conv_state:Tensor, state:Tensor, conv_weight:Tensor, norm_weight:Tensor,
-               dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float) -> Tensor:
+               dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float,
+               track:tuple[Tensor, Tensor]|None=None) -> Tensor:
   """One GatedDeltaNet decode token (T == 1) -- T4.132: or a run of T <= GDN_DECODE_TOKENS tokens, sequential inside the kernels -- from
   the projections: qkv = attn_qkv(x), out_gate = attn_gate(x), beta_alpha = ssm_beta(x) and ssm_alpha(x) run as ONE f16 gemv (T4.127b,
   model.py's prepare_nv_decode/nv_f16_gemv_raw) over their concatenated weight -- (B,T,2*heads), beta at [:heads], alpha at [heads:].
   Updates conv_state and state in place; returns z (B,T,H*V) fp16, ssm_out's input. The four weights must be realized buffers
-  (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be re-copied every step."""
+  (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be re-copied every step. T4.132: track = (conv (S,B,taps-1,C),
+  state (S,B,H,V,K)) buffers also receive the conv window / recurrent state after each of the first T-1 tokens (S >= T-1)."""
   batch, heads, value_dim, _ = state.shape
   tokens = cast(int, qkv.shape[1])
   assert 1 <= tokens <= GDN_DECODE_TOKENS, f"{tokens=}"
   channels, device = conv_state.shape[2], conv_state.device
   lanes = 32 if isinstance(device, str) and device.split(":")[0] == "NV" else 1  # off NV only the CPU tests get here
   assert start_pos.is_bound_var
-  # the kernels read start_pos as a PARAM by name (kernel_var); the bound variable itself rides along as an extra CALL src (`_bound`,
+  # the kernels read start_pos as a PARAM by name (kernel_var); the bound variable itself rides along as the LAST CALL src (`_bound`,
   # never loaded) so the schedule binds it -- a precompiled @function drops arguments no kernel references, and the generic graph
-  # this replaces got the binding from its conv-window kernel
+  # this replaces got the binding from its conv-window kernel. T4.132: last -- it is no buffer slot, so a track buffer after it went unbound
   var, bound = kernel_var(start_pos.src[0]), Tensor(start_pos)
   conv_out = Tensor.empty(batch*tokens, channels, dtype=dtypes.float32, device=device)
-  conv_out = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, bound,
+  conv_track, state_track = ((track[0],), (track[1],)) if track is not None and tokens > 1 else ((), ())
+  conv_out = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, *conv_track, bound,
                                   fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes, tokens=tokens))[0]
   z = Tensor.empty(batch*tokens, heads*value_dim, dtype=dtypes.float16, device=device)
   z = Tensor.custom_kernel(z, state, conv_out, beta_alpha.reshape(batch*tokens, 2*heads), dt_bias, ssm_a,
-                           _split_k_partials(out_gate), norm_weight, bound, fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads,
+                           _split_k_partials(out_gate), norm_weight, *state_track, bound, fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads,
                            qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes, tokens=tokens))[0]
   return z.reshape(batch, tokens, heads*value_dim)

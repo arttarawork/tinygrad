@@ -13,7 +13,8 @@ if TYPE_CHECKING:
   from tinygrad.llm.model import Transformer
   from tinygrad.llm.vision import VisionEncoder
 
-# T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag.
+# T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag. T4.132: speculative_generate and
+# warmup cap it at 3 (model.py spec_k_clamped: VERIFY's k+1 tokens must stay on the 4-token NV decode kernels).
 SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
 # T4.67: MB cap for the cross-session prefill state cache (LLMServer.snapshots) when enabled -- see
 # LLMServer.store_snapshot and cli.py's --state-cache flag. Mirrors SPEC_TOKENS/--mtp above: this constant is

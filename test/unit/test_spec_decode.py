@@ -9,6 +9,7 @@ from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
   Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits, spec_check_ids,
+  spec_k_clamped,
 )
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 from test.unit.test_llm_device_map import TEST_CONFIG
@@ -557,11 +558,10 @@ class TestOneSyncPerIteration(unittest.TestCase):
 def _spec_keys(model:Transformer) -> list[tuple]:
   return [key for key in model.jit if key[3]]  # spec=True is the 4th (is_prefill, greedy, chunk_size, spec) slot
 
-def _verify_key(width:int, redo:bool=False) -> tuple:
+def _verify_key(width:int) -> tuple:
   """T4.132: the jit key of a concrete width-`width` VERIFY call (Transformer.__call__: a 1-token call is decode-shaped, a wider
-  one stores its width negated in the chunk_size slot so it never collides with a symbolic chunk's "toks" bound); redo=True is the
-  partial-accept REDO family of that width (its graph restores the GDN checkpoint first)."""
-  return (width > 1, True, -width if width > 1 else None, True) + (("redo",) if redo else ())
+  one stores its width negated in the chunk_size slot so it never collides with a symbolic chunk's "toks" bound)."""
+  return (width > 1, True, -width if width > 1 else None, True)
 
 class TestVerifyConcreteWidth(unittest.TestCase):
   """T4.132: VERIFY (and REDO) run at CONCRETE widths -- k_eff+1 and m+1, each width its own jit family keyed on the width
@@ -592,8 +592,15 @@ class TestVerifyConcreteWidth(unittest.TestCase):
     self.assertTrue(all(isinstance(w, int) and 1 <= w <= k + 1 for w in widths), f"not concrete / out of 1..k+1: {widths}")
     self.assertIn(k + 1, widths, f"the first iteration's VERIFY is at the full width k_eff+1={k+1}, saw {widths}")
     loop_keys = [key for key in _spec_keys(model) if key[2] != 32]
-    allowed = {_verify_key(w) for w in range(1, k + 2)} | {_verify_key(w, redo=True) for w in range(1, k + 1)}
+    allowed = {_verify_key(w) for w in range(1, k + 2)}
     self.assertTrue(all(key in allowed for key in loop_keys), loop_keys)
+
+  def test_k_above_the_decode_kernels_is_clamped(self):
+    # T4.132: k+1 > NV_SMALL_T would run VERIFY on the generic dequant+matmul path (k=4: ~1.4 s per iteration on the card)
+    self.assertEqual([spec_k_clamped(k) for k in (1, 3, 4, 7)], [1, 3, 3, 3])
+    model = _load_gdn(seed=0, max_context=64)
+    self.assertEqual(_run(model, [1, 2, 3], 8, spec=True, k=5), _run(_load_gdn(seed=0, max_context=64), [1, 2, 3], 8, spec=False))
+    self.assertTrue(all(key[2] is None or key[2] >= -4 for key in _spec_keys(model)), _spec_keys(model))
 
   def test_each_width_is_one_family_captured_once_and_replayed(self):
     # widths 1..k+1 driven directly: the second call of a width captures its family, every later call replays it (cnt grows,
@@ -614,7 +621,7 @@ class TestSpecWarmup(unittest.TestCase):
   instead (the T4.65 gap; recommended fix in T4.72). See warmup()'s own comment for why each key needs calling
   TWICE (engine/jit.py _TinyJit.__call__: a key's first-ever call just runs eagerly, no capture at all -- the
   capture that actually pays off on every later replay is the SAME key's second call). T4.132: every concrete
-  VERIFY/REDO width 1..spec_k+1 is its own family and warmup drives each directly."""
+  VERIFY width 1..spec_k+1 is its own family and warmup drives each directly, and the partial-accept adopt family."""
 
   def test_warmup_captures_spec_keys_when_mtp_present(self):
     model = _load_gdn(seed=0, max_context=64)
@@ -622,11 +629,11 @@ class TestSpecWarmup(unittest.TestCase):
     model.warmup(spec_k=3)
     spec_keys = _spec_keys(model)
     for w in range(1, 3 + 2): self.assertIn(_verify_key(w), spec_keys, f"VERIFY width {w} not warmed: {spec_keys}")
-    for w in range(1, 3 + 1): self.assertIn(_verify_key(w, redo=True), spec_keys, f"REDO width {w} not warmed: {spec_keys}")
     for key in spec_keys:
       self.assertIsNotNone(model.jit[key].captured, f"jit[{key}] was called but never actually captured (still cnt<=1)")
-    # T4.132 step 6: the loop's own graphs -- every draft step, the greedy and sampled accept families at n = k+1, the MTP fill/rewrite
-    for key in [("draft", i) for i in range(3)] + [("accept", 4, True), ("accept", 4, False)]:
+    # T4.132: the loop's own graphs -- the draft chain and the greedy and sampled accept families at every k_eff 1..3 (n = k_eff+1), the
+    # partial-accept adopt, the prompt's MTP fill
+    for key in [("chain", i) for i in (1, 2, 3)] + [("accept", n, g) for n in (2, 3, 4) for g in (True, False)] + [("adopt",)]:
       self.assertIn(key, model.spec_jit, f"{key} not warmed: {sorted(model.spec_jit, key=str)}")
     self.assertTrue(any(key[0] == "mtp_prefill" for key in model.spec_jit), sorted(model.spec_jit, key=str))
     for key, jit in model.spec_jit.items(): self.assertIsNotNone(cast(TinyJit, jit).captured, f"spec_jit[{key}] never captured")
@@ -1085,65 +1092,85 @@ class TestSpecForwardMatchesDecode(unittest.TestCase):
     rows = self._spec_rows(chunk, self.pos)
     for i in range(4): np.testing.assert_allclose(rows[i], want[i], rtol=1e-3, atol=1e-3, err_msg=f"row {i}")
 
-  def test_checkpoint_orders_the_copy_first_and_leaves_plain_buffers(self):
-    # the forward with the checkpoint == the forward without it (bit-exact: same kernels, only ordering edges differ); spec_snap is
-    # the pre-call state; the live state tensors are plain buffers again afterwards (no AFTER view lingers into the next call)
-    chunk = [self.first] + self.ref[1:4]
-    orig = GatedDeltaNetBlock.checkpoint
-    GatedDeltaNetBlock.checkpoint = lambda self, x, restore=False: None  # type: ignore[method-assign]
-    try:
+  def _gdn_states(self) -> list[tuple[np.ndarray, np.ndarray]]: return [(b.conv_state.numpy(), b.recurrent_state.numpy()) for b in self.gdn]
+
+  def test_adopt_equals_the_state_of_the_accepted_tokens(self):
+    # T4.132: a partial accept of m drafts adopts VERIFY's per-token slot m (Transformer._adopt_step) -- bit for bit the GDN state a fresh
+    # forward of exactly the m+1 accepted tokens leaves (what T4.66d's REDO recomputed), at every m; at m == 0 (one fed token) also
+    # bit for bit plain decode's. (m >= 1 differs from plain decode by fp16 conv rounding: a multi-token run keeps its conv window in
+    # fp32, decode rounds conv_state between steps -- generate() vs any VERIFY chunk, unchanged by T4.132.) The live state tensors are
+    # plain buffers again afterwards.
+    v_m = UOp.variable("spec_m", 0, 2)
+    for m in range(3):
+      chunk = [self.first] + self.ref[1:1 + m] + [(self.ref[1 + m] + 1) % 512] + [7] * (2 - m)  # d_m is wrong: accept length m
       self.model.restore_state(self.snap)
-      want_rows = self._spec_rows(chunk, self.pos)
-      want_post = [(b.conv_state.numpy(), b.recurrent_state.numpy()) for b in self.gdn]
-    finally: GatedDeltaNetBlock.checkpoint = orig
+      rows = self._spec_rows(chunk, self.pos)
+      self.assertEqual(rows.argmax(-1).tolist()[:m + 1], self.ref[1:2 + m], f"{m=}: VERIFY rows")
+      self.model._adopt_step(v_m.bind(m))
+      got = self._gdn_states()
+      self.model.restore_state(self.snap)
+      self._spec_rows(chunk[:m + 1], self.pos)
+      for i, ((gc, gr), (wc, wr)) in enumerate(zip(got, self._gdn_states())):
+        np.testing.assert_array_equal(gc, wc, err_msg=f"{m=} gdn {i} conv")
+        np.testing.assert_array_equal(gr, wr, err_msg=f"{m=} gdn {i} recurrent")
+      if m == 0:
+        self.model.restore_state(self.snap)
+        self.model.forward(Tensor([[self.first]]), self.pos, None).realize()
+        for i, ((gc, gr), (wc, wr)) in enumerate(zip(got, self._gdn_states())):
+          np.testing.assert_array_equal(gc, wc, err_msg=f"gdn {i} conv vs decode")
+          np.testing.assert_array_equal(gr, wr, err_msg=f"gdn {i} recurrent vs decode")
+      for b in self.gdn: self.assertTrue(b.conv_state.uop.has_buffer_identity() and b.recurrent_state.uop.has_buffer_identity())
+
+  def test_verify_output_and_final_state_unchanged_by_the_track(self):
+    # the per-token stores are a pure addition: VERIFY's rows and final state == the same forward with the track stores stripped (the
+    # per-token loop scan either way: capture forces it, GDN_SCAN_IMPL=1 picks it for the plain call -- WY reassociates the state math)
+    chunk = [self.first] + self.ref[1:4]
     self.model.restore_state(self.snap)
-    pre = [(b.conv_state.numpy(), b.recurrent_state.numpy()) for b in self.gdn]
-    rows = self._spec_rows(chunk, self.pos)
-    np.testing.assert_array_equal(rows, want_rows)
-    for i, (b, (pc, pr), (qc, qr)) in enumerate(zip(self.gdn, pre, want_post)):
-      self.assertTrue(b.conv_state.uop.has_buffer_identity() and b.recurrent_state.uop.has_buffer_identity(), f"gdn {i}: an AFTER view lingers")
-      assert b.spec_snap is not None
-      np.testing.assert_array_equal(b.spec_snap[0].numpy(), pc, err_msg=f"gdn {i} conv snapshot")
-      np.testing.assert_array_equal(b.spec_snap[1].numpy(), pr, err_msg=f"gdn {i} recurrent snapshot")
-      np.testing.assert_array_equal(b.conv_state.numpy(), qc, err_msg=f"gdn {i} conv after")
-      np.testing.assert_array_equal(b.recurrent_state.numpy(), qr, err_msg=f"gdn {i} recurrent after")
-    # RESTORE (speculative_generate's partial-accept path) puts the pre-call state back exactly
-    Tensor.realize(*(x for b in self.gdn for x in (b.conv_state.assign(cast(tuple, b.spec_snap)[0]),
-                                                    b.recurrent_state.assign(cast(tuple, b.spec_snap)[1]))))
-    for i, (b, (pc, pr)) in enumerate(zip(self.gdn, pre)):
-      np.testing.assert_array_equal(b.conv_state.numpy(), pc, err_msg=f"gdn {i} conv restored")
-      np.testing.assert_array_equal(b.recurrent_state.numpy(), pr, err_msg=f"gdn {i} recurrent restored")
+    rows, post = self._spec_rows(chunk, self.pos), self._gdn_states()
+    self.model.restore_state(self.snap)
+    orig = GatedDeltaNetBlock.__call__
+    with mock.patch.object(GatedDeltaNetBlock, "__call__", lambda self, x, sp, rope=None, spec=False: orig(self, x, sp, rope)), \
+         Context(GDN_SCAN_IMPL=1):
+      np.testing.assert_array_equal(self._spec_rows(chunk, self.pos), rows)
+    for i, ((gc, gr), (wc, wr)) in enumerate(zip(self._gdn_states(), post)):
+      np.testing.assert_array_equal(gc, wc, err_msg=f"gdn {i} conv")
+      np.testing.assert_array_equal(gr, wr, err_msg=f"gdn {i} recurrent")
 
   def test_speculative_generate_matches_generate_on_varied_ids(self):
     for k in (1, 3):
       self.assertEqual(_run(_load_gdn_varied(), VARIED_PROMPT, 12, spec=True, k=k), self.ref, f"{k=}")
 
-  def test_nv_decode_kernels_see_the_checkpointed_state(self):
-    # the card path: GatedDeltaNetBlock through nv.gdn_decode's two kernels (gate mocked open, CPU form) with the checkpoint active,
-    # at concrete widths 1 and 3, against the generic block with the same checkpoint -- output, both states, both snapshots
+  def test_nv_decode_kernels_track_every_token(self):
+    # the card path: GatedDeltaNetBlock(spec=True) through nv.gdn_decode's two kernels (gate mocked open, CPU form) at concrete widths
+    # 2..4: slot t == the state the same kernels leave after a fresh run of the first t+1 tokens (bit for bit), and the fused block's
+    # output, final states and slots match the generic block's (the per-token loop) at the existing fused-vs-generic tolerances
     from test.unit.test_llm_nv_scan import tiny_block, decode_gate, TINY_DIM
-    fused, generic = tiny_block(), tiny_block()
-    with decode_gate(): fused.prepare_nv_decode()
+    fused, generic, fresh = tiny_block(), tiny_block(), tiny_block()
+    with decode_gate():
+      for b in (fused, fresh): b.prepare_nv_decode()
     self.assertIsNotNone(fused.nv_decode_weights)
-    xs = Tensor.randn(1, 8, TINY_DIM).realize()
+    xs = Tensor.randn(1, 12, TINY_DIM).realize()
     pos = 0
-    for T in (1, 3, 1, 3):
-      pre = {}
-      for name, block in (("fused", fused), ("generic", generic)):
-        block._init_state(xs)
-        pre[name] = (block.conv_state.numpy(), block.recurrent_state.numpy())
-        block.checkpoint(xs[:, pos:pos + T])
-        with decode_gate() if name == "fused" else contextlib.nullcontext():
-          pre[name] += (cast(Tensor, block(xs[:, pos:pos + T].contiguous(), pos)).numpy(),)
-      np.testing.assert_allclose(pre["fused"][2], pre["generic"][2], rtol=1e-3, atol=1e-5, err_msg=f"{pos=} {T=} output")
-      for name, block in (("fused", fused), ("generic", generic)):
-        assert block.spec_snap is not None
-        np.testing.assert_array_equal(block.spec_snap[0].numpy(), pre[name][0], err_msg=f"{name} {pos=} {T=} conv snapshot")
-        np.testing.assert_array_equal(block.spec_snap[1].numpy(), pre[name][1], err_msg=f"{name} {pos=} {T=} recurrent snapshot")
-        self.assertFalse(np.array_equal(block.recurrent_state.numpy(), pre[name][1]), f"{name} {pos=} {T=}: the state did not advance")
-      np.testing.assert_array_equal(fused.conv_state.numpy(), generic.conv_state.numpy(), err_msg=f"{pos=} {T=} conv")
-      np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-5, atol=1e-7,
-                                 err_msg=f"{pos=} {T=} recurrent")
+    for T in (2, 4, 3):
+      x = xs[:, pos:pos + T].contiguous().realize()
+      pre = []
+      for b in (fused, generic, fresh): b._init_state(x)
+      for b in (fused, generic): pre.append((b.conv_state.numpy(), b.recurrent_state.numpy()))
+      with decode_gate(): out_f = cast(Tensor, fused(x, pos, None, True)).numpy()
+      out_g = cast(Tensor, generic(x, pos, None, True)).numpy()
+      with self.subTest(T=T, pos=pos):
+        np.testing.assert_allclose(out_f, out_g, rtol=1e-3, atol=1e-5)
+        np.testing.assert_array_equal(fused.conv_state.numpy(), generic.conv_state.numpy())
+        np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-5, atol=1e-7)
+        ft, gt = cast(tuple, fused.spec_track), cast(tuple, generic.spec_track)
+        for t in range(T - 1):
+          np.testing.assert_array_equal(ft[0][t].numpy(), gt[0][t].numpy(), err_msg=f"slot {t} conv fused vs generic")
+          np.testing.assert_allclose(ft[1][t].numpy(), gt[1][t].numpy(), rtol=1e-5, atol=1e-7, err_msg=f"slot {t} recurrent")
+          for b, (c0, r0) in ((fresh, pre[0]),):
+            b.conv_state.assign(Tensor(c0)).realize(); b.recurrent_state.assign(Tensor(r0)).realize()
+            with decode_gate(): cast(Tensor, b(x[:, :t + 1].contiguous(), pos)).realize()
+            np.testing.assert_array_equal(ft[0][t].numpy(), b.conv_state.numpy(), err_msg=f"slot {t} conv vs a {t+1}-token run")
+            np.testing.assert_array_equal(ft[1][t].numpy(), b.recurrent_state.numpy(), err_msg=f"slot {t} recurrent vs a {t+1}-token run")
       pos += T
 
 class TestSpecDebugAndIdGuard(unittest.TestCase):
@@ -1198,10 +1225,10 @@ class TestSpecDebugAndIdGuard(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "outside vocab 512"): spec_check_ids(bad, 512, "bad")
 
 class TestSpecLaunchCensus(unittest.TestCase):
-  """T4.132 step 6: once warm, one speculative iteration is k_eff draft replays + VERIFY + the accept replay + (full accept) the MTP
-  rewrite replay or (partial) the REDO replay that restores the GDN checkpoint inside its graph -- and a handful of 1-2 kernel eager
-  launches (the next anchor and h_last uploaded/copied as jit inputs, the chunk cat, REDO's / the rewrite's input prep). Before: ~93
-  eagerly dispatched draft launches, 96 eager restore assigns per partial accept, the accept math and the rewrite trace per iteration."""
+  """T4.132: once warm, one speculative iteration schedules NOTHING eagerly -- the draft chain replay, VERIFY, the accept replay (the
+  test, the readback, the next anchor and h_last gathered on device, the MTP cache rewrite) and on a partial accept the adopt replay.
+  Step 6 had 3-4 eager launches per iteration (h_last's copy, the anchor upload, the chunk cat, REDO's / the rewrite's input prep:
+  ~20 ms each on the card's host) and k + 3..4 replays; before step 6, ~93 eagerly dispatched draft launches per iteration."""
 
   def _census(self, temperature:float) -> list[list[tuple[str, int]]]:
     import tinygrad.tensor as tensor_mod, tinygrad.engine.jit as jit_mod
@@ -1216,9 +1243,9 @@ class TestSpecLaunchCensus(unittest.TestCase):
     try:
       model = _load_gdn_varied()
       gen = model.speculative_generate(list(VARIED_PROMPT), k=3, temperature=temperature)
-      for _ in range(9): next(gen)  # prefill + the first iterations: traces and captures
+      for _ in range(12): next(gen)  # prefill + the first iterations: traces and captures
       per_yield = []
-      for _ in range(12):
+      for _ in range(16):
         n0 = len(log)
         next(gen)
         per_yield.append(log[n0:])
@@ -1226,17 +1253,15 @@ class TestSpecLaunchCensus(unittest.TestCase):
     finally: tensor_mod.run_linear, jit_mod.run_linear = orig_t, orig_j
     return [p for p in per_yield if p]  # a yield inside an accepted batch launches nothing
 
-  def test_warm_iteration_is_replays_plus_tiny_eager_launches(self):
+  def test_warm_iteration_is_replays_only(self):
     for temperature in (0.0, 1.0):
       iters = self._census(temperature)
       self.assertGreater(len(iters), 3)
       for launches in iters:
-        eager, replays = [k for t, k in launches if t == "eager"], [k for t, k in launches if t == "replay"]
-        self.assertLessEqual(len(eager), 5, f"{temperature=}: too many eager launches in one iteration: {launches}")
-        self.assertLessEqual(max(eager), 2, f"{temperature=}: an eager launch of more than 2 kernels (a restore? a draft chain?): {launches}")
-        # drafts (3) + VERIFY + accept, then the REDO (partial accept) and/or the MTP rewrite (m > 0)
-        self.assertIn(len(replays), (6, 7), f"{temperature=}: {launches}")
-        self.assertGreaterEqual(min(replays[:3]), 10, f"{temperature=}: the first three replays are the draft steps: {launches}")
+        self.assertEqual([k for t, k in launches if t == "eager"], [], f"{temperature=}: an eager schedule in a warm iteration: {launches}")
+        # the chain, VERIFY, the accept (+ the adopt on a partial accept)
+        self.assertIn(len(launches), (3, 4), f"{temperature=}: {launches}")
+      self.assertTrue(any(len(launches) == 4 for launches in iters), f"{temperature=}: no partial accept exercised the adopt: {iters}")
 
 if __name__ == '__main__':
   unittest.main()
