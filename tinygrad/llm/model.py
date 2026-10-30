@@ -15,7 +15,7 @@ from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, ad
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention
 from tinygrad.llm.gguf import gguf_load
-from tinygrad.uop.ops import resolve, Ops, GroupOp
+from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
 import traceback
 
@@ -1186,21 +1186,24 @@ class GatedDeltaNetBlock(FFNBlock):
     return _run(x, start_pos)
 
   spec_snap: tuple[Tensor, Tensor]|None = None  # T4.132: (conv_state, recurrent_state) checkpoint buffers -- see checkpoint()
-  def checkpoint(self, x:Tensor) -> Tensor:
+  def checkpoint(self, x:Tensor) -> None:
     """T4.132: copy conv_state/recurrent_state into spec_snap (allocated on first use, so a model that never speculates never pays
-    for it) and return x ordered AFTER those copies -- every kernel of this block's own update reads x, so the copies see the state
-    as it was before the update (the explicit UOp.after edge _sdpa_default uses; the in-place stores are raw STOREs inside the
-    block's precompiled call, which the scheduler's ASSIGN ordering never sees). speculative_generate's partial accept assigns
-    spec_snap back (RESTORE) before REDO; a full accept leaves it unread."""
+    for it) BEFORE this block's next call updates them in place. speculative_generate's partial accept assigns spec_snap back
+    (RESTORE) before REDO; a full accept leaves it unread.
+    The ordering edge lives on the STATE, not on the block's input: each live state Tensor becomes the view
+    AFTER(state, STORE(snap, state)) -- Tensor.assign's own STORE+AFTER idiom on the buffer being copied -- so every read of the
+    state inside the block's precompiled call depends on the copy kernel and the block's own in-place store supersedes it; the
+    realize maps the views back to the plain buffers (as it does for any assign). 10-30: the first form, AFTER(x, <snapshot
+    assigns>) on the input activation, is not an ordering edge in this scheduler -- a reader of an AFTER state depends only on that
+    AFTER's own CALL/END kernels (schedule/__init__.py create_schedule), and an AFTER wrapped around an input has none: the block
+    lost its dependency on x's producer and read an unwritten buffer (every VERIFY row wrong on the card, T=1 included), while the
+    copies ran first only by queue order. test_spec_decode.py::TestSpecForwardMatchesDecode pins it on a model whose ids vary."""
     self._init_state(x)
     if self.spec_snap is None:
       conv, rec = self.conv_state, self.recurrent_state
       self.spec_snap = (Tensor.empty(*conv.shape, dtype=conv.dtype, device=conv.device), Tensor.empty(*rec.shape, dtype=rec.dtype, device=rec.device))
-    stores = [snap.assign(live) for snap, live in zip(self.spec_snap, (self.conv_state, self.recurrent_state))]
-    # an AFTER's base must be buffer-like (uop/spec.py): a block's output already is (its call's AFTER); block 0's embedding reduce
-    # gets the contiguous it would be realized through anyway
-    base = x if x.uop.op in GroupOp.Movement or x.uop.op in (Ops.AFTER, Ops.CONTIGUOUS) or x.uop.has_buffer_identity() else x.contiguous()
-    return Tensor(base.uop.after(*(s.uop for s in stores)))
+    for snap, live in zip(self.spec_snap, (self.conv_state, self.recurrent_state)):
+      live.uop = live.uop.after(snap.uop.store(live.uop))
 
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
@@ -1619,7 +1622,7 @@ class Transformer:
     # activations hop devices at block boundaries (.to is a no-op when the device matches)
     for block in self.blk:
       xin = x.to(block.device)
-      if ckpt and isinstance(block, GatedDeltaNetBlock): xin = block.checkpoint(xin)
+      if ckpt and isinstance(block, GatedDeltaNetBlock): block.checkpoint(xin)
       x = cast(Tensor, block(xin, start_pos, rope.to(block.device) if isinstance(rope, Tensor) else rope))
     if spec:
       # T4.64: speculative_generate's verify/prefill-tail path needs (a) the model's per-position output (to

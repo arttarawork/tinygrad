@@ -1009,5 +1009,133 @@ class TestMTPPrefill(unittest.TestCase):
     np.testing.assert_array_equal(ca, cb)
     self.assertGreater(float(np.abs(ca[:, :, :, 1:n]).max()), 0.0)
 
+def _load_gdn_varied(seed:int=0, max_context:int=128) -> Transformer:
+  """T4.132 (10-30): a tiny GDN+attention model whose greedy stream is NOT one repeating id. _load()/_load_gdn()'s models emit
+  [1, 1, ...] / [1, 7, 1, 7, ...]: a VERIFY forward that read an UNWRITTEN input buffer still produced those ids, so every
+  token-identity test above passed while the card produced garbage. Six blocks in the 27B's pattern (GDN, GDN, GDN, attention,
+  GDN, GDN), dim 64, vocab 512, weights at 0.5 scale -- the first 12 greedy ids are all different."""
+  ssm = SSMConfig(conv_kernel=4, state_size=16, group_count=2, time_step_rank=4, inner_size=64)
+  config = TransformerConfig(num_blocks=6, dim=64, hidden_dim=128, n_heads=4, n_kv_heads=2, norm_eps=1e-5, vocab_size=512, head_dim=16,
+                             rope_theta=10000.0, rope_dim=16, v_head_dim=16, max_context=max_context, attn_output_gate=True,
+                             ssm_layers=(True, True, True, False, True, True), ssm=ssm)
+  model = Transformer(config)
+  model.mtp_head = MTPHead(replace(config, qk_norm=config.head_dim), TransformerBlock)
+  Tensor.manual_seed(seed)
+  params = nn.state.get_parameters(model)
+  for p in params: p.replace(Tensor.randn(*p.shape) * 0.5)
+  Tensor.realize(*params)
+  return model
+
+VARIED_PROMPT = [5, 2, 3, 4, 1, 7, 3, 9, 11, 2, 40, 100, 7]
+
+class TestSpecForwardMatchesDecode(unittest.TestCase):
+  """T4.132 (10-30, the card bisect): forward(spec=True) -- VERIFY/REDO -- was wrong at EVERY concrete width, T=1 included, while
+  generate() was right, independent of every kernel knob. GatedDeltaNetBlock.checkpoint returned the block's input as
+  AFTER(x, <snapshot assigns>). In this scheduler (schedule/__init__.py create_schedule) a reader of an AFTER state depends only
+  on that AFTER's OWN kernels (its srcs[1:] that are CALL/END); an AFTER wrapped around an input with no kernels of its own has
+  none, so the block lost its dependency on x's producer (it read an unwritten buffer) and the snapshot ordering edge hung off
+  nothing. The checkpoint now orders the block's STATE reads after the copies (Tensor.assign's STORE+AFTER idiom on the buffer
+  being snapshotted). These tests compare rows of logits on a model whose greedy ids vary, with the probe's own eager calls."""
+
+  def setUp(self):
+    self.model = _load_gdn_varied()
+    self.ref = _run(self.model, VARIED_PROMPT, 12, spec=False)  # plain greedy: the ground truth
+    self.assertGreaterEqual(len(set(self.ref)), 8, f"{self.ref}: this model's greedy stream must vary for these tests to mean anything")
+    self.first = next(iter(self.model.generate(list(VARIED_PROMPT), temperature=0.0)))  # state = the prompt, _cached_tokens = the prompt
+    self.assertEqual(self.first, self.ref[0])
+    self.snap = self.model.snapshot_state()
+    self.pos = self.snap["pos"]
+    self.gdn = [b for b in self.model.blk if isinstance(b, GatedDeltaNetBlock)]
+
+  def _spec_rows(self, ids:list[int], pos:int) -> np.ndarray:  # eager, no jit: the card probe's own call (spec_bisect.py)
+    logits, _ = cast(tuple[Tensor, Tensor], self.model.forward(Tensor([ids]), pos, None, spec=True))
+    return logits.float().numpy()[0]
+
+  def test_t1_chain_and_every_width_match_generate(self):
+    self.model.restore_state(self.snap)
+    chain, cur = [], self.first
+    for i in range(4):
+      cur = int(self._spec_rows([cur], self.pos + i)[-1].argmax())
+      chain.append(cur)
+    self.assertEqual(chain, self.ref[1:5], "T=1 spec forwards fed one token at a time must reproduce generate()'s ids")
+    chunk = [self.first] + self.ref[1:4]  # what a VERIFY of three correct drafts feeds; the right verdicts are ref[1:5]
+    for T in range(1, 5):
+      self.model.restore_state(self.snap)
+      rows = self._spec_rows(chunk[:T], self.pos)
+      self.assertFalse(np.isnan(rows).any(), f"T={T}: NaN logits")
+      self.assertEqual(rows.argmax(-1).tolist(), self.ref[1:1 + T], f"T={T}: VERIFY rows disagree with generate()")
+
+  def test_width4_rows_equal_the_t1_chain_logits(self):
+    chunk = [self.first] + self.ref[1:4]
+    want = []
+    for i in range(4):
+      self.model.restore_state(self.snap)
+      if i: self._spec_rows(chunk[:i], self.pos)  # advance the state through the first i tokens, then one more
+      want.append(self._spec_rows([chunk[i]], self.pos + i)[-1])
+    self.model.restore_state(self.snap)
+    rows = self._spec_rows(chunk, self.pos)
+    for i in range(4): np.testing.assert_allclose(rows[i], want[i], rtol=1e-3, atol=1e-3, err_msg=f"row {i}")
+
+  def test_checkpoint_orders_the_copy_first_and_leaves_plain_buffers(self):
+    # the forward with the checkpoint == the forward without it (bit-exact: same kernels, only ordering edges differ); spec_snap is
+    # the pre-call state; the live state tensors are plain buffers again afterwards (no AFTER view lingers into the next call)
+    chunk = [self.first] + self.ref[1:4]
+    orig = GatedDeltaNetBlock.checkpoint
+    GatedDeltaNetBlock.checkpoint = lambda self, x: x  # type: ignore[method-assign]
+    try:
+      self.model.restore_state(self.snap)
+      want_rows = self._spec_rows(chunk, self.pos)
+      want_post = [(b.conv_state.numpy(), b.recurrent_state.numpy()) for b in self.gdn]
+    finally: GatedDeltaNetBlock.checkpoint = orig
+    self.model.restore_state(self.snap)
+    pre = [(b.conv_state.numpy(), b.recurrent_state.numpy()) for b in self.gdn]
+    rows = self._spec_rows(chunk, self.pos)
+    np.testing.assert_array_equal(rows, want_rows)
+    for i, (b, (pc, pr), (qc, qr)) in enumerate(zip(self.gdn, pre, want_post)):
+      self.assertTrue(b.conv_state.uop.has_buffer_identity() and b.recurrent_state.uop.has_buffer_identity(), f"gdn {i}: an AFTER view lingers")
+      assert b.spec_snap is not None
+      np.testing.assert_array_equal(b.spec_snap[0].numpy(), pc, err_msg=f"gdn {i} conv snapshot")
+      np.testing.assert_array_equal(b.spec_snap[1].numpy(), pr, err_msg=f"gdn {i} recurrent snapshot")
+      np.testing.assert_array_equal(b.conv_state.numpy(), qc, err_msg=f"gdn {i} conv after")
+      np.testing.assert_array_equal(b.recurrent_state.numpy(), qr, err_msg=f"gdn {i} recurrent after")
+    # RESTORE (speculative_generate's partial-accept path) puts the pre-call state back exactly
+    Tensor.realize(*(x for b in self.gdn for x in (b.conv_state.assign(cast(tuple, b.spec_snap)[0]),
+                                                    b.recurrent_state.assign(cast(tuple, b.spec_snap)[1]))))
+    for i, (b, (pc, pr)) in enumerate(zip(self.gdn, pre)):
+      np.testing.assert_array_equal(b.conv_state.numpy(), pc, err_msg=f"gdn {i} conv restored")
+      np.testing.assert_array_equal(b.recurrent_state.numpy(), pr, err_msg=f"gdn {i} recurrent restored")
+
+  def test_speculative_generate_matches_generate_on_varied_ids(self):
+    for k in (1, 3):
+      self.assertEqual(_run(_load_gdn_varied(), VARIED_PROMPT, 12, spec=True, k=k), self.ref, f"{k=}")
+
+  def test_nv_decode_kernels_see_the_checkpointed_state(self):
+    # the card path: GatedDeltaNetBlock through nv.gdn_decode's two kernels (gate mocked open, CPU form) with the checkpoint active,
+    # at concrete widths 1 and 3, against the generic block with the same checkpoint -- output, both states, both snapshots
+    from test.unit.test_llm_nv_scan import tiny_block, decode_gate, TINY_DIM
+    fused, generic = tiny_block(), tiny_block()
+    with decode_gate(): fused.prepare_nv_decode()
+    self.assertIsNotNone(fused.nv_decode_weights)
+    xs = Tensor.randn(1, 8, TINY_DIM).realize()
+    pos = 0
+    for T in (1, 3, 1, 3):
+      pre = {}
+      for name, block in (("fused", fused), ("generic", generic)):
+        block._init_state(xs)
+        pre[name] = (block.conv_state.numpy(), block.recurrent_state.numpy())
+        block.checkpoint(xs[:, pos:pos + T])
+        with decode_gate() if name == "fused" else contextlib.nullcontext():
+          pre[name] += (cast(Tensor, block(xs[:, pos:pos + T].contiguous(), pos)).numpy(),)
+      np.testing.assert_allclose(pre["fused"][2], pre["generic"][2], rtol=1e-3, atol=1e-5, err_msg=f"{pos=} {T=} output")
+      for name, block in (("fused", fused), ("generic", generic)):
+        assert block.spec_snap is not None
+        np.testing.assert_array_equal(block.spec_snap[0].numpy(), pre[name][0], err_msg=f"{name} {pos=} {T=} conv snapshot")
+        np.testing.assert_array_equal(block.spec_snap[1].numpy(), pre[name][1], err_msg=f"{name} {pos=} {T=} recurrent snapshot")
+        self.assertFalse(np.array_equal(block.recurrent_state.numpy(), pre[name][1]), f"{name} {pos=} {T=}: the state did not advance")
+      np.testing.assert_array_equal(fused.conv_state.numpy(), generic.conv_state.numpy(), err_msg=f"{pos=} {T=} conv")
+      np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-5, atol=1e-7,
+                                 err_msg=f"{pos=} {T=} recurrent")
+      pos += T
+
 if __name__ == '__main__':
   unittest.main()
