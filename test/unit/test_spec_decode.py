@@ -54,7 +54,8 @@ def _run(model:Transformer, prompt:list[int], n:int, spec:bool, k:int=3) -> list
   gen = model.speculative_generate(list(prompt), k=k) if spec else model.generate(list(prompt), temperature=0.0)
   return [v for _, v in zip(range(n), gen)]
 
-def _wrong_logits(target:int) -> Tensor: return Tensor([[[100.0 if i == target else -100.0 for i in range(VOCAB)]]])
+def _wrong_logits_v(target:int, vocab:int) -> Tensor: return Tensor([[[100.0 if i == target else -100.0 for i in range(vocab)]]])
+def _wrong_logits(target:int) -> Tensor: return _wrong_logits_v(target, VOCAB)
 
 # T4.71: sized for CI -- the fork's 2-core ubuntu runners run these model tests ~3x slower than the M3 they
 # were written on, and the full matrix (k x prompts x N_GEN, a fresh model PAIR per combo) blew both the

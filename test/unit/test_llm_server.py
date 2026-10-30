@@ -999,6 +999,180 @@ class TestSpliceCacheCopy(unittest.TestCase):
     self.assertEqual(len(calls), 2)
     # the resumed prompt is prompt + (everything generated before the budget hit) + THINK_CLOSE, each token once
     self.assertEqual(calls[1], [ord("q")] + [ord(c) for c in "think think "] + [ord(c) for c in srv.THINK_CLOSE])
+class TestSpecInjection(unittest.TestCase):
+  """T4.132: under --mtp the reasoning-loop breaker and the think budget work too, and presence_penalty routes to plain generate().
+  speculative_generate commits a whole accepted batch before yielding it (model._cached_tokens = everything but the batch's LAST
+  token), so a trigger inside a batch waits for the batch's last token -- the first point where the state is exactly ids+out minus
+  the last token -- and the restart (speculative_generate again) resumes from the live cache. The fake below keeps exactly that
+  bookkeeping: the anchor alone, then batches of k+1 (full accepts)."""
+  K = 3
+  def _tok(self):
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return i == 0
+      def stream_decoder(self): return lambda i=None: "" if i is None else chr(i)
+    return Tok()
+
+  def _model(self, stream_for):
+    """a --mtp model whose speculative_generate yields stream_for(ids) with speculative_generate's own _cached_tokens bookkeeping;
+    get_start_pos is the real recurrent rule (extend the live cache exactly, else 0); plain generate() must not be called"""
+    from types import SimpleNamespace
+    calls: list[tuple[list[int], int]] = []
+    def get_start_pos(tokens):
+      c = model._cached_tokens
+      return len(c) if c and len(c) < len(tokens) and tokens[:len(c)] == c else 0
+    def speculative_generate(ids, k=3, temperature=0.0):
+      calls.append((list(ids), get_start_pos(ids)))
+      stream = iter(stream_for(ids))
+      v = next(stream)
+      ids.append(v)
+      model._cached_tokens = ids[:-1]  # the anchor: the state is the prompt
+      yield v
+      while True:
+        batch = [next(stream) for _ in range(k + 1)]
+        committed = ids + batch[:-1]   # VERIFY fed the anchor + the k drafts; the batch's last token is not fed yet
+        for v in batch:
+          ids.append(v)
+          model._cached_tokens = committed
+          yield v
+    def generate(*a, **kw): raise AssertionError("a --mtp request without a presence penalty must stay speculative")
+    model = SimpleNamespace(get_start_pos=get_start_pos, speculative_generate=speculative_generate, generate=generate,
+                            mtp_head=object(), max_context=4096, _cached_tokens=[])
+    return model, calls
+
+  def _handler(self, model):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=self._tok(), mtp=True, spec_k=self.K, state_cache_mb=0, vision=None, last=None)
+    return h
+
+  def test_think_budget_fires_at_the_batch_boundary_and_resumes_the_cache(self):
+    import tinygrad.llm.serve as srv
+    close = [ord(c) for c in srv.THINK_CLOSE]
+    def stream_for(ids):
+      if ids[-len(close):] == close: return [ord(c) for c in "42"] + [0] * 8
+      return [ord(c) for c in "think " * 100]
+    model, calls = self._model(stream_for)
+    prompt = [ord("q")]
+    out = list(self._handler(model).run_model(prompt, "m", reasoning=True, think_budget=12))
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 2)
+    # the budget is reached at the 12th token, inside the batch of tokens 10..13 (anchor + batches of 4): injected after token 13
+    before = 1 + -(-(12 - 1) // (self.K + 1)) * (self.K + 1)
+    self.assertEqual(before, 13)
+    self.assertEqual(calls[1][0], prompt + [ord(c) for c in ("think " * 3)[:before]] + close)
+    self.assertEqual(calls[1][1], len(prompt) + before - 1, "the restart resumes from the live cache (only the last token + the close)")
+    self.assertLessEqual(before - 12, self.K)
+    self.assertEqual(content.strip(), "42")
+
+  def test_loop_hit_inside_a_batch_is_injected_at_the_batch_boundary(self):
+    import tinygrad.llm.serve as srv
+    cycle = "Actually, the simplest is: keep two files, zip them. A single self-contained file is more portable. "
+    close, nudge = [ord(c) for c in srv.THINK_CLOSE], [ord(c) for c in srv.LOOP_NUDGE]
+    def stream_for(ids):
+      if ids[-len(close):] == close: return [ord(c) for c in "42"] + [0] * 8
+      return [ord(c) for c in "\n" + cycle * 20]
+    # where the detector fires in a fresh cycle stream (feeding chars as the router does: reasoning text only); the leading
+    # newline (an empty sentence) shifts the hit off a batch boundary
+    d = srv.LoopDetector(3)
+    trigger = next(i for i, c in enumerate("\n" + cycle * 20) if d.feed(c) is not None) + 1  # tokens out when it fires
+    boundary = 1 + -(-(trigger - 1) // (self.K + 1)) * (self.K + 1)
+    self.assertGreater(boundary, trigger, "the hit must land inside a batch for this test to mean anything")
+    model, calls = self._model(stream_for)
+    prompt = [ord("q")]
+    with patch.object(srv, "LOOP_REPEATS", 3), patch.object(srv, "LOOP_NUDGES", 2):
+      out = list(self._handler(model).run_model(prompt, "m", reasoning=True))
+    reasoning = "".join(c["choices"][0]["delta"].get("reasoning_content", "") for c in out if c["choices"])
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 4)                                       # initial + 2 nudges + the close, all speculative
+    self.assertEqual(calls[1][0], prompt + [ord(c) for c in ("\n" + cycle * 20)[:boundary]] + nudge)
+    self.assertLessEqual(boundary - trigger, self.K, "at most k real tokens between the hit and its injection")
+    for ids_, start_pos in calls[1:]:
+      inj = len(close) if ids_[-len(close):] == close else len(nudge)
+      self.assertGreater(start_pos, 0)
+      self.assertEqual(start_pos, len(ids_) - inj - 1, "every restart resumes from the live cache")
+    self.assertEqual(reasoning.count(srv.LOOP_NUDGE.strip()), 2)
+    self.assertIn("Considering the limited time", reasoning)
+    self.assertEqual(content.strip(), "42")
+
+  def test_think_block_closing_before_the_boundary_drops_the_injection(self):
+    # the budget fires at token 10 (inside the batch 10..13); the model closes its think block itself at token 11: no injection
+    stream = [ord(c) for c in "abc</think>"] + [ord(c) for c in "answer"] + [0] * 8
+    def stream_for(ids): return stream
+    model, calls = self._model(stream_for)
+    out = list(self._handler(model).run_model([ord("q")], "m", reasoning=True, think_budget=10))
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in out if c["choices"])
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(content.strip(), "answer")
+
+  def test_presence_penalty_routes_to_plain_generate(self):
+    from types import SimpleNamespace
+    from tinygrad.llm.serve import Handler
+    seen = []
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      seen.append(("plain", presence_penalty))
+      yield 0
+    def speculative_generate(ids, k=3, temperature=0.0):
+      seen.append(("spec", None))
+      yield 0
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, speculative_generate=speculative_generate, mtp_head=object(),
+                            max_context=4096)
+    h = Handler.__new__(Handler)
+    h.server = SimpleNamespace(model=model, tok=self._tok(), mtp=True, spec_k=3, state_cache_mb=0, vision=None, last=None)
+    list(h.run_model([1], "m", presence_penalty=1.5))
+    list(h.run_model([1], "m", presence_penalty=0.0))
+    h.server.mtp = False
+    list(h.run_model([1], "m", presence_penalty=0.0))
+    self.assertEqual(seen, [("plain", 1.5), ("spec", None), ("plain", 0.0)])
+
+  def test_real_model_budget_restart_resumes_and_matches_plain(self):
+    # a tiny GDN+attention model with an MTP head (test_spec_decode's varied one): the think budget lands somewhere in a batch, the
+    # speculative restart resumes at the live cache (start_pos = everything before the last emitted token), and its continuation is
+    # what plain greedy generate() resumed from the same live state produces (a fresh prefill from 0 is a different float path, and
+    # this random-weight model is chaotic enough to flip an argmax on it). The MTP draft is an oracle peeking at plain greedy's own
+    # continuation (test_spec_decode's TestPerfectDraftFullAcceptance trick), so the first batches are full accepts of k+1 tokens and the
+    # budget lands inside one.
+    import tinygrad.llm.serve as srv
+    from tinygrad.llm.model import Transformer
+    from test.unit.test_spec_decode import _load_gdn_varied
+    class Tok:
+      def encode(self, s): return [ord(c) for c in s]
+      def is_end(self, i): return False
+      def stream_decoder(self): return lambda i=None: "" if i is None else chr(i)
+    from test.unit.test_spec_decode import _wrong_logits_v
+    model = _load_gdn_varied()
+    prompt, budget = [5, 2, 3, 4, 1, 7, 3, 9], 6
+    ref = list(prompt) + [v for _, v in zip(range(16), _load_gdn_varied().generate(list(prompt), temperature=0.0))]
+    def oracle(owner, h, tok_ids, start_pos):
+      pos = start_pos if isinstance(start_pos, int) else start_pos.unbind()[1]
+      return _wrong_logits_v(ref[pos + 1] if pos + 1 < len(ref) else 0, 512)
+    model.mtp_head.draft = oracle
+    restarts = []
+    orig = Transformer.speculative_generate
+    def spy(self, tokens, *a, **kw):
+      restarts.append((list(tokens), self.get_start_pos(tokens), self.snapshot_state() if restarts else None))
+      return orig(self, tokens, *a, **kw)
+    h = self._handler(model)
+    h.server.tok = Tok()
+    # a short close sentence: this random-weight model's logits overflow to NaN past ~100 tokens (plain generate() too)
+    with patch.object(Transformer, "speculative_generate", spy), patch.object(srv, "LOOP_REPEATS", 0), patch.object(srv, "THINK_CLOSE", "!</think>"):
+      list(h.run_model(list(prompt), "m", reasoning=True, think_budget=budget, max_tokens=budget + 9 + 10, record=("r", list(prompt), 1)))
+    ids = h.server.last[3]  # every id run_model emitted, the injected close included
+    self.assertEqual(len(restarts), 2)
+    resumed, start_pos, snap = restarts[1]
+    close = [ord(c) for c in "!</think>"]
+    before = len(resumed) - len(prompt) - len(close)
+    self.assertEqual(resumed[-len(close):], close)
+    self.assertTrue(budget < before <= budget + self.K, f"{before=}: the budget must land inside a full-accept batch")
+    self.assertEqual(start_pos, len(prompt) + before - 1, "resumed from the live cache, not re-prefilled from 0")
+    after = ids[before + len(close):]
+    self.assertGreater(len(after), 3)
+    model.restore_state(snap)
+    self.assertEqual(model.get_start_pos(resumed), start_pos)
+    ref = [v for _, v in zip(range(len(after)), model.generate(list(resumed), temperature=0.0))]
+    self.assertEqual(after, ref)
+
 class TestBoundarySnapshot(unittest.TestCase):
   """T4.96: only a request that did NOT extend the live cache (cold, or resumed from a snapshot) stores one --
   a tool-loop step that merely extended it must not evict the snapshot that bridges the next real boundary."""
