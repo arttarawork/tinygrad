@@ -197,7 +197,7 @@ def _imma_params(ggml_type:int, tokens:int, out_features:int, in_features:int, s
          ([UOp.placeholder((tokens, groups), dtypes.float32, slot=4)] if ggml_type != Q4_0 else [])
 
 def _imma_sink(tokens:int, out_features:int, in_features:int, token_tile:int=64, warps:int=4, out_tiles:int=2, stage:int=4,
-               ggml_type:int=Q4_0, pipe:int=0, minblocks:int=0, wprefetch:int=0, splitk:int=1):
+               ggml_type:int=Q4_0, pipe:int=0, minblocks:int=3, wprefetch:int=0, splitk:int=1):  # minblocks 3 = the knob default since 10-29
   return nv_gemm._linear_imma_nv.__wrapped__(*_imma_params(ggml_type, tokens, out_features, in_features, splitk), ggml_type=ggml_type,
                                              out_features=out_features, in_features=in_features, token_tile=token_tile, warps=warps,
                                              out_tiles=out_tiles, stage=stage, pipe=pipe, minblocks=minblocks, wprefetch=wprefetch, splitk=splitk)
@@ -251,7 +251,7 @@ class TestImmaKernel(unittest.TestCase):
               prg = to_program(_imma_sink(128, out_features, in_features, token_tile, warps, out_tiles, stage, ggml_type, pipe, wprefetch=wprefetch),
                                renderer)
               src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
-              self.assertIn(f"__launch_bounds__({32*warps})", src)
+              self.assertIn(f"__launch_bounds__({32*warps}, 3)", src)  # minblocks 3 = the knob default since 10-29
               self.assertEqual(src.count("__syncthreads();"), 2 if stage else 0)  # pipe: one before the loop, one per step
               self.assertEqual(prod(prg.arg.global_size), 128 // token_tile * out_features // (8*warps*out_tiles))  # a size-1 axis drops out
               self.assertLessEqual(_shared_bytes(src), 48 * 1024)
@@ -271,7 +271,7 @@ class TestImmaKernel(unittest.TestCase):
     from tinygrad.helpers import DEV
     try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
     except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
-    src = next(u.arg for u in to_program(_imma_sink(128, 5120, 5120), renderer).src if u.op is Ops.SOURCE)
+    src = next(u.arg for u in to_program(_imma_sink(128, 5120, 5120, minblocks=0), renderer).src if u.op is Ops.SOURCE)  # the T4.126 render: no bound
     self.assertEqual(hashlib.md5(src.encode()).hexdigest(), "91ffc1757984810a4116f7fb2f7f3e40")
 
   def test_pipe_one_barrier_per_step_and_prefetch_stores_after_the_mmas(self):
@@ -428,11 +428,12 @@ class TestImmaSplitK(unittest.TestCase):
     # layers (160 blocks) and the 10240-output qkv (320) are below two waves of 82 SMs x 2 blocks, gate/up (544) are not
     from tinygrad import Context
     steps = {5120: 40, 17408: 136, 6144: 48}  # stage 4
+    shapes = ((5120, 5120), (5120, 17408), (10240, 5120), (17408, 5120), (5120, 6144))
+    with Context(NV_IMMA_SPLITK=0, NV_IMMA_MINBLOCKS=0):  # two resident blocks per SM (the pre-T4.131 occupancy)
+      self.assertEqual([nv_gemm._imma_splitk(steps[i], o // 64 * 2) for o, i in shapes], [4, 4, 2, 1, 3])
+    with Context(NV_IMMA_SPLITK=0, NV_IMMA_MINBLOCKS=3):  # the 10-29 default: 3 blocks/SM -> two waves = 492 (gate/up's 544 still one pass)
+      self.assertEqual([nv_gemm._imma_splitk(steps[i], o // 64 * 2) for o, i in shapes], [4, 4, 2, 1, 4])
     with Context(NV_IMMA_SPLITK=0):
-      self.assertEqual([nv_gemm._imma_splitk(steps[i], o // 64 * 2) for o, i in ((5120, 5120), (5120, 17408), (10240, 5120), (17408, 5120), (5120, 6144))],
-                       [4, 4, 2, 1, 3])
-      with Context(NV_IMMA_MINBLOCKS=3):  # three resident blocks per SM -> two waves = 492 blocks (gate/up's 544 still one pass)
-        self.assertEqual([nv_gemm._imma_splitk(steps[i], o // 64 * 2) for o, i in ((5120, 5120), (10240, 5120), (17408, 5120), (5120, 6144))], [4, 2, 1, 4])
       self.assertEqual(nv_gemm._imma_splitk(3, 160), 3)  # no divisor reaches two waves: the largest <= 8
       self.assertEqual(nv_gemm._imma_splitk(1, 160), 1)
     with Context(NV_IMMA_SPLITK=1): self.assertEqual([nv_gemm._imma_splitk(40, b) for b in (160, 544)], [1, 1])
@@ -575,7 +576,7 @@ class TestImmaDispatch(unittest.TestCase):
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32):
       self.assertEqual(nv_gemm._imma_geometry(lin, 128)["stage"], 8)  # 128 tokens x (68 + 9) words = 39 KB; 16 would be 75 KB
     with Context(NV_IMMA=1, NV_IMMA_TOKEN_TILE=128, NV_IMMA_STAGE=32, NV_IMMA_PIPE=1):  # T4.128: two copies -> 2 x 128 x (36 + 5) = 41 KB
-      self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1, "minblocks": 0,
+      self.assertEqual(nv_gemm._imma_geometry(lin, 128), {"token_tile": 128, "warps": 4, "out_tiles": 2, "stage": 4, "pipe": 1, "minblocks": 3,
                                                           "wprefetch": 0, "splitk": 1})
 
   def test_wprefetch_knob_reaches_the_kernel(self):
@@ -601,7 +602,7 @@ class TestImmaDispatch(unittest.TestCase):
       kernel = _kernels(nv_gemm.nv_wmma_linear(lin, x))["linear_q4_0_imma_nv"]
     self.assertIs(kernel, _imma_sink(64, 256, 128, minblocks=3))
     self.assertEqual(kernel.arg.min_blocks, 3)
-    self.assertEqual(_imma_sink(64, 256, 128).arg.min_blocks, 0)
+    self.assertEqual(_imma_sink(64, 256, 128, minblocks=0).arg.min_blocks, 0)
     try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
     except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
     for minblocks, bounds in ((0, "__launch_bounds__(128) "), (3, "__launch_bounds__(128, 3) "), (4, "__launch_bounds__(128, 4) ")):

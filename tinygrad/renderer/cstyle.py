@@ -156,7 +156,7 @@ class CStyleLanguage(Renderer):
                        self._render_dtype(u.dtype, sz=1, addrspace=u.addrspace, mutable=mutable, shape=u._shape)+
                        (self.var_suffix if u.addrspace == AddrSpace.ALU else self.buffer_suffix)) for name,(u,mutable) in bufs]
     local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
-    launch_bounds:int|str = prod([d.vmax for d in local_dims])
+    launch_bounds:int|str = int(prod([d.vmax for d in local_dims]))
     # T4.131: KernelInfo.min_blocks -> CUDA's __launch_bounds__(threads, minBlocksPerSM): ptxas caps the registers so that many blocks
     # fit an SM (spilling if it must). Only the CUDA typedef takes the second argument; 0 (every other kernel) renders as before
     if (mb := next((u.arg.min_blocks for u in uops if u.op is Ops.SINK and u.arg is not None), 0)): launch_bounds = f"{launch_bounds}, {mb}"

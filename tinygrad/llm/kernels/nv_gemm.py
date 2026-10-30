@@ -72,7 +72,7 @@ NV_IMMA_STAGE = ContextVar("NV_IMMA_STAGE", 4)            # 32-groups per shared
 NV_IMMA_PIPE = ContextVar("NV_IMMA_PIPE", 0)
 # T4.131: occupancy. The T4.126 kernel takes 196 registers (ptxas, nvcc 12.8 sm_86) = 2 blocks of 4 warps per SM; min blocks per SM
 # through __launch_bounds__(threads, n): 3 -> 158 registers, 0 spills; 4 -> 128 registers, 144 B spills. 0 = today's render
-NV_IMMA_MINBLOCKS = ContextVar("NV_IMMA_MINBLOCKS", 0)
+NV_IMMA_MINBLOCKS = ContextVar("NV_IMMA_MINBLOCKS", 3)  # 10-29 card: 0 140.6, 3 138.2, 4 178.9 (spills) ms/chunk
 # T4.131: 1 = the next stage's weight words are loaded into registers one stage ahead (their global-load latency, exposed at the
 # top of every step today, hides behind this stage's mmas); 0 = today's kernel, byte-identical. Costs one register per word read
 NV_IMMA_WPREFETCH = ContextVar("NV_IMMA_WPREFETCH", 0)
@@ -478,7 +478,10 @@ class _RegRaw:
   hands the slots back, in order, as register loads; count mode (raw only) just counts the reads to size the array. The format
   functions' call order is the whole contract -- the index arithmetic (Q5_K's sub-block shift and bit) is recomputed on replay
   from the stage being computed, only the words come from the registers."""
-  def __init__(self, regs:UOp|None, raw:UOp|None): self.regs, self.raw, self.k, self.stores, self.loads = regs, raw, 0, [], []
+  def __init__(self, regs:UOp|None, raw:UOp|None):
+    self.regs, self.raw, self.k = regs, raw, 0
+    self.stores: list[UOp] = []
+    self.loads: list[UOp] = []
   def __getitem__(self, idx:UOp) -> UOp:
     k, self.k = self.k, self.k + 1
     if self.raw is None:
