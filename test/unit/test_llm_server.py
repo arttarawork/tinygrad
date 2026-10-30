@@ -1143,6 +1143,29 @@ class TestSpecInjection(unittest.TestCase):
     list(h.run_model([1], "m", presence_penalty=0.0))
     self.assertEqual(seen, [("plain", 1.5), ("spec", None), ("plain", 0.0)])
 
+  def test_long_prompt_routes_to_plain_generate(self):
+    # T4.132: SPEC_MAX_CONTEXT -- a prompt at or past it decodes plainly on a --mtp server; 0 speculates at any length
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import tinygrad.llm.serve as srv
+    seen = []
+    def generate(ids, temperature=0.0, vision=None, presence_penalty=0.0):
+      seen.append("plain")
+      yield 0
+    def speculative_generate(ids, k=3, temperature=0.0):
+      seen.append("spec")
+      yield 0
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=generate, speculative_generate=speculative_generate, mtp_head=object(),
+                            max_context=4096)
+    h = srv.Handler.__new__(srv.Handler)
+    h.server = SimpleNamespace(model=model, tok=self._tok(), mtp=True, spec_k=3, state_cache_mb=0, vision=None, last=None)
+    with patch.object(srv, "SPEC_MAX_CONTEXT", 4):
+      list(h.run_model([1, 2, 3], "m"))
+      list(h.run_model([1, 2, 3, 4], "m"))
+    with patch.object(srv, "SPEC_MAX_CONTEXT", 0):
+      list(h.run_model([1, 2, 3, 4], "m"))
+    self.assertEqual(seen, ["spec", "plain", "spec"])
+
   def test_real_model_budget_restart_resumes_and_matches_plain(self):
     # a tiny GDN+attention model with an MTP head (test_spec_decode's varied one): the think budget lands somewhere in a batch, the
     # speculative restart resumes at the live cache (start_pos = everything before the last emitted token), and its continuation is
