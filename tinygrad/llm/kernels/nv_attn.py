@@ -149,6 +149,9 @@ NV_ATTN_DEC_MMA = ContextVar("NV_ATTN_DEC_MMA", 1)       # 0 = the T4.107a kerne
 NV_ATTN_DEC_SLOTS = ContextVar("NV_ATTN_DEC_SLOTS", 256)  # partial slots per (batch, q head) at most (= warps per kv head)
 NV_ATTN_DEC_WARPS = ContextVar("NV_ATTN_DEC_WARPS", 4)    # warps (each its own slot) per block
 NV_ATTN_DEC_KTILES = ContextVar("NV_ATTN_DEC_KTILES", 1)  # 16-key tiles per loop step (one softmax rescale per step); divides 8
+# T4.134: head_dim parts per slot (adjacent blocks: each keeps D/parts of O and reads its share of V, S is recomputed per part) --
+# O^T is D/16 x 4 fp32 per row group per lane, 192 registers for VERIFY(3) at the model's G = 6; a card knob, divides head_dim/64
+NV_ATTN_DEC_DSPLIT = ContextVar("NV_ATTN_DEC_DSPLIT", 1)
 DEC_IMMA_ARG = ((WMMA_N, WMMA_M, 32), 'CUDA', WARP_SIZE)  # m16n8k32 s8 -> s32 ('CUDA': the PYTHON emulator's fragment model; the
 DEC_HMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)  # renderer ignores the string) and m16n8k16 f16 -> f32
 MAGIC = 0x4B400000  # bitcast(MAGIC + c) = 1.5*2**23 + c exactly for |c| < 2**22 (T4.126): int32 -> fp32 without an I2F
@@ -168,7 +171,7 @@ def _decode_mma_ok(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None) -> boo
 
 @functools.cache
 def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, valid_kv_len:int|UOp, max_kv_len:int, warps:int,
-                       k_tiles:int, tokens:int=1) -> UOp:
+                       k_tiles:int, tokens:int=1, d_split:int=1) -> UOp:
   """T4.129: _decode_partial_kernel's contract -- (acc, m, l) per (batch, q head, slot) for _merge_partials -- for a KV_INT4 cache, on
   the tensor cores. Grid: (batch x kv head) x slot blocks of `warps` warps; each warp is one slot and walks chunks slot, slot+S,
   slot+2S, ... of KS = 16*k_tiles keys (S = live slots = min(ceil(valid/KS), out.shape[2])); lane is AxisType.WARP (threadIdx.x,
@@ -193,21 +196,25 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   (k even) / g+8 (k odd) -- the A fragment's g+8 half T == 1 leaves zero -- and the P.V n-tile k (P never moves: C rows g+8 of an
   S tile are the B fragment of the next n-tile). K/V words, their dequant and the int8 B fragments are shared by every row group.
   Row r is token r % T and sees keys < valid_kv_len - (T-1) + r % T: one compare per (row group, score) replaces the shared key
-  mask (a select, no branch); the loads keep the shared valid_kv_len mask. T == 1 builds exactly the T4.129 graph."""
+  mask (a select, no branch); the loads keep the shared valid_kv_len mask. d_split > 1 splits a slot's head_dim over that many
+  adjacent blocks (NV_ATTN_DEC_DSPLIT); T == 1 at d_split 1 builds exactly the T4.129 graph."""
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, D = cast(tuple[int, int, int, int], q.shape)
   G, slots, KS, blocks, run = H // H_KV, cast(int, out.shape[2]), 16 * k_tiles, D // 32, D // 64  # run = V words per row group
   RG = -(-G // 8)  # T4.134: 8-row groups (1 at T == 1)
   assert M == 1 and 2 <= G <= 32 and G % tokens == 0 and H % H_KV == 0 and D in (64, 128, 256) and max_kv_len == N and N % KS == 0
+  assert run % d_split == 0, f"d_split={d_split} must divide head_dim/64 = {run} (whole V words per part)"
+  JD = D // 16 // d_split  # O^T dim tiles per block
   assert cache_kv.dtype == dtypes.uint32 and cache_kv.shape[4] * 8 == D, "the int4 cache arrives as uint32 words (_decode_mma_attention)"
   live = (valid_kv_len + KS - 1) // KS
   S = min(live, slots) if isinstance(live, int) else live.minimum(slots)
   per_bh = (S + warps - 1) // warps
-  block = UOp.range(B * H_KV * per_bh, 0, AxisType.GLOBAL)
+  block = UOp.range(B * H_KV * per_bh * d_split, 0, AxisType.GLOBAL)
+  cell, dpart = (block // d_split, block % d_split) if d_split > 1 else (block, None)  # T4.134: a slot's head_dim parts are adjacent blocks
   warp = UOp.range(warps, 1, AxisType.LOCAL) if warps > 1 else UOp.const(0, dtypes.weakint)
   lane = UOp.range(WARP_SIZE, -1, AxisType.WARP)
-  bh, slot = block // per_bh, ((block % per_bh) * warps + warp).minimum(S - 1)  # surplus warps redo the last slot: same values
+  bh, slot = cell // per_bh, ((cell % per_bh) * warps + warp).minimum(S - 1)  # surplus warps redo the last slot: same values
   b, kvh = bh // H_KV, bh % H_KV
   g, t = lane // 4, lane % 4
   # prologue: this lane's A fragments (head g, dims 32*blk+8t..+7) and the per-(head, block) scales, q8_quantize's rounding
@@ -239,7 +246,7 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
              for blk in range(blocks)] for mt in range(-(-RG // 2))]
   row_max, row_sum = _reg((RG,), 1, SENTINEL, block), _reg((RG,), 2, 0, block)
   # O^T m-tile j x row group k: (dim rows g, g+8) x (rows 2t, 2t+1 of the group)
-  o_acc = [tuple(_reg((4,), 10 + k * (D // 16) + j, 0, block) for j in range(D // 16)) for k in range(RG)]
+  o_acc = [tuple(_reg((4,), 10 + k * JD + j, 0, block) for j in range(JD)) for k in range(RG)]
   steps = (live + S - 1) // S
   step = UOp.range(steps, 100, AxisType.REDUCE)
   base = (slot + step * S) * KS
@@ -282,7 +289,8 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
     alphas.append((_shfl(alpha, 8 * t), _shfl(alpha, 8 * t + 4)))  # O^T's columns are rows 2t, 2t+1 = S rows of lanes 8t, 8t+4
     row_stores += [row_max[k].store(new_max), row_sum[k].store(new_sum)]
   # V: per tile key, this lane's run of row group g (D/16 bytes) and its block's scale, as fp16
-  vruns = [[[cache_kv[1, b, kvh, key.valid(ok), run * g + w].load() for w in range(run)] for key, ok in zip(keys, key_ok)]
+  vw = run * g if dpart is None else run * g + run // d_split * dpart  # T4.134: this block's words of the run
+  vruns = [[[cache_kv[1, b, kvh, key.valid(ok), vw + w].load() for w in range(run // d_split)] for key, ok in zip(keys, key_ok)]
            for keys, key_ok in zip(tiles, [oks[4*kt:4*kt+4] for kt in range(k_tiles)])]
   svs = [[scale[1, b, kvh, key.valid(ok), (D // 8) * g // 32].load() for key, ok in zip(keys, oks[4*kt:4*kt+4])] for kt, keys in enumerate(tiles)]
   def vval(kt:int, k:int, j:int, high:int) -> UOp:
@@ -291,7 +299,7 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
     return ((nib | 0x6400).cast(dtypes.uint16).bitcast(dtypes.float16) - 1032.0) * svs[kt][k]
   pfrags = [[UOp.stack(*(p.cast(dtypes.float16) for p in ps[k][4*kt:4*kt+4])) for kt in range(k_tiles)] for k in range(RG)]
   o_stores = []
-  for j in range(D // 16):
+  for j in range(JD):
     # A e0..e7 = (rows g, g+8) x (k 2t, 2t+1, 2t+8, 2t+9) in the m16n8k16 order: A[g][2t], A[g][2t+1], A[g+8][2t], A[g+8][2t+1], ...
     vfrags = [UOp.stack(*(vval(kt, 2 * kh + kk, j, high) for kh in range(2) for high in range(2) for kk in range(2))) for kt in range(k_tiles)]
     for k in range(RG):  # T4.134: one V^T fragment, every row group's P
@@ -314,7 +322,8 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
       vals = acc.after(update)
       for i in range(4):
         oh = 2 * t + i % 2 + 8 * k if k else 2 * t + i % 2
-        stores.append(out[b, kvh * G + oh, slot, ((D // 8) * g + 2 * j + i // 2).valid(oh < G)].store(vals[i].load()))
+        dim = (D // 8) * g + 2 * j + i // 2 if dpart is None else (D // 8) * g + 2 * j + i // 2 + 2 * JD * dpart
+        stores.append(out[b, kvh * G + oh, slot, dim.valid(oh < G)].store(vals[i].load()))
   ends = (lane, warp, block) if warps > 1 else (lane, block)
   return UOp.group(*stores).end(*ends).sink(arg=KernelInfo(name="flash_decode_mma_nv", opts_to_apply=()))
 
@@ -331,8 +340,10 @@ def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, vali
   srcs = (partial, stats, q.contiguous() if T == 1 else q.reshape(B, H * T, 1, D).contiguous(), cache_kv, cache_kv_scale)
   params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
   params[3] = UOp.placeholder((2, B, cast(int, cache_kv.shape[2]), N, D // 8), dtypes.uint32, slot=3)
+  d_split = max(NV_ATTN_DEC_DSPLIT.value, 1)
+  if (D // 64) % d_split: d_split = 1  # T4.134: whole V words per part (head_dim 64: no split)
   kernel = _decode_mma_kernel(*params, valid_kv_len=valid_kv_len, max_kv_len=N, warps=max(NV_ATTN_DEC_WARPS.value, 1), k_tiles=k_tiles,
-                              tokens=T)
+                              tokens=T, d_split=d_split)
   call = kernel.call(*(s.uop for s in srcs))
   partial, stats = Tensor(partial.uop.after(call)), Tensor(stats.uop.after(call))
   # live slots = ceil(valid / KS): _merge_partials counts ceil(valid' / BLOCK_N), so hand it valid' = valid * BLOCK_N / KS
