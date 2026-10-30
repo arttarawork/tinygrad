@@ -16,9 +16,10 @@ if TYPE_CHECKING:
 # T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag. T4.132: speculative_generate and
 # warmup cap it at 3 (model.py spec_k_clamped: VERIFY's k+1 tokens must stay on the 4-token NV decode kernels).
 SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
-# T4.132: --mtp speculates only while the request's prompt is shorter than this many tokens (0 = always). VERIFY's attention runs the
-# 16-row prefill kernel, whose cost grows with the fill: on the card (10-30, k=2) 1.47x plain at 2k, 1.04x at 131k -- plain decode above.
-SPEC_MAX_CONTEXT = getenv("SPEC_MAX_CONTEXT", 65536)
+# T4.132: --mtp speculates only while the request's prompt is shorter than this many tokens (0 = always). It was 65536 while VERIFY's
+# attention ran the 16-row prefill kernel (1.04x plain at 131k); T4.134 put VERIFY on the split-KV decode kernel: k=2 on the card
+# (10-30) 1.63x plain at 2k, 1.60x at 20k, 1.46x at 131k -- no cap.
+SPEC_MAX_CONTEXT = getenv("SPEC_MAX_CONTEXT", 0)
 # T4.67: MB cap for the cross-session prefill state cache (LLMServer.snapshots) when enabled -- see
 # LLMServer.store_snapshot and cli.py's --state-cache flag. Mirrors SPEC_TOKENS/--mtp above: this constant is
 # only the MAGNITUDE: LLMServer.__init__'s own default is 0 (off), so a caller who doesn't ask for this
