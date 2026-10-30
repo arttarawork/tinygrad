@@ -1413,7 +1413,10 @@ class MTPHead:
     return self.eh_proj(self.enorm(e).cat(self.hnorm(h.to(dev).float()), dim=-1))
 
   def local_embedding(self, owner:Transformer) -> nn.Embedding:
-    """the owner's token embedding on self.block's device (T4.66d), copied once on first use"""
+    """the owner's token embedding on self.block's device (T4.66d), copied once on first use. T4.132: on the same device the owner's own
+    (a lazy dequant view of the GGUF bytes, gathered per row like the main model's lookup) -- realizing it was the whole fp16 table,
+    248320 x 5120 = 2.4 GiB on the card, the 262k window's OOM"""
+    if owner.token_embd.weight.device == self.block.device: return owner.token_embd
     if not hasattr(self, "_local_token_embd"):
       local = nn.Embedding.__new__(nn.Embedding)
       local.weight = owner.token_embd.weight.to(self.block.device).realize()
