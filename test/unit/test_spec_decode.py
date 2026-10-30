@@ -631,8 +631,9 @@ class TestSpecWarmup(unittest.TestCase):
     for w in range(1, 3 + 2): self.assertIn(_verify_key(w), spec_keys, f"VERIFY width {w} not warmed: {spec_keys}")
     for key in spec_keys:
       self.assertIsNotNone(model.jit[key].captured, f"jit[{key}] was called but never actually captured (still cnt<=1)")
-    # T4.132 step 6: the loop's own graphs -- every draft step, the greedy and sampled accept families at n = k+1, the MTP fill/rewrite
-    for key in [("draft", i) for i in range(3)] + [("accept", 4, True), ("accept", 4, False), ("adopt",)]:
+    # T4.132: the loop's own graphs -- the draft chain and the greedy and sampled accept families at every k_eff 1..3 (n = k_eff+1), the
+    # partial-accept adopt, the prompt's MTP fill
+    for key in [("chain", i) for i in (1, 2, 3)] + [("accept", n, g) for n in (2, 3, 4) for g in (True, False)] + [("adopt",)]:
       self.assertIn(key, model.spec_jit, f"{key} not warmed: {sorted(model.spec_jit, key=str)}")
     self.assertTrue(any(key[0] == "mtp_prefill" for key in model.spec_jit), sorted(model.spec_jit, key=str))
     for key, jit in model.spec_jit.items(): self.assertIsNotNone(cast(TinyJit, jit).captured, f"spec_jit[{key}] never captured")
@@ -1224,10 +1225,10 @@ class TestSpecDebugAndIdGuard(unittest.TestCase):
       with self.assertRaisesRegex(RuntimeError, "outside vocab 512"): spec_check_ids(bad, 512, "bad")
 
 class TestSpecLaunchCensus(unittest.TestCase):
-  """T4.132 step 6: once warm, one speculative iteration is k_eff draft replays + VERIFY + the accept replay + (full accept) the MTP
-  rewrite replay or (partial) the REDO replay that restores the GDN checkpoint inside its graph -- and a handful of 1-2 kernel eager
-  launches (the next anchor and h_last uploaded/copied as jit inputs, the chunk cat, REDO's / the rewrite's input prep). Before: ~93
-  eagerly dispatched draft launches, 96 eager restore assigns per partial accept, the accept math and the rewrite trace per iteration."""
+  """T4.132: once warm, one speculative iteration schedules NOTHING eagerly -- the draft chain replay, VERIFY, the accept replay (the
+  test, the readback, the next anchor and h_last gathered on device, the MTP cache rewrite) and on a partial accept the adopt replay.
+  Step 6 had 3-4 eager launches per iteration (h_last's copy, the anchor upload, the chunk cat, REDO's / the rewrite's input prep:
+  ~20 ms each on the card's host) and k + 3..4 replays; before step 6, ~93 eagerly dispatched draft launches per iteration."""
 
   def _census(self, temperature:float) -> list[list[tuple[str, int]]]:
     import tinygrad.tensor as tensor_mod, tinygrad.engine.jit as jit_mod
@@ -1242,9 +1243,9 @@ class TestSpecLaunchCensus(unittest.TestCase):
     try:
       model = _load_gdn_varied()
       gen = model.speculative_generate(list(VARIED_PROMPT), k=3, temperature=temperature)
-      for _ in range(9): next(gen)  # prefill + the first iterations: traces and captures
+      for _ in range(12): next(gen)  # prefill + the first iterations: traces and captures
       per_yield = []
-      for _ in range(12):
+      for _ in range(16):
         n0 = len(log)
         next(gen)
         per_yield.append(log[n0:])
@@ -1252,17 +1253,15 @@ class TestSpecLaunchCensus(unittest.TestCase):
     finally: tensor_mod.run_linear, jit_mod.run_linear = orig_t, orig_j
     return [p for p in per_yield if p]  # a yield inside an accepted batch launches nothing
 
-  def test_warm_iteration_is_replays_plus_tiny_eager_launches(self):
+  def test_warm_iteration_is_replays_only(self):
     for temperature in (0.0, 1.0):
       iters = self._census(temperature)
       self.assertGreater(len(iters), 3)
       for launches in iters:
-        eager, replays = [k for t, k in launches if t == "eager"], [k for t, k in launches if t == "replay"]
-        self.assertLessEqual(len(eager), 5, f"{temperature=}: too many eager launches in one iteration: {launches}")
-        self.assertLessEqual(max(eager), 2, f"{temperature=}: an eager launch of more than 2 kernels (a restore? a draft chain?): {launches}")
-        # drafts (3) + VERIFY + accept, then the REDO (partial accept) and/or the MTP rewrite (m > 0)
-        self.assertIn(len(replays), (6, 7), f"{temperature=}: {launches}")
-        self.assertGreaterEqual(min(replays[:3]), 10, f"{temperature=}: the first three replays are the draft steps: {launches}")
+        self.assertEqual([k for t, k in launches if t == "eager"], [], f"{temperature=}: an eager schedule in a warm iteration: {launches}")
+        # the chain, VERIFY, the accept (+ the adopt on a partial accept)
+        self.assertIn(len(launches), (3, 4), f"{temperature=}: {launches}")
+      self.assertTrue(any(len(launches) == 4 for launches in iters), f"{temperature=}: no partial accept exercised the adopt: {iters}")
 
 if __name__ == '__main__':
   unittest.main()
