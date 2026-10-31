@@ -2357,8 +2357,9 @@ class Transformer:
     """T4.132: speculative_generate's graphs, one TinyJit per key in self.spec_jit, each captured on its FIRST call (the prefill families'
     T4.128 rule: an eager first call schedules every intermediate unplanned at once -- the card's memory peak). prune=True runs the first
     call's one-time work once (MTPHead.prefill: the MTP block's KV zero-fill on the first prompt). The chain and the accept test do NOT
-    prune: pruning keeps Tensor.rand's counter advance out of the replay (engine/jit.py) and every sampled draw would repeat; their
-    one-time work is done beforehand instead (MTPHead.ready, the RNG state in speculative_generate). adopt has no Tensor inputs."""
+    prune: pruning kept Tensor.rand's counter advance out of the replay and every sampled draw repeated (T4.139: engine/jit.py's
+    prune_linear keeps it now -- the plain prefill family's first-token draw had that bug); their one-time work is done beforehand
+    instead (MTPHead.ready, the RNG state in speculative_generate). adopt has no Tensor inputs."""
     if key not in self.spec_jit:
       self.spec_jit[key] = jit = TinyJit(fxn, prune=prune)
       jit.cnt = 1
