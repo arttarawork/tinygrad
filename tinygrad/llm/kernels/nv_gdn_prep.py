@@ -48,6 +48,7 @@ from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import kernel_var
 from tinygrad.llm.kernels.nv import _gated_delta_prefill_kernel
+from tinygrad.llm.kernels.nv_quant import _q8_pack
 
 # ******** step 1: the pre-scan glue as two kernels ********
 # gdn_prep_nv -- one warp per (batch, tile of PREP_TILE tokens, k-head): its lanes own the k-head's 128 q and 128 k channels and the
@@ -183,3 +184,65 @@ def gdn_prefill(qkv:Tensor, beta_alpha:Tensor, conv_state:Tensor, state:Tensor, 
   scan = functools.partial(_gated_delta_prefill_kernel, start_pos=kernel_var(start_pos.src[0]), lanes=lanes_for(conv_state.device))
   # the scan's state input carries the conv_state store into the graph (model.py's generic path hangs it there too)
   return Tensor(core.uop.after(_call(scan, core.uop, q.uop, k.uop, v.uop, beta.uop, alpha.uop, state.uop.after(conv_call), kq.uop)))
+
+# ******** step 2: the post-scan glue as one kernel ********
+# gdn_post_nv -- one warp per (batch, token, v-head) at V = 128 (128/V heads per warp below it); each lane owns one q8 word of the head's
+#   row, 4 consecutive values. ssm_norm's rms over the head row (a warp reduction), * norm weight * SiLU(attn_gate) -> fp16 z (zero past
+#   toks: the rows nv_wmma_linear's pad zeroed), then ssm_out's q8 activations of that fp16 z -- the max over each 32-group's 8 lanes,
+#   the packed word, the scale and the group sum, q8_quantize's exact formulas, so bit-identical to quantizing z. register_fused_q8 hands
+#   them to ssm_out's IMMA gemm (sums for the card's Q5_K). Replaces ssm_norm's reduce, the gated elementwise, z's pad copy and ssm_out's
+#   q8_quantize_nv: ~43 us per block at 128 tokens on the card for ~7 MB of traffic (~8 us).
+
+def _offsets(n:int) -> tuple[int, ...]: return tuple(1 << i for i in reversed(range(n.bit_length() - 1)))  # xor butterfly over n lanes
+
+@functools.cache
+def _gdn_post_kernel(z:UOp, xq:UOp, xd:UOp, xs:UOp, core:UOp, gate:UOp, norm_w:UOp, *bound:UOp, toks:UOp|int, norm_eps:float,
+                     lanes:int=32) -> UOp:
+  """z (B,T,H*V) fp16, xq (B*T,H*V/32,8) uint32, xd/xs (B*T,H*V/32) fp32 out (q8_quantize(z, sums=True)'s layout); core (B,H,T,V) fp32 =
+  the scan's output, gate (B,T,H*V) = attn_gate(x), norm_w (V,) fp32 = ssm_norm's weight."""
+  batch, heads, tokens, value_dim = cast(tuple[int, int, int, int], core.shape)
+  per = 4 if lanes > 1 else value_dim  # values per thread: one q8 word, or the CPU form's whole head row
+  hl = value_dim // per  # threads per head row
+  hpw = lanes // hl if lanes > 1 else 1  # heads per warp
+  assert value_dim % 32 == 0 and hl & (hl - 1) == 0 and (lanes == 1 or (lanes % hl == 0 and heads % hpw == 0))
+  w, lane = UOp.range(batch*tokens*heads // hpw, 0), _warp_lane(lanes)
+  bt, hw = w // (heads // hpw), w % (heads // hpw)
+  b, t = bt // tokens, bt % tokens
+  h, li = (hw*hpw + lane // hl, lane % hl) if hpw > 1 else (hw, lane)
+  base, row = h*value_dim + li*per, b*tokens + t  # this thread's first feature of z's row, and that row
+  vals = [core[b, h, t, li*per + j].load() for j in range(per)]
+  sq = _added(x*x for x in vals)
+  if hl > 1: sq = xor_reduce(sq, _offsets(hl))
+  inv, ok = (sq * (1/value_dim) + norm_eps).rsqrt(), t < toks  # nn.RMSNorm: x * (mean(x^2) + eps).rsqrt(), then * weight
+  zh = [ok.where(x*inv*norm_w[li*per + j].load() * gate[b, t, base + j].load().float().silu(), 0.0).cast(dtypes.float16) for j, x in enumerate(vals)]
+  stores = [z[b, t, base + j].store(x) for j, x in enumerate(zh)]
+  # quantize the STORED fp16 z (q8_quantize's input): the codegen folds a cast(half).float() pair back to the fp32 value, so read the
+  # thread's own stores back (an L1 hit) -- this keeps the q8 words bit-identical to the old path's q8_quantize_nv of z
+  zf = [z.after(*stores)[b, t, base + j].load().float() for j in range(per)]
+  def amax(xs) -> UOp: return functools.reduce(lambda a, x: a.maximum(x), (x.abs() for x in xs))
+  def qsum(xs, scale) -> UOp: return _added((x/scale).round().clip(-127, 127) for x in xs)  # integers <= 32*127: exact in any order
+  if per == 4:  # one word per lane, a 32-group = 8 adjacent lanes (the WARP lane is the hardware lane: xor 4/2/1 stays in the group)
+    scale = (xor_reduce(amax(zf), (4, 2, 1), maximum=True) / 127).maximum(1e-8)
+    g = base // 32
+    stores += [xq[row, g, li % 8].store(_q8_pack(tuple(zf), scale)), xd[row, g].store(scale),
+               xs[row, g].store(scale * xor_reduce(qsum(zf, scale), (4, 2, 1)))]  # the same bits in the group's 8 lanes: no gate
+  else:
+    for gi in range(per // 32):
+      vs = zf[32*gi:32*gi + 32]
+      scale, g = (amax(vs) / 127).maximum(1e-8), base // 32 + gi
+      stores += [xq[row, g, wi].store(_q8_pack(tuple(vs[4*wi:4*wi + 4]), scale)) for wi in range(8)]
+      stores += [xd[row, g].store(scale), xs[row, g].store(scale * qsum(vs, scale))]
+  return UOp.group(*stores).end(*(r for r in (lane, w) if r.op is Ops.RANGE)).sink(arg=KernelInfo(name="gdn_post_nv", opts_to_apply=()))
+
+def gdn_post(core:Tensor, gate:Tensor, norm_w:Tensor, toks:int|UOp, norm_eps:float) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+  """(z (B,T,H*V) fp16 = (ssm_norm(core) * SiLU(gate)) with rows >= toks zeroed, and q8_quantize(z, sums=True)'s (q, scale, sums)):
+  core = gdn_prefill's output, gate = attn_gate(x) at the padded width, norm_w = prepare_nv_decode's fp32 ssm_norm weight."""
+  batch, heads, tokens, value_dim = cast(tuple[int, int, int, int], core.shape)
+  features, device = heads*value_dim, core.device
+  tk, bound = (kernel_var(toks.src[0]), (Tensor(toks),)) if isinstance(toks, UOp) else (toks, ())
+  outs = [Tensor.empty(batch, tokens, features, dtype=dtypes.float16, device=device),
+          Tensor.empty(batch*tokens, features // 32, 8, dtype=dtypes.uint32, device=device)] + \
+         [Tensor.empty(batch*tokens, features // 32, dtype=dtypes.float32, device=device) for _ in range(2)]
+  fxn = functools.partial(_gdn_post_kernel, toks=tk, norm_eps=norm_eps, lanes=lanes_for(device))
+  z, xq, xd, xs = Tensor.custom_kernel(*outs, core, gate.reshape(batch, tokens, features), norm_w, *bound, fxn=fxn)[:4]
+  return z, xq, xd, xs

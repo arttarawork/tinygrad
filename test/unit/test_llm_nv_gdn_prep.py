@@ -13,7 +13,7 @@ from tinygrad.uop.ops import Ops, KernelInfo, AxisType
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, Q4_0, kernel_var
 from tinygrad.llm.kernels import nv, nv_gemm, nv_gdn_prep
-from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill, _gdn_prep_kernel, _gdn_conv_state_kernel
+from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill, gdn_post, _gdn_prep_kernel, _gdn_conv_state_kernel, _gdn_post_kernel
 from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig, Transformer
 
 # ******** the 27B GDN block, scheduled with the NV gates open ********
@@ -203,7 +203,8 @@ def emulated_lanes():
        mock.patch.object(nv, "warp_reduce", _emulated_warp_reduce), \
        mock.patch.object(nv_gdn_prep, "_gdn_prep_kernel", _gdn_prep_kernel.__wrapped__), \
        mock.patch.object(nv_gdn_prep, "_gdn_conv_state_kernel", _gdn_conv_state_kernel.__wrapped__), \
-       mock.patch.object(nv_gdn_prep, "_gated_delta_prefill_kernel", nv._gated_delta_prefill_kernel.__wrapped__):
+       mock.patch.object(nv_gdn_prep, "_gated_delta_prefill_kernel", nv._gated_delta_prefill_kernel.__wrapped__), \
+       mock.patch.object(nv_gdn_prep, "_gdn_post_kernel", _gdn_post_kernel.__wrapped__):
     yield
 
 @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
@@ -248,6 +249,65 @@ class TestGDNPrefillEmulator(unittest.TestCase):
   def test_chunk_32(self): self._chain(32, ((0, 32), (32, 32), (64, 11)), max_context=128)
   def test_chunk_128_restart_and_near_max(self): self._chain(128, ((5, 128), (0, 128), (262000, 77)), max_context=262144)
 
+# ******** step 2: gdn_post (gdn_post_nv) ********
+
+def np_gdn_post(core, gate, norm_w, toks:int, eps:float=1e-6) -> np.ndarray:
+  """fp64 z (B,T,H*V) = ssm_norm(core) * norm_w * SiLU(gate), rows >= toks zero (model.py's generic graph, then nv_wmma_linear's pad)"""
+  B, H, T, V = core.shape
+  c = core.astype(np.float64)
+  g = gate.astype(np.float64).reshape(B, T, H, V).transpose(0, 2, 1, 3)
+  z = c / np.sqrt((c**2).mean(-1, keepdims=True) + eps) * norm_w * g / (1 + np.exp(-g))
+  z = np.where((np.arange(T) < toks)[None, None, :, None], z, 0)
+  return z.transpose(0, 2, 1, 3).reshape(B, T, H*V)
+
+def np_q8(z:np.ndarray):
+  """q8_quantize_nv's exact formulas (test_llm_nv_gemm._q8) on an fp32 (rows, F) activation: packed words, scales, group sums"""
+  x = z.astype(np.float32).reshape(z.shape[0], -1, 32)
+  xd = np.maximum(np.abs(x).max(-1) / np.float32(127), np.float32(1e-8)).astype(np.float32)
+  q = np.clip(np.rint(x / xd[..., None]), -127, 127).astype(np.int8)
+  return q.view(np.uint32), xd, (xd * q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32)
+
+def check_post(test:unittest.TestCase, core, gate, norm_w, toks:int, device:str|None):
+  T = core.shape[2]
+  tk = UOp.variable("toks", 1, T).bind(toks)
+  z, xq, xd, xs = (t.numpy() for t in gdn_post(Tensor(core, device=device), Tensor(gate, device=device), Tensor(norm_w, device=device), tk, 1e-6))
+  np.testing.assert_allclose(z.astype(np.float32), np_gdn_post(core, gate, norm_w, toks), rtol=2e-3, atol=2e-4)  # one fp16 rounding
+  np.testing.assert_array_equal(z[:, toks:], 0)
+  # q8 of the kernel's own fp16 z: numpy's exact division may round a near-tie of x/scale the other way than the backend's lowering of
+  # the same formula (fp16 z makes those ties common), so +-1 there; the scale to fp32 rounding; the sums exactly scale * sum(q)
+  zf = z.reshape(-1, z.shape[-1]).astype(np.float32)
+  wq, wd, _ = np_q8(zf)
+  q, ref = xq.view(np.int8).reshape(zf.shape[0], -1, 32).astype(np.int32), wq.view(np.int8).reshape(zf.shape[0], -1, 32).astype(np.int32)
+  frac = np.abs(zf.reshape(q.shape) / wd[..., None]) % 1
+  test.assertTrue((np.abs(q - ref) <= 1).all() and (np.abs(frac[q != ref] - 0.5) < 1e-3).all())
+  np.testing.assert_allclose(xd, wd, rtol=1e-6)
+  np.testing.assert_array_equal(xs, (xd * q.sum(-1).astype(np.float32)).astype(np.float32))
+  if device == "PYTHON":  # bit-identical to q8_quantize_nv (the prefill multi-warp kernel) run on that z
+    from tinygrad.llm.kernels import nv_quant
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce), \
+         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):
+      got = [t.numpy() for t in nv_quant.q8_quantize(Tensor(zf.astype(np.float16), device=device), zf.shape[0], zf.shape[1], sums=True)]
+    for a, b in zip((xq, xd, xs), got): np.testing.assert_array_equal(a, b)
+
+def post_inputs(rng, B, T, H, V):
+  return (rng.standard_normal((B, H, T, V)).astype(np.float32), rng.standard_normal((B, T, H*V)).astype(np.float32),
+          rng.standard_normal(V).astype(np.float32))
+
+class TestGDNPostCPU(unittest.TestCase):
+  def test_matches_numpy(self):
+    rng = np.random.default_rng(2)
+    for T, toks, V in ((8, 8, 32), (8, 3, 32), (32, 20, 128), (2, 1, 64)):
+      with self.subTest(T=T, toks=toks, V=V): check_post(self, *post_inputs(rng, 1, T, 4, V), toks, None)
+
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestGDNPostEmulator(unittest.TestCase):
+  """gdn_post_nv at lanes=32 on the PYTHON emulator: V = 128 (one warp per head row: the rms reduction over 32 lanes, a q8 group per
+  8 lanes) and V = 32 (4 heads per warp, 8 lanes each), a remainder chunk -- z vs fp64, the q8 words/scales/sums bit-exact"""
+  def test_matches_numpy(self):
+    rng = np.random.default_rng(3)
+    for T, toks, V in ((32, 32, 128), (32, 11, 128), (16, 9, 32)):
+      with self.subTest(T=T, toks=toks, V=V), emulated_lanes(): check_post(self, *post_inputs(rng, 1, T, 4, V), toks, "PYTHON")
+
 # ******** the block path (GatedDeltaNetBlock._nv_prefill) on CPU against the generic graph ********
 
 TINY = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=4, inner_size=32*4)  # K = V = 32, 2 k-heads -> 4 v-heads
@@ -287,6 +347,27 @@ class TestNVPrefillBlock(unittest.TestCase):
         np.testing.assert_allclose(outs[1], outs[0], rtol=1e-3, atol=1e-5)
         np.testing.assert_allclose(fused.conv_state.numpy(), generic.conv_state.numpy(), rtol=1e-3, atol=1e-6)
         np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-4, atol=1e-6)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_emulator_lanes_match_generic_path(self):
+    # the real call path at the card's lane mapping: _attention on the PYTHON device, lanes=32 (shuffles emulated), against the
+    # generic graph on CPU -- two symbolic 32-token chunks (32, then an 11-token remainder) from a nonzero resident state
+    fused, generic = tiny_block(), tiny_block()
+    for p in nn.state.get_parameters(fused): p.replace(p.to("PYTHON")).realize()
+    xs = Tensor.randn(1, 64, TINY_DIM).realize()
+    v_toks, v_sp = UOp.variable("toks", 1, 32), UOp.variable("start_pos", 0, 63)
+    with prefill_gate(), emulated_lanes(): fused.prepare_nv_decode()
+    for i, (pos, n) in enumerate(((5, 32), (37, 11))):
+      with self.subTest(call=i, start_pos=pos, toks=n):
+        outs = []
+        for block, ctx, dev in ((generic, contextlib.nullcontext(), "CPU"), (fused, prefill_gate(), "PYTHON")):
+          x = block.attn_norm(xs[:, pos:pos+32].to(dev)[:, :v_toks.bind(n)])
+          block._init_state(x)
+          with ctx, emulated_lanes() if dev == "PYTHON" else contextlib.nullcontext():
+            outs.append(block._attention(x, v_sp.bind(pos)).pad_to((1, 32, TINY_DIM)).numpy()[:, :n])
+        np.testing.assert_allclose(outs[1], outs[0], rtol=2e-3, atol=2e-5)
+        np.testing.assert_allclose(fused.conv_state.numpy(), generic.conv_state.numpy(), rtol=2e-3, atol=1e-5)
+        np.testing.assert_allclose(fused.recurrent_state.numpy(), generic.recurrent_state.numpy(), rtol=1e-3, atol=1e-5)
 
   def test_gate_closed_or_unprepared_keeps_the_generic_graph(self):
     for prepared, gate_open in ((True, False), (False, True)):
@@ -357,7 +438,23 @@ def _prep_sinks(T:int=128, H:int=48, Hk:int=16, K:int=128, V:int=128, toks=None)
   state = _gdn_conv_state_kernel(ph((1, 3, C), dtypes.float16, 0), ph((1, T, C), f32, 1), *bound, start_pos=sp, toks=tk)
   return _render_cuda(prep), _render_cuda(state)
 
+def _post_sink(T:int=128, H:int=48, V:int=128):
+  from test.unit.test_llm_nv_scan import _render_cuda
+  tk, F = kernel_var(UOp.variable("toks", 1, T)), H*V
+  def ph(shape, dtype, slot): return UOp.placeholder(shape, dtype, slot=slot)
+  return _render_cuda(_gdn_post_kernel(ph((1, T, F), dtypes.float16, 0), ph((T, F // 32, 8), dtypes.uint32, 1), ph((T, F // 32), dtypes.float32, 2),
+                                       ph((T, F // 32), dtypes.float32, 3), ph((1, H, T, V), dtypes.float32, 4), ph((1, T, F), dtypes.float32, 5),
+                                       ph((V,), dtypes.float32, 6), tk, toks=tk, norm_eps=1e-6))
+
 class TestGDNPrepRender(unittest.TestCase):
+  def test_post_27b_geometry(self):
+    src = _post_sink()
+    self.assertEqual(re.findall(r"(?:blockIdx|threadIdx)\.[xyz]; /\* (\d+) \*/", src), ["48", "128", "32"])  # a warp per (head, token)
+    self.assertIn("*((half4*)((data0_786432+alu1))) =", src)  # z stored, then read back for the q8 pack (the fp16 value q8_quantize saw)
+    self.assertLess(src.index("*((half4*)((data0_786432+alu1))) ="), src.index("half4 val3 = (*((half4*)((data0_786432+alu1))));"))
+    self.assertEqual(src.count("__shfl_xor_sync(0xffffffff"), 5 + 3 + 3)  # the rms over the row, the group max, the group sum
+    self.assertNotIn("__syncthreads", src)
+
   def test_27b_geometry(self):
     for T in (128, 32):
       prep, state = _prep_sinks(T)
@@ -389,8 +486,19 @@ class TestPrefillCensus(unittest.TestCase):
            "linear_q4_0_imma_nv", "linear_q4_0_imma_nv", "E_28toks2A13629_128", "E_16_272_8_16_4", "q8_quantize_nv", "linear_q4_0_imma_nv",
            "E_28toks2A4029_128"]
 
+  # step 2: ssm_norm's reduce, the gated elementwise, z's pad copy and ssm_out's q8_quantize_nv -> gdn_post_nv
+  STEP2 = STEP1[:10] + ["gdn_post_nv"] + STEP1[14:]
+
   def test_gdn_prefill_kernels(self):
-    self.assertEqual(prefill_census(card_block()), self.STEP1)
+    self.assertEqual(prefill_census(card_block()), self.STEP2)
+
+  def test_q5_k_ssm_out_takes_the_fused_sums(self):
+    # the card's ssm_out is Q5_K: its IMMA gemm asks q8_quantize for sums, which gdn_post_nv's registered entry carries
+    from test.unit.test_llm_nv_gemm import _quantized_linear
+    from tinygrad.llm.kernels.amd import Q5_K
+    block = card_block()
+    block.ssm_out = _quantized_linear(Q5_K, 5120, 6144)
+    self.assertEqual(prefill_census(block), self.STEP2[:11] + ["linear_q5_k_imma_nv"] + self.STEP2[12:])
 
   def test_gate_closed_is_step_0(self):
     with mock.patch("tinygrad.llm.model.nv_gdn_prefill", side_effect=AssertionError("taken")):

@@ -165,8 +165,10 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple
   """(q, scale), or with sums=True (q, scale, sums) -- T4.128: the IMMA Q4_1/Q5_K prefill kernels need the per-group sums. The
   variant is its own cache entry rather than always computed: the plain kernel (every decode quantize, the Q4_0 prefill one) keeps
   its render, and no activation of the 27B feeds both kinds of consumer (Q4_1 ffn_down and Q5_K ssm_out read their own inputs), so
-  the split never costs a second launch. The fused (decode-only) entries carry no sums and are skipped for a sums request."""
-  if not sums and (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
+  the split never costs a second launch. A fused entry without sums (the decode ones) is skipped for a sums request; T4.138: one with
+  (nv_gdn_prep's post-scan kernel, for the Q5_K ssm_out) serves both kinds."""
+  if (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None and (not sums or len(hit) == 3):
+    return tuple(Tensor(u) for u in hit[:2+sums])
   warps = max(NV_Q8_WARPS.value, 1) if tokens > 4 else 1  # T4.128 (step 6): multi-warp blocks for prefill; decode as it was
   return tuple(Tensor(u) for u in _q8_quantize_cached(x.uop, tokens, in_features, sums, warps))
 
@@ -182,12 +184,12 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple
 # within the same block's _run body, microseconds after being registered, so eviction order barely matters here
 # (unlike _q8_quantize_cached's true LRU, tuned for sharing across back-to-back calls).
 _FUSED_Q8_MAXSIZE = 16
-_fused_q8: dict[tuple[UOp, int, int], tuple[UOp, UOp]] = {}
+_fused_q8: dict[tuple[UOp, int, int], tuple[UOp, ...]] = {}
 
-def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Tensor) -> None:
+def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Tensor, sums:Tensor|None=None) -> None:
   key = (x.uop, tokens, in_features)
   if key not in _fused_q8 and len(_fused_q8) >= _FUSED_Q8_MAXSIZE: _fused_q8.pop(next(iter(_fused_q8)))
-  _fused_q8[key] = (q.uop, scale.uop)
+  _fused_q8[key] = (q.uop, scale.uop) + ((sums.uop,) if sums is not None else ())
 
 # T4.125b: nv_q8_linear's result is its kernel's split-K partials (tokens, out_features, C) summed by a generic reduce -- one
 # r_40_32_4_6 per ssm_out/attn_output per step. add_rmsnorm_q8 sums partials in-kernel, so _ffn_output (model.py) fetches the
