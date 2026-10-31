@@ -153,6 +153,15 @@ NV_ATTN_DEC_KTILES = ContextVar("NV_ATTN_DEC_KTILES", 1)  # 16-key tiles per loo
 # recomputed per part); divides head_dim/64. O^T is D/16 x 4 fp32 per row group per lane: 192 registers at VERIFY(3), G = 6. sm_86
 # cubins (nvrtc lane, 10-30; registers + spill stack bytes): T == 1 194 + 0 (never split); VERIFY(3) at 1: 255 + 1120, 2: 255 + 160,
 # 4: 250 + 0; VERIFY(2) at 1: 255 + 112, 2: 224 + 0; VERIFY(4) at 2: 255 + 272, 4: 255 + 80. A card knob (1 / 2 / 4)
+# T4.144 diagnosis (nvrtc 12.8 lane, sm_86, 4 warps, 262144 window; STL/LDL total, then inside the key loop = per 16-key step):
+#   T == 1:              194 regs +   0 B stack, STL/LDL   0 /   0, loop   0 /   0 (16 IMMA, 16 HMMA)
+#   VERIFY(3) DSPLIT 2:  255 regs + 160 B stack, STL/LDL  46 /  44, loop  20 /  40 (32 IMMA, 24 HMMA)
+#   VERIFY(4) DSPLIT 2:  255 regs + 272 B stack, STL/LDL  76 /  73, loop  25 /  68
+#   VERIFY(3) DSPLIT 1:  255 regs + 1120 B,      STL/LDL 268 / 249, loop 181 / 244;  VERIFY(4) DSPLIT 4: 255 + 80 B, loop 6 / 19
+# Where the state sits (VERIFY(3), DSPLIT 2): resident across the loop are the O^T accumulators (3 row groups x 8 dim tiles x 4 =
+# 96), the q A fragments (2 m-tiles x 8 blocks x 4 words, 16 of them the zero half = 48) and the q scales (3 x 8 = 24): 168 of 255
+# before the step's K words, K scales and S partials. ptxas parks 18 of the read-only q values in local memory before the loop and
+# swaps 17 O registers out (STL) for the S phase and back (LDL.LU) for P.V every step -- live state, not an ordering artefact.
 NV_ATTN_DEC_DSPLIT = ContextVar("NV_ATTN_DEC_DSPLIT", 2)
 DEC_IMMA_ARG = ((WMMA_N, WMMA_M, 32), 'CUDA', WARP_SIZE)  # m16n8k32 s8 -> s32 ('CUDA': the PYTHON emulator's fragment model; the
 DEC_HMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)  # renderer ignores the string) and m16n8k16 f16 -> f32
