@@ -12,9 +12,10 @@ from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attentio
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
-  clear_step_caches, _register_split_k, register_padded, padded_source
+  clear_step_caches, _register_split_k, register_padded, padded_source, attn_merge_inputs
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
-from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
+from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention, \
+  NV_ATTN_FINISH, attn_finish
 from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post, GDN_NV_PREP
 from tinygrad.llm.kernels.nv_attn_prep import NV_ATTN_PREP, attn_prep, attn_prep_geometry_ok
 from tinygrad.llm.gguf import gguf_load, ggml_data_to_tensor
@@ -930,7 +931,14 @@ class TransformerBlock(FFNBlock):
     else:
       attn = nv_fast if nv_fast is not None else attention_impl(q, k, v, mask)      # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-    return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+    if not self.config.attn_output_gate: return self.attn_output(attn)
+    gated = attn * gate.sigmoid()
+    # T4.144: on the NV decode/VERIFY path (attn_prep's fp32 gate, a decode-kernel merge, a q8 attn_output) the merge, the gate and
+    # attn_output's q8 activations are ONE kernel (attn_finish_nv); the graph above is then never read (register_fused_q8)
+    if (prep is not None and nv_fast is not None and NV_ATTN_FINISH.value and self.attn_output.ggml_type in NV_QUANT_TYPES
+        and isinstance(T, int) and (merge := attn_merge_inputs(nv_fast)) is not None):
+      register_fused_q8(gated, cast(int, B) * T, self.attn_output.in_features, *attn_finish(*merge, gate, T))
+    return self.attn_output(gated)
 
   def _nv_attn_prep(self, q:Tensor, k:Tensor, v:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]|None:
     """T4.137: (q (B,H,T,Hd) fp32, gate (B,T,H*Hd), cache_kv, cache_kv_scale after this run's store) from the projections by kernels/

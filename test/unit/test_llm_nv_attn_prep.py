@@ -177,11 +177,12 @@ class TestRoutingAndCensus(unittest.TestCase):
   """graph level on CPU with every NV gate mocked open (test_llm_nv_quant's _nv_gates_open): a KV_INT4 decode step / VERIFY run takes
   attn_prep_nv in place of the 9 generic glue kernels; NV_ATTN_PREP=0, a prefill chunk (symbolic or wider than 4), an fp16 cache, q/k norm
   weights not prepared at load, an image rope tensor and a geometry the lanes don't cover keep the generic graph."""
-  def _census(self, b, T=1, symbolic=False, kv_dtype=dtypes.uint8, rope=None, prepare=True):
+  def _census(self, b, T=1, symbolic=False, kv_dtype=dtypes.uint8, rope=None, prepare=True, finish=0):
+    # finish: NV_ATTN_FINISH (T4.144, test_llm_nv_attn_finish) -- off here, so the counts below are attn_prep's alone
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights
     from test.unit.test_llm_nv_quant import _decode_census, _nv_gates_open
     cfg = b.config
-    with _nv_gates_open(), patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True):
+    with _nv_gates_open(), patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), Context(NV_ATTN_FINISH=finish):
       prepare_dense_weights(b)
       if prepare: b.prepare_nv_norms()
       with Context(DEBUG=0):

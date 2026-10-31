@@ -138,7 +138,13 @@ def nv_decode_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, v
   fxn = functools.partial(_decode_partial_kernel, valid_kv_len=valid_kv_len, max_kv_len=N)
   srcs = (partial, stats, q.contiguous(), cache_kv) + ((cache_kv_scale,) if cache_kv_scale is not None else ())
   partial, stats = Tensor.custom_kernel(*srcs, fxn=fxn)[:2]
-  return _merge_partials(partial, stats, valid_kv_len).unsqueeze(2)
+  return _merged(partial, stats, valid_kv_len, _merge_partials(partial, stats, valid_kv_len).unsqueeze(2))
+
+def _merged(partial:Tensor, stats:Tensor, valid:int|UOp, out:Tensor) -> Tensor:
+  # T4.144: remember what the merge read, for attn_finish (model.py's _attention); `out` is the merge as the caller returns it
+  from tinygrad.llm.kernels.nv_quant import register_attn_merge
+  register_attn_merge(out, partial, stats, valid)
+  return out
 
 # ******** T4.129: KV_INT4 decode on the tensor cores ********
 # The T4.107a kernel above reached ~159 GB/s at a 131k fill (951 us per layer for 151 MB): every key cost a 32-lane shuffle-reduce
@@ -395,8 +401,9 @@ def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, vali
   call = kernel.call(*(s.uop for s in srcs))
   partial, stats = Tensor(partial.uop.after(call)), Tensor(stats.uop.after(call))
   # live slots = ceil(valid / KS): _merge_partials counts ceil(valid' / BLOCK_N), so hand it valid' = valid * BLOCK_N / KS
-  out = _merge_partials(partial, stats, valid_kv_len * (BLOCK_N // (16 * k_tiles)))
-  return out.unsqueeze(2) if T == 1 else out.reshape(B, H, T, D)
+  valid = valid_kv_len * (BLOCK_N // (16 * k_tiles))
+  out = _merge_partials(partial, stats, valid)
+  return _merged(partial, stats, valid, out.unsqueeze(2) if T == 1 else out.reshape(B, H, T, D))
 
 # ******** T4.134: speculative VERIFY runs on the decode kernel ********
 # VERIFY (2..k+1 query tokens) took the prefill kernel: every query head padded to a 16-row m-tile, 64 slots -- its cost grew with the
@@ -413,6 +420,86 @@ def nv_verify_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, v
   if not NV_ATTN_DEC_MMA_T.value or not isinstance(T, int) or not 2 <= T <= MAX_VERIFY_TOKENS: return None
   if not _decode_mma_ok(q, cache_kv, cache_kv_scale): return None
   return _decode_mma_attention(q, cache_kv, cast(Tensor, cache_kv_scale), valid_kv_len)
+
+# ******** T4.144: the attention block's post-attention glue as one kernel ********
+# Per attention block and decode/VERIFY step the generic path ran four kernels after the attention: the merge's row max and denominator
+# (one thread per row walking every live slot: 13.6 us each at a 2k fill), the weighted partials with the output gate folded in (20.2
+# us) and attn_output's q8_quantize_nv (6.3 us) -- 0.86 ms per plain decode step over the 16 blocks (10-31 card profile), more per
+# VERIFY. attn_finish_nv is all of it in one launch.
+NV_ATTN_FINISH = ContextVar("NV_ATTN_FINISH", 1)  # read in model.py's TransformerBlock._attention; 0 = the generic merge + gate + q8 (A/B)
+NV_ATTN_FINISH_UNROLL = ContextVar("NV_ATTN_FINISH_UNROLL", 8)  # slots per merge step = the 16-byte partial loads a lane keeps in flight; card knob
+
+@functools.cache
+def _attn_finish_kernel(q:UOp, scale:UOp, partial:UOp, stats:UOp, gate:UOp, *bound:UOp, valid:int|UOp, T:int, unroll:int=8) -> UOp:
+  """q (B*T, H*D/32, 8) uint32 + scale (B*T, H*D/32) fp32 = attn_output's q8 activations of _merge_partials(partial, stats, valid)
+  (partial (B, H*T, slots, D) / stats (B, H*T, slots, 2), rows head*T + t) times sigmoid(gate) (B*T, H*D), the generic path's merge,
+  `attn * gate.sigmoid()` and q8_quantize in one launch. One-warp blocks of 4 consecutive 32-feature groups; a lane owns one packed word
+  (4 features, a group = 8 adjacent lanes: q8_quantize's prefill layout, _q8_lane_words), lane is AxisType.WARP (threadIdx.x, unsplit).
+  Every element follows the generic arithmetic in its order: the row max over the live slots (8 lanes split the slots, a max is exact in
+  any order), then ONE pass s = 0, 1, ..., live-1 accumulating l_s*w_s and partial_s*w_s from 0, w_s = exp2((m_s - max)*log2 e) -- the
+  generic reduce is that sequential loop (a symbolic slot count is never split or unrolled by the optimizer) -- `unroll` slots per
+  loop step, the slots past `live` weighted exactly 0 (an accumulator that starts at +0 is never -0, so + 0 changes no bit); then
+  num * (1/den), x * sigmoid(gate) as Tensor.sigmoid lowers it, and q8_quantize's scale (max |x| / 127, min 1e-8) and _q8_pack.
+  The bound variables ride last (`bound`, never loaded: attn_prep's idiom)."""
+  from tinygrad.llm.kernels.nv_quant import _q8_pack
+  B, R, slots, D = cast(tuple[int, int, int, int], partial.shape)
+  tokens, groups = cast(tuple[int, int], q.shape[:2])
+  GH = D // 32  # 32-feature groups per head
+  live = (valid + BLOCK_N - 1) // BLOCK_N  # _merge_partials' live slot count
+  live = min(live, slots) if isinstance(live, int) else live.minimum(slots)
+  total = tokens * groups
+  block, lane = UOp.range(-(-total // 4), 0, AxisType.GLOBAL), UOp.range(WARP_SIZE, -1, AxisType.WARP)
+  tg = block * 4 + lane // 8 if total % 4 == 0 else (block * 4 + lane // 8).minimum(total - 1)  # surplus lanes redo the last group
+  tok, grp, wl = tg // groups, tg % groups, lane % 8
+  b, t, head = tok // T, tok % T, grp // GH
+  row, d0 = head * T + t, (grp % GH) * 32 + wl * 4
+  def group_max(x:UOp) -> UOp:  # over the 8 lanes of this lane's group
+    for off in (4, 2, 1): x = x.maximum(_shfl(x, lane ^ off))
+    return x
+  # the row max: lane wl of the group takes slots wl, wl+8, ...: 4 per loop step
+  mx = _reg((1,), 1, -math.inf, block)
+  i = UOp.range((live + 31) // 32, 100, AxisType.REDUCE)
+  ms = []
+  for u in range(4):
+    s = wl + 8 * (4 * i + u)
+    ms.append((s < live).where(stats[b, row, s.valid(s < live), 0].load(), -math.inf))
+  m = group_max(mx.after(mx[0].store(functools.reduce(lambda a, x: a.maximum(x), ms, mx.after(i)[0].load())).end(i))[0].load())
+  # the weighted sums in slot order: acc = (den, num of this lane's 4 features)
+  acc = _reg((5,), 2, 0, block)
+  j = UOp.range((live + unroll - 1) // unroll, 101, AxisType.REDUCE)
+  sums = [acc.after(j)[e].load() for e in range(5)]
+  for u in range(unroll):
+    s = j * unroll + u
+    ok = s < live
+    sv = s.valid(ok)
+    w = ok.where(((stats[b, row, sv, 0].load() - m) * LOG2E).exp2(), 0.0)
+    sums = [sums[0] + stats[b, row, sv, 1].load() * w] + [x + partial[b, row, sv, d0 + e].load() * w for e, x in enumerate(sums[1:])]
+  acc = acc.after(UOp.group(*(acc[e].store(x) for e, x in enumerate(sums))).end(j))
+  den = acc[0].load()
+  # x through a register: the generic quantize reads x from memory, and as one expression the symbolic pass folds x * (1/scale) into
+  # num * (1/(den * (1 + e^-g) * scale)) -- another rounding of the value q8 rounds (the merge kernel's own fold, num * (1/(den * (1 +
+  # e^-g))), is the generic one: it multiplies the gate in the same kernel)
+  xr = UOp.placeholder((4,), dtypes.float, slot=3, addrspace=AddrSpace.REG)
+  xr = xr.after(*(xr[e].store(acc[1 + e].load() / den * gate[tok, head * D + d0 + e].load().sigmoid()) for e in range(4)))
+  xs = tuple(xr[e].load() for e in range(4))
+  gscale = (group_max(functools.reduce(lambda a, x: a.maximum(x), (x.abs() for x in xs))) / 127).maximum(1e-8)
+  # the scale store: the same bits in all 8 lanes of a group (a butterfly ends equal in every lane), so no lane gate (_q8_lane_words)
+  stores = [q[tok, grp, wl].store(_q8_pack(xs, gscale)), scale[tok, grp].store(gscale)]
+  return UOp.group(*stores).end(lane, block).sink(arg=KernelInfo(name="attn_finish_nv", opts_to_apply=()))
+
+def attn_finish(partial:Tensor, stats:Tensor, valid:int|UOp, gate:Tensor, T:int) -> tuple[Tensor, Tensor]:
+  """(q, scale) for attn_output's nv_q8_linear (q8_quantize's (tokens, groups, 8) uint32 / (tokens, groups) fp32), ready for
+  register_fused_q8: the merge of a decode/VERIFY attention kernel's partials (partial, stats, valid as its _merge_partials read them,
+  nv_quant.attn_merge_inputs) times sigmoid(gate), gate (B, T, H*D) fp32 (attn_prep_nv's output-gate half)."""
+  B, R, _, D = cast(tuple[int, int, int, int], partial.shape)
+  assert gate.dtype == dtypes.float32 and R % T == 0 and D % 32 == 0, f"{gate.dtype=} {partial.shape=} {T=}"
+  groups = R // T * D // 32
+  q = Tensor.empty(B * T, groups, 8, dtype=dtypes.uint32, device=partial.device)
+  scale = Tensor.empty(B * T, groups, dtype=dtypes.float32, device=partial.device)
+  binds = [Tensor(u) for u in dict.fromkeys(u for u in valid.toposort() if u.is_bound_var)] if isinstance(valid, UOp) else []
+  fxn = functools.partial(_attn_finish_kernel, valid=_unbind(valid), T=T, unroll=max(NV_ATTN_FINISH_UNROLL.value, 1))
+  q, scale = Tensor.custom_kernel(q, scale, partial, stats, gate.reshape(B * T, R // T * D), *binds, fxn=fxn)[:2]
+  return q, scale
 
 # ******** T4.107b: prefill chunks ********
 

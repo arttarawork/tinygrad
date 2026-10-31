@@ -226,6 +226,16 @@ def _register_split_k(result:Tensor, partials:Tensor) -> None: _fifo_put(_split_
 
 def split_k_partials(result:Tensor) -> Tensor|None: return None if (p := _split_k.get(result.uop)) is None else Tensor(p)
 
+# T4.144: a decode/VERIFY attention result -> the (partial, stats, valid) its _merge_partials read (nv_attn.py), so model.py's _attention
+# can hand them to attn_finish_nv (merge + output gate + attn_output's q8 in one kernel) and the merge graph is never read. Same FIFO.
+_attn_merge: dict[UOp, tuple[UOp, UOp, int|UOp]] = {}
+
+def register_attn_merge(result:Tensor, partial:Tensor, stats:Tensor, valid:int|UOp) -> None:
+  _fifo_put(_attn_merge, result.uop, (partial.uop, stats.uop, valid))
+
+def attn_merge_inputs(result:Tensor) -> tuple[Tensor, Tensor, int|UOp]|None:
+  return None if (m := _attn_merge.get(result.uop)) is None else (Tensor(m[0]), Tensor(m[1]), m[2])
+
 # T4.141: a fused prefill norm's chunk-width output -> the padded buffer it is a row slice of (GatedDeltaNetBlock._normed_for_attention):
 # _nv_prefill's projections run at the padded width and mask the rows past the chunk, so they read that buffer -- a pad of the slice
 # would be a copy kernel. Same bounded FIFO.
@@ -239,7 +249,7 @@ def clear_step_caches() -> None:
   """T4.126: drop the per-step sharing caches above (Transformer._forward_step calls this after every forward) -- their entries
   hold a step's activation buffers alive past the step, which a 128-token prefill capture at 262k cannot afford."""
   _q8_quantize_cached.cache_clear()
-  for d in (_fused_q8, _split_k, _padded): d.clear()
+  for d in (_fused_q8, _split_k, _padded, _attn_merge): d.clear()
 
 # ******** T4.123d: fused residual-add + RMSNorm + q8-quantize decode kernel (design doc section 3, P4 kernel
 # half) -- wired into model.py's FFNBlock._ffn_output / GatedDeltaNetBlock._normed_for_attention by T4.123e
