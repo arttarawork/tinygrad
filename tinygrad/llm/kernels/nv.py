@@ -205,18 +205,25 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
   initial = start_pos.eq(0)
   previous = {row: tuple(initial.where(0, state[b, h, row, c].load().float()) for c in cols) for row in rows}
   partial = UOp.placeholder((tokens*waves,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL) if waves > 1 else None
-  z_stores = []
+  z_stores: list[UOp] = []
   for t in range(tokens):
     r = row_of(t)
-    q = tuple(x * key_dim**-0.5 for x in l2(tuple(conv_out[r, k_head*key_dim + c].load() for c in cols)))
-    k = l2(tuple(conv_out[r, q_dim + k_head*key_dim + c].load() for c in cols))
+    # T4.140: token t reads its inputs only after token t-1's stores. Unordered, the linearizer hoisted every load to the top and sank
+    # every store to the bottom, so all T tokens' gate partials (40 floats per token), outputs and track rows were live at once: under
+    # the 128-register cap of 512 threads ptxas (nvrtc lane, sm_86, with track) needed stack frames of 0 / 304 / 584 / 1368 B per thread
+    # at T = 1 / 2 / 3 / 4 (~4 KB of spill traffic per thread at T = 4, ~100 MB per launch: the card's 14.5 / 51.6 / 130 us). Ordered,
+    # one token's inputs are live at a time: 0 / 24 / 0 / 0 B, 128 registers. The arithmetic is untouched (bit-identical on the
+    # emulator); t == 0 has no stores before it, so T == 1 keeps its exact graph (md5-pinned).
+    co, ba, gt = (x.after(*z_stores) for x in (conv_out, beta_alpha, gate))
+    q = tuple(x * key_dim**-0.5 for x in l2(tuple(co[r, k_head*key_dim + c].load() for c in cols)))
+    k = l2(tuple(co[r, q_dim + k_head*key_dim + c].load() for c in cols))
     kq = dot(q, k)
-    bv = beta_alpha[r, h].load().sigmoid().float()
-    av = ((beta_alpha[r, heads+h].load().float() + dt_bias[h].load()).softplus() * ssm_a[h].load()).exp()
+    bv = ba[r, h].load().sigmoid().float()
+    av = ((ba[r, heads+h].load().float() + dt_bias[h].load()).softplus() * ssm_a[h].load()).exp()
     outs = []
     for row in rows:  # _gated_delta_prefill_kernel's step at tokens == 1
       prev = previous[row]
-      delta = (conv_out[r, 2*q_dim + h*value_dim + row].load() - dot(prev, k)*av) * bv
+      delta = (co[r, 2*q_dim + h*value_dim + row].load() - dot(prev, k)*av) * bv
       previous[row] = tuple(x*av + delta*y for x,y in zip(prev, k))
       outs.append(dot(prev, q)*av + delta*kq)
       if t < tokens-1: z_stores += [tr[t, b, h, row, c].store(x) for tr in track for x,c in zip(previous[row], cols)]
@@ -227,7 +234,7 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
       squares = _added(partial[w if tokens == 1 else t*waves + w].load() for w in range(waves))
     inv = (squares * (1/value_dim) + norm_eps).rsqrt()  # nn.RMSNorm: x * (mean(x^2) + eps).rsqrt(), then * weight
     for row,o in zip(rows, outs):
-      gated = o*inv*norm_weight[row].load() * _added(gate[r, h*value_dim + row, p].load() for p in range(parts)).silu()
+      gated = o*inv*norm_weight[row].load() * _added(gt[r, h*value_dim + row, p].load() for p in range(parts)).silu()
       z_stores.append(z[r, (h*value_dim + row).valid(lane.eq(0))].store(gated.cast(z.dtype)))
   stores = [state[b, h, row, c].store(x.cast(state.dtype)) for row in rows for x,c in zip(previous[row], cols)] + z_stores
   return UOp.group(*stores).end(*(r for r in (wave, lane, bh) if r.op is Ops.RANGE)).sink(arg=KernelInfo(name="gdn_decode_nv", opts_to_apply=()))
