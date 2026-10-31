@@ -25,14 +25,26 @@ from __future__ import annotations
 import functools
 from typing import cast
 from tinygrad import Tensor, UOp
-from tinygrad.helpers import ALLOW_DEVICE_USAGE
+from tinygrad.helpers import ALLOW_DEVICE_USAGE, ContextVar
 from tinygrad.engine.realize import capturing
-from tinygrad.dtype import dtypes, least_upper_dtype
+from tinygrad.dtype import AddrSpace, dtypes, least_upper_dtype
 from tinygrad.uop.ops import AxisType, KernelInfo
 from tinygrad.llm.kernels.amd import Linear, IQ_GRID_SIZES
 from tinygrad.llm.kernels.nv import warp_reduce, iq_grid
 
 WARP_SIZE, VAL_CHUNK = 32, 4
+# T4.138 (step 4): a prefill call (tokens > 4) gives each warp a tile of NV_F16_GEMV_TOKENS tokens x NV_F16_GEMV_ROWS output rows: a
+# lane's 4 weight halves serve every token of the tile and its 4 activation halves every row. One warp per (token, row) re-read a
+# 10 KB weight row and a 10 KB token row per output (126 MB of L2 traffic for ssm_beta|ssm_alpha at 128 tokens -- 47 us per 48 rows on
+# the card, 10-31 profile); an 8 x 8 tile reads 1/8 of that. Each (token, row)'s lane sum is the same FMA sequence in the same order,
+# so the outputs are bit-identical to the 1 x 1 kernel. Card knobs, read in the dispatchers (uncached) and passed into the cache key;
+# a value that doesn't divide the call's tokens/rows falls back to 1. Decode (tokens <= 4) keeps its kernel byte for byte.
+NV_F16_GEMV_TOKENS, NV_F16_GEMV_ROWS = ContextVar("NV_F16_GEMV_TOKENS", 8), ContextVar("NV_F16_GEMV_ROWS", 8)
+
+def _gemv_tile(tokens:int, out_features:int) -> dict[str, int]:
+  if tokens <= 4: return {}
+  t, r = NV_F16_GEMV_TOKENS.value, NV_F16_GEMV_ROWS.value
+  return {"tile_tokens": t if t > 1 and tokens % t == 0 else 1, "tile_rows": r if r > 1 and out_features % r == 0 else 1}
 
 def nv_dense_eligible(layer:Linear) -> bool:
   """Shape/dtype check only: stable for the lifetime of a Linear instance (its weight shape/dtype never
@@ -43,20 +55,39 @@ def nv_dense_eligible(layer:Linear) -> bool:
   return layer.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and layer.out_features <= 2048 and layer.in_features % 128 == 0
 
 @functools.cache
-def _nv_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *, in_features:int, out_features:int, tokens:int) -> UOp:
-  # one warp per (token, output row); each of the 32 lanes accumulates a 4-wide fp16 chunk of the row per step
-  token, out_row = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(out_features, 1, AxisType.GLOBAL)
+def _nv_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *, in_features:int, out_features:int, tokens:int, tile_tokens:int=1, tile_rows:int=1) -> UOp:
+  # one warp per (token, output row) -- T4.138: per (tile_tokens tokens, tile_rows rows) --; each of the 32 lanes accumulates a 4-wide
+  # fp16 chunk of the row per step. 1 x 1 builds exactly the graph it always did
+  assert tokens % tile_tokens == 0 and out_features % tile_rows == 0
+  token, out_row = UOp.range(tokens // tile_tokens, 0, AxisType.GLOBAL), UOp.range(out_features // tile_rows, 1, AxisType.GLOBAL)
   lane = UOp.range(WARP_SIZE, 2, axis_type=AxisType.LOCAL)
   per = in_features // (WARP_SIZE * VAL_CHUNK)
   assert per * WARP_SIZE * VAL_CHUNK == in_features
   w, x = w.reshape((out_features, per, WARP_SIZE*VAL_CHUNK)), x.reshape((tokens, per, WARP_SIZE*VAL_CHUNK))
-  acc = UOp.const(0, dtypes.float32)
-  for i in range(per):
-    for j in range(VAL_CHUNK):
-      acc = acc + w[out_row, i, lane*VAL_CHUNK+j].load().float() * x[token, i, lane*VAL_CHUNK+j].load().float()
-  total = warp_reduce(acc, full_wave=True)
-  return out[token, out_row.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token, out_row, lane).sink(
-    arg=KernelInfo(name="linear_f16_gemv_nv", opts_to_apply=()))
+  if tile_tokens == 1 and tile_rows == 1:
+    acc = UOp.const(0, dtypes.float32)
+    for i in range(per):
+      for j in range(VAL_CHUNK):
+        acc = acc + w[out_row, i, lane*VAL_CHUNK+j].load().float() * x[token, i, lane*VAL_CHUNK+j].load().float()
+    total = warp_reduce(acc, full_wave=True)
+    return out[token, out_row.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token, out_row, lane).sink(
+      arg=KernelInfo(name="linear_f16_gemv_nv", opts_to_apply=()))
+  # T4.138: the K steps as a REDUCE loop, the tile's accumulators a register file (the fused scan's idiom) -- unrolled like the 1 x 1
+  # kernel, all 40 x (tokens + rows) loads were hoisted ahead of the math and an 8 x 8 tile spilled 6.4 KB per thread (ptxas sm_86).
+  # Per (token, row) the FMAs still run i-major, j-minor from 0: the 1 x 1 kernel's sequence
+  toks, rows = tuple(token*tile_tokens + m for m in range(tile_tokens)), tuple(out_row*tile_rows + r for r in range(tile_rows))
+  pairs = tuple((t, o) for t in toks for o in rows)
+  regs = UOp.placeholder((len(pairs),), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+  regs = regs.after(regs.store(UOp.stack(*(UOp.const(0, dtypes.float32),) * len(pairs))))
+  i = UOp.range(per, 3, AxisType.REDUCE)
+  accs = [regs.after(i)[k].load() for k in range(len(pairs))]
+  for j in range(VAL_CHUNK):
+    ws, xs = {o: w[o, i, lane*VAL_CHUNK+j].load().float() for o in rows}, {t: x[t, i, lane*VAL_CHUNK+j].load().float() for t in toks}
+    accs = [a + ws[o] * xs[t] for a, (t, o) in zip(accs, pairs)]
+  step = regs.store(UOp.stack(*accs)).end(i)
+  stores = [out[t, o.valid(lane.eq(0))].store(warp_reduce(regs.after(step)[k].load(), full_wave=True).cast(out.dtype))
+            for k, (t, o) in enumerate(pairs)]
+  return UOp.group(*stores).end(token, out_row, lane).sink(arg=KernelInfo(name="linear_f16_gemv_nv", opts_to_apply=()))
 
 def _fp16_copy(layer:Linear) -> Tensor:
   # realize once: casting+copying a lazy (ggml-load-chain-or-not) weight view on every decode step would cost as
@@ -113,7 +144,8 @@ def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
   xh = x_pad if x_pad.dtype == dtypes.float16 and x_pad.uop.has_buffer_identity(after_ok=True) else \
     x_pad.contiguous() if x_pad.dtype == dtypes.float16 else x_pad.cast(dtypes.float16).contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=out_dtype, device=x.device)
-  fxn = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens)
+  fxn = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens,
+                          **_gemv_tile(tokens, layer.out_features))
   result = Tensor.custom_kernel(out, weight.reshape(-1), xh.reshape(tokens, layer.in_features), fxn=fxn)[0]
   result = result.reshape(*x_pad.shape[:-1], layer.out_features)
   if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], layer.out_features)))
@@ -127,5 +159,5 @@ def nv_f16_gemv_raw(weight:Tensor, x:Tensor, out_features:int) -> Tensor:
   tokens, in_features = cast(int, x.shape[0]), cast(int, x.shape[1])
   xh = x if x.uop.has_buffer_identity(after_ok=True) else x.contiguous()  # T4.125b: nv_f16_gemv's own dance, fp16-only here
   out = Tensor.empty(tokens, out_features, dtype=dtypes.float16, device=x.device)
-  fxn = functools.partial(_nv_f16_gemv_kernel, in_features=in_features, out_features=out_features, tokens=tokens)
+  fxn = functools.partial(_nv_f16_gemv_kernel, in_features=in_features, out_features=out_features, tokens=tokens, **_gemv_tile(tokens, out_features))
   return Tensor.custom_kernel(out, weight.reshape(-1), xh.reshape(tokens, in_features), fxn=fxn)[0]

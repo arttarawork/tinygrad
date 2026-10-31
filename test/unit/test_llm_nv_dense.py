@@ -6,7 +6,7 @@ and, when the nvrtc lane is reachable, rendered+compiled for sm_86 through a CUD
 Target spec (mirrors test_llm_nv_quant.py's pattern) -- never via an actual NV device. The dispatch gate (which
 needs a real NV device to open for real) is exercised by monkeypatching nv_quant.nv_quant_supported and
 nv_dense.nv_f16_gemv, exactly as test_llm_nv_quant.py's own docstring describes for that class of test."""
-import unittest
+import functools, re, sys, unittest
 from unittest import mock
 import numpy as np
 from tinygrad import Tensor, UOp, Context, dtypes, nn
@@ -125,6 +125,49 @@ class TestKernelGraphAndRender(unittest.TestCase):
         self.assertEqual(prg.arg.local_size, (WARP_SIZE, 1, 1))  # one warp per block, unchanged since T4.98h
         blocks = prg.arg.global_size[0] * prg.arg.global_size[1] * prg.arg.global_size[2]
         self.assertGreaterEqual(blocks, 48)
+
+# ******** T4.138 (step 4): the register-tiled prefill gemv ********
+
+class TestTiledPrefillGemv(unittest.TestCase):
+  """tokens > 4: one warp per (NV_F16_GEMV_TOKENS tokens x NV_F16_GEMV_ROWS rows) tile; each (token, row)'s lane sum is the 1 x 1
+  kernel's FMA sequence, so the outputs are bit-identical to it; decode keeps its kernel byte for byte."""
+  def test_decode_render_unchanged_and_tile_selection(self):
+    import hashlib
+    from test.unit.test_llm_nv_scan import _render_cuda
+    for tokens, digest in ((1, "c54f88f5be5d2faebb0db55f9960fec0"), (4, "8b2e12c90f2d6a4ec751aaf5ed4f1811")):
+      with self.subTest(tokens=tokens):
+        self.assertEqual(nv_dense._gemv_tile(tokens, 48), {})
+        sink = TestKernelGraphAndRender._build(5120, 48, tokens)
+        self.assertEqual(hashlib.md5(_render_cuda(sink).encode()).hexdigest(), digest)
+    self.assertEqual(nv_dense._gemv_tile(128, 96), {"tile_tokens": 8, "tile_rows": 8})
+    self.assertEqual(nv_dense._gemv_tile(12, 48), {"tile_tokens": 1, "tile_rows": 8})  # 8 doesn't divide 12 tokens
+    with Context(NV_F16_GEMV_TOKENS=1, NV_F16_GEMV_ROWS=1): self.assertEqual(nv_dense._gemv_tile(128, 96), {"tile_tokens": 1, "tile_rows": 1})
+
+  def test_tiled_render(self):
+    from test.unit.test_llm_nv_scan import _render_cuda
+    out = UOp.placeholder((128, 96), dtypes.float16, slot=0)
+    w, x = UOp.placeholder((96*5120,), dtypes.float16, slot=1), UOp.placeholder((128, 5120), dtypes.float16, slot=2)
+    src = _render_cuda(_nv_f16_gemv_kernel(out, w, x, in_features=5120, out_features=96, tokens=128, tile_tokens=8, tile_rows=8))
+    self.assertEqual(re.findall(r"blockIdx\.[xyz]; /\* (\d+) \*/", src), ["12", "16"])  # (row tile, token tile) blocks of one warp
+    self.assertEqual(re.findall(r"threadIdx\.[xyz]; /\* (\d+) \*/", src), ["32"])
+    self.assertEqual(src.count("__shfl_xor_sync(0xffffffff"), 5 * 64)  # one warp reduction per (token, row) of the 8 x 8 tile
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_tiled_matches_one_by_one_bit_for_bit(self):
+    from test.unit.test_llm_nv_gdn_prep import _emulated_warp_reduce
+    rng = np.random.default_rng(4)
+    tokens, in_features, out_features = 16, 256, 24
+    w = rng.standard_normal((out_features, in_features)).astype(np.float16)
+    x = rng.standard_normal((tokens, in_features)).astype(np.float16)
+    got = {}
+    for tile in ((1, 1), (8, 8), (4, 2), (16, 3)):
+      fxn = functools.partial(_nv_f16_gemv_kernel.__wrapped__, in_features=in_features, out_features=out_features, tokens=tokens,
+                              tile_tokens=tile[0], tile_rows=tile[1])
+      with mock.patch.object(nv_dense, "warp_reduce", _emulated_warp_reduce):
+        got[tile] = Tensor.custom_kernel(Tensor.empty(tokens, out_features, dtype=dtypes.float16, device="PYTHON"),
+                                         Tensor(w.reshape(-1), device="PYTHON"), Tensor(x, device="PYTHON"), fxn=fxn)[0].numpy()
+    np.testing.assert_allclose(got[(1, 1)].astype(np.float32), _numpy_gemv(w, x, in_features), rtol=2e-3, atol=2e-2)
+    for tile in ((8, 8), (4, 2), (16, 3)): np.testing.assert_array_equal(got[tile], got[(1, 1)], err_msg=str(tile))
 
 # ******** nv_dense_eligible: the shape/dtype gate ********
 
