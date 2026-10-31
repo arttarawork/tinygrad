@@ -764,6 +764,7 @@ class TransformerBlock(FFNBlock):
     # T4.137: the per-head q/k RMSNorm weights' fp32 copies (the same .float() of the lazy GGUF views nn.RMSNorm multiplies by), made once at
     # load like attn_norm/ffn_norm's -- read by the decode path's attn_prep kernel (_nv_attn_prep), same NV gate as the parent's
     if self.nv_norm_weights is not None and self.config.qk_norm == self.config.head_dim and self.config.attn_output_gate:
+      assert self.attn_q_norm.weight is not None and self.attn_k_norm.weight is not None  # nn.RMSNorm types the weight Optional (mypy)
       self.nv_qk_norm_weights = (self.attn_q_norm.weight.float().contiguous().realize(), self.attn_k_norm.weight.float().contiguous().realize())
 
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
