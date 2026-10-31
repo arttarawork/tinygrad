@@ -1322,7 +1322,8 @@ class TestDecodeStepCensus(unittest.TestCase):
     for T in (1, NV_SMALL_T):  # T4.132: a 4-token VERIFY run schedules exactly the decode step's kernels (one block per token each)
       census = self._step(b, T)
       self.assertNotIn(f"elementwise half[{T*D}] <- half[{T*D}]", census, "the f16 gemvs read the fused fp16 output in place")
-      # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only ssm_out's q8_quantize_nv remains
+      # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only ssm_out's q8_quantize_nv remains (T4.146: on the card it is
+      # gdn_decode_nv's epilogue -- test_llm_nv_scan's TestGDNDecodeQ8Epilogue; the CPU form here has none)
       self.assertEqual(census.count("q8_quantize_nv"), 1, "attn_qkv/attn_gate's is the fused kernel's; ffn_down's is ffn_act_q8_nv's")
       # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs -- are now the one combined gemv (dim 256 is 128-aligned); T4.146: run inside
       # gdn_conv_decode_nv (the CPU form has a conv thread per channel, so it fits at T=4 too -- on the card T=4 keeps the launch)
@@ -1331,6 +1332,8 @@ class TestDecodeStepCensus(unittest.TestCase):
       if T == 1: t1 = census
     def kinds(c): return sorted(k.partition(" ")[0] for k in c)  # a generic kernel by kind only: its buffer sizes scale with T
     self.assertEqual(kinds(census), kinds(t1), "the T=4 run is the T=1 step's kernel list")
+    with Context(GDN_DECODE_GEMV=0): off = self._step(b, 1)  # T4.146's A/B knob: the combined gemv's own launch is back
+    self.assertEqual(off.count("linear_f16_gemv_nv"), 1)
 
   def test_attention_decode_step(self):
     D, W = self.DIM, self.WIDE

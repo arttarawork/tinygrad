@@ -326,24 +326,26 @@ class TestGDNDecodeKernelSource(unittest.TestCase):
             self.assertIn("__syncthreads()", src)  # the rms block reduction
           self.assertTrue(next(u.arg for u in prg.src if u.op is Ops.BINARY).startswith(b"\x7fELF"))
 
-def _decode_sinks(tokens:int=1, track:bool=False, gemv:bool=False):
+def _decode_sinks(tokens:int=1, track:bool=False, gemv:bool=False, q8:bool=False):
   """both kernels' sinks at the 27B geometry (heads 48, k-heads 16, K=V=128, 5 split-K parts) for a run of `tokens` rows; track=True
   adds T4.132's per-token state outputs (3 slots, before the bound start_pos as gdn_decode passes them); T4.146: gemv=True folds the
-  beta_alpha gemv (dim 5120) into the conv kernel (its out/x/weight at slots 4-6, the conv track then at 7)"""
+  beta_alpha gemv (dim 5120) into the conv kernel (its out/x/weight at slots 4-6, the conv track then at 7); q8=True adds the scan kernel's
+  ssm_out q8 outputs (slots 8-9, the state track then at 10)"""
   sp = kernel_var(UOp.variable("start_pos", 0, 262143))
   heads, key_dim, value_dim, k_heads, parts = 48, 128, 128, 16, 5
   channels = 2*k_heads*key_dim + heads*value_dim
   def ph(shape, dtype, slot): return UOp.placeholder(shape, dtype, slot=slot)
   folded = (ph((tokens, 2*heads), dtypes.float16, 4), ph((tokens, 5120), dtypes.float16, 5), ph((2*heads*5120,), dtypes.float16, 6)) if gemv else ()
   conv_track = (ph((3, 1, 3, channels), dtypes.float16, 4 + len(folded)),) if track else ()
-  state_track = (ph((3, 1, heads, value_dim, key_dim), dtypes.float32, 8),) if track else ()
+  zq8 = (ph((tokens, heads*value_dim//32, 8), dtypes.uint32, 8), ph((tokens, heads*value_dim//32), dtypes.float32, 9)) if q8 else ()
+  state_track = (ph((3, 1, heads, value_dim, key_dim), dtypes.float32, 8 + len(zq8)),) if track else ()
   conv = _gdn_conv_decode_kernel(ph((tokens, channels), dtypes.float32, 0), ph((1, 3, channels), dtypes.float16, 1),
                                  ph((tokens, channels, parts), dtypes.float32, 2), ph((channels, 4), dtypes.float32, 3), *folded, *conv_track, sp,
                                  start_pos=sp, tokens=tokens, gemv=gemv)
   step = _gdn_decode_kernel(ph((tokens, heads*value_dim), dtypes.float16, 0), ph((1, heads, value_dim, key_dim), dtypes.float32, 1),
     ph((tokens, channels), dtypes.float32, 2), ph((tokens, 2*heads), dtypes.float16, 3), ph((heads,), dtypes.float32, 4),
     ph((heads,), dtypes.float32, 5), ph((tokens, heads*value_dim, parts), dtypes.float32, 6), ph((value_dim,), dtypes.float32, 7),
-    *state_track, sp, start_pos=sp, k_heads=k_heads, qk_eps=1e-6, norm_eps=1e-6, tokens=tokens)
+    *zq8, *state_track, sp, start_pos=sp, k_heads=k_heads, qk_eps=1e-6, norm_eps=1e-6, tokens=tokens, q8=q8)
   return conv, step
 
 def _render_cuda(sink:UOp) -> str:
@@ -464,18 +466,19 @@ class TestGDNDecodeMatchesNumpy(unittest.TestCase):
 # ******** T4.140: the decode kernels' card form (lanes=32) EXECUTED on the PYTHON emulator ********
 
 _emu_slot = itertools.count(300)
-def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:  # T4.146: + maximum (the q8 epilogue's group max)
   """nv.warp_reduce with each __shfl_xor_sync(v, off) as a block-shared exchange for the PYTHON emulator (no CUDA intrinsics): thread
   wave*32 + lane writes v and reads [.. ^ off] (test_llm_nv_norm's _emulated_warp_reduce; here the lane is LOCAL axis 1 and the wave LOCAL
   axis 2). A sum that does not depend on the wave (token 0's q/k norms) is the same in every wave, so one 32-slot exchange serves them all.
   The emulator runs the block in lockstep, so the store is always seen."""
-  assert full_wave and not maximum
+  assert full_wave
   rngs = {u.arg[0]: u for u in val.toposort() if u.op is Ops.RANGE and u.arg[1] is AxisType.LOCAL}
   lane, wave = rngs[1], rngs.get(2)
   tid, n = (lane, 32) if wave is None else (wave*32 + lane, wave.src[0].arg*32)
   for off in (16, 8, 4, 2, 1):
     buf = UOp.placeholder((n,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
-    val = val + buf.after(buf[tid].store(val))[tid + off - (tid // off) % 2 * (2*off)].load()  # tid ^ off, z3-boundable
+    other = buf.after(buf[tid].store(val))[tid + off - (tid // off) % 2 * (2*off)].load()  # tid ^ off, z3-boundable
+    val = val.maximum(other) if maximum else val + other
   return val
 
 def _card_form(builder):
@@ -555,9 +558,9 @@ def _np_beta_alpha(x:np.ndarray, w:np.ndarray) -> np.ndarray: return (x.astype(n
 class TestGDNDecodeGemvFold(unittest.TestCase):
   """T4.146: gdn_decode handed the beta_alpha gemv's inputs (x, the concatenated ssm_beta|ssm_alpha weight) runs the gemv inside its conv
   kernel (GDN_DECODE_GEMV=1, one output per conv block) instead of nv_dense's linear_f16_gemv_nv launch. The card form needs C/32 >= 2H*T
-  up to T = 3: 2 k-heads / 2 v-heads, K = 128, V = 64 (C = 640: 20 conv warps per batch row), D = 256 (two 128-wide gemv steps); the CPU
+  up to T = 3: odd batch 3, 2 k-heads / 2 v-heads, K = 128, V = 64 (C = 640: 20 conv warps per batch row), D = 256 (two gemv steps); the CPU
   form (one thread per conv channel; one lane per head, so its compile grows with V*K) runs the small geometry of the other CPU tests."""
-  CARD, SMALL = (2, 2, 2, 128, 64, 3, 256), (1, 2, 4, 32, 32, 3, 128)  # B, Hk, H, K, V, P, D
+  CARD, SMALL = (3, 2, 2, 128, 64, 3, 256), (1, 2, 4, 32, 32, 3, 128)  # B, Hk, H, K, V, P, D
 
   def _inputs(self, T:int, seed:int, dims:tuple[int, ...]):
     self.B, self.Hk, self.H, self.K, self.V, self.P, self.D = B, Hk, H, K, V, P, D = dims
@@ -581,7 +584,7 @@ class TestGDNDecodeGemvFold(unittest.TestCase):
       want_z.append(zt)
     return np.concatenate(want_z, axis=1), conv, st
 
-  def _run(self, qkv, gate, x, w, conv0, state0, weights, pos:int, T:int, dev:str, fold:int):
+  def _run(self, qkv, gate, x, w, conv0, state0, weights, pos:int, T:int, dev:str, fold:int, q8:bool=False):
     from test.unit.test_llm_nv_gdn_prep import _emulated_warp_reduce as one_warp_reduce
     from tinygrad.llm.kernels import nv_dense
     B, H, V = self.B, self.H, self.V
@@ -595,15 +598,19 @@ class TestGDNDecodeGemvFold(unittest.TestCase):
       stack.enter_context(Context(GDN_DECODE_GEMV=fold))
       if card:
         for target, attr, new in ((nv, "warp_reduce", _emulated_warp_reduce), (nv_dense, "warp_reduce", one_warp_reduce),
+                                  (nv, "_decode_lanes", lambda device: 32),  # the card's lane count, as gdn_decode sees it on NV
                                   (nv, "_gdn_decode_kernel", _card_form(nv._gdn_decode_kernel)),
                                   (nv, "_gdn_conv_decode_kernel", _card_form(nv._gdn_conv_decode_kernel)),
                                   (nv_dense, "_nv_f16_gemv_kernel", nv_dense._nv_f16_gemv_kernel.__wrapped__)):
           stack.enter_context(mock.patch.object(target, attr, new))
-      z = gdn_decode(rows(qkv), rows(gate), (Tensor(x, device=dev), Tensor(w, device=dev)), conv_state, state,
-                     *(Tensor(v, device=dev) for v in weights), UOp.variable("start_pos", 0, 63).bind(pos), k_heads=self.Hk, qk_eps=1e-6,
-                     norm_eps=1e-5, track=track if T > 1 else None)
+      res = gdn_decode(rows(qkv), rows(gate), (Tensor(x, device=dev), Tensor(w, device=dev)), conv_state, state,
+                       *(Tensor(v, device=dev) for v in weights), UOp.variable("start_pos", 0, 63).bind(pos), k_heads=self.Hk, qk_eps=1e-6,
+                       norm_eps=1e-5, track=track if T > 1 else None, q8=q8)
+      z, zq8 = (res[0], res[1:]) if isinstance(res, tuple) else (res, ())
       names = [u.src[0].arg.name for u in z.uop.toposort() if u.op is Ops.CALL and isinstance(u.src[0].arg, KernelInfo)]
-      return names, z.numpy().reshape(B, T, H*V), conv_state.numpy(), state.numpy(), track[0].numpy()[:T-1], track[1].numpy()[:T-1]
+      Tensor.realize(z, *zq8)  # one realize: each output's own would re-run the kernels' in-place state updates
+      return [names, z.numpy().reshape(B, T, H*V), conv_state.numpy(), state.numpy(), track[0].numpy()[:T-1], track[1].numpy()[:T-1],
+              *(t.numpy() for t in zq8)]
 
   def test_cpu_form_matches_reference(self):
     # the CPU form (lanes=1: the 32 lane sums and their butterfly unrolled) against fp64 numpy, the fold taking the place of the gemv launch
@@ -673,6 +680,86 @@ class TestGDNDecodeGemvFold(unittest.TestCase):
     with mock.patch.object(nv, "_decode_lanes", lambda device: 32):
       self.assertEqual(step(3), ["gdn_conv_decode_nv", "gdn_decode_nv"])
       self.assertEqual(step(4), ["linear_f16_gemv_nv", "gdn_conv_decode_nv", "gdn_decode_nv"])
+
+class TestGDNDecodeQ8Epilogue(unittest.TestCase):
+  """T4.146: gdn_decode(q8=True) -- the scan kernel also writes ssm_out's q8 activations of z (the decode q8_quantize_nv launch at every GDN
+  block's ssm_out, gone): a second barrier per token stages the fp16 z rows in shared memory, warp g quantizes the head's group g."""
+  fold = TestGDNDecodeGemvFold
+
+  def _run(self, inp, pos:int, T:int, dev:str, q8:bool):
+    t = self.fold()
+    t.B, t.Hk, t.H, t.K, t.V, t.P, t.D = self.dims
+    return t._run(*inp, pos, T, dev, 1, q8=q8)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_emulator_bit_identical_to_quantizing_z(self):
+    # the card form on the PYTHON emulator (odd batch 3, 2 heads of V = 64: 2 q8 groups per head over 8 warps, T = 1..4 with track,
+    # start_pos 0 and > 0): z, both states and the track slots equal the q8=False run's bit for bit, and (xq, xd) equal q8_quantize_nv's
+    # decode kernel run on that z -- bit for bit
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce
+    from tinygrad.llm.kernels import nv_quant
+    self.dims = self.fold.CARD
+    for T in range(1, GDN_DECODE_TOKENS + 1):
+      for pos in (0, 5):
+        with self.subTest(tokens=T, start_pos=pos):
+          inp = self.fold()._inputs(T, 346 + T, self.dims)
+          names, *with_q8 = self._run(inp, pos, T, "PYTHON", True)
+          _, *plain = self._run(inp, pos, T, "PYTHON", False)
+          for a, b in zip(with_q8[:5], plain): np.testing.assert_array_equal(a, b)
+          rows, feats = with_q8[0].shape[0] * T, with_q8[0].shape[2]
+          with mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+               mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):
+            want_q, want_d = (u.numpy() for u in nv_quant.q8_quantize(Tensor(with_q8[0].reshape(rows, feats), device="PYTHON"), rows, feats))
+          np.testing.assert_array_equal(with_q8[5], want_q)
+          np.testing.assert_array_equal(with_q8[6], want_d)
+
+  def test_cpu_form_returns_z_alone(self):
+    # the CPU form has no epilogue (_z_q8): gdn_decode(q8=True) hands back z only, so ssm_out quantizes it itself
+    self.dims = self.fold.SMALL
+    out = self._run(self.fold()._inputs(1, 447, self.dims), 5, 1, "CPU", True)
+    self.assertEqual(len(out), 6)
+
+  def test_model_wiring_on_the_card_form(self):
+    # GatedDeltaNetBlock's decode step scheduled (never run) with the card's lane count patched in: ssm_out's q8_quantize_nv is gone (its
+    # input is the scan kernel's), and GDN_DECODE_Q8=0 brings it back
+    from test.unit.test_llm_nv_quant import TestDecodeStepCensus, _nv_gates_open
+    def census() -> list[str]:
+      D, W = 256, 2048
+      config = TransformerConfig(num_blocks=1, dim=D, hidden_dim=W, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=D,
+                                 rope_theta=10000.0, rope_dim=D, v_head_dim=D, max_context=64)
+      b = GatedDeltaNetBlock(config, SSMConfig(conv_kernel=4, state_size=32, group_count=1, time_step_rank=8, inner_size=W))
+      q4 = TestDecodeStepCensus._q4_0
+      b.attn_qkv, b.attn_gate, b.ssm_out = q4(D, b.conv_channels, 0), q4(D, W, 1), q4(W, D, 2)
+      with _nv_gates_open(), mock.patch.object(nv, "_decode_lanes", lambda device: 32):
+        b.prepare_nv_decode()
+        x = Tensor.randn(1, 1, D).contiguous().realize()
+        b._init_state(x)
+        Tensor.realize(b.conv_state, b.recurrent_state)
+        return kernel_names(b._attention(x, 5))
+    self.assertEqual([n for n in census() if n != "?"].count("q8_quantize_nv"), 1)  # attn_qkv/attn_gate's own (no fused norm here)
+    with Context(GDN_DECODE_Q8=0): self.assertEqual([n for n in census() if n != "?"].count("q8_quantize_nv"), 2)
+
+  def test_render_at_27b(self):
+    # sm_86 source (no nvrtc lane): two barriers per token (the rms partials, the staged z rows), the q8 word stores of lanes < 8 and the
+    # scale stores of lane 0 into the (T, 192, 8) / (T, 192) outputs, the q=False kernel untouched (TestGDNDecodeSmallT's md5)
+    for tokens, track in ((1, False), (3, True)):
+      with self.subTest(tokens=tokens, track=track):
+        src = _render_cuda(_decode_sinks(tokens, track, q8=True)[1])
+        self.assertEqual(src.count("__syncthreads()"), 2*tokens)
+        self.assertEqual(len(re.findall(rf"\*\(data8_{tokens*1536}\+.*\) = ", src)), tokens)
+        self.assertEqual(len(re.findall(rf"\*\(data9_{tokens*192}\+.*\) = ", src)), tokens)
+        self.assertIn("(lidx0<8)", src)
+        self.assertIn("__shared__ __align__(16) half buf1[", src)
+
+  def test_registers_at_27b(self):
+    # the real compiler (docker nvrtc lane; skipped when it cannot start): the epilogue keeps T4.140's fit -- 11-01: 128 registers, no stack
+    # at T = 1..4 (track)
+    from test.unit.test_llm_nv_gdn_prep import TestNvrtcRegisters
+    for tokens, track in ((1, False), (2, True), (3, True), (4, True)):
+      with self.subTest(tokens=tokens, track=track):
+        try: regs, stack = TestNvrtcRegisters._attrs(_render_cuda(_decode_sinks(tokens, track, q8=True)[1]))
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        self.assertEqual((regs, stack), (128, 0))
 
 class TestGDNDecodeBlock(unittest.TestCase):
   """GatedDeltaNetBlock._attention at T=1 through nv.gdn_decode (gate mocked open, CPU form) against the generic graph: output and

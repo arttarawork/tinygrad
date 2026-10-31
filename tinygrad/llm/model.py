@@ -10,7 +10,7 @@ from tinygrad.dtype import DType
 from tinygrad.device import Buffer
 from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, Q4_0
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
-  gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
+  gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS, GDN_DECODE_Q8
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
   clear_step_caches, _register_split_k, register_padded, padded_source
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
@@ -1146,10 +1146,16 @@ class GatedDeltaNetBlock(FFNBlock):
       # T4.146: the gemv's inputs go to gdn_decode, which runs it inside its conv kernel (GDN_DECODE_GEMV)
       beta_alpha = ((x.reshape(B*T, self.config.dim), self.nv_beta_alpha_weight) if self.nv_beta_alpha_weight is not None else
                     self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
-      z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
-                        *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps,
-                        track=self.spec_track if capture else None)
+      # T4.146: the scan kernel also emits ssm_out's q8 activations when ssm_out reads them (an NV-quantized Linear: nv_q8_linear)
+      q8 = bool(GDN_DECODE_Q8.value and self.head_v_dim % 32 == 0 and self.ssm_out.ggml_type in NV_QUANT_TYPES
+                and nv_quant_supported(self.ssm_out.weight.device))
+      res = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
+                          *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps,
+                          track=self.spec_track if capture else None, q8=q8)
       assert not capture or T - 1 <= cast(tuple[Tensor, Tensor], self.spec_track)[1].shape[0], f"{T=}: more tokens than spec_track slots"
+      if not isinstance(res, tuple): return self.ssm_out(res)
+      z, zq, zd = res
+      register_fused_q8(z, B*T, self.num_v_heads*self.head_v_dim, zq, zd)
       return self.ssm_out(z)
 
     # T4.138: every other call on the card's fused-scan path (a prefill chunk: symbolic T, padded to T_pad) -- see _nv_prefill.

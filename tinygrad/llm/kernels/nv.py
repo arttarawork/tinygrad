@@ -17,6 +17,8 @@ GDN_NV_FUSED = ContextVar("GDN_NV_FUSED", 1)  # 0 = never take the fused path, e
 GDN_NV_FUSED_DECODE = ContextVar("GDN_NV_FUSED_DECODE", 0)
 # T4.146: gdn_decode folds the beta_alpha f16 gemv into its conv kernel (1, default) or runs nv_dense's own launch (0, A/B) -- bit-identical
 GDN_DECODE_GEMV = ContextVar("GDN_DECODE_GEMV", 1)
+# T4.146: gdn_decode_nv also emits ssm_out's q8 activations (1, default; read in model.py) or ssm_out quantizes z itself (0, A/B) -- bit-identical
+GDN_DECODE_Q8 = ContextVar("GDN_DECODE_Q8", 1)
 
 @functools.cache
 @functools.cache
@@ -207,8 +209,8 @@ def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, *
   return UOp.group(*outs, *shifts).end(*ends).sink(arg=KernelInfo(name="gdn_conv_decode_nv", opts_to_apply=()))
 
 @functools.cache
-def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, *track_bound:UOp,
-                       start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float, lanes:int=32, row_tile:int=8, tokens:int=1) -> UOp:
+def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:UOp, ssm_a:UOp, gate:UOp, norm_weight:UOp, *rest:UOp,
+                       start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float, lanes:int=32, row_tile:int=8, tokens:int=1, q8:bool=False) -> UOp:
   """model.py's decode graph from conv_out on, per (b, v-head h): q/k = conv_out's k-head h % k_heads l2-normalized (q * key_dim^-0.5),
   v = conv_out's v channels, beta = sigmoid(beta) in its own dtype, alpha = exp(softplus(alpha + dt_bias) * ssm_a), the fused scan's
   one-token step on state (B,H,V,K) in place (zeroed at start_pos 0), then z (B,H*V) = rmsnorm(core) * norm_weight * SiLU(sum_p gate).
@@ -216,13 +218,20 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
   (model.py's GatedDeltaNetBlock.prepare_nv_decode/nv_f16_gemv_raw) -- beta at column h, alpha at column heads+h,
   plain indexing into the one buffer (no copy kernel).
   T4.132: `tokens` sequential rows (conv_out/beta_alpha/gate/z are (B*tokens, ...)): the state runs through the tokens in registers
-  and is stored once; each token's rms reduction uses its own LOCAL slots. track (S,B,H,V,K) <- the state after token t, t < tokens-1."""
-  *track, _ = track_bound
+  and is stored once; each token's rms reduction uses its own LOCAL slots. track (S,B,H,V,K) <- the state after token t, t < tokens-1.
+  T4.146: q8=True (card form, value_dim % 32 == 0) also writes ssm_out's q8 activations of z -- rest starts with xq (B*tokens, H*V/32, 8) uint32 and
+  xd (B*tokens, H*V/32) fp32, q8_quantize(z)'s decode layout. A q8 group (32 rows of a head) spans 32/row_tile warps, so each token's fp16
+  z rows are staged in shared memory behind a second barrier; then warp g quantizes the head's group g exactly as q8_quantize_nv's decode
+  kernel does (the max over its 32 lanes, lanes < 8 pack a word -- surplus warps redo the last group: the same bits, the same addresses),
+  from the fp16 values (a load in between: the codegen folds a cast(half).float() pair back to fp32). Bit-identical to quantizing z."""
+  xq = xd = None
+  if q8: (xq, xd), rest = rest[:2], rest[2:]
+  *track, _ = rest
   batch, heads, value_dim, key_dim = state.shape
   parts = gate.shape[-1]
   assert all(isinstance(s, int) for s in (batch, heads, value_dim, key_dim, parts)) and heads % k_heads == 0
   batch, heads, value_dim, key_dim, parts = cast(tuple[int, int, int, int, int], (batch, heads, value_dim, key_dim, parts))
-  assert key_dim % lanes == 0 and value_dim % row_tile == 0 and value_dim // row_tile <= 32
+  assert key_dim % lanes == 0 and value_dim % row_tile == 0 and value_dim // row_tile <= 32 and (not q8 or (lanes > 1 and value_dim % 32 == 0))
   waves, q_dim = value_dim // row_tile if lanes > 1 else 1, k_heads*key_dim
   beta_alpha = beta_alpha.reshape(batch*tokens, 2*heads)
   bh, lane = UOp.range(batch*heads, 0), _lane(lanes, 1)
@@ -269,11 +278,25 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
       partial = partial.after(partial[slot].store(squares).barrier())
       squares = _added(partial[w if tokens == 1 else t*waves + w].load() for w in range(waves))
     inv = (squares * (1/value_dim) + norm_eps).rsqrt()  # nn.RMSNorm: x * (mean(x^2) + eps).rsqrt(), then * weight
-    for row,o in zip(rows, outs):
-      gated = o*inv*norm_weight[row].load() * _added(gt[r, h*value_dim + row, p].load() for p in range(parts)).silu()
-      z_stores.append(z[r, (h*value_dim + row).valid(lane.eq(0))].store(gated.cast(z.dtype)))
+    zh = [(o*inv*norm_weight[row].load() * _added(gt[r, h*value_dim + row, p].load() for p in range(parts)).silu()).cast(z.dtype)
+          for row,o in zip(rows, outs)]
+    z_stores += [z[r, (h*value_dim + row).valid(lane.eq(0))].store(x) for row, x in zip(rows, zh)]
+    if q8: z_stores += _z_q8(xq, xd, rows, zh, t, r, h, value_dim, tokens, lane, wave, waves)
   stores = [state[b, h, row, c].store(x.cast(state.dtype)) for row in rows for x,c in zip(previous[row], cols)] + z_stores
   return UOp.group(*stores).end(*(r for r in (wave, lane, bh) if r.op is Ops.RANGE)).sink(arg=KernelInfo(name="gdn_decode_nv", opts_to_apply=()))
+
+def _z_q8(xq:UOp, xd:UOp, rows, zh:list[UOp], t:int, r:UOp, h:UOp, value_dim:int, tokens:int, lane:UOp, wave:UOp, waves:int) -> list[UOp]:
+  """T4.146: _gdn_decode_kernel's q8 epilogue for token t (see its docstring): the stores of z's q8 words and scales. The card form only:
+  in the CPU form one thread owns a head, and its unrolled 32-wide group maxima and packs made the scheduler of a whole speculative
+  iteration (test_llm_nv_quant's census) run for minutes -- gdn_decode leaves ssm_out's own quantize there."""
+  from tinygrad.llm.kernels.nv_quant import _q8_pack  # nv_quant imports this module
+  groups = value_dim // 32
+  zbuf = UOp.placeholder((tokens*value_dim,), dtypes.float16, slot=1, addrspace=AddrSpace.LOCAL)
+  zb = zbuf.after(UOp.group(*(zbuf[(t*value_dim + row).valid(lane.eq(0))].store(x) for row, x in zip(rows, zh))).barrier())
+  g = wave.minimum(groups - 1) if waves > groups else wave
+  gscale = (warp_reduce(zb[t*value_dim + g*32 + lane].load().float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
+  word = _q8_pack(tuple(zb[t*value_dim + g*32 + lane.minimum(7)*4 + i].load().float() for i in range(4)), gscale)
+  return [xq[r, h*groups + g, lane.valid(lane < 8)].store(word), xd[r, (h*groups + g).valid(lane.eq(0))].store(gscale)]
 
 def _split_k_partials(t:Tensor) -> Tensor:
   """t (B,1,F) as (B,F,P): nv_q8_linear returns its split-K partials summed lazily (`Tensor(out.after(call)).sum(-1).reshape(...)`), so
@@ -290,7 +313,7 @@ def _decode_lanes(device) -> int: return 32 if isinstance(device, str) and devic
 
 def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor|tuple[Tensor, Tensor], conv_state:Tensor, state:Tensor, conv_weight:Tensor,
                norm_weight:Tensor, dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float,
-               track:tuple[Tensor, Tensor]|None=None) -> Tensor:
+               track:tuple[Tensor, Tensor]|None=None, q8:bool=False) -> Tensor|tuple[Tensor, Tensor, Tensor]:
   """One GatedDeltaNet decode token (T == 1) -- T4.132: or a run of T <= GDN_DECODE_TOKENS tokens, sequential inside the kernels -- from
   the projections: qkv = attn_qkv(x), out_gate = attn_gate(x), beta_alpha = ssm_beta(x) and ssm_alpha(x) run as ONE f16 gemv (T4.127b,
   model.py's prepare_nv_decode/nv_f16_gemv_raw) over their concatenated weight -- (B,T,2*heads), beta at [:heads], alpha at [heads:].
@@ -298,7 +321,9 @@ def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor|tuple[Tensor, Tens
   (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be re-copied every step. T4.132: track = (conv (S,B,taps-1,C),
   state (S,B,H,V,K)) buffers also receive the conv window / recurrent state after each of the first T-1 tokens (S >= T-1).
   T4.146: beta_alpha may be the gemv's inputs instead, (x (B*T, D) fp16, the concatenated weight (2H, D) fp16): the conv kernel forms it
-  (GDN_DECODE_GEMV, one output per conv block), else nv_dense's linear_f16_gemv_nv launch."""
+  (GDN_DECODE_GEMV, one output per conv block), else nv_dense's linear_f16_gemv_nv launch. q8=True (head_v_dim % 32 == 0) returns
+  (z, xq, xd) -- z's q8 activations from the scan kernel's epilogue, for register_fused_q8 (ssm_out's input) -- on the card; the CPU
+  form returns z alone (see _z_q8)."""
   batch, heads, value_dim, _ = state.shape
   tokens = cast(int, qkv.shape[1])
   assert 1 <= tokens <= GDN_DECODE_TOKENS, f"{tokens=}"
@@ -324,8 +349,13 @@ def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor|tuple[Tensor, Tens
                               fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes, tokens=tokens, gemv=bool(gemv)))
   conv_out, beta_alpha = outs[0], outs[4] if gemv else cast(Tensor, beta_alpha)
   z = Tensor.empty(batch*tokens, heads*value_dim, dtype=dtypes.float16, device=device)
-  z = Tensor.custom_kernel(z, state, conv_out, beta_alpha.reshape(batch*tokens, 2*heads), dt_bias, ssm_a,
-                           _split_k_partials(out_gate), norm_weight, *state_track, bound,
-                           fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads, qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes,
-                                                 tokens=tokens))[0]
-  return z.reshape(batch, tokens, heads*value_dim)
+  assert not q8 or value_dim % 32 == 0, f"q8 groups must not span heads ({value_dim=})"
+  q8 = q8 and lanes > 1
+  xq8 = (Tensor.empty(batch*tokens, heads*value_dim//32, 8, dtype=dtypes.uint32, device=device),
+         Tensor.empty(batch*tokens, heads*value_dim//32, dtype=dtypes.float32, device=device)) if q8 else ()
+  res = Tensor.custom_kernel(z, state, conv_out, beta_alpha.reshape(batch*tokens, 2*heads), dt_bias, ssm_a,
+                             _split_k_partials(out_gate), norm_weight, *xq8, *state_track, bound,
+                             fxn=functools.partial(_gdn_decode_kernel, start_pos=var, k_heads=k_heads, qk_eps=qk_eps, norm_eps=norm_eps, lanes=lanes,
+                                                   tokens=tokens, q8=q8))
+  z = res[0].reshape(batch, tokens, heads*value_dim)
+  return (z, res[8], res[9]) if q8 else z
