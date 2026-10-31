@@ -413,7 +413,9 @@ def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|No
   # T4.141: the bound toks rides last, never read (gdn_decode's convention: the schedule binds the kernel's toks Variable from it)
   if isinstance(toks, UOp): srcs.append(Tensor(toks))
   # T4.137: NV_NORM_SPLIT read here (uncached) and passed into the cache key; 1 = per_thread blocks per token (one q8 group per warp each)
-  split = dim // threads if NV_NORM_SPLIT.value else 1
+  # T4.141 (10-31 card): the split pays only at decode width -- at 128 tokens one block per token already fills the SMs and the split's 5 blocks
+  # re-read the row + partials (chunk 116.4 ms split vs 114.6 unsplit; decode 9.3 vs 13.4 us). Bit-identical either way (T4.137's tests).
+  split = dim // threads if NV_NORM_SPLIT.value and tokens <= 4 else 1
   fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads, split=split,
                           toks=kernel_var(toks.src[0]) if isinstance(toks, UOp) else None, kfirst=kfirst, q8_fp16=q8_fp16)
   results = srcs[0].custom_kernel(*srcs[1:], fxn=fxn)
