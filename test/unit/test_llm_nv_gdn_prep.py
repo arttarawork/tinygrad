@@ -468,6 +468,39 @@ class TestGDNPrepRender(unittest.TestCase):
         self.assertEqual(re.findall(r"(?:blockIdx|threadIdx)\.[xyz]; /\* (\d+) \*/", state), ["320", "32"])
         self.assertLess(state.index("val1 ="), state.index("*(data0_30720+alu0) ="))
 
+class TestNvrtcRegisters(unittest.TestCase):
+  """the sm_86 cubins through the real compiler (on macOS the docker nvrtc lane, as the server; skipped when it cannot start):
+  EIATTR_REGCOUNT and the spill stack (EIATTR_MIN_STACK_SIZE) of the new kernels at the 27B geometry, 128-token chunk"""
+  @staticmethod
+  def _attrs(src:str) -> tuple[int, int]:
+    import struct
+    from tinygrad.runtime.support.compiler_cuda import NVRTCCompiler
+    from tinygrad.runtime.support.elf import elf_loader
+    lib = NVRTCCompiler("sm_86", ptx=False, cache_key="nv").compile(src)
+    attrs = {}
+    for sh in elf_loader(lib, force_section_align=128)[1]:
+      off = 0
+      while sh.name == ".nv.info" and off < sh.header.sh_size:
+        typ, param, sz = struct.unpack_from("BBH", sh.content, off)
+        if typ == 0x4 and sz >= 8: attrs[param] = struct.unpack_from("II", sh.content, off + 4)[1]
+        off += (sz if typ == 0x4 else 0) + 4
+    return attrs[0x2f], attrs.get(0x12, 0)
+
+  def test_registers_and_spills(self):
+    from test.unit.test_llm_nv_scan import _render_cuda
+    from tinygrad.llm.kernels.nv_dense import _nv_f16_gemv_kernel
+    prep, state = _prep_sinks(128)
+    out, w, x = (UOp.placeholder(s, dtypes.float16, slot=i) for i, s in enumerate(((128, 96), (96*5120,), (128, 5120))))
+    gemv = _render_cuda(_nv_f16_gemv_kernel(out, w, x, in_features=5120, out_features=96, tokens=128, tile_tokens=8, tile_rows=8))
+    # 11-01: prep 255 + 56 B (its 4-token tile holds ~300 loaded values), conv_state 16, post 34, the 8 x 8 gemv tile 134 (looped K)
+    for name, src, max_stack in (("gdn_prep_nv", prep, 128), ("gdn_conv_state_nv", state, 0), ("gdn_post_nv", _post_sink(), 0),
+                                 ("linear_f16_gemv_nv", gemv, 0)):
+      with self.subTest(kernel=name):
+        try: regs, stack = self._attrs(src)
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        self.assertLessEqual(regs, 255)
+        self.assertLessEqual(stack, max_stack)
+
 class TestPrefillCensus(unittest.TestCase):
   # step 0 (the map): the input copy of this harness (x is a slice, the served block input a buffer), the window zero fill (pruned on the
   # card), then the 10-31 profile's kernels in schedule order
@@ -499,6 +532,9 @@ class TestPrefillCensus(unittest.TestCase):
     block = card_block()
     block.ssm_out = _quantized_linear(Q5_K, 5120, 6144)
     self.assertEqual(prefill_census(block), self.STEP2[:11] + ["linear_q5_k_imma_nv"] + self.STEP2[12:])
+
+  def test_knob_off_is_step_0(self):
+    with Context(GDN_NV_PREP=0): self.assertEqual(prefill_census(card_block()), self.BEFORE)
 
   def test_gate_closed_is_step_0(self):
     with mock.patch("tinygrad.llm.model.nv_gdn_prefill", side_effect=AssertionError("taken")):

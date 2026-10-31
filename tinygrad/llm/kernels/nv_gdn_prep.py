@@ -45,6 +45,7 @@ import functools
 from typing import cast
 from tinygrad import Tensor, UOp
 from tinygrad.dtype import dtypes
+from tinygrad.helpers import ContextVar
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.llm.kernels.amd import kernel_var
 from tinygrad.llm.kernels.nv import _gated_delta_prefill_kernel
@@ -62,6 +63,8 @@ from tinygrad.llm.kernels.nv_quant import _q8_pack
 #   own kernel because the prep kernel's tile 0 reads the old rows: a store gated to tile 0 does not survive the index lowering (a gate
 #   clause whose ranges are not in the gated component is dropped -- symbolic.py drop_and_clauses), and any other writer would race the
 #   reads. Ordered after the prep kernel by taking its conv_state output; the scan's state input carries it into the graph.
+# card A/B and rollback: 0 = the generic glue around the fused scan (step 0's graph); read at call time in GatedDeltaNetBlock._attention
+GDN_NV_PREP = ContextVar("GDN_NV_PREP", 1)
 PREP_TILE = 4  # tokens per prep warp: >= conv_kernel-1 (only tile 0 reads conv_state); a chunk it doesn't divide is one tile
 FULL_WARP = (16, 8, 4, 2, 1)
 

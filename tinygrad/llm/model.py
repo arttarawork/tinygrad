@@ -15,7 +15,7 @@ from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, ad
   clear_step_caches
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
-from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post
+from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post, GDN_NV_PREP
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
@@ -1062,8 +1062,10 @@ class GatedDeltaNetBlock(FFNBlock):
       assert not capture or T - 1 <= cast(tuple[Tensor, Tensor], self.spec_track)[1].shape[0], f"{T=}: more tokens than spec_track slots"
       return self.ssm_out(z)
 
-    # T4.138: every other call on the card's fused-scan path (a prefill chunk: symbolic T, padded to T_pad) -- see _nv_prefill
-    if not capture and not is_kda and self.nv_decode_weights is not None and self.head_v_dim % 32 == 0 and nv_custom_kernels_supported(x.device):
+    # T4.138: every other call on the card's fused-scan path (a prefill chunk: symbolic T, padded to T_pad) -- see _nv_prefill.
+    # GDN_NV_PREP=0: the generic glue below around the same fused scan (A/B, rollback)
+    if (GDN_NV_PREP.value and not capture and not is_kda and self.nv_decode_weights is not None and self.head_v_dim % 32 == 0
+        and nv_custom_kernels_supported(x.device)):
       return self._nv_prefill(x, start_pos, T, T_pad)
 
     # input processing
