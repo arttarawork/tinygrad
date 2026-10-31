@@ -1324,8 +1324,9 @@ class TestDecodeStepCensus(unittest.TestCase):
       self.assertNotIn(f"elementwise half[{T*D}] <- half[{T*D}]", census, "the f16 gemvs read the fused fp16 output in place")
       # T4.127a: ffn_down's own quantize is now ffn_act_q8_nv's -- only ssm_out's q8_quantize_nv remains
       self.assertEqual(census.count("q8_quantize_nv"), 1, "attn_qkv/attn_gate's is the fused kernel's; ffn_down's is ffn_act_q8_nv's")
-      # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs -- are now the one combined gemv (dim 256 is 128-aligned)
-      self.assertEqual(census.count("linear_f16_gemv_nv"), 1, "ssm_beta/ssm_alpha's two gemvs are now the combined one")
+      # T4.127b: ssm_beta(x)/ssm_alpha(x) -- two f16 gemvs -- are now the one combined gemv (dim 256 is 128-aligned); T4.146: run inside
+      # gdn_conv_decode_nv (the CPU form has a conv thread per channel, so it fits at T=4 too -- on the card T=4 keeps the launch)
+      self.assertEqual(census.count("linear_f16_gemv_nv"), 0, "ssm_beta/ssm_alpha's combined gemv runs in the conv kernel")
       self.assertEqual([k for k in census if k.startswith("gdn_")], ["gdn_conv_decode_nv", "gdn_decode_nv"])
       if T == 1: t1 = census
     def kinds(c): return sorted(k.partition(" ")[0] for k in c)  # a generic kernel by kind only: its buffer sizes scale with T

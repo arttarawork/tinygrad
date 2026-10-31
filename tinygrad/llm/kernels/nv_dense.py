@@ -30,7 +30,7 @@ from tinygrad.engine.realize import capturing
 from tinygrad.dtype import AddrSpace, dtypes, least_upper_dtype
 from tinygrad.uop.ops import AxisType, KernelInfo
 from tinygrad.llm.kernels.amd import Linear, IQ_GRID_SIZES
-from tinygrad.llm.kernels.nv import warp_reduce, iq_grid
+from tinygrad.llm.kernels.nv import warp_reduce, iq_grid, f16_dot_lane
 
 WARP_SIZE, VAL_CHUNK = 32, 4
 # T4.138 (step 4): a prefill call (tokens > 4) gives each warp a tile of NV_F16_GEMV_TOKENS tokens x NV_F16_GEMV_ROWS output rows: a
@@ -65,11 +65,7 @@ def _nv_f16_gemv_kernel(out:UOp, w:UOp, x:UOp, *, in_features:int, out_features:
   assert per * WARP_SIZE * VAL_CHUNK == in_features
   w, x = w.reshape((out_features, per, WARP_SIZE*VAL_CHUNK)), x.reshape((tokens, per, WARP_SIZE*VAL_CHUNK))
   if tile_tokens == 1 and tile_rows == 1:
-    acc = UOp.const(0, dtypes.float32)
-    for i in range(per):
-      for j in range(VAL_CHUNK):
-        acc = acc + w[out_row, i, lane*VAL_CHUNK+j].load().float() * x[token, i, lane*VAL_CHUNK+j].load().float()
-    total = warp_reduce(acc, full_wave=True)
+    total = warp_reduce(f16_dot_lane(w, x, out_row, token, lane, per), full_wave=True)  # T4.146: shared with nv.py's folded gemv
     return out[token, out_row.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token, out_row, lane).sink(
       arg=KernelInfo(name="linear_f16_gemv_nv", opts_to_apply=()))
   # T4.138: the K steps as a REDUCE loop, the tile's accumulators a register file (the fused scan's idiom) -- unrolled like the 1 x 1

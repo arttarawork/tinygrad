@@ -1143,8 +1143,9 @@ class GatedDeltaNetBlock(FFNBlock):
       # concatenated weight (prepare_nv_decode) when that's ready; gdn_decode reads beta/alpha out of the one result
       # (beta at [:heads], alpha at [heads:]). Falls back to the two separate calls (dim not a multiple of 128 --
       # prepare_nv_decode's own comment) with the same (B,T,2*heads) shape via one concat.
-      beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x.reshape(B*T, self.config.dim), 2*self.num_v_heads).reshape(B, T, -1)
-                    if self.nv_beta_alpha_weight is not None else self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
+      # T4.146: the gemv's inputs go to gdn_decode, which runs it inside its conv kernel (GDN_DECODE_GEMV)
+      beta_alpha = ((x.reshape(B*T, self.config.dim), self.nv_beta_alpha_weight) if self.nv_beta_alpha_weight is not None else
+                    self.ssm_beta(x).cat(self.ssm_alpha(x), dim=-1))
       z = nv_gdn_decode(self.attn_qkv(x), self.attn_gate(x), beta_alpha, self.conv_state, self.recurrent_state,
                         *self.nv_decode_weights, start_pos, k_heads=self.num_k_heads, qk_eps=1e-6, norm_eps=self.ssm_norm.eps,
                         track=self.spec_track if capture else None)

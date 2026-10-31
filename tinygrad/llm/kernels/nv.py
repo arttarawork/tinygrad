@@ -15,6 +15,8 @@ GDN_NV_FUSED = ContextVar("GDN_NV_FUSED", 1)  # 0 = never take the fused path, e
 # separate gate, default 0 (byte-identical), independent of GDN_NV_FUSED: the pooled recipe leaves that one 0
 # under BEAM_CACHE_ONLY for reasons specific to PREFILL's neighbouring kernels (CLAUDE.md), unrelated to decode.
 GDN_NV_FUSED_DECODE = ContextVar("GDN_NV_FUSED_DECODE", 0)
+# T4.146: gdn_decode folds the beta_alpha f16 gemv into its conv kernel (1, default) or runs nv_dense's own launch (0, A/B) -- bit-identical
+GDN_DECODE_GEMV = ContextVar("GDN_DECODE_GEMV", 1)
 
 @functools.cache
 @functools.cache
@@ -118,7 +120,10 @@ def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor,
 #  1. _gdn_conv_decode_kernel: one thread per conv channel -- sums attn_qkv's split-K partials, runs the taps + SiLU into conv_out and
 #     shifts conv_state in place. Every conv_state element is read and written by one thread only, so the shift is race-free.
 #     It cannot live in the scan kernel: a k-head's q/k channels feed every v-head mapped to it (3 blocks at 27B geometry), and one
-#     block overwriting conv_state rows that the others still read needs a grid-wide barrier.
+#     block overwriting conv_state rows that the others still read needs a grid-wide barrier. (T4.146 re-checked the alternatives: one
+#     block per k-head puts the 6.3 MB state stream on 16 SMs; a last-arriver atomic counter needs atomics + fences the codegen and the
+#     PYTHON emulator don't model; a ring-buffered conv_state changes the state-cache layout.) T4.146: it also runs the beta_alpha f16 gemv
+#     (gemv=True), one launch fewer per GDN block.
 #  2. _gdn_decode_kernel: one block per (batch, v-head) = value_dim/row_tile warps x row_tile value rows (the old scan's lane map), so
 #     the block owns the whole head. Each warp l2-normalizes its k-head's q/k from conv_out (three warp_reduces over the same 2x128
 #     floats in every warp -- L1 hits), forms kq, beta, alpha, runs the gated-delta update of its rows, then ssm_norm's rms over the head
@@ -146,13 +151,34 @@ GDN_DECODE_TOKENS = 4
 
 def _token_row(b:UOp, tokens:int): return (lambda t: b) if tokens == 1 else (lambda t: b*tokens + t)  # (batch b, token t) -> flat row
 
+def f16_dot_lane(w:UOp, x:UOp, row:UOp, tok:UOp, lane:UOp|int, per:int) -> UOp:
+  """lane `lane`'s fp32 sum of nv_dense's one-warp f16 gemv: w (rows, per, 128), x (tokens, per, 128) fp16, the lane's 4 halves of each
+  128-wide step, i-major j-minor from 0 -- T4.146: shared by nv_dense's 1 x 1 kernel and _gdn_conv_decode_kernel's folded gemv"""
+  acc = UOp.const(0, dtypes.float32)
+  for i in range(per):
+    for j in range(4): acc = acc + w[row, i, lane*4+j].load().float() * x[tok, i, lane*4+j].load().float()
+  return acc
+
+def _lane_tree(vals:list[UOp]) -> UOp:  # warp_reduce(full_wave)'s butterfly over 32 lane values for the CPU form: v[l] + v[l ^ off]
+  for off in (16, 8, 4, 2, 1): vals = [vals[l] + vals[l ^ off] for l in range(32)]
+  return vals[0]
+
 @functools.cache
-def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, *track_bound:UOp, start_pos:UOp, lanes:int=32,
-                            tokens:int=1) -> UOp:
+def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, *rest:UOp, start_pos:UOp, lanes:int=32,
+                            tokens:int=1, gemv:bool=False) -> UOp:
   """conv_out (B*tokens,C) fp32: row (b,t) = SiLU(sum_i weight[c,i] * window[t+i]) with window = [conv_state rows (zero at start_pos 0) |
   sum_p qkv[(b,t),c,p] per token]; conv_state (B,taps-1,C) <- window[tokens:] in place. T4.132: track (S,B,taps-1,C) <- window[t+1:t+taps]
-  for t < tokens-1, the conv state after token t. The bound start_pos rides last (see gdn_decode): a scalar src, not a buffer slot."""
-  *track, _ = track_bound
+  for t < tokens-1, the conv state after token t. The bound start_pos rides last (see gdn_decode): a scalar src, not a buffer slot.
+  T4.146: gemv=True also runs model.py's beta_alpha gemv (ssm_beta | ssm_alpha over their concatenated fp16 weight, T4.127b) in this
+  launch: rest starts with beta_alpha (B*tokens, 2H) fp16 out, x (B*tokens, D) fp16 and the weight (2H, D) fp16. Block i's warp also forms
+  output i (B*tokens*2H <= blocks: 96 / 288 of 320 at 27B geometry, 1 / 3 tokens), exactly nv_dense's 1 x 1 gemv warp (f16_dot_lane + the
+  5-shuffle butterfly + fp16), so beta_alpha is the separate linear_f16_gemv_nv launch's bit for bit; surplus blocks redo the last output
+  (the same bits to the same address). Its 80 half4 loads per lane stay hoisted: 188-196 registers of the one-warp block's 255, no spill
+  (nvrtc lane, sm_86; two outputs per block -- 4 tokens -- spilled 344 B, so gdn_decode keeps the separate gemv there). Not the conv
+  itself into gdn_decode: see the section comment."""
+  beta_alpha = xh = ba_w = None
+  if gemv: (beta_alpha, xh, ba_w), rest = rest[:3], rest[3:]
+  *track, _ = rest
   batch, history, channels = conv_state.shape
   parts = qkv.shape[-1]
   assert all(isinstance(s, int) for s in (batch, history, channels, parts)) and channels % lanes == 0 and weight.shape == (channels, history+1)
@@ -167,6 +193,16 @@ def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, *
   # the old rows all feed the outs, so storing the shifted window through conv_state.after(outs) orders every load before every store
   shifts = [conv_state.after(*outs)[b, i, c].store(window[tokens+i].cast(conv_state.dtype)) for i in range(history)]
   shifts += [tr[t, b, i, c].store(window[t+1+i].cast(tr.dtype)) for tr in track for t in range(tokens-1) for i in range(history)]
+  if gemv:  # T4.146: see the docstring
+    rows, out_features, dim = cast(int, beta_alpha.shape[0]), cast(int, beta_alpha.shape[1]), cast(int, xh.shape[-1])
+    per, n_out = dim // 128, rows * out_features
+    assert dim % 128 == 0 and ba_w.shape == (out_features * dim,) and n_out <= batch*channels//lanes
+    w3, x3 = ba_w.reshape(out_features, per, 128), xh.reshape(rows, per, 128)
+    o = block if n_out == batch*channels//lanes else block.minimum(n_out - 1)
+    tok, row = o // out_features, o % out_features
+    total = warp_reduce(f16_dot_lane(w3, x3, row, tok, lane, per), full_wave=True) if lanes > 1 else \
+      _lane_tree([f16_dot_lane(w3, x3, row, tok, ln, per) for ln in range(32)])
+    shifts.append(beta_alpha[tok, row.valid(lane.eq(0))].store(total.cast(beta_alpha.dtype)))
   ends = tuple(r for r in (lane, block) if r.op is Ops.RANGE)
   return UOp.group(*outs, *shifts).end(*ends).sink(arg=KernelInfo(name="gdn_conv_decode_nv", opts_to_apply=()))
 
@@ -250,20 +286,24 @@ def _split_k_partials(t:Tensor) -> Tensor:
     u = u.src[0]
   return t.reshape(-1, t.shape[-1], 1)  # T4.132: (B*T, F, 1) for a T-token run too
 
-def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor, conv_state:Tensor, state:Tensor, conv_weight:Tensor, norm_weight:Tensor,
-               dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float,
+def _decode_lanes(device) -> int: return 32 if isinstance(device, str) and device.split(":")[0] == "NV" else 1  # off NV only the CPU tests
+
+def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor|tuple[Tensor, Tensor], conv_state:Tensor, state:Tensor, conv_weight:Tensor,
+               norm_weight:Tensor, dt_bias:Tensor, ssm_a:Tensor, start_pos:UOp, k_heads:int, qk_eps:float, norm_eps:float,
                track:tuple[Tensor, Tensor]|None=None) -> Tensor:
   """One GatedDeltaNet decode token (T == 1) -- T4.132: or a run of T <= GDN_DECODE_TOKENS tokens, sequential inside the kernels -- from
   the projections: qkv = attn_qkv(x), out_gate = attn_gate(x), beta_alpha = ssm_beta(x) and ssm_alpha(x) run as ONE f16 gemv (T4.127b,
   model.py's prepare_nv_decode/nv_f16_gemv_raw) over their concatenated weight -- (B,T,2*heads), beta at [:heads], alpha at [heads:].
   Updates conv_state and state in place; returns z (B,T,H*V) fp16, ssm_out's input. The four weights must be realized buffers
   (GatedDeltaNetBlock.prepare_nv_decode): lazy GGUF byte views would be re-copied every step. T4.132: track = (conv (S,B,taps-1,C),
-  state (S,B,H,V,K)) buffers also receive the conv window / recurrent state after each of the first T-1 tokens (S >= T-1)."""
+  state (S,B,H,V,K)) buffers also receive the conv window / recurrent state after each of the first T-1 tokens (S >= T-1).
+  T4.146: beta_alpha may be the gemv's inputs instead, (x (B*T, D) fp16, the concatenated weight (2H, D) fp16): the conv kernel forms it
+  (GDN_DECODE_GEMV, one output per conv block), else nv_dense's linear_f16_gemv_nv launch."""
   batch, heads, value_dim, _ = state.shape
   tokens = cast(int, qkv.shape[1])
   assert 1 <= tokens <= GDN_DECODE_TOKENS, f"{tokens=}"
   channels, device = conv_state.shape[2], conv_state.device
-  lanes = 32 if isinstance(device, str) and device.split(":")[0] == "NV" else 1  # off NV only the CPU tests get here
+  lanes = _decode_lanes(device)
   assert start_pos.is_bound_var
   # the kernels read start_pos as a PARAM by name (kernel_var); the bound variable itself rides along as the LAST CALL src (`_bound`,
   # never loaded) so the schedule binds it -- a precompiled @function drops arguments no kernel references, and the generic graph
@@ -271,8 +311,18 @@ def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor, conv_state:Tensor
   var, bound = kernel_var(start_pos.src[0]), Tensor(start_pos)
   conv_out = Tensor.empty(batch*tokens, channels, dtype=dtypes.float32, device=device)
   conv_track, state_track = ((track[0],), (track[1],)) if track is not None and tokens > 1 else ((), ())
-  conv_out = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, *conv_track, bound,
-                                  fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes, tokens=tokens))[0]
+  gemv: tuple[Tensor, ...] = ()
+  if isinstance(beta_alpha, tuple):  # T4.146: the gemv folded into the conv kernel (one output per block); its x as nv_f16_gemv_raw takes it
+    x, w = beta_alpha
+    if GDN_DECODE_GEMV.value and batch*tokens*2*heads <= batch*channels//lanes:
+      gemv = (Tensor.empty(batch*tokens, 2*heads, dtype=dtypes.float16, device=device), x if x.uop.has_buffer_identity(after_ok=True) else
+              x.contiguous(), w.reshape(-1))
+    else:
+      from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw  # nv_dense imports this module
+      beta_alpha = nv_f16_gemv_raw(w, x, 2*heads)
+  outs = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, *gemv, *conv_track, bound,
+                              fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes, tokens=tokens, gemv=bool(gemv)))
+  conv_out, beta_alpha = outs[0], outs[4] if gemv else cast(Tensor, beta_alpha)
   z = Tensor.empty(batch*tokens, heads*value_dim, dtype=dtypes.float16, device=device)
   z = Tensor.custom_kernel(z, state, conv_out, beta_alpha.reshape(batch*tokens, 2*heads), dt_bias, ssm_a,
                            _split_k_partials(out_gate), norm_weight, *state_track, bound,
