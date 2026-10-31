@@ -193,8 +193,8 @@ def _emulated_xor(val:UOp, offsets, maximum:bool=False) -> UOp:
     other = buf.after(buf[tid].store(val))[tid + off - (tid // off) % 2 * (2 * off)].load()  # tid ^ off, z3-boundable
     val = val.maximum(other) if maximum else val + other
   return val
-def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  return _emulated_xor(val, (16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1), maximum)
+def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, offsets=None) -> UOp:
+  return _emulated_xor(val, offsets or ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)), maximum)
 
 @contextlib.contextmanager
 def emulated_lanes():

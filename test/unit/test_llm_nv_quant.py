@@ -549,8 +549,9 @@ class TestQ8QuantizeSums(unittest.TestCase):
     np.testing.assert_allclose(sums, ref_sums, rtol=1e-6)
 
 class TestQ8QuantizeWarps(unittest.TestCase):
-  """T4.128 (step 6): prefill-sized quantizes (tokens > 4) put NV_Q8_WARPS (token, group)s in one block -- one hardware warp each,
-  the lane a WARP range -- instead of one 32-thread block per group; decode keeps its kernel byte for byte."""
+  """T4.128 (step 6): prefill-sized quantizes (tokens > 4) put NV_Q8_WARPS warps in one block -- the lane a WARP range -- instead of
+  one 32-thread block per group; decode keeps its kernel byte for byte. T4.138 (step 3): each lane packs one word (4 elements, one
+  vector load), 4 groups per warp, a group reduced over its 8 lanes -- bit-identical to the one-warp kernel."""
   def _kernel(self, tokens:int, in_features:int, sums:bool=False) -> UOp:
     outs = q8_quantize(Tensor.empty(tokens, in_features), tokens, in_features, sums=sums)
     return next(u.src[0] for u in outs[0].uop.toposort() if u.op is Ops.CALL)
@@ -578,9 +579,10 @@ class TestQ8QuantizeWarps(unittest.TestCase):
           prg = self._program(self._kernel(128, in_features, sums))
           src = next(u.arg for u in prg.src if u.op is Ops.SOURCE)
           self.assertEqual(tuple(prg.arg.local_size), (32, warps, 1))
-          self.assertEqual(tuple(prg.arg.global_size), (-(-128 * in_features // 32 // warps), 1, 1))
+          self.assertEqual(tuple(prg.arg.global_size), (-(-128 * in_features // 32 // (4 * warps)), 1, 1))  # 4 groups per warp
           self.assertIn(f"__launch_bounds__({32 * warps})", src)
-          self.assertEqual(src.count("__shfl_xor_sync"), 10 if sums else 5)
+          self.assertEqual(src.count("__shfl_xor_sync"), 6 if sums else 3)  # xor 4/2/1 within a group's 8 lanes
+          self.assertIn("float4 val0 = (*((float4*)", src)  # one 16-byte load per lane
 
   @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
   def test_multi_warp_runs_on_python_emulator(self):
@@ -596,6 +598,22 @@ class TestQ8QuantizeWarps(unittest.TestCase):
         np.testing.assert_array_equal(q.view(np.int8).reshape(ref_q.shape), ref_q)
         np.testing.assert_allclose(scale, ref_scale, rtol=1e-6)
         np.testing.assert_array_equal(sums, (scale * ref_q.astype(np.int32).sum(-1).astype(np.float32)).astype(np.float32))
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_multi_warp_matches_one_warp_bit_for_bit(self):
+    # T4.138: fp16 activations (prefill's GDN/attention inputs) put many x/scale values on rounding near-ties -- both kernels must
+    # land on the same side: same formulas, words/scales/sums equal to the bit. 37 tokens x 6 groups: a partial last block
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce
+    tokens, in_features = 37, 192
+    x = (np.random.default_rng(7).standard_normal((tokens, in_features)) * 2).astype(np.float16)
+    x[3, 64:96] = 0
+    got = {}
+    for warps in (1, 8, 4):
+      with Context(NV_Q8_WARPS=warps), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+           mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):
+        got[warps] = [t.numpy() for t in q8_quantize(Tensor(x, device="PYTHON"), tokens, in_features, sums=True)]  # 1: the decode kernel
+    for warps in (8, 4):
+      for a, b in zip(got[warps], got[1]): np.testing.assert_array_equal(a, b, err_msg=f"{warps=}")
 
 class TestQuantizeOncePerActivation(unittest.TestCase):
   """T4.123a: several Linears in one decode step read the identical activation (FFN gate+up, GDN

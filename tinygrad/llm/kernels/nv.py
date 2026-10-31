@@ -48,8 +48,9 @@ def nv_decode_kernel_supported(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "NV" or not GDN_NV_FUSED_DECODE.value: return False
   return _nv_device_ok(device)
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, offsets:tuple[int, ...]|None=None) -> UOp:
+  # T4.138: `offsets` reduces a sub-warp group (nv_quant's prefill quantizer: (4, 2, 1) over 8 lanes); the lane must be the hardware lane
+  for offset in (offsets if offsets is not None else (16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
     other = UOp(Ops.CUSTOM, src=(val,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
     val = val.maximum(other) if maximum else val + other
