@@ -540,6 +540,11 @@ class TestFFNActQ8Prefill(unittest.TestCase):
     self.assertIn("__launch_bounds__(256)", src)
     self.assertEqual(src.count("__shfl_xor_sync"), 6)
     self.assertEqual(src.count("float4 val"), 2)
+    from test.unit.test_llm_nv_gdn_prep import TestNvrtcRegisters
+    try: regs, stack = TestNvrtcRegisters._attrs(src)  # the docker nvrtc lane; 11-01: 30 registers, no spill stack
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    self.assertLessEqual(regs, 64)
+    self.assertEqual(stack, 0)
 
   def test_decode_render_unchanged(self):
     import hashlib

@@ -388,4 +388,16 @@ class TestPrefillWidthRender(unittest.TestCase):
         self.assertEqual(src.count("__syncthreads()"), 2 if want_fp16 else 1)  # q8_fp16: the staged fp16 values' own barrier
         self.assertEqual("half" in src, want_fp16)
 
+  def test_nvrtc_registers_and_spills(self):
+    # the real compiler (the docker nvrtc lane; skipped when it cannot start): 1024 threads cap a thread at 64 registers -- 11-01: the ffn
+    # site (4 partials) 54, the GDN/attention attn_norm sites 38, no spill stack
+    from test.unit.test_llm_nv_gdn_prep import TestNvrtcRegisters
+    view = Tensor.empty(1, 128, 5120)[:, :UOp.variable("toks", 1, 128).bind(77)]
+    for partials, want_fp16 in ((Tensor.empty(4, 128, 5120), False), (None, True), (None, False)):
+      with self.subTest(partials=partials is not None, want_fp16=want_fp16):
+        try: regs, stack = TestNvrtcRegisters._attrs(self._source(view, partials, want_fp16, q8_fp16=want_fp16))
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        self.assertLessEqual(regs, 64)
+        self.assertEqual(stack, 0)
+
 if __name__ == "__main__": unittest.main()
