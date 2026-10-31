@@ -8,7 +8,7 @@ if TYPE_CHECKING: import numpy as np  # T4.65 CI fix: tinygrad's core stays nump
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
 from tinygrad.dtype import DType
 from tinygrad.device import Buffer
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, Q4_0
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
@@ -460,9 +460,9 @@ class TransformerConfig:
 NV_SMALL_T = 4
 
 # T4.141: the same fused kernels at a PREFILL chunk's padded width (nv_prefill_tokens): every norm site (attention q/k/v, the head,
-# ffn_norm with the residual add, GDN's attn_norm) hands the IMMA gemms (kernels/nv_gemm.py) their q8 activations, summing the producing
-# gemm's split-K partials in-kernel. 0 = the generic graphs at T > NV_SMALL_T (card A/B, rollback); read at call time in nv_fused_norm,
-# _ffn_output and GatedDeltaNetBlock._normed_for_attention.
+# ffn_norm with the residual add, GDN's attn_norm) and the FFN activation hand the IMMA gemms (kernels/nv_gemm.py) their q8 activations,
+# summing the producing gemm's split-K partials in-kernel. 0 = the generic graphs at T > NV_SMALL_T (card A/B, rollback); read at call
+# time in nv_fused_norm, _ffn_output, _feed_forward and GatedDeltaNetBlock._normed_for_attention.
 NV_PREFILL_FUSED_NORM = ContextVar("NV_PREFILL_FUSED_NORM", 1)
 
 def nv_prefill_tokens(x:Tensor) -> int|None:
@@ -616,6 +616,18 @@ class FFNBlock:
         register_fused_q8(act := gate.silu() * up, tokens, hidden, q, scale)
         return self.ffn_down(act)
       return self.ffn_down(gate.silu() * up)
+    # T4.141: a prefill chunk -- SiLU(gate)*up and ffn_down's q8 activations (+ the group sums a Q4_1/Q5_K ffn_down's IMMA gemm reads)
+    # as one ffn_act_q8 kernel over the gate/up gemms' raw outputs at the padded width, instead of the contiguous SiLU, the padded
+    # SiLU*up and a q8_quantize_nv (E_28toks2A13629_128, E_16_272_8_16_4, q8_quantize_nv: ~72 us per block on the card, 10-31 profile)
+    if ((T_pad := nv_prefill_tokens(x)) is not None and nv_quant_supported(self.ffn_gate.weight.device)
+        and all(lin.ggml_type in NV_QUANT_TYPES for lin in (self.ffn_gate, self.ffn_up, self.ffn_down))):
+      gate, up = self.ffn_gate(x), self.ffn_up(x)
+      if (gate_partials := split_k_partials(gate)) is not None and (up_partials := split_k_partials(up)) is not None:
+        hidden = self.ffn_gate.out_features
+        q, scale, *sums = ffn_act_q8(gate_partials, up_partials, T_pad, hidden, sums=self.ffn_down.ggml_type != Q4_0)
+        act = gate.silu() * up
+        register_fused_q8(act.pad_to(act.max_shape), T_pad, hidden, q, scale, *sums)
+        return self.ffn_down(act)
     # TODO: remove the need for this contiguous
     return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
 

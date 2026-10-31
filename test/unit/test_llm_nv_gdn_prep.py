@@ -484,8 +484,8 @@ def _card_model(device:str="PYTHON") -> Transformer:
 class TestFusedPrefillServedOnEmulator(unittest.TestCase):
   """T4.141 (trap 3: a gate is only as good as the path it executes): Transformer.generate's PRUNED capture-first prefill family on the
   emulator, a 37-token prompt in chunks of 16 (16 + 16 + 5: two replays, the last a remainder whose padded rows read stale arena rows),
-  every prefill norm site on the fused kernel. The jit == JIT=0 bit for bit (first token, both GDN states, the KV cache),
-  and both == the generic norms (NV_PREFILL_FUSED_NORM=0) up to fp32 reduction order."""
+  every prefill norm site and activation on the fused kernels. The jit == JIT=0 bit for bit (first token, both GDN states, the KV cache),
+  and both == the generic norms/activation (NV_PREFILL_FUSED_NORM=0) up to fp32 reduction order."""
   def test_jitted_prefill_matches_eager_and_generic(self):
     prompt = [int(t) for t in np.random.default_rng(5).integers(1, 64, 37)]
     got = {}
@@ -500,8 +500,9 @@ class TestFusedPrefillServedOnEmulator(unittest.TestCase):
         if jit:
           family = m.jit[(True, False, 16, False)]
           names = [call.src[0].arg.name for call in family.captured.linear.src if hasattr(call.src[0].arg, "name")]
-          # per chunk: 2 norm sites per block; q8_quantize_nv for attn_output's input (attn * gate) and each block's ffn_down input
-          self.assertEqual((names.count("add_rmsnorm_q8_nv"), names.count("q8_quantize_nv")), (4, 3) if knob else (0, 7))
+          # per chunk: 2 norm sites per block, an activation per block; q8_quantize_nv only for attn_output's input (attn * gate)
+          self.assertEqual((names.count("add_rmsnorm_q8_nv"), names.count("ffn_act_q8_nv"), names.count("q8_quantize_nv")),
+                           (4, 2, 1) if knob else (0, 0, 7))
     self.assertEqual(got["jit"][0], got["eager"][0])
     for a, b in zip(got["jit"][1:], got["eager"][1:]): np.testing.assert_array_equal(a, b)
     self.assertEqual(got["jit"][0], got["generic"][0])
@@ -606,12 +607,13 @@ class TestPrefillCensus(unittest.TestCase):
   # step 2: ssm_norm's reduce, the gated elementwise, z's pad copy and ssm_out's q8_quantize_nv -> gdn_post_nv
   STEP2 = STEP1[:10] + ["gdn_post_nv"] + STEP1[14:]
 
-  # T4.141 (model.py NV_PREFILL_FUSED_NORM) step 1: attn_norm's reduce + apply/pad + q8_quantize_nv -> add_rmsnorm_q8_nv (its fp16 copy is
-  # the f16 gemv's and the IMMA gemms' padded input, its q8 the gemms' activations); x + ssm_out, ffn_norm's reduce + apply and the ffn
-  # input's q8_quantize_nv -> add_rmsnorm_q8_nv (ssm_out's split-K partials summed in-kernel)
+  # T4.141 (model.py NV_PREFILL_FUSED_NORM): attn_norm's reduce + apply/pad + q8_quantize_nv -> add_rmsnorm_q8_nv (its fp16 copy is the
+  # f16 gemv's and the IMMA gemms' padded input, its q8 the gemms' activations); x + ssm_out, ffn_norm's reduce + apply and the ffn input's
+  # q8_quantize_nv -> add_rmsnorm_q8_nv (ssm_out's split-K partials summed in-kernel); the contiguous SiLU(gate), the padded SiLU*up and
+  # ffn_down's q8_quantize_nv -> ffn_act_q8_nv. 22 -> 16 kernels per GDN block (the first is this harness's input copy)
   T4141 = ["E_28toks2A4029_128", "add_rmsnorm_q8_nv", "linear_q4_0_imma_nv", "linear_f16_gemv_nv", "linear_q4_0_imma_nv", "gdn_prep_nv",
            "gdn_conv_state_nv", "gated_delta_prefill_nv", "gdn_post_nv", "linear_q4_0_imma_nv", "add_rmsnorm_q8_nv", "linear_q4_0_imma_nv",
-           "linear_q4_0_imma_nv", "E_28toks2A13629_128", "E_16_272_8_16_4", "q8_quantize_nv", "linear_q4_0_imma_nv", "E_28toks2A4029_128"]
+           "linear_q4_0_imma_nv", "ffn_act_q8_nv", "linear_q4_0_imma_nv", "E_28toks2A4029_128"]
 
   def test_gdn_prefill_kernels(self):
     self.assertEqual(prefill_census(card_block()), self.T4141)
@@ -625,13 +627,23 @@ class TestPrefillCensus(unittest.TestCase):
     with Context(NV_PREFILL_FUSED_NORM=0): self.assertEqual(prefill_census(block), self.STEP2[:11] + ["linear_q5_k_imma_nv"] + self.STEP2[12:])
     self.assertEqual(prefill_census(block), self.T4141[:9] + ["linear_q5_k_imma_nv"] + self.T4141[10:])
 
+  def test_q4_1_ffn_down_takes_the_activation_sums(self):
+    # T4.141: the card's 8 Q4_1 ffn_downs: ffn_act_q8_nv also writes the group sums their IMMA gemm reads (no q8_quantize_nv)
+    from test.unit.test_llm_nv_gemm import _quantized_linear
+    from tinygrad.llm.kernels.amd import Q4_1
+    block = card_block()
+    block.ffn_down = _quantized_linear(Q4_1, 5120, 17408)
+    self.assertEqual(prefill_census(block), self.T4141[:14] + ["linear_q4_1_imma_nv"] + self.T4141[15:])
+
   def test_fused_norm_knob_off_is_step_2(self):
     with Context(NV_PREFILL_FUSED_NORM=0): self.assertEqual(prefill_census(card_block()), self.STEP2)
 
   def test_knob_off_is_step_0(self):
     with Context(GDN_NV_PREP=0, NV_PREFILL_FUSED_NORM=0): self.assertEqual(prefill_census(card_block()), self.BEFORE)
-    # T4.141: GDN's attn_norm site only feeds _nv_prefill (it stays generic here); the ffn_norm site still fuses
-    with Context(GDN_NV_PREP=0): self.assertEqual(prefill_census(card_block()), self.BEFORE[:27] + ["add_rmsnorm_q8_nv"] + self.BEFORE[30:])
+    # T4.141: GDN's attn_norm site only feeds _nv_prefill (it stays generic here); the ffn_norm site and the activation still fuse
+    with Context(GDN_NV_PREP=0):
+      self.assertEqual(prefill_census(card_block()),
+                       self.BEFORE[:27] + ["add_rmsnorm_q8_nv"] + self.BEFORE[30:32] + ["ffn_act_q8_nv"] + self.BEFORE[35:])
 
   def test_gate_closed_is_step_0(self):
     with mock.patch("tinygrad.llm.model.nv_gdn_prefill", side_effect=AssertionError("taken")), Context(NV_PREFILL_FUSED_NORM=0):

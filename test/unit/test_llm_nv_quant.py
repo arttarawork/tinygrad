@@ -500,6 +500,56 @@ class TestFFNActQ8Kernel(unittest.TestCase):
     np.testing.assert_allclose(scale_np, ref_scale, rtol=1e-6)
     np.testing.assert_array_equal(q_np.view(np.int8).reshape(ref_q.shape), ref_q)
 
+class TestFFNActQ8Prefill(unittest.TestCase):
+  """T4.141: ffn_act_q8 at a prefill chunk's padded width -- q8_quantize's prefill layout (_q8_lane_words: one word per lane, NV_Q8_WARPS
+  warps per block), gate/up as the IMMA gemm's raw (C, tokens, hidden) outputs, and the group sums a Q4_1/Q5_K ffn_down reads. The decode
+  kernel's render is md5-pinned at c685345f4 (before T4.141)."""
+  DECODE_MD5 = {1: "b021e918160051c0d8414003616c5b14", 4: "3508b7607bacbe47bafab34eca4f565f"}
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_prefill_layout_matches_the_decode_kernel_bit_for_bit(self):
+    # the same act and q8 formulas in both layouts: words and scales equal to the bit; sums = scale * sum(q) of those words. 21 tokens x 3
+    # groups: 8-warp blocks with surplus warps; both partials layouts, one and several splits
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce
+    tokens, hidden = 21, 96
+    for C, kfirst in ((1, True), (3, True), (2, False)):
+      with self.subTest(C=C, kfirst=kfirst):
+        rng = np.random.default_rng(C)
+        gate, up = ((rng.standard_normal((C, tokens, hidden)) * 2).astype(np.float32) for _ in range(2))
+        gate[:, 4, :32] = 0  # an all-zero group: scale 1e-8
+        def partials(p): return Tensor(p if kfirst else np.ascontiguousarray(p.transpose(1, 2, 0)), device="PYTHON")
+        with mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+             mock.patch.object(nv_quant, "_ffn_act_q8_kernel", nv_quant._ffn_act_q8_kernel.__wrapped__):
+          q, scale, sums = (t.numpy() for t in ffn_act_q8(partials(gate), partials(up), tokens, hidden, sums=True))
+          groups = hidden // Q8_GROUP_SIZE
+          outs = (Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device="PYTHON"), Tensor.empty(tokens, groups, device="PYTHON"))
+          decode = functools.partial(nv_quant._ffn_act_q8_kernel, tokens=tokens, hidden_dim=hidden, C=C)  # warps 0: one block per group
+          ref_q, ref_scale = (t.numpy() for t in Tensor.custom_kernel(*outs, *(Tensor(np.ascontiguousarray(p.transpose(1, 2, 0)), device="PYTHON")
+                                                                               for p in (gate, up)), fxn=decode)[:2])
+        np.testing.assert_array_equal(q, ref_q)
+        np.testing.assert_array_equal(scale, ref_scale)
+        np.testing.assert_array_equal(sums, (scale * q.view(np.int8).reshape(tokens, groups, 32).astype(np.int32).sum(-1)).astype(np.float32))
+        np.testing.assert_array_equal(scale[4, 0], np.float32(1e-8))
+
+  def test_prefill_render(self):
+    # 128 tokens x 17408 (the 27B's ffn_down input), the IMMA gemm's one split: 8-warp blocks of 4 groups per warp, one 16-byte load of each
+    # of gate and up per lane, 3 xor shuffles for the max and 3 for the sums
+    from test.unit.test_llm_nv_scan import _render_cuda
+    q = ffn_act_q8(Tensor.empty(1, 128, 17408), Tensor.empty(1, 128, 17408), 128, 17408, sums=True)[0]
+    src = _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
+    self.assertIn("__launch_bounds__(256)", src)
+    self.assertEqual(src.count("__shfl_xor_sync"), 6)
+    self.assertEqual(src.count("float4 val"), 2)
+
+  def test_decode_render_unchanged(self):
+    import hashlib
+    from test.unit.test_llm_nv_scan import _render_cuda
+    for tokens, digest in self.DECODE_MD5.items():
+      with self.subTest(tokens=tokens):
+        q = ffn_act_q8(Tensor.empty(tokens, 17408, 17), Tensor.empty(tokens, 17408, 17), tokens, 17408)[0]
+        src = _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
+        self.assertEqual(hashlib.md5(src.encode()).hexdigest(), digest)
+
 def np_q8_quantize(x:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
   """q8_quantize_nv's math on (tokens, in_features) fp32: int8 q (tokens, groups, 32), scale, and T4.128's group sums scale*sum(q)."""
   g = x.reshape(x.shape[0], -1, Q8_GROUP_SIZE)
@@ -1101,8 +1151,8 @@ class TestFFNNormSiteFusion(unittest.TestCase):
 class TestPrefillFFNSiteOnEmulator(unittest.TestCase):
   """T4.141: FFNBlock._ffn_output -> _feed_forward on an 11-token chunk of a 16-row bound, executed on the PYTHON emulator with the IMMA
   gemms (test_llm_nv_gdn_prep.emulated_card): attn_out comes from an IMMA gemm in one or four split-K partials (summed inside
-  add_rmsnorm_q8), ffn_gate/up Q4_0, ffn_down Q4_1. The fused path replaces the generic norm kernels and the ffn input's quantize and
-  matches the generic graph (NV_PREFILL_FUSED_NORM=0) to fp32 reduction order."""
+  add_rmsnorm_q8), ffn_gate/up Q4_0, ffn_down Q4_1 (ffn_act_q8's group sums). The fused path replaces every generic norm/activation kernel
+  and matches the generic graph (NV_PREFILL_FUSED_NORM=0) to fp32 reduction order."""
   def test_fused_matches_generic(self):
     from test.unit.test_llm_nv_gdn_prep import emulated_card, _q4_linear
     dim, hidden, chunk, n = 256, 512, 16, 11
@@ -1120,8 +1170,8 @@ class TestPrefillFFNSiteOnEmulator(unittest.TestCase):
         block.prepare_nv_norms()
         out = block._ffn_output(xs[:, :toks], proj(ys[:, :toks]))
         names = [u.src[0].arg.name for u in out.uop.toposort() if u.op is Ops.CALL and isinstance(u.src[0].arg, KernelInfo)]
-        self.assertEqual(names.count("q8_quantize_nv"), 2 if knob else 3)  # proj's own input, ffn_down's; generic: + the ffn input
-        self.assertEqual(names.count("add_rmsnorm_q8_nv"), knob)
+        self.assertEqual(names.count("q8_quantize_nv"), 1 if knob else 3)  # proj's own input; generic: + the ffn input, ffn_down's
+        self.assertEqual((names.count("add_rmsnorm_q8_nv"), names.count("ffn_act_q8_nv")), (knob, knob))
         outs[(knob, splitk)] = out.pad_to((1, chunk, dim)).numpy()[0, :n]
     for key in ((1, 1), (1, 4)): np.testing.assert_allclose(outs[key], outs[(0, 1)], rtol=0, atol=1e-5 * np.abs(outs[(0, 1)]).max())
 
