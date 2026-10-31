@@ -34,10 +34,15 @@ def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
   # conv_state BEFORE that chunk's own conv_state store). The upstream single pass only knew buffers touched by EARLIER kept kernels: it
   # ran that read once at capture and every replayed prefill chunk convolved a stale window (arena garbage). What stays one-time:
   # write-only inits (KV cache zero-fill, arange), anything computed only from constant buffers (weight preprocessing, lazily
-  # initialized weights) -- and, as upstream, Tensor.rand's counter advance: a pruned graph replays the capture's random numbers.
+  # initialized weights).
+  # T4.139: Tensor.rand's per-device counters change every call although no input reaches them (the advance reads and writes only the
+  # counter, the draw reads the counter and the seed): upstream pruned both and every replay reused the capture's random numbers -- the
+  # LLM prefill family's sampled first token. They count as changing from the start, so the advance, the draw and everything reading it
+  # replay; the counter's first-use init (a copy that only writes it) stays one-time.
+  rng = {b for t in Tensor._device_rng_counters.values() for b in _collect_bufs(t.uop.base)}
   rw = [_kernel_rw(si) for si in linear.src]
   touches = [{b for src in si.src[1:] for b in _collect_bufs(src)} for si in linear.src]
-  keep, changing = [False] * len(linear.src), set(needed)
+  keep, changing = [False] * len(linear.src), set(needed) | rng
   while True:
     grew = False
     for i, ((reads, writes), bufs) in enumerate(zip(rw, touches)):
@@ -296,6 +301,13 @@ class _TinyJit(Generic[ReturnType]):
       # jit capture
       assert self.fxn is not None
       if capturing: raise RuntimeError(f"having TinyJit inside another TinyJit is not supported {len(capturing)=} {capturing=}")
+      # T4.139: a pruned replay keeps every kernel that reads Tensor.rand's counter (prune_linear), so a draw made BEFORE the capture and
+      # only realized inside it (a lazily initialized random weight) would replay too and re-randomize the weight every call. Realize
+      # such draws (and a lazy counter) now: the capture's only counter readers are then its own draws.
+      if self.prune and (pending := [t for tref in list(all_tensors) if (t:=tref()) is not None and not t.uop.is_realized and
+                                     any(u.op is Ops.THREEFRY for u in t.uop.toposort())] +
+                                    [c for c in Tensor._device_rng_counters.values() if not c.uop.is_realized]):
+        Tensor.realize(*pending)
       self._linears: list[UOp] = []
       capturing.append(self)
       try:

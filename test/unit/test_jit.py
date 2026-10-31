@@ -437,6 +437,31 @@ class TestJitPrune(unittest.TestCase):
     got = [f(Tensor([float(i + 1)]).contiguous().realize(), v.bind(i)).item() for i in range(4)]
     self.assertEqual(got, [1.0, 3.0, 6.0, 10.0])
 
+  # T4.139: Tensor.rand's counter advance and draw read only the counter and the seed, never an input -- a pruned replay must still run
+  # them (the LLM prefill family samples every request's first token), while the counter's first-use init stays one-time
+  def test_prune_keeps_rand_draws(self):
+    Tensor.manual_seed(0)
+    ref = [Tensor.rand(4).tolist() for _ in range(3)]
+    Tensor.manual_seed(0)  # the capture creates the counter: its init copy must not replay
+    f = TinyJit(lambda x: (x + Tensor.rand(4)).realize(), prune=True)
+    f.cnt = 1
+    x = Tensor.zeros(4).contiguous().realize()
+    got, counts = [], []
+    for _ in range(3):
+      got.append(f(x).tolist())
+      counts.append(Tensor._device_rng_counters[x.device].tolist())
+    self.assertEqual(counts, [[4, 0], [8, 0], [12, 0]])
+    self.assertEqual(got, ref)
+
+  def test_prune_keeps_lazy_random_weight_one_time(self):
+    # T4.139: a random weight drawn BEFORE the capture (lazy, realized by it) is one-time work, not a per-call draw
+    w = Tensor.rand(4)
+    f = TinyJit(lambda x: (x * w).realize(), prune=True)
+    f.cnt = 1
+    x = Tensor.ones(4).contiguous().realize()
+    got = [f(x).tolist() for _ in range(3)]
+    self.assertEqual(got, [w.tolist()] * 3)
+
 
 class TestJitInsideJit(unittest.TestCase):
   def test_jit_jit_error(self):

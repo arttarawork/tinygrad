@@ -16,6 +16,7 @@ from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, ad
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
 from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post, GDN_NV_PREP
+from tinygrad.llm.kernels.nv_attn_prep import NV_ATTN_PREP, attn_prep, attn_prep_geometry_ok
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
@@ -758,23 +759,34 @@ class TransformerBlock(FFNBlock):
   def _normed_for_attention(self, x:Tensor) -> Tensor:  # T4.125b: q/k/v are q8 consumers -- see nv_fused_norm
     return nv_fused_norm(self.attn_norm, None if self.nv_norm_weights is None else self.nv_norm_weights[0], x, self.attn_q, self.attn_k, self.attn_v)
 
+  nv_qk_norm_weights: tuple[Tensor, Tensor]|None = None  # T4.137: (attn_q_norm, attn_k_norm) fp32 copies for attn_prep, set by prepare_nv_norms
+  def prepare_nv_norms(self) -> None:
+    super().prepare_nv_norms()
+    # T4.137: the per-head q/k RMSNorm weights' fp32 copies (the same .float() of the lazy GGUF views nn.RMSNorm multiplies by), made once at
+    # load like attn_norm/ffn_norm's -- read by the decode path's attn_prep kernel (_nv_attn_prep), same NV gate as the parent's
+    if self.nv_norm_weights is not None and self.config.qk_norm == self.config.head_dim and self.config.attn_output_gate:
+      assert self.attn_q_norm.weight is not None and self.attn_k_norm.weight is not None  # nn.RMSNorm types the weight Optional (mypy)
+      self.nv_qk_norm_weights = (self.attn_q_norm.weight.float().contiguous().realize(), self.attn_k_norm.weight.float().contiguous().realize())
+
   def _attention(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None) -> Tensor:
     if rope is None: rope = start_pos  # T5.3 callers pass the rope position explicitly; direct callers (tests) get the pre-T5.3 default
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
-    if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
-
     B, T, _ = x.shape
-    if self.config.attn_output_gate:
-      qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
-      q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
-    q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
-    k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
-    if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+    # T4.137: on the NV decode path the q/k norms, rope, the gate split and the KV_INT4 store below are ONE kernel (attn_prep_nv)
+    if (prep := self._nv_attn_prep(q, k, v, start_pos, rope)) is not None: q, gate = prep[0], prep[1]
+    else:
+      if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
+      if self.config.attn_output_gate:
+        qg = q.reshape(B, T, self.config.n_heads, 2, self.config.head_dim)
+        q, gate = qg[:, :, :, 0, :], qg[:, :, :, 1, :].reshape(B, T, self.config.n_heads * self.config.head_dim)
+      q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
+      k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
+      v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
+      if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    freqs_cis = self._rope_freqs(rope, T)
-    q = apply_rope(q[..., :self.config.rope_dim], freqs_cis).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], freqs_cis).cat(k[..., self.config.rope_dim:], dim=-1)
+      freqs_cis = self._rope_freqs(rope, T)
+      q = apply_rope(q[..., :self.config.rope_dim], freqs_cis).cat(q[..., self.config.rope_dim:], dim=-1)
+      k = apply_rope(k[..., :self.config.rope_dim], freqs_cis).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     # cast to the cache's dtype at write (a no-op when KV_F32=1); cast back up to the activation dtype at
@@ -814,14 +826,16 @@ class TransformerBlock(FFNBlock):
       # error <= scale/2, the same round-to-nearest guarantee any such quantizer gives -- see
       # test_llm_kv_dtype.py's direct pack/unpack round-trip test).
       blk, hd = kv_int8_block(self.config.head_dim), self.config.head_dim
-      blocks = Tensor.stack(k, v).reshape(2, B, self.config.n_kv_heads, T, hd // blk, blk)
-      scale = (blocks.abs().max(axis=-1, keepdim=True) / 7.0).maximum(1e-8)               # (2,B,KvH,T,Hd//blk,1)
-      nibble = ((blocks / scale).round().clip(-8, 7) + 8).cast(dtypes.uint8).reshape(2, B, self.config.n_kv_heads, T, hd // 2, 2)
-      packed = nibble[..., 0].bitwise_or(nibble[..., 1].lshift(4))                        # (2,B,KvH,T,Hd//2) uint8, [0,15]|[0,15]<<4
-      assigned_kv = Tensor(self.cache_kv.uop.after(
-        self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(packed.uop)))
-      assigned_scale = Tensor(self.cache_kv_scale.uop.after(
-        self.cache_kv_scale[:, :, :, start_pos:start_pos+T, :].uop.store(scale.squeeze(-1).cast(self.cache_kv_scale.dtype).uop)))
+      if prep is not None: assigned_kv, assigned_scale = prep[2], prep[3]  # T4.137: attn_prep_nv already stored this run's rows
+      else:
+        blocks = Tensor.stack(k, v).reshape(2, B, self.config.n_kv_heads, T, hd // blk, blk)
+        scale = (blocks.abs().max(axis=-1, keepdim=True) / 7.0).maximum(1e-8)               # (2,B,KvH,T,Hd//blk,1)
+        nibble = ((blocks / scale).round().clip(-8, 7) + 8).cast(dtypes.uint8).reshape(2, B, self.config.n_kv_heads, T, hd // 2, 2)
+        packed = nibble[..., 0].bitwise_or(nibble[..., 1].lshift(4))                        # (2,B,KvH,T,Hd//2) uint8, [0,15]|[0,15]<<4
+        assigned_kv = Tensor(self.cache_kv.uop.after(
+          self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(packed.uop)))
+        assigned_scale = Tensor(self.cache_kv_scale.uop.after(
+          self.cache_kv_scale[:, :, :, start_pos:start_pos+T, :].uop.store(scale.squeeze(-1).cast(self.cache_kv_scale.dtype).uop)))
       def _dequant(idx:int) -> Tensor:
         pv, sv = assigned_kv[idx, :, :, 0:start_pos+T, :], assigned_scale[idx, :, :, 0:start_pos+T, :]
         lo, hi = pv.bitwise_and(0xF), pv.rshift(4)                                        # unpacked nibbles, both [0,15]
@@ -869,6 +883,18 @@ class TransformerBlock(FFNBlock):
       attn = nv_fast if nv_fast is not None else attention_impl(q, k, v, mask)      # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
+
+  def _nv_attn_prep(self, q:Tensor, k:Tensor, v:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]|None:
+    """T4.137: (q (B,H,T,Hd) fp32, gate (B,T,H*Hd), cache_kv, cache_kv_scale after this run's store) from the projections by kernels/
+    nv_attn_prep.py's attn_prep -- a concrete run of T <= NV_SMALL_T tokens (decode, VERIFY) on a KV_INT4 cache where the NV attention
+    kernels run (nv_decode_attention_ok), per-head q/k norms with load-time weights (prepare_nv_norms), the output gate, a text rope
+    position. None = the generic graph (prefill chunks, image rope rows, NV_ATTN_PREP=0, every other config)."""
+    cfg, T = self.config, q.shape[1]
+    if not (NV_ATTN_PREP.value and isinstance(T, int) and T <= NV_SMALL_T and self.nv_qk_norm_weights is not None and not isinstance(rope, Tensor)
+            and self.cache_kv.dtype == dtypes.uint8 and attn_prep_geometry_ok(cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, cfg.rope_dim)
+            and nv_decode_attention_ok(q.device, cfg.head_dim, self.cache_kv)): return None
+    return attn_prep(q, k, v, *self.nv_qk_norm_weights, self.freqs_cis, self.cache_kv, self.cache_kv_scale, start_pos, rope, cfg.n_heads,
+                     (self.attn_q_norm.eps, self.attn_k_norm.eps))
 
   def _nv_attn(self, q:Tensor, assigned_kv:Tensor, assigned_scale:Tensor|None, start_pos:int|UOp, T:int|UOp) -> Tensor|None:
     """T4.107a/b: the NV split-KV kernels (kernels/nv_attn.py, NV_CUSTOM_ATTN=1) on the cache as stored -- the decode kernel for a
@@ -2387,8 +2413,9 @@ class Transformer:
     """T4.132: speculative_generate's graphs, one TinyJit per key in self.spec_jit, each captured on its FIRST call (the prefill families'
     T4.128 rule: an eager first call schedules every intermediate unplanned at once -- the card's memory peak). prune=True runs the first
     call's one-time work once (MTPHead.prefill: the MTP block's KV zero-fill on the first prompt). The chain and the accept test do NOT
-    prune: pruning keeps Tensor.rand's counter advance out of the replay (engine/jit.py) and every sampled draw would repeat; their
-    one-time work is done beforehand instead (MTPHead.ready, the RNG state in speculative_generate). adopt has no Tensor inputs."""
+    prune: pruning kept Tensor.rand's counter advance out of the replay and every sampled draw repeated (T4.139: engine/jit.py's
+    prune_linear keeps it now -- the plain prefill family's first-token draw had that bug); their one-time work is done beforehand
+    instead (MTPHead.ready, the RNG state in speculative_generate). adopt has no Tensor inputs."""
     if key not in self.spec_jit:
       self.spec_jit[key] = jit = TinyJit(fxn, prune=prune)
       jit.cnt = 1

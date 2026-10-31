@@ -18,7 +18,7 @@ model a threadgroup), with only the warp shuffle swapped for an equivalent share
 import itertools, sys, unittest
 from unittest import mock
 import numpy as np
-from tinygrad import Tensor, UOp, dtypes
+from tinygrad import Tensor, UOp, dtypes, Context
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import AxisType, Ops
 from tinygrad.llm.kernels import nv_quant
@@ -96,10 +96,10 @@ class TestKernelGraphAndRender(unittest.TestCase):
     return params
 
   def _build(self, tokens:int|None=None, dim:int|None=None, threads:int|None=None, C:int=0, want_fp16:bool=False,
-             eps:float=1e-6) -> UOp:
+             eps:float=1e-6, split:int=1) -> UOp:
     tokens, dim, threads = tokens or self.TOKENS, dim or self.DIM, threads or self.THREADS
     params = self._placeholders(tokens, dim, C, want_fp16)
-    return _add_rmsnorm_q8_kernel(*params, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads)
+    return _add_rmsnorm_q8_kernel(*params, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads, split=split)
 
   def test_graph_builds_for_every_partials_and_fp16_combo(self):
     for C in (0, 6):
@@ -152,9 +152,10 @@ class TestKernelGraphAndRender(unittest.TestCase):
     from tinygrad.device import CompileError
     try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
     except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
-    for C, want_fp16, threads in itertools.product((0, 6), (False, True), (256, 1024)):  # T4.125b: 1024 = the default at dim 5120
-      with self.subTest(C=C, want_fp16=want_fp16, threads=threads):
-        sink = self._build(C=C, want_fp16=want_fp16, threads=threads)
+    # T4.125b: 1024 = the default at dim 5120; T4.137: split 5 = its default dim/threads blocks per token
+    for C, want_fp16, (threads, split) in itertools.product((0, 6), (False, True), ((256, 1), (1024, 1), (1024, 5))):
+      with self.subTest(C=C, want_fp16=want_fp16, threads=threads, split=split):
+        sink = self._build(C=C, want_fp16=want_fp16, threads=threads, split=split)
         try: prg = to_program(sink, renderer)
         except CompileError: raise
         except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
@@ -242,13 +243,15 @@ class TestWrapperBuildsExpectedShapes(unittest.TestCase):
       add_rmsnorm_q8(residual, weight, eps=1e-6, threads=384)
 
   def test_default_threads_is_the_widest_block(self):
-    # T4.125b: <= 1024 threads, a multiple of 32 dividing dim -- 1024 at the standing 5120 (the 256 default was latency-bound)
+    # T4.125b: <= 1024 threads, a multiple of 32 dividing dim -- 1024 at the standing 5120 (the 256 default was latency-bound).
+    # T4.137: dim/threads blocks per token (NV_NORM_SPLIT, default 1), one with NV_NORM_SPLIT=0
     for dim, threads in ((5120, 1024), (256, 256), (2560, 640)):
-      with self.subTest(dim=dim):
-        new_residual = add_rmsnorm_q8(Tensor.empty(1, dim, dtype=dtypes.float32), Tensor.empty(dim, dtype=dtypes.float32), eps=1e-6)[0]
-        warps = [u.src[0].arg for u in new_residual.uop.toposort() if u.op is Ops.CALL for u in u.src[0].toposort()
-                 if u.op is Ops.RANGE and u.arg[-1] is AxisType.LOCAL]
-        self.assertEqual(warps, [threads // 32])
+      for split in (1, 0):
+        with self.subTest(dim=dim, split=split), Context(NV_NORM_SPLIT=split):
+          new_residual = add_rmsnorm_q8(Tensor.empty(2, dim, dtype=dtypes.float32), Tensor.empty(dim, dtype=dtypes.float32), eps=1e-6)[0]
+          ranges = [u for u in new_residual.uop.toposort() if u.op is Ops.CALL for u in u.src[0].toposort() if u.op is Ops.RANGE]
+          self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.LOCAL], [threads // 32])
+          self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.GLOBAL], [2 * (dim // threads if split else 1)])
 
 _emu_slot = itertools.count(60)
 def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
@@ -272,7 +275,7 @@ class TestKernelRunsOnPythonEmulator(unittest.TestCase):
   both phases, the barrier-ordered shared buffers, the q8 packing -- with only the warp shuffle swapped for an equivalent shared
   exchange (_emulated_warp_reduce; the emulator has no CUDA intrinsics). Compared against np_add_rmsnorm_q8. The standing shape:
   dim 5120 at the default 1024 threads with C=6 split-K partials (ssm_out/attn_output), plus the old 256-thread layout."""
-  def _check(self, tokens:int, dim:int, C:int, threads:int|None, want_fp16:bool):
+  def _run(self, tokens:int, dim:int, C:int, threads:int|None, want_fp16:bool):
     rng = np.random.default_rng(dim + C)
     residual, weight = rng.standard_normal((tokens, dim)).astype(np.float32), rng.standard_normal(dim).astype(np.float32)
     partials = rng.standard_normal((tokens, dim, C)).astype(np.float32) if C else None
@@ -282,6 +285,10 @@ class TestKernelRunsOnPythonEmulator(unittest.TestCase):
                             partials=None if partials is None else Tensor(partials, device="PYTHON"))
       new_residual, q, scale = (t.numpy() for t in outs[:3])
       fp16 = None if outs[3] is None else outs[3].numpy()
+    return residual, partials, weight, new_residual, q, scale, fp16
+
+  def _check(self, tokens:int, dim:int, C:int, threads:int|None, want_fp16:bool):
+    residual, partials, weight, new_residual, q, scale, fp16 = self._run(tokens, dim, C, threads, want_fp16)
     ref_residual, ref_q, ref_scale, ref_normed = np_add_rmsnorm_q8(residual, partials, weight, 1e-6)
     # partials summed left to right, then the residual: the same order numpy's 6-element sum + add uses -> exact
     np.testing.assert_array_equal(new_residual, ref_residual)
@@ -291,5 +298,15 @@ class TestKernelRunsOnPythonEmulator(unittest.TestCase):
 
   def test_standing_shape_1024_threads_with_partials(self): self._check(2, 5120, 6, None, True)
   def test_256_threads_without_partials(self): self._check(1, 256, 0, 256, False)
+
+  def test_split_blocks_are_bit_identical_to_one_block(self):
+    # T4.137: NV_NORM_SPLIT (default 1) runs dim/threads = 5 blocks per token at the standing shape, each repeating phase 1 and doing a fifth
+    # of phase 2 -- every output equal to the one-block kernel's (NV_NORM_SPLIT=0), bit for bit; VERIFY's 3 tokens = 15 blocks
+    for C, want_fp16 in ((6, False), (0, True)):
+      with self.subTest(C=C, want_fp16=want_fp16):
+        with Context(NV_NORM_SPLIT=1): split = self._run(3, 5120, C, None, want_fp16)[3:]
+        with Context(NV_NORM_SPLIT=0): one = self._run(3, 5120, C, None, want_fp16)[3:]
+        for a, b in zip(split, one):
+          if a is not None: np.testing.assert_array_equal(a, b)
 
 if __name__ == "__main__": unittest.main()
