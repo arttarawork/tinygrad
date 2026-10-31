@@ -30,6 +30,9 @@ NV_GEMV_ROWS = ContextVar("NV_GEMV_ROWS", 4)  # 10-28 card sweep: R=1 28.6, R=2 
 # 32-thread block per (token, group) hit Ampere's 16-resident-blocks-per-SM cap: 16 of 48 warp slots, 150-190 GB/s on the card
 # (10-28 q8_bench). Read in q8_quantize (uncached) and passed into the cache keys, like NV_GEMV_ROWS
 NV_Q8_WARPS = ContextVar("NV_Q8_WARPS", 8)
+# T4.137: add_rmsnorm_q8's phase 2 over dim/threads blocks per token (1, default) or the one block per token of T4.125b (0, A/B) --
+# bit-identical outputs either way
+NV_NORM_SPLIT = ContextVar("NV_NORM_SPLIT", 1)
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
@@ -222,7 +225,7 @@ def _q8_pack(values:tuple[UOp, ...], group_scale:UOp) -> UOp:
               for i,v in enumerate(values)), UOp.const(0, dtypes.uint32))
 
 @functools.cache
-def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, want_fp16:bool, threads:int) -> UOp:
+def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, want_fp16:bool, threads:int, split:int=1) -> UOp:
   """params, in order: new_residual, q, scale, residual, weight, [partials if C>0], [fp16_out if want_fp16] --
   the variadic *params (keyed by position, not by a keyword-with-default that would shift when an optional src
   is omitted) is what lets Tensor.custom_kernel's one-placeholder-per-src convention carry two independent
@@ -244,12 +247,19 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
   32-wide q8 groups and quantizes its normed slice with _q8_pack -- the identical warp-per-group / lane<8-packs-4 layout
   _q8_quantize_kernel uses, just reading the LOCAL-staged (not global) activation and multiplying in
   inv_rms*weight first. An optional fp16 copy of the normed value (the GDN block's `x.half()` f16-gemv input,
-  design table row for E_40_32_4) is written from the same per-lane value, no recompute."""
+  design table row for E_40_32_4) is written from the same per-lane value, no recompute.
+
+  T4.137: split > 1 (a divisor of per_thread) runs `split` blocks per token: each repeats phase 1 and 1b in full (the same per-thread
+  elements, the same warp/cross-warp order: the same inv_rms bit for bit) and does 1/split of phase 2 -- per_thread/split of each warp's
+  groups -- and of the new_residual stores. One block per token put all of a decode token's phase 2 (~4/5 of the instructions) on one of
+  the 82 SMs (13.4 us per launch on the card, 10-31 profile); the redundant phase 1 costs L2 reads, not DRAM."""
   assert threads % 32 == 0 and dim % threads == 0, f"threads={threads} must be a multiple of 32 dividing dim={dim}"
   warps = threads // 32
   # groups_per_warp (= groups/warps, groups=dim/32) is ALWAYS == per_thread (= dim/threads) given the assert
   # above: dim=m*threads=m*32*warps => dim/32=m*warps => (dim/32)/warps=m=dim/threads. One variable, two uses.
   per_thread = dim // threads
+  assert per_thread % split == 0, f"split={split} must divide the {per_thread} groups each warp owns"
+  gpb = per_thread // split  # groups per warp per block
   new_residual, q, scale, residual, weight = params[:5]
   i = 5
   partials = params[i] if C > 0 else None
@@ -265,7 +275,10 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
   # AxisType.WARP -- confirmed by rendering this kernel both ways (the first draft's split render showed
   # local_size=(8,32) with our "lane" value NOT equal to the hardware lane, which would make warp_reduce's
   # __shfl_xor_sync combine the wrong 32 threads).
-  tok = UOp.range(tokens, 0, AxisType.GLOBAL)
+  if split == 1: tok = block = UOp.range(tokens, 0, AxisType.GLOBAL)
+  else:
+    block = UOp.range(tokens * split, 0, AxisType.GLOBAL)
+    tok, part = block // split, block % split
   warp, lane = UOp.range(warps, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
   tid = warp * 32 + lane
   val_buf = UOp.placeholder((dim,), dtypes.float32, slot=50, addrspace=AddrSpace.LOCAL)
@@ -283,7 +296,11 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
     # residual add it replaces (the C renderer strips a same-op child's parens, so residual+(p0+...) compiled as (residual+p0)+...)
     if C: val = sum((cast(UOp, partials)[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32)) + val
     vals.append(val)
-    writes += [new_residual[tok, d].store(val), val_buf[d].store(val)]
+    writes += [new_residual[tok, d].store(val), val_buf[d].store(val)] if split == 1 else [val_buf[d].store(val)]
+  for rr in range(gpb if split > 1 else 0):  # T4.137: block `part` stores element rows part*gpb .. of every thread
+    r = part * gpb + rr
+    writes.append(new_residual[tok, tid + r*threads].store(functools.reduce(lambda a, i: r.eq(i).where(vals[i], a), range(rr+gpb, per_thread, gpb),
+                                                                             vals[rr])))
   warp_sq = warp_reduce(sum((v*v for v in vals), UOp.const(0, dtypes.float32)), full_wave=True)
   writes.append(wsum_buf[warp.valid(lane.eq(0))].store(warp_sq))
   phase1 = UOp.group(*writes)
@@ -296,8 +313,8 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
 
   # phase 2: normed = val_buf * inv_rms * weight, then _q8_quantize_kernel's exact per-32-group pack
   stores = []
-  for g in range(per_thread):  # groups_per_warp == per_thread, see above
-    group = warp * per_thread + g
+  for gg in range(gpb):  # groups_per_warp == per_thread, see above; T4.137: this block's share of them
+    group = warp * per_thread + (gg if split == 1 else part * gpb + gg)
     base = group * Q8_GROUP_SIZE
     own = vb[base + lane].load() * inv_rms * weight[base + lane].load().float()
     group_scale = (warp_reduce(own.abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
@@ -305,7 +322,7 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
     xs = tuple(vb[base + word_lane*4 + j].load() * inv_rms * weight[base + word_lane*4 + j].load().float() for j in range(4))
     stores += [q[tok, group, lane.valid(lane < 8)].store(_q8_pack(xs, group_scale)), scale[tok, group.valid(lane.eq(0))].store(group_scale)]
     if want_fp16: stores.append(cast(UOp, fp16_out)[tok, base + lane].store(own.cast(dtypes.float16)))
-  return UOp.group(*stores).end(lane, warp, tok).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
+  return UOp.group(*stores).end(lane, warp, block).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
 
 def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|None=None, want_fp16:bool=False,
                     threads:int|None=None) -> tuple[Tensor, Tensor, Tensor, Tensor|None]:
@@ -332,7 +349,9 @@ def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|No
   srcs = [new_residual, q, scale, residual, weight]
   if partials is not None: srcs.append(partials)
   if fp16_out is not None: srcs.append(fp16_out)
-  fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads)
+  # T4.137: NV_NORM_SPLIT read here (uncached) and passed into the cache key; 1 = per_thread blocks per token (one q8 group per warp each)
+  split = dim // threads if NV_NORM_SPLIT.value else 1
+  fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads, split=split)
   results = srcs[0].custom_kernel(*srcs[1:], fxn=fxn)
   return results[0], results[1], results[2], (results[-1] if want_fp16 else None)
 
