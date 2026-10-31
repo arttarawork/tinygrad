@@ -1,4 +1,4 @@
-import contextlib, io, re, unittest
+import contextlib, io, os, re, tempfile, unittest
 from unittest import mock
 from dataclasses import replace
 import numpy as np
@@ -9,8 +9,10 @@ from tinygrad.schedule import schedule_cache
 from tinygrad.uop.ops import Ops
 from tinygrad.llm.model import (
   Transformer, TransformerConfig, TransformerBlock, GatedDeltaNetBlock, MTPHead, SSMConfig, spec_accept_tensor, sample_logits, spec_check_ids,
-  spec_k_clamped,
+  spec_k_clamped, linear_rows,
 )
+from tinygrad.llm.kernels.amd import Linear
+from tinygrad.llm.gguf import ggml_data_to_tensor, _GGML_QUANT
 from test.unit.test_mtp_load import _build_tiny_qwen35_gguf, _gguf_tensor, VOCAB, DIM, HIDDEN, N_HEADS, N_KV_HEADS, HEAD_DIM
 from test.unit.test_llm_device_map import TEST_CONFIG
 
@@ -379,6 +381,14 @@ class TestMTPDraftDeviceLocalEmbed(unittest.TestCase):
     copies = [call for call in linear.src if call.src[0].op is Ops.COPY]
     self.assertEqual(copies, [], f"draft() should perform zero cross-device copies once warm: {copies}")
 
+    # T4.142: a draft vocabulary lives on the head's device too -- the slice, the id map and full_vocab's gather add no hop
+    model.mtp_head.set_draft_vocab(model, list(range(0, config.vocab_size, 2)))
+    out = model.mtp_head.draft(model, h, tok_ids, 1)
+    self.assertEqual(out.shape, (1, 1, config.vocab_size))
+    linear, _ = out.linear_with_vars()
+    copies = [call for call in linear.src if call.src[0].op is Ops.COPY]
+    self.assertEqual(copies, [], f"draft() under a draft vocabulary should perform zero cross-device copies: {copies}")
+
 class TestSpecDeviceMap(unittest.TestCase):
   """T4.66f: speculative_generate on a REAL multi-device map -- blk[0] and mtp_head/output on DIFFERENT
   devices (CPU:0/CPU:1 standing in for the real hardware's METAL/NV split, same convention
@@ -522,8 +532,9 @@ class TestOneSyncPerIteration(unittest.TestCase):
   """T4.132: the loop's only host round-trip per outer iteration is ACCEPT's readback, greedy and sampled alike (before: the greedy
   chain synced after DRAFT and again after VERIFY, the sampled one pulled a vocab-wide row to the host per drafted token)."""
 
-  def _syncs_per_iteration(self, temperature:float) -> tuple[int, int]:
+  def _syncs_per_iteration(self, temperature:float, draft_vocab:list[int]|None=None) -> tuple[int, int]:
     model = _load_gdn(seed=0, max_context=64)  # a real GDN block: the partial-accept restore + REDO path runs too
+    if draft_vocab is not None: model.mtp_head.set_draft_vocab(model, draft_vocab)  # T4.142
     syncs: list[str] = []
     orig = {name: getattr(Tensor, name) for name in ("tolist", "numpy", "item")}
     def wrap(name):
@@ -555,6 +566,14 @@ class TestOneSyncPerIteration(unittest.TestCase):
     syncs, iters = self._syncs_per_iteration(1.0)
     self.assertGreater(iters, 3)
     self.assertEqual(syncs, iters)
+
+  def test_draft_vocab_adds_no_sync(self):
+    # T4.142: the subset pick, the id map and the full-vocab q are gathers inside the captured chain -- still one readback per iteration
+    for temperature in (0.0, 1.0):
+      Tensor.manual_seed(3)
+      syncs, iters = self._syncs_per_iteration(temperature, draft_vocab=list(range(0, VOCAB, 2)))
+      self.assertGreater(iters, 3)
+      self.assertEqual(syncs, iters, f"{temperature=}")
 
 def _spec_keys(model:Transformer) -> list[tuple]:
   return [key for key in model.jit if key[3]]  # spec=True is the 4th (is_prefill, greedy, chunk_size, spec) slot
@@ -1234,7 +1253,7 @@ class TestSpecLaunchCensus(unittest.TestCase):
   Step 6 had 3-4 eager launches per iteration (h_last's copy, the anchor upload, the chunk cat, REDO's / the rewrite's input prep:
   ~20 ms each on the card's host) and k + 3..4 replays; before step 6, ~93 eagerly dispatched draft launches per iteration."""
 
-  def _census(self, temperature:float) -> list[list[tuple[str, int]]]:
+  def _census(self, temperature:float, draft_vocab:list[int]|None=None) -> list[list[tuple[str, int]]]:
     import tinygrad.tensor as tensor_mod, tinygrad.engine.jit as jit_mod
     log: list[tuple[str, int]] = []
     orig_t, orig_j = tensor_mod.run_linear, jit_mod.run_linear
@@ -1246,6 +1265,7 @@ class TestSpecLaunchCensus(unittest.TestCase):
     tensor_mod.run_linear, jit_mod.run_linear = spy("eager", orig_t), spy("replay", orig_j)
     try:
       model = _load_gdn_varied()
+      if draft_vocab is not None: model.mtp_head.set_draft_vocab(model, draft_vocab)  # T4.142
       gen = model.speculative_generate(list(VARIED_PROMPT), k=3, temperature=temperature)
       for _ in range(12): next(gen)  # prefill + the first iterations: traces and captures
       per_yield = []
@@ -1258,14 +1278,15 @@ class TestSpecLaunchCensus(unittest.TestCase):
     return [p for p in per_yield if p]  # a yield inside an accepted batch launches nothing
 
   def test_warm_iteration_is_replays_only(self):
-    for temperature in (0.0, 1.0):
-      iters = self._census(temperature)
+    # T4.142: and with a draft vocabulary -- the chain stays one captured graph
+    for temperature, draft_vocab in ((0.0, None), (1.0, None), (0.0, list(range(0, 512, 2))), (1.0, list(range(0, 512, 2)))):
+      iters, tag = self._census(temperature, draft_vocab), f"{temperature=} vocab={draft_vocab is not None}"
       self.assertGreater(len(iters), 3)
       for launches in iters:
-        self.assertEqual([k for t, k in launches if t == "eager"], [], f"{temperature=}: an eager schedule in a warm iteration: {launches}")
+        self.assertEqual([k for t, k in launches if t == "eager"], [], f"{tag}: an eager schedule in a warm iteration: {launches}")
         # the chain, VERIFY, the accept (+ the adopt on a partial accept)
-        self.assertIn(len(launches), (3, 4), f"{temperature=}: {launches}")
-      self.assertTrue(any(len(launches) == 4 for launches in iters), f"{temperature=}: no partial accept exercised the adopt: {iters}")
+        self.assertIn(len(launches), (3, 4), f"{tag}: {launches}")
+      self.assertTrue(any(len(launches) == 4 for launches in iters), f"{tag}: no partial accept exercised the adopt: {iters}")
 
 class TestSpecTrackSlots(unittest.TestCase):
   """T4.132: spec_track holds spec_k_clamped(k) slots (k=2: 2 per GDN block, ~300 MB at 27B geometry instead of ~460); a later request
@@ -1407,6 +1428,188 @@ class TestDraftChainHidden(unittest.TestCase):
       for chain_h in (0, 1):
         with Context(SPEC_CHAIN_H=chain_h):
           self.assertEqual(_run(load(), prompt, N_GEN, spec=True, k=3), ref, f"{load.__name__} SPEC_CHAIN_H={chain_h}")
+
+# --- T4.142: the draft vocabulary (SPEC_DRAFT_VOCAB, MTPHead.set_draft_vocab) ---
+
+def _quant_linear(ggml_type:int, out_f:int, in_f:int, seed:int=0) -> Linear:
+  """a Linear holding a random ggml-quantized weight the way from_gguf loads one: the lazy dequant view of a realized byte buffer, cast
+  to fp16 (random bytes, one finite fp16 scale per block)"""
+  elems, nbytes = _GGML_QUANT[ggml_type]
+  rng = np.random.default_rng(seed)
+  blocks = rng.integers(0, 256, size=(out_f * in_f // elems, nbytes), dtype=np.uint8)
+  d = rng.uniform(0.01, 0.1, size=len(blocks)).astype(np.float16).view(np.uint8).reshape(-1, 2)
+  if ggml_type == 14: blocks[:, -2:] = d  # Q6_K: d is the block's last 2 bytes
+  else: blocks[:, :2] = d                 # Q4_0: its first
+  lin = Linear.__new__(Linear)
+  lin.in_features, lin.out_features, lin.bias = in_f, out_f, None
+  lin.weight = ggml_data_to_tensor(Tensor(blocks.reshape(-1)).realize(), out_f * in_f, ggml_type).reshape(out_f, in_f).cast("float16")
+  return lin
+
+def _load_with_vocab(ids:list[int], seed:int=0) -> Transformer:
+  """_load() with SPEC_DRAFT_VOCAB pointing at an .npy of `ids` -- the server's path (from_gguf reads it once, at load)"""
+  with tempfile.TemporaryDirectory() as d:
+    np.save(path := os.path.join(d, "vocab.npy"), np.array(ids, dtype=np.int32))
+    with Context(SPEC_DRAFT_VOCAB=path): return _load(seed=seed)
+
+def _with_vocab(model:Transformer, ids:list[int]) -> Transformer:
+  cast(MTPHead, model.mtp_head).set_draft_vocab(model, ids)
+  return model
+
+def _accept_hist(text:str) -> dict[int, int]:
+  hist = cast(re.Match, re.search(r"accept_len_hist=\{([^}]*)\}", text)).group(1)
+  return {int(a): int(c) for a, c in (pair.split(":") for pair in hist.split(", "))} if hist else {}
+
+def _table_draft(model:Transformer, ref_tokens:list[int]) -> None:
+  """a perfect draft that still goes through the draft vocabulary: an instance draft_step (not draft -- so the chain stays the captured
+  family and its picks map through draft_ids) whose (1,1,S) logits peak at the slice column of the true next token, read on device from
+  a table by the bound draft position (every replay reads its own), and are flat when that token is off the set (column 0 wins greedy;
+  sampled, a uniform pick over the set) -- a forced miss."""
+  mh, dev = cast(MTPHead, model.mtp_head), model.output.weight.device
+  S, inv = cast(Tensor, mh.draft_ids).shape[0], cast(Tensor, mh.draft_inv)
+  table = Tensor(ref_tokens + [0] * model.max_context, dtype="int32", device=dev).realize()
+  cols = Tensor(list(range(S)), dtype="int32", device=dev).realize()
+  def draft_step(owner, h, tok_ids, start_pos):
+    col = inv[table[start_pos + 1:start_pos + 2]]
+    return (cols == col).where(100.0, -100.0).float().reshape(1, 1, S), h
+  mh.draft_step = draft_step
+
+class TestDraftVocab(unittest.TestCase):
+  """T4.142: the draft steps run a vocabulary-trimmed copy of the output head (draft_output: the head's rows at draft_ids, in its own ggml
+  format), pick among its S columns, map the pick through draft_ids and hand the sampled accept q over the full vocab, -inf off the set.
+  A token outside the set is never drafted -- a wasted draft, never a wrong token: the stream must stay generate()'s."""
+
+  def test_linear_rows_gathers_raw_blocks_in_the_heads_format(self):
+    ids = [0, 3, 4, 5, 17, 40, 63]
+    for ggml_type in (14, 2):  # Q6_K (the 27B's output head), Q4_0
+      elems, nbytes = _GGML_QUANT[ggml_type]
+      lin = _quant_linear(ggml_type, 64, 512, seed=ggml_type)
+      sub = linear_rows(lin, Tensor(ids, dtype="int32"))
+      self.assertEqual((sub.in_features, sub.out_features, sub.bias), (512, len(ids), None))
+      np.testing.assert_array_equal(sub.weight.numpy(), lin.weight.numpy()[ids])  # dequantized: exactly the head's rows
+      x = Tensor.randn(1, 1, 512)
+      np.testing.assert_allclose(sub(x).numpy(), lin(x).numpy()[..., ids], rtol=1e-5, atol=1e-5)
+      # what set_quantized sees on the card: the same format over a buffer of exactly S rows of raw blocks -- no dequantized copy
+      probe = Linear.__new__(Linear)
+      probe.set_quantized(sub.weight)
+      self.assertEqual(probe.ggml_type, ggml_type)
+      self.assertEqual(probe.weight.shape, (len(ids) * 512 // elems * nbytes,))
+      self.assertEqual(probe.weight.uop.buf_uop.buffer.base.nbytes, len(ids) * 512 // elems * nbytes)
+      # a head that already ran set_quantized (on the card prepare_dense_weights does) gathers from its pre-quantization graph's bytes
+      lin.set_quantized(lin.weight)
+      self.assertEqual(lin.ggml_type, ggml_type)
+      np.testing.assert_array_equal(linear_rows(lin, Tensor(ids, dtype="int32")).weight.numpy(), sub.weight.numpy())
+
+  def test_from_gguf_builds_the_slice_and_unset_changes_nothing(self):
+    ids = [0, 2, 4, 6, 8, 10]
+    model, plain = _load_with_vocab([10, 4, 0, 2, 8, 6, 4]), _load()  # unsorted, a duplicate: normalized to the sorted set
+    mh = cast(MTPHead, model.mtp_head)
+    self.assertEqual(cast(Tensor, mh.draft_ids).tolist(), ids)
+    self.assertEqual(cast(Tensor, mh.draft_inv).tolist(), [ids.index(i) if i in ids else len(ids) for i in range(VOCAB)])
+    np.testing.assert_array_equal(cast(Linear, mh.draft_output).weight.numpy(), model.output.weight.numpy()[ids])
+    pm = cast(MTPHead, plain.mtp_head)
+    self.assertEqual((pm.draft_output, pm.draft_ids, pm.draft_inv), (None, None, None))
+    self.assertNotIn("draft_output", vars(pm))
+    # draft(): still (1,1,VOCAB) -- the full head's logits on the set, exactly -inf off it. Loose: this f32 GGUF's dense slice is realized
+    # fp16, while the full head's lazy f32 -> fp16 cast fuses into its matmul without the rounding (a quantized head's slice is the same
+    # lazy dequant view as the head -- test_linear_rows_gathers_raw_blocks_in_the_heads_format)
+    h, tok = Tensor.randn(1, 1, DIM).realize(), Tensor([[3]], dtype="int32")
+    got, want = mh.draft(model, h, tok, 0).numpy()[0, 0], pm.draft(plain, h, tok, 0).numpy()[0, 0]
+    np.testing.assert_allclose(got[ids], want[ids], rtol=5e-3, atol=5e-3)
+    self.assertTrue(np.isneginf(np.delete(got, ids)).all())
+    with self.assertRaises(AssertionError): _with_vocab(_load(), [0, VOCAB])  # an id outside the vocab
+
+  def test_half_vocab_matches_generate(self):
+    # correctness never depends on draft quality: greedy, and sampled at a temperature low enough that p is one-hot (each emitted token
+    # is then generate()'s greedy one whatever the drafts were), match generate() token for token with half the vocabulary drafted
+    cases = ((lambda: _with_vocab(_load_gdn_varied(), list(range(0, 512, 2))), _load_gdn_varied, VARIED_PROMPT),
+             (lambda: _load_with_vocab(list(range(0, VOCAB, 2))), _load, [1, 2, 3]),
+             (lambda: _with_vocab(_load_gdn(), list(range(1, VOCAB, 2))), _load_gdn, [7]))
+    for load_vocab, load, prompt in cases:
+      ref = _run(load(), prompt, N_GEN, spec=False)
+      for temperature in (0.0, 1e-4):
+        Tensor.manual_seed(1)
+        model = load_vocab()
+        got = [v for _, v in zip(range(N_GEN), model.speculative_generate(list(prompt), k=3, temperature=temperature))]
+        self.assertEqual(got, ref, f"{load.__name__} {temperature=}")
+
+  def test_sampled_state_integrity_with_half_vocab(self):
+    # temperature 1: not reference-comparable token for token, but every id is in the vocab and the state left behind is exactly the
+    # emitted tokens' (a greedy continuation matches a fresh model's) -- test_sampled_state_integrity_continues_like_a_fresh_generate's check
+    Tensor.manual_seed(7)
+    for k in (1, 3):
+      model, toks = _with_vocab(_load_gdn_varied(), list(range(0, 512, 2))), list(VARIED_PROMPT)
+      got = [v for _, v in zip(range(12), model.speculative_generate(toks, k=k, temperature=1.0))]
+      self.assertTrue(all(0 <= t < 512 for t in got), f"{k=} {got}")
+      prefix = list(toks)
+      self.assertEqual([v for _, v in zip(range(6), model.generate(toks, temperature=0.0))],
+                       [v for _, v in zip(range(6), _load_gdn_varied().generate(prefix, temperature=0.0))], f"{k=}")
+
+  def test_forced_misses_off_the_set_still_match_generate(self):
+    # a perfect draft through the slice (_table_draft) with the true token of the second iteration's first draft taken OUT of the set:
+    # the first iteration fully accepts (the slice's picks map back to the true ids), that one misses at once (m=0 -- greedy: column 0,
+    # sampled: the residual p - q = p emits the off-set token), and the stream is still generate()'s -- greedy and sampled (p one-hot)
+    k = 3
+    ref = _run(_load_gdn_varied(), VARIED_PROMPT, N_GEN + k + 4, spec=False)
+    excluded = ref[k + 2]  # anchor ref[0]; iteration 1 drafts ref[1..k] and emits ref[1..k+1]; iteration 2's first draft is ref[k+2]
+    self.assertNotIn(excluded, ref[1:k + 1], "pick a model whose first chain is all in the set")
+    for temperature in (0.0, 1e-4):
+      model = _with_vocab(_load_gdn_varied(), [i for i in range(512) if i != excluded])
+      _table_draft(model, list(VARIED_PROMPT) + ref)
+      Tensor.manual_seed(2)
+      buf = io.StringIO()
+      with Context(SPEC_STATS=1), contextlib.redirect_stdout(buf):
+        gen = model.speculative_generate(list(VARIED_PROMPT), k=k, temperature=temperature)
+        got = [v for _, v in zip(range(N_GEN), gen)]
+        gen.close()
+      self.assertEqual(got, ref[:N_GEN], f"{temperature=}")
+      hist = _accept_hist(buf.getvalue())
+      self.assertIn(k, hist, f"{temperature=}: no full accept -- the slice's picks did not map back to the true ids: {hist}")
+      self.assertIn(0, hist, f"{temperature=}: the off-set token was not a forced miss: {hist}")
+      self.assertIsNotNone(cast(TinyJit, model.spec_jit[("chain", k)]).captured, "the chain ran as its captured family")
+
+  def test_restricted_q_is_zero_off_the_set_and_keeps_the_marginal(self):
+    # the sampled accept with q over a draft vocabulary: full_vocab's -inf columns are exactly 0 after the softmax (no NaN), and the token
+    # at a drafted position is still marginally p -- including the mass p puts on ids the draft can never propose (only the residual emits
+    # them). Drafts are drawn as _draft_step draws them: the Gumbel-max over the S columns (min_p relative to the subset's max), mapped
+    # through the ids. min_p cuts p and q alike (T4.132), here with q's lowest column below the cut.
+    V, ids, B = 6, [1, 2, 4], 20000
+    mh = MTPHead.__new__(MTPHead)
+    mh.draft_ids, mh.draft_inv = Tensor(ids, dtype="int32"), Tensor([ids.index(i) if i in ids else len(ids) for i in range(V)], dtype="int32")
+    q_sub, p = [0.1, 0.6, 0.3], [0.15, 0.30, 0.05, 0.20, 0.10, 0.20]
+    def cut(d, min_p): return (t := np.where(np.array(d) >= min_p * max(d), d, 0.0)) / t.sum()
+    for min_p in (0.0, 0.3):
+      Tensor.manual_seed(11)
+      q_logits = Tensor(np.log(np.array(q_sub, dtype=np.float32))).reshape(1, 1, 3).expand(B, 1, 3)
+      q_full = mh.full_vocab(q_logits)  # (B,1,V)
+      soft = q_full[0, 0].softmax(-1).numpy()
+      self.assertFalse(np.isnan(soft).any())
+      np.testing.assert_allclose(soft[ids], q_sub, rtol=1e-5)
+      self.assertEqual(soft[[0, 3, 5]].tolist(), [0.0, 0.0, 0.0])
+      drafts = cast(Tensor, mh.draft_ids)[sample_logits(q_logits[:, 0], Tensor([1.0]), min_p)]  # (B,1) ids from the set
+      p_logits = Tensor(np.log(np.array([p, [1 / V] * V], dtype=np.float32))).unsqueeze(0).expand(B, 2, V)  # k=1 + an unused bonus row
+      m, final = spec_accept_tensor(drafts, q_full, p_logits, 1.0, Tensor.rand(B, 1), Tensor.rand(B, 2, V), min_p=min_p)
+      emitted = (m.reshape(B, 1) == 1).where(drafts, final[:, :1]).numpy().ravel()
+      self.assertTrue(set(np.unique(drafts.numpy()).tolist()) <= set(ids))
+      self.assertTrue(((emitted >= 0) & (emitted < V)).all() and ((final.numpy() >= 0) & (final.numpy() < V)).all())
+      np.testing.assert_allclose(np.bincount(emitted, minlength=V) / B, cut(p, min_p), atol=0.02, err_msg=f"{min_p=}")
+
+  def test_split_chain_stays_one_graph_on_the_heads_device(self):
+    # a CPU:0/CPU:1 split: the slice, the id map and full_vocab's gather live on the head's device -- the captured chain's only copy is
+    # VERIFY's chunk to blk[0]'s device, no compute kernel mixes devices, and the stream is generate()'s
+    ref = _load_gdn(seed=0)
+    want = _run(_split(ref), [1, 2, 3], N_GEN, spec=False)
+    m = _with_vocab(_split(ref), list(range(0, VOCAB, 2)))
+    mh = cast(MTPHead, m.mtp_head)
+    self.assertEqual({cast(Tensor, mh.draft_ids).device, cast(Tensor, mh.draft_inv).device, cast(Linear, mh.draft_output).weight.device},
+                     {m.output.weight.device})
+    self.assertNotEqual(m.blk[0].device, m.output.weight.device)
+    self.assertEqual(_run(m, [1, 2, 3], N_GEN, spec=True, k=3), want)
+    copies = []
+    for call in cast(TinyJit, m.spec_jit[("chain", 3)]).captured.linear.src:
+      devs = {u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None}
+      if call.src[0].op is Ops.COPY: copies.append(call.src[0].arg)
+      else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
+    self.assertEqual(copies, [m.blk[0].device])
 
 if __name__ == '__main__':
   unittest.main()

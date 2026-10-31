@@ -2392,8 +2392,9 @@ class Transformer:
     Gumbel-max + min_p, relative to the subset's max) runs over the S columns and maps through draft_ids, and the q handed to the accept
     is full_vocab's (B,1,vocab), -inf off the set -- the softmax over the subset, exactly the distribution the draft was drawn from. Two
     gathers on the head's device inside the same graph: no sync, no copy. An instance-patched draft returns full-vocab logits: unmapped."""
-    assert self.mtp_head is not None
-    mh, ids = self.mtp_head, None
+    mh = self.mtp_head
+    assert mh is not None
+    ids: Tensor|None = None
     if "draft" in vars(mh): logits, x = mh.draft(self, h, tok, pos), h
     else: (logits, x), ids = mh.draft_step(self, h, tok, pos), mh.draft_ids
     greedy = logits.argmax(-1)
