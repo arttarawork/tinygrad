@@ -752,6 +752,13 @@ class TestVerifyMMAKernel(unittest.TestCase):
         self.assertIn("threadIdx.y; /* 4 */", src)
         self.assertIn("start_pos", src)
         self.assertLess(len(pickle.dumps(prg)), 2_000_000)
+        # T4.144: the q words (row groups x 8 blocks x 2 parities x 32 lanes) and scales in shared memory, ONE barrier after the
+        # cooperative prologue and none inside the key loop (the loop only reads them)
+        units = groups * (D // 32)
+        self.assertEqual(len(re.findall(rf"__shared__ __align__\(16\) uint buf\d+\[{units * 64}\];", src)), 1)
+        self.assertEqual(len(re.findall(rf"__shared__ __align__\(16\) float buf\d+\[{units * 32}\];", src)), 1)
+        self.assertEqual(src.count("__syncthreads();"), 1)
+        self.assertLess(src.index("__syncthreads();"), src.index("for (int Ridx100"))
 
   @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
   def test_verify_matches_numpy_on_emulator(self):
@@ -792,24 +799,26 @@ class TestVerifyMMAKernel(unittest.TestCase):
         np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
 
   def test_compiles_on_the_nvrtc_lane(self):
-    # VERIFY(3) at the model's geometry and the default knobs through the real compiler (on macOS the docker nvrtc lane, as the server;
-    # skipped when it cannot start): the sm_86 cubin's register count and spill stack (EIATTR_REGCOUNT / EIATTR_MIN_STACK_SIZE, what
-    # ops_nv reads). Unsplit, VERIFY(3) spilled 1120 bytes per thread (more than L1 holds at two blocks per SM); d_split 2: 160
+    # VERIFY(3)/(4) at the model's geometry and the default knobs through the real compiler (on macOS the docker nvrtc lane, as the
+    # server; skipped when it cannot start): the sm_86 cubin's register count and spill stack (EIATTR_REGCOUNT / EIATTR_MIN_STACK_SIZE,
+    # what ops_nv reads). Unsplit, VERIFY(3) spilled 1120 bytes per thread (more than L1 holds at two blocks per SM); d_split 2: 160
+    # (VERIFY(4): 272). T4.144 (q words in shared memory): VERIFY(3) 0, VERIFY(4) 16 (three loop-invariant index words)
     import struct
     from tinygrad.runtime.support.compiler_cuda import NVRTCCompiler
     from tinygrad.runtime.support.elf import elf_loader
-    _, src = _lower_sm86(_mma_sink(262144, UOp.variable("start_pos", 0, 262144 - 3) + 3, T=3, d_split=nv_attn.NV_ATTN_DEC_DSPLIT.value))
-    try: lib = NVRTCCompiler("sm_86", ptx=False, cache_key="nv").compile(src)
-    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
-    attrs = {}
-    for sh in elf_loader(lib, force_section_align=128)[1]:
-      off = 0
-      while sh.name == ".nv.info" and off < sh.header.sh_size:
-        typ, param, sz = struct.unpack_from("BBH", sh.content, off)
-        if typ == 0x4 and sz >= 8: attrs[param] = struct.unpack_from("II", sh.content, off + 4)[1]
-        off += (sz if typ == 0x4 else 0) + 4
-    self.assertLessEqual(attrs[0x2f], 255)   # EIATTR_REGCOUNT
-    self.assertLessEqual(attrs[0x12], 256)   # EIATTR_MIN_STACK_SIZE: the spill stack, bytes per thread
+    for T, max_stack in ((3, 0), (4, 16)):
+      _, src = _lower_sm86(_mma_sink(262144, UOp.variable("start_pos", 0, 262144 - T) + T, T=T, d_split=nv_attn.NV_ATTN_DEC_DSPLIT.value))
+      try: lib = NVRTCCompiler("sm_86", ptx=False, cache_key="nv").compile(src)
+      except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+      attrs = {}
+      for sh in elf_loader(lib, force_section_align=128)[1]:
+        off = 0
+        while sh.name == ".nv.info" and off < sh.header.sh_size:
+          typ, param, sz = struct.unpack_from("BBH", sh.content, off)
+          if typ == 0x4 and sz >= 8: attrs[param] = struct.unpack_from("II", sh.content, off + 4)[1]
+          off += (sz if typ == 0x4 else 0) + 4
+      self.assertLessEqual(attrs[0x2f], 255, f"T={T}")        # EIATTR_REGCOUNT
+      self.assertLessEqual(attrs[0x12], max_stack, f"T={T}")  # EIATTR_MIN_STACK_SIZE: the spill stack, bytes per thread
 
   def test_dispatch(self):
     # graph-level, on CPU with the sm_80 check mocked: a concrete 2..4-token run on a KV_INT4 cache takes the mma kernel over H*T rows;
