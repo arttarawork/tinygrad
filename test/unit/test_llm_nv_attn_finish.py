@@ -81,7 +81,8 @@ class TestFinishOnEmulator(unittest.TestCase):
         gate_np = (rng.standard_normal((1, T, Hq * Dh)) * 2).astype(np.float32)
         kv, sct, q, gate = (Tensor(a, device="PYTHON").contiguous().realize() for a in (raw, sc, q_np, gate_np))
         vl = UOp.variable("start_pos", 0, N - T).bind(start) + T
-        with patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), patch.object(nv_attn, "_decode_mma_kernel", nv_attn._decode_mma_kernel.__wrapped__), \
+        with patch.object(nv_gemm, "_nv_wmma_ok", lambda device: True), \
+             patch.object(nv_attn, "_decode_mma_kernel", nv_attn._decode_mma_kernel.__wrapped__), \
              Context(NV_ATTN_DEC_SLOTS=slots, NV_ATTN_DEC_WARPS=warps, NV_ATTN_DEC_DSPLIT=d_split), _emulated():
           with patch.object(nv_attn, "_shfl", _emulated_shfl(warps)):  # the attention kernel's warps
             out = nv_attn.nv_decode_attention(q, kv, sct, vl) if T == 1 else nv_attn.nv_verify_attention(q, kv, sct, vl)
