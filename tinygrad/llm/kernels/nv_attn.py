@@ -340,7 +340,10 @@ def _decode_mma_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor, vali
   stats = Tensor.empty(B, H * T, slots, 2, dtype="float32", device=q.device)
   # Tensor.custom_kernel's call by hand so the int4 cache's parameter is uint32 words over the same uint8 buffer (a kernel argument
   # is a pointer: no view, no copy -- a Tensor-level bitcast of the stored cache would schedule a full copy every step)
-  srcs = (partial, stats, q.contiguous() if T == 1 else q.reshape(B, H * T, 1, D).contiguous(), cache_kv, cache_kv_scale)
+  # T4.137: a q that is already a kernel's output buffer (attn_prep_nv's (B,H,T,D)) goes in as a view: .contiguous() after the reshape
+  # would copy it (a reshape of a buffer only folds BEFORE the contiguous); a lazy q is materialized in this layout as before
+  qv = q.reshape(B, H * T, 1, D)
+  srcs = (partial, stats, q.contiguous() if T == 1 else qv if q.uop.op is Ops.AFTER else qv.contiguous(), cache_kv, cache_kv_scale)
   params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]
   params[3] = UOp.placeholder((2, B, cast(int, cache_kv.shape[2]), N, D // 8), dtypes.uint32, slot=3)
   d_split = max(NV_ATTN_DEC_DSPLIT.value, 1) if T > 1 else 1
