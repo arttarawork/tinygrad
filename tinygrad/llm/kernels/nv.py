@@ -196,6 +196,7 @@ def _gdn_conv_decode_kernel(conv_out:UOp, conv_state:UOp, qkv:UOp, weight:UOp, *
   shifts = [conv_state.after(*outs)[b, i, c].store(window[tokens+i].cast(conv_state.dtype)) for i in range(history)]
   shifts += [tr[t, b, i, c].store(window[t+1+i].cast(tr.dtype)) for tr in track for t in range(tokens-1) for i in range(history)]
   if gemv:  # T4.146: see the docstring
+    assert beta_alpha is not None and xh is not None and ba_w is not None  # the gemv's optional srcs (mypy)
     rows, out_features, dim = cast(int, beta_alpha.shape[0]), cast(int, beta_alpha.shape[1]), cast(int, xh.shape[-1])
     per, n_out = dim // 128, rows * out_features
     assert dim % 128 == 0 and ba_w.shape == (out_features * dim,) and n_out <= batch*channels//lanes
@@ -281,7 +282,9 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
     zh = [(o*inv*norm_weight[row].load() * _added(gt[r, h*value_dim + row, p].load() for p in range(parts)).silu()).cast(z.dtype)
           for row,o in zip(rows, outs)]
     z_stores += [z[r, (h*value_dim + row).valid(lane.eq(0))].store(x) for row, x in zip(rows, zh)]
-    if q8: z_stores += _z_q8(xq, xd, rows, zh, t, r, h, value_dim, tokens, lane, wave, waves)
+    if q8:
+      assert xq is not None and xd is not None  # the q8 outputs' optional srcs (mypy)
+      z_stores += _z_q8(xq, xd, rows, zh, t, r, h, value_dim, tokens, lane, wave, waves)
   stores = [state[b, h, row, c].store(x.cast(state.dtype)) for row in rows for x,c in zip(previous[row], cols)] + z_stores
   return UOp.group(*stores).end(*(r for r in (wave, lane, bh) if r.op is Ops.RANGE)).sink(arg=KernelInfo(name="gdn_decode_nv", opts_to_apply=()))
 
@@ -344,7 +347,7 @@ def gdn_decode(qkv:Tensor, out_gate:Tensor, beta_alpha:Tensor|tuple[Tensor, Tens
               x.contiguous(), w.reshape(-1))
     else:
       from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw  # nv_dense imports this module
-      beta_alpha = nv_f16_gemv_raw(w, x, 2*heads)
+      beta_alpha = nv_f16_gemv_raw(w, x, 2*cast(int, heads))
   outs = Tensor.custom_kernel(conv_out, conv_state, _split_k_partials(qkv), conv_weight, *gemv, *conv_track, bound,
                               fxn=functools.partial(_gdn_conv_decode_kernel, start_pos=var, lanes=lanes, tokens=tokens, gemv=bool(gemv)))
   conv_out, beta_alpha = outs[0], outs[4] if gemv else cast(Tensor, beta_alpha)

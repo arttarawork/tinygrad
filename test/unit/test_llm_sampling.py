@@ -101,7 +101,6 @@ class TestMinPMaskLogDomain(unittest.TestCase):
         self.assertTrue(old_mask[0, 3] and old_mask[0, 4] and new_mask[0, 3] and new_mask[0, 4])
 
 
-
 class TestNVSampleKernels(unittest.TestCase):
   """T4.146: kernels/nv_sample.py -- the head's pick as head_max_nv / head_draw_nv / head_pick_nv -- EXECUTED on the PYTHON emulator (the
   xor shuffle swapped for a block-shared exchange) against the generic graph forward() builds (argmax; (temp > 0).where(sample_logits,

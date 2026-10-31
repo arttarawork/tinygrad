@@ -251,7 +251,8 @@ class TestWrapperBuildsExpectedShapes(unittest.TestCase):
         with self.subTest(dim=dim, split=split, words=words), Context(NV_NORM_SPLIT=split, NV_NORM_WORDS=words):
           new_residual = add_rmsnorm_q8(Tensor.empty(2, dim, dtype=dtypes.float32), Tensor.empty(dim, dtype=dtypes.float32), eps=1e-6)[0]
           ranges = [u for u in new_residual.uop.toposort() if u.op is Ops.CALL for u in u.src[0].toposort() if u.op is Ops.RANGE]
-          self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.LOCAL], [words_warps if split and words and words_warps else threads // 32])
+          self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.LOCAL],
+                           [words_warps if split and words and words_warps else threads // 32])
           self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.GLOBAL], [2 * (dim // threads if split else 1)])
 
 _emu_slot = itertools.count(60)
@@ -386,7 +387,8 @@ class TestPrefillWidthRender(unittest.TestCase):
     return _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
 
   # T4.146: the words kernel's decode renders (the default since T4.146), md5-pinned at its commit
-  WORDS_MD5 = {(1, 0, False): "0f9ff95c9c90329b24320f9d286f5a3e", (1, 5, True): "64f83bf1033b8bd6f3f33b888063e972", (4, 5, False): "bb2f08badbce1190affb64b0ed28c547", (4, 0, True): "336ede3dc3647420fa92e29f83245645"}
+  WORDS_MD5 = {(1, 0, False): "0f9ff95c9c90329b24320f9d286f5a3e", (1, 5, True): "64f83bf1033b8bd6f3f33b888063e972",
+               (4, 5, False): "bb2f08badbce1190affb64b0ed28c547", (4, 0, True): "336ede3dc3647420fa92e29f83245645"}
 
   def test_decode_renders_unchanged(self):
     # T4.146: T4.137's split kernel is NV_NORM_WORDS=0's now -- byte-identical to before

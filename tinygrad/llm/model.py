@@ -1156,7 +1156,7 @@ class GatedDeltaNetBlock(FFNBlock):
       assert not capture or T - 1 <= cast(tuple[Tensor, Tensor], self.spec_track)[1].shape[0], f"{T=}: more tokens than spec_track slots"
       if not isinstance(res, tuple): return self.ssm_out(res)
       z, zq, zd = res
-      register_fused_q8(z, B*T, self.num_v_heads*self.head_v_dim, zq, zd)
+      register_fused_q8(z, cast(int, B*T), self.num_v_heads*self.head_v_dim, zq, zd)  # the decode path: T concrete
       return self.ssm_out(z)
 
     # T4.138: every other call on the card's fused-scan path (a prefill chunk: symbolic T, padded to T_pad) -- see _nv_prefill.

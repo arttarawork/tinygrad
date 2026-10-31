@@ -673,7 +673,8 @@ class TestGDNDecodeGemvFold(unittest.TestCase):
     heads, C = 48, 10240
     def step(T:int) -> list[str]:
       z = gdn_decode(Tensor.empty(1, T, C), Tensor.empty(1, T, heads*128), (Tensor.empty(T, 5120, dtype=dtypes.float16),
-                     Tensor.empty(2*heads, 5120, dtype=dtypes.float16)), Tensor.empty(1, 3, C, dtype=dtypes.float16), Tensor.empty(1, heads, 128, 128),
+                     Tensor.empty(2*heads, 5120, dtype=dtypes.float16)), Tensor.empty(1, 3, C, dtype=dtypes.float16),
+                     Tensor.empty(1, heads, 128, 128),
                      Tensor.empty(C, 4), Tensor.empty(128), Tensor.empty(heads), Tensor.empty(heads), UOp.variable("start_pos", 0, 63).bind(3),
                      k_heads=16, qk_eps=1e-6, norm_eps=1e-6)
       return [n for n in kernel_names(z) if n.startswith(("linear", "gdn"))]
