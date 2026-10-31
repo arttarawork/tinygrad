@@ -1439,7 +1439,7 @@ def linear_rows(lin:Linear, ids:Tensor) -> Linear:
   out.in_features, out.out_features, out.bias = lin.in_features, S, None
   if probe.ggml_type is None: out.weight = lin.weight[ids].contiguous().realize()
   else:
-    raw = cast(Tensor, probe.packed_bytes if probe.packed_bytes is not None else probe.weight)  # uint8: the whole tensor's blocks
+    raw = probe.packed_bytes if probe.packed_bytes is not None else probe.weight  # uint8: the whole tensor's blocks
     rows = raw.reshape(lin.out_features, -1)[ids].reshape(-1).contiguous().realize()
     out.weight = ggml_data_to_tensor(rows, S * lin.in_features, probe.ggml_type).reshape(S, lin.in_features) \
       .cast(cast(Tensor, probe.dequant_weight).dtype)
