@@ -1354,5 +1354,59 @@ class TestLiveGraphsAfterSpec(unittest.TestCase):
     self.assertLess(sum(new.values()), 600, f"{len(new)} new live tensors, {sum(new.values())} nodes")
     self.assertEqual(self._decode_walks(model), (0, 0))
 
+class TestDraftChainHidden(unittest.TestCase):
+  """T4.136: under SPEC_CHAIN_H=1 (default) the draft chain feeds step i+1 step i's own block output (MTPHead.draft_step's x) instead of
+  reusing h_last (0); the knob is read when the ("chain", k_eff) family captures. Draft quality only: the token stream never moves."""
+  K = 2
+
+  def _chain(self, model:Transformer, h:np.ndarray, chain_h:int) -> list[np.ndarray]:
+    """each step's logits from the ("chain", K) family's REPLAY (captured under chain_h, replayed under the other value: read at capture
+    only; the replay rewrites the same slots from the same inputs)."""
+    model.mtp_head.ready(model, self.K)
+    dev = model.output.weight.device
+    Tensor.rand(1, device=dev).realize()  # the device's RNG state, as speculative_generate sets it up before the first capture
+    args = (Tensor(h, device=dev).realize(), Tensor([[3]], dtype="int32", device=dev).realize(), Tensor([0.0], device=dev).realize())
+    pos = [UOp.variable(f"draft_pos_{i}", 0, model.max_context - 1).bind(5 + i) for i in range(self.K)]
+    for v in (chain_h, 1 - chain_h):
+      with Context(SPEC_CHAIN_H=v): out = cast(tuple[Tensor, ...], model._spec_replay(("chain", self.K), model._draft_chain, *args, *pos))
+    self.assertEqual(cast(TinyJit, model.spec_jit[("chain", self.K)]).cnt, 3)  # captured on the first call, replayed on the second
+    return [q.numpy() for q in out[2:]]
+
+  def test_chain_feeds_each_step_the_heads_own_hidden(self):
+    # split models (head on CPU:1, blk[0] on CPU), so the captured graph's copies are visible too
+    ref = _load_gdn(seed=0)
+    h = np.random.default_rng(0).standard_normal((1, 1, DIM)).astype(np.float32)
+    chained_m, reused_m = _split(ref), _split(ref)
+    chained, reused = self._chain(chained_m, h, 1), self._chain(reused_m, h, 0)
+    # the eager oracle: draft_step twice on a fresh copy, the first step's x fed back as the second step's h
+    m = _split(ref)
+    m.mtp_head.ready(m, self.K)
+    dev, v = m.output.weight.device, [UOp.variable(f"draft_pos_{i}", 0, m.max_context - 1) for i in range(self.K)]
+    lg0, x = m.mtp_head.draft_step(m, Tensor(h, device=dev), Tensor([[3]], dtype="int32", device=dev), v[0].bind(5))
+    Tensor.realize(lg0, x)
+    self.assertEqual(x.shape, (1, 1, DIM))
+    self.assertEqual(x.device, m.mtp_head.block.device)
+    lg1, _ = m.mtp_head.draft_step(m, x, lg0.argmax(-1), v[1].bind(6))
+    np.testing.assert_allclose(chained[0], reused[0], rtol=1e-6, atol=1e-6)  # step 1 takes h_last either way
+    np.testing.assert_allclose(chained[0], lg0.numpy(), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(chained[1], lg1.numpy(), rtol=1e-5, atol=1e-5)
+    self.assertGreater(float(np.abs(chained[1] - reused[1]).max()), 1e-3, "step 2 took the same hidden under both values")
+    # x stays on the head's device: the captured chain's only copy is VERIFY's chunk to blk[0]'s device, either value
+    for model in (chained_m, reused_m):
+      copies = []
+      for call in cast(TinyJit, model.spec_jit[("chain", self.K)]).captured.linear.src:
+        devs = {u.device for u in call.toposort() if u.op is Ops.BUFFER and u.device is not None}
+        if call.src[0].op is Ops.COPY: copies.append(call.src[0].arg)
+        else: self.assertLessEqual(len(devs), 1, f"compute kernel with mixed-device buffers: {devs}")
+      self.assertEqual(copies, [model.blk[0].device])
+
+  def test_both_values_match_generate(self):
+    # correctness must not depend on draft quality: greedy speculative_generate == generate() under either hidden
+    for load, prompt in ((_load_gdn_varied, VARIED_PROMPT), (_load, [1, 2, 3])):
+      ref = _run(load(), prompt, N_GEN, spec=False)
+      for chain_h in (0, 1):
+        with Context(SPEC_CHAIN_H=chain_h):
+          self.assertEqual(_run(load(), prompt, N_GEN, spec=True, k=3), ref, f"{load.__name__} SPEC_CHAIN_H={chain_h}")
+
 if __name__ == '__main__':
   unittest.main()
