@@ -17,7 +17,7 @@ from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
 from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post, GDN_NV_PREP
 from tinygrad.llm.kernels.nv_attn_prep import NV_ATTN_PREP, attn_prep, attn_prep_geometry_ok
-from tinygrad.llm.gguf import gguf_load
+from tinygrad.llm.gguf import gguf_load, ggml_data_to_tensor
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
 import traceback
@@ -269,6 +269,14 @@ SPEC_DEBUG = ContextVar("SPEC_DEBUG", 0)
 # ("chain", k_eff) family captures (Transformer._draft_chain): replays keep the value that family was captured with -- on the server that
 # is warmup's, so an A/B needs a restart per value. Draft quality only: correctness never depends on it.
 SPEC_CHAIN_H = ContextVar("SPEC_CHAIN_H", 1)
+
+# T4.142 (10-31): a vocabulary-trimmed output head for the MTP draft steps. "" (default): the draft steps run the owner's full head,
+# byte-identical. A path to an .npy of token ids (draft_vocab_32k.npy: 32768 ids covering > 99 % of what the 27B emits): from_gguf
+# builds MTPHead.draft_output = the head's rows at those ids in the head's own ggml format (MTPHead.set_draft_vocab) and every draft
+# step picks among them -- on the card the full head is 1.2 ms of a ~2.85 ms draft step (~1.1 GB of Q6_K read), a 32k slice ~0.16 ms.
+# A token outside the set is never drafted: a wasted draft (VERIFY emits the token), never a wrong one. VERIFY and plain decode keep
+# the full head. Read once, at load.
+SPEC_DRAFT_VOCAB = ContextVar("SPEC_DRAFT_VOCAB", "")
 
 def spec_check_ids(ids:list[int], vocab:int, where:str) -> None:
   """T4.132 (10-30): an id outside [0, vocab) can only come from NaN logits (an argmax over a NaN row read back as the row width on
@@ -1416,6 +1424,27 @@ def _rename_mtp_keys(state_dict:dict[str, Tensor], num_blocks:int) -> None:
     new_k = f"mtp_head.{rest[len('nextn.'):]}" if rest.startswith("nextn.") else f"mtp_head.block.{rest}"
     state_dict[new_k] = state_dict.pop(k)
 
+def linear_rows(lin:Linear, ids:Tensor) -> Linear:
+  """T4.142: a bias-free Linear holding rows `ids` ((S,) int, on lin's device) of lin's weight, in lin's own storage. A ggml-quantized
+  weight (from_gguf's lazy dequant view of the GGUF bytes, or set_quantized's packed view of them) gathers whole rows of its RAW blocks
+  -- row r of an (out, in) ggml tensor is the in/block_elems consecutive blocks at r * row_bytes (Q6_K at in=5120: 20 x 210 bytes) --
+  into one realized byte buffer (a single byte-gather kernel, S x row_bytes; nothing is dequantized) and rebuilds the same dequant view
+  over it (gguf.py ggml_data_to_tensor), so set_quantized finds the same format and the NV decode gemv runs the slice like any head.
+  A dense weight -- or a format set_quantized does not know (then dequantized, those S rows only) -- gathers its rows, realized.
+  Linear.__new__: no random init (it would advance the default device's RNG counter)."""
+  assert lin.bias is None, "linear_rows: the output head has no bias"
+  probe = Linear.__new__(Linear)  # set_quantized's format probe, on the pre-quantization graph if lin already ran it
+  probe.set_quantized(lin.weight if lin.dequant_weight is None else lin.dequant_weight)
+  out, S = Linear.__new__(Linear), cast(int, ids.shape[0])
+  out.in_features, out.out_features, out.bias = lin.in_features, S, None
+  if probe.ggml_type is None: out.weight = lin.weight[ids].contiguous().realize()
+  else:
+    raw = cast(Tensor, probe.packed_bytes if probe.packed_bytes is not None else probe.weight)  # uint8: the whole tensor's blocks
+    rows = raw.reshape(lin.out_features, -1)[ids].reshape(-1).contiguous().realize()
+    out.weight = ggml_data_to_tensor(rows, S * lin.in_features, probe.ggml_type).reshape(S, lin.in_features) \
+      .cast(cast(Tensor, probe.dequant_weight).dtype)
+  return out
+
 class MTPHead:
   """DeepSeek-style multi-token-prediction ("nextn") head (qwen3.5-family GGUFs -- see from_gguf's
   MTP=1 branch and _rename_mtp_keys for how blk.{num_blocks}.* lands here). llama.cpp-compatible
@@ -1433,11 +1462,36 @@ class MTPHead:
   attribute with no cycle guard -- a stored back-reference would make it walk
   model -> mtp_head -> owner -> model -> ... forever the moment anything asks for this model's
   state/parameters (load_state_dict, realize_placement, get_parameters, ...)."""
+  # T4.142: the draft vocabulary (set_draft_vocab; class-level None = the owner's full head, and nothing extra in get_state_dict)
+  draft_output:Linear|None = None
+  draft_ids:Tensor|None = None
+  draft_inv:Tensor|None = None
   def __init__(self, config:TransformerConfig, block_cls:type[FFNBlock]=TransformerBlock):
     self.enorm, self.hnorm = nn.RMSNorm(config.dim, config.norm_eps), nn.RMSNorm(config.dim, config.norm_eps)
     self.eh_proj = Linear(2 * config.dim, config.dim, bias=False)
     self.block = block_cls(config)
     self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
+
+  def set_draft_vocab(self, owner:Transformer, ids:list[int]) -> None:
+    """T4.142 (SPEC_DRAFT_VOCAB, from_gguf): restrict the draft steps' output head to the token ids `ids` -- draft_output = the owner's
+    head's rows at those ids (linear_rows: its own ggml format, realized once on the head's device), draft_ids (S,) the sorted ids and
+    draft_inv (vocab,) each id's column in the slice (S off the set; full_vocab), both int32 on the same device. The owner's output is
+    untouched (VERIFY, plain decode). On a card, call it before prepare_dense_weights (from_gguf does) so the slice's format probe runs
+    at load, outside any capture."""
+    vocab, dev = owner.output.out_features, owner.output.weight.device
+    ids = sorted(set(ids))
+    assert ids and ids[0] >= 0 and ids[-1] < vocab, f"draft vocabulary ids must lie in [0, {vocab}): got {ids[0]}..{ids[-1]}"
+    inv = [len(ids)] * vocab
+    for s, i in enumerate(ids): inv[i] = s
+    self.draft_ids, self.draft_inv = (Tensor(x, dtype=dtypes.int32, device=dev).realize() for x in (ids, inv))
+    self.draft_output = linear_rows(owner.output, self.draft_ids)
+
+  def full_vocab(self, logits:Tensor) -> Tensor:
+    """T4.142: draft_step's logits (B,T,S) over the draft vocabulary -> (B,T,vocab), -inf off the set: the q spec_accept_tensor tests
+    (softmax is exactly 0 there, so a token outside the set is only ever emitted by the residual resample, p - q = p). One gather by
+    draft_inv from the slice padded with a -inf column -- a single vocab-wide elementwise kernel. The identity without a draft vocab."""
+    if self.draft_inv is None: return logits
+    return logits.pad(((0, 0), (0, 0), (0, 1)), value=float("-inf"))[:, :, self.draft_inv]
 
   def draft(self, owner:Transformer, h:Tensor, tok_ids:Tensor, start_pos:int|UOp) -> Tensor:
     """h: (B,1,dim) the main model's last-layer hidden state (pre-output-norm) at position t -- or, T4.136, the draft
@@ -1447,7 +1501,8 @@ class MTPHead:
     main block's (see FFNBlock._init_state/__call__) -- so calling this again at start_pos+1
     continues the same drafted sequence instead of overwriting it. T4.136: = draft_step(...)[0]; the chain calls
     draft_step (for x too) unless this method is patched on the INSTANCE -- test_spec_decode.py's oracles return
-    logits only, and the chain reuses h for them.
+    logits only, and the chain reuses h for them. T4.142: under a draft vocabulary, full_vocab(draft_step(...)[0]) --
+    still (B,1,vocab), -inf off the set.
 
     start_pos accepts a bound UOp Variable, not just a plain int (T4.66): TransformerBlock/
     MLATransformerBlock already handle one end-to-end (the same way the main model's own decode step
@@ -1470,13 +1525,15 @@ class MTPHead:
     byte-size accounting (this fork always serves a quantized GGUF, so the copy is the quantized size, not a
     dequantized fp32 one -- `.to()` replicates whatever owner.token_embd.weight is resident as, verbatim, no
     new precision decision here)."""
-    return self.draft_step(owner, h, tok_ids, start_pos)[0]
+    return self.full_vocab(self.draft_step(owner, h, tok_ids, start_pos)[0])
 
   def draft_step(self, owner:Transformer, h:Tensor, tok_ids:Tensor, start_pos:int|UOp) -> tuple[Tensor, Tensor]:
     """T4.136: draft() plus the block's output x (B,1,dim) on self.block's device, before shared_head_norm -- the hidden the draft
-    chain's next step takes (SPEC_CHAIN_H). Both lazy: in the chain's graph x feeds the next step's hnorm directly (same device)."""
+    chain's next step takes (SPEC_CHAIN_H). Both lazy: in the chain's graph x feeds the next step's hnorm directly (same device).
+    T4.142: under a draft vocabulary the logits are draft_output's, (B,1,S) -- column s is token draft_ids[s] (full_vocab maps back)."""
     x = self.block(self._block_in(owner, h, tok_ids), start_pos)
-    return owner.output(self.shared_head_norm(x).to(owner.output.weight.device)), x
+    head = owner.output if self.draft_output is None else self.draft_output
+    return head(self.shared_head_norm(x).to(owner.output.weight.device)), x
 
   def _block_in(self, owner:Transformer, h:Tensor, tok_ids:Tensor) -> Tensor:
     """eh_proj(concat(enorm(embed(tok_ids)), hnorm(h))) on self.block's device -- (B,T,dim) f32 from h (B,T,dim) and
@@ -1997,6 +2054,10 @@ class Transformer:
       # device_map's cross-device placements MUST realize -- see Transformer.realize_placement's docstring.
       # No-op when device_map is None (nothing moved off Device.DEFAULT to begin with).
       model.realize_placement()
+    # T4.142: the draft steps' vocabulary-trimmed head (SPEC_DRAFT_VOCAB) -- before prepare_dense_weights, which probes its format too
+    if model.mtp_head is not None and SPEC_DRAFT_VOCAB.value:
+      import numpy as np
+      model.mtp_head.set_draft_vocab(model, np.load(SPEC_DRAFT_VOCAB.value).tolist())
     from tinygrad.llm.kernels.nv_dense import prepare_dense_weights  # local: mirrors amd.py's import discipline
     prepare_dense_weights(model)  # T4.98h: the fp16 head copies must exist before the first (@function, JIT-captured) call
     for blk in model.blk:
@@ -2326,12 +2387,18 @@ class Transformer:
     T4.136: MTPHead.draft_step's, the next step's hidden under SPEC_CHAIN_H; an instance-patched draft -- the eager oracles, logits
     only -- hands h back instead). Greedy or sampled is decided inside the graph from `temp` (forward()'s T4.105 where-select), so one
     family serves both; the sampled draw is sample_logits' Gumbel-max over softmax(logits/temp) with MIN_P -- the ancestral q
-    spec_accept_tensor's proof assumes."""
+    spec_accept_tensor's proof assumes.
+    T4.142: under a draft vocabulary (MTPHead.set_draft_vocab) the step's logits are the slice's (B,1,S): the pick (argmax / the same
+    Gumbel-max + min_p, relative to the subset's max) runs over the S columns and maps through draft_ids, and the q handed to the accept
+    is full_vocab's (B,1,vocab), -inf off the set -- the softmax over the subset, exactly the distribution the draft was drawn from. Two
+    gathers on the head's device inside the same graph: no sync, no copy. An instance-patched draft returns full-vocab logits: unmapped."""
     assert self.mtp_head is not None
-    if "draft" in vars(self.mtp_head): logits, x = self.mtp_head.draft(self, h, tok, pos), h
-    else: logits, x = self.mtp_head.draft_step(self, h, tok, pos)
+    mh, ids = self.mtp_head, None
+    if "draft" in vars(mh): logits, x = mh.draft(self, h, tok, pos), h
+    else: (logits, x), ids = mh.draft_step(self, h, tok, pos), mh.draft_ids
     greedy = logits.argmax(-1)
-    return (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp, MIN_P), greedy), logits, x
+    d = (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp, MIN_P), greedy)
+    return (d, logits, x) if ids is None else (ids[d], mh.full_vocab(logits), x)
 
   def _draft_chain(self, h:Tensor, tok:Tensor, temp:Tensor, *pos:UOp) -> tuple[Tensor, ...]:
     """T4.132: the draft chain as one graph -- len(pos) MTP steps (_draft_step), each fed the previous step's id at its own bound position
