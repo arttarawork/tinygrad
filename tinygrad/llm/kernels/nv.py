@@ -48,28 +48,32 @@ def nv_decode_kernel_supported(device:str|tuple[str, ...]|None) -> bool:
   if device is None or device.split(":")[0] != "NV" or not GDN_NV_FUSED_DECODE.value: return False
   return _nv_device_ok(device)
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
+def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, offsets:tuple[int, ...]|None=None) -> UOp:
+  # T4.138: `offsets` reduces a sub-warp group (nv_quant's prefill quantizer: (4, 2, 1) over 8 lanes); the lane must be the hardware lane
+  for offset in (offsets if offsets is not None else (16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
     if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
     other = UOp(Ops.CUSTOM, src=(val,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.float))
     val = val.maximum(other) if maximum else val + other
   return val
 
-# verbatim amd._gated_delta_prefill_kernel except for warp_reduce and the kernel name (kept separate so the AMD kernel stays untouched)
+# verbatim amd._gated_delta_prefill_kernel except for warp_reduce and the kernel name (kept separate so the AMD kernel stays untouched).
+# T4.138: lanes=1 is the CPU form (one thread owns a row tile's whole key dim, no shuffle -- gdn_decode's convention) for the CPU tests of
+# nv_gdn_prep.gdn_prefill; lanes=32 builds exactly the graph it always did.
 @functools.cache
-def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None) -> UOp:
+def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:UOp, state:UOp, kq:UOp, start_pos:UOp|None=None,
+                                lanes:int=32) -> UOp:
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
-  assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
+  assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % lanes == 0 and value_dim % row_tile == 0
   batch, heads, tokens, value_dim, key_dim = cast(tuple[int, int, int, int, int], (batch, heads, tokens, value_dim, key_dim))
   core, v = (x.reshape(batch*heads, tokens, value_dim) for x in (core, v))
   q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
   beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(batch*heads, value_dim, key_dim)
-  bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), _lane(lanes, 1)
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
-  rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
-  current = UOp.placeholder((row_tile*key_dim//32,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
+  rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*lanes for i in range(key_dim//lanes))
+  current = UOp.placeholder((row_tile*key_dim//lanes,), dtypes.float32, slot=0, addrspace=AddrSpace.REG)
   initial = None if start_pos is None else start_pos.eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
@@ -77,18 +81,20 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   keys = tuple(k[bh, token, col].load() for col in cols)
   queries = tuple(q[bh, token, col].load() for col in cols)
   updates, stores = [], []
+  reduce = (lambda x: warp_reduce(x, full_wave=True)) if lanes > 1 else (lambda x: x)
   for row_idx,row in enumerate(rows):
-    previous = tuple(current.after(token)[row_idx*key_dim//32+i].load() for i in range(key_dim//32))
+    previous = tuple(current.after(token)[row_idx*key_dim//lanes+i].load() for i in range(key_dim//lanes))
     av, bv = alpha[bh, token, row if alpha_dim > 1 else 0].load(), beta[bh, token].load()
-    state_k = warp_reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)), full_wave=True)
-    state_q = warp_reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)), full_wave=True)
+    state_k = reduce(sum((x*y for x,y in zip(previous, keys)), UOp.const(0, dtypes.float32)))
+    state_q = reduce(sum((x*y for x,y in zip(previous, queries)), UOp.const(0, dtypes.float32)))
     delta = (v[bh, token, row].load() - state_k*av) * bv
     updates += [x*av + delta*y for x,y in zip(previous, keys)]
     stores.append(core[bh, token, row.valid(lane.eq(0))].store(state_q*av + delta*kq[bh, token]))
   step = UOp.group(*stores, current.store(UOp.stack(*updates))).end(token)
-  state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//32+i].load().cast(state.dtype))
+  state_stores = (state[bh, row, col].store(current.after(step)[row_idx*key_dim//lanes+i].load().cast(state.dtype))
                   for row_idx,row in enumerate(rows) for i,col in enumerate(cols))
-  return UOp.group(*state_stores).end(lane, bh_row).sink(arg=KernelInfo(name="gated_delta_prefill_nv", opts_to_apply=()))
+  return UOp.group(*state_stores).end(*(r for r in (lane, bh_row) if r.op is Ops.RANGE)).sink(
+    arg=KernelInfo(name="gated_delta_prefill_nv", opts_to_apply=()))
 
 def gated_delta_prefill(q:Tensor, k:Tensor, v:Tensor, beta:Tensor, alpha:Tensor, state:Tensor, start_pos:Tensor|None=None) -> Tensor:
   batch, heads, tokens, key_dim = q.shape

@@ -30,6 +30,7 @@ NV_GEMV_ROWS = ContextVar("NV_GEMV_ROWS", 4)  # 10-28 card sweep: R=1 28.6, R=2 
 # 32-thread block per (token, group) hit Ampere's 16-resident-blocks-per-SM cap: 16 of 48 warp slots, 150-190 GB/s on the card
 # (10-28 q8_bench). Read in q8_quantize (uncached) and passed into the cache keys, like NV_GEMV_ROWS
 NV_Q8_WARPS = ContextVar("NV_Q8_WARPS", 8)
+Q8_WORD_LANES = (4, 2, 1)  # T4.138: xor offsets over a 32-group's 8 lanes (one 4-element word each)
 # T4.137: add_rmsnorm_q8's phase 2 over dim/threads blocks per token (1, default) or the one block per token of T4.125b (0, A/B) --
 # bit-identical outputs either way
 NV_NORM_SPLIT = ContextVar("NV_NORM_SPLIT", 1)
@@ -115,18 +116,31 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:i
   # T4.128: `sums` (optional 4th param, an output after the input so the 3-param kernel and its render stay as they were) gets
   # xd * sum(q8) per (token, group) -- llama.cpp q8_1's `s`, the activation side of Q4_1's +m and Q5_K's -dmin*m terms
   groups = in_features//Q8_GROUP_SIZE
-  if warps == 1:  # one 32-lane block per (token, group): the decode kernel, unchanged
-    token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
-    ranges: tuple[UOp, ...] = (token_group, lane)
-  else:
-    # T4.128 (step 6): `warps` (token, group)s per block, each warp exactly the one-warp kernel. lane is the AxisType.WARP range
-    # (threadIdx.x, never split) and warp a LOCAL range, so warp_reduce's shuffles combine one hardware warp (_add_rmsnorm_q8_kernel's
-    # layout). A count the warps don't divide: the last block's surplus warps redo the last group -- same values, same addresses
+  if warps > 1:
+    # T4.128 (step 6): blocks of `warps` warps; lane is the AxisType.WARP range (threadIdx.x, never split) and warp a LOCAL range, so the
+    # shuffles combine one hardware warp (_add_rmsnorm_q8_kernel's layout).
+    # T4.138 (step 3): each lane owns one packed word -- 4 consecutive elements, one 8/16-byte load -- so a warp quantizes 4 groups,
+    # a group being 8 adjacent lanes reduced by 3 xor shuffles. The one-group-per-warp layout loaded every element twice (once for the
+    # max, again by the 8 packing lanes) through 2/4-byte loads, 5-10 dependent shuffles per 64-128 bytes: latency-bound, 17 us per
+    # 128-token quantize on the card (10-31 profile, ~3x its DRAM floor). Same formulas, so bit-identical words, scales and sums. A
+    # group count the block doesn't divide: the surplus lanes redo the last group (same values, same addresses).
     total = tokens*groups
-    block, warp, lane = UOp.range(-(-total // warps), 0), UOp.range(warps, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
-    token_group = block*warps + warp
-    if total % warps: token_group = token_group.minimum(total - 1)
-    ranges = (block, warp, lane)
+    block, warp, wlane = UOp.range(-(-total // (4*warps)), 0), UOp.range(warps, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)
+    tg = (block*warps + warp)*4 + wlane // 8
+    if total % (4*warps): tg = tg.minimum(total - 1)
+    tok, grp, wl = tg // groups, tg % groups, wlane % 8
+    xw = x.reshape(tokens, groups, 32)
+    vals = tuple(xw[tok, grp, wl*4+i].float() for i in range(4))
+    amax = functools.reduce(lambda a, v: a.maximum(v), (v.abs() for v in vals))
+    gscale = (warp_reduce(amax, maximum=True, offsets=Q8_WORD_LANES) / 127).maximum(1e-8)
+    # the scale/sum stores: the same bits in all 8 lanes of a group (an xor butterfly ends equal in every lane), so no lane gate
+    wstores = [q[tok, grp, wl].store(_q8_pack(vals, gscale)), scale[tok, grp].store(gscale)]
+    if sums is not None:  # integers <= 32*127: exact in any order
+      qs = functools.reduce(lambda a, v: a + v, ((v/gscale).round().clip(-127, 127) for v in vals))
+      wstores.append(sums[tok, grp].store(gscale * warp_reduce(qs, offsets=Q8_WORD_LANES)))
+    return UOp.group(*wstores).end(block, warp, wlane).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
+  # one 32-lane block per (token, group): the decode kernel, unchanged
+  token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group//groups, token_group%groups
   x = x.reshape(tokens, groups, 32)
   group_scale = (warp_reduce(x[token, group, lane].float().abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
@@ -140,7 +154,7 @@ def _q8_quantize_kernel(q:UOp, scale:UOp, x:UOp, sums:UOp|None=None, *, tokens:i
     # exact in fp32 in any order), times the scale once
     qsum = warp_reduce((x[token, group, lane].float()/group_scale).round().clip(-127, 127), full_wave=True)
     stores += (sums[token, group.valid(lane.eq(0))].store(group_scale * qsum),)
-  return UOp.group(*stores).end(*ranges).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
+  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="q8_quantize_nv", opts_to_apply=()))
 
 # T4.123a: several Linears in one forward step quantize the SAME activation (FFN gate+up, GDN attn_gate/attn_qkv,
 # attention q/k/v all read one norm output) -- q8_quantize used to run the quantize kernel once per Linear even
@@ -168,8 +182,10 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple
   """(q, scale), or with sums=True (q, scale, sums) -- T4.128: the IMMA Q4_1/Q5_K prefill kernels need the per-group sums. The
   variant is its own cache entry rather than always computed: the plain kernel (every decode quantize, the Q4_0 prefill one) keeps
   its render, and no activation of the 27B feeds both kinds of consumer (Q4_1 ffn_down and Q5_K ssm_out read their own inputs), so
-  the split never costs a second launch. The fused (decode-only) entries carry no sums and are skipped for a sums request."""
-  if not sums and (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None: return Tensor(hit[0]), Tensor(hit[1])
+  the split never costs a second launch. A fused entry without sums (the decode ones) is skipped for a sums request; T4.138: one with
+  (nv_gdn_prep's post-scan kernel, for the Q5_K ssm_out) serves both kinds."""
+  if (hit := _fused_q8.get((x.uop, tokens, in_features))) is not None and (not sums or len(hit) == 3):
+    return tuple(Tensor(u) for u in hit[:2+sums])
   warps = max(NV_Q8_WARPS.value, 1) if tokens > 4 else 1  # T4.128 (step 6): multi-warp blocks for prefill; decode as it was
   return tuple(Tensor(u) for u in _q8_quantize_cached(x.uop, tokens, in_features, sums, warps))
 
@@ -185,12 +201,12 @@ def q8_quantize(x:Tensor, tokens:int, in_features:int, sums:bool=False) -> tuple
 # within the same block's _run body, microseconds after being registered, so eviction order barely matters here
 # (unlike _q8_quantize_cached's true LRU, tuned for sharing across back-to-back calls).
 _FUSED_Q8_MAXSIZE = 16
-_fused_q8: dict[tuple[UOp, int, int], tuple[UOp, UOp]] = {}
+_fused_q8: dict[tuple[UOp, int, int], tuple[UOp, ...]] = {}
 
-def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Tensor) -> None:
+def register_fused_q8(x:Tensor, tokens:int, in_features:int, q:Tensor, scale:Tensor, sums:Tensor|None=None) -> None:
   key = (x.uop, tokens, in_features)
   if key not in _fused_q8 and len(_fused_q8) >= _FUSED_Q8_MAXSIZE: _fused_q8.pop(next(iter(_fused_q8)))
-  _fused_q8[key] = (q.uop, scale.uop)
+  _fused_q8[key] = (q.uop, scale.uop) + ((sums.uop,) if sums is not None else ())
 
 # T4.125b: nv_q8_linear's result is its kernel's split-K partials (tokens, out_features, C) summed by a generic reduce -- one
 # r_40_32_4_6 per ssm_out/attn_output per step. add_rmsnorm_q8 sums partials in-kernel, so _ffn_output (model.py) fetches the

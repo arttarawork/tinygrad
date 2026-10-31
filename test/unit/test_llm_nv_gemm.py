@@ -611,16 +611,17 @@ class TestImmaDispatch(unittest.TestCase):
       self.assertEqual(src.count("__launch_bounds__"), 1)
 
 _emu_slot = itertools.count(60)
-def _emulated_lane_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def _emulated_lane_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, offsets:tuple[int, ...]|None=None) -> UOp:
   # warp_reduce's xor butterfly for q8_quantize_nv's lane range, each __shfl_xor_sync swapped for a shared exchange (the PYTHON
   # emulator has no CUDA intrinsics and runs the block in lockstep) -- test_llm_nv_norm's _emulated_warp_reduce. T4.128: a fresh
   # buffer per exchange (the sums variant reduces twice), and the multi-warp prefill quantizer's WARP lane + LOCAL warp ranges
-  # (thread warp*32 + lane, whose xor partner stays in its warp) besides the one-warp kernel's LOCAL lane
-  assert full_wave
+  # (thread warp*32 + lane, whose xor partner stays in its warp) besides the one-warp kernel's LOCAL lane. T4.138: `offsets` (the
+  # prefill quantizer's 8-lane groups)
+  assert full_wave or offsets is not None
   rngs = {u.arg[-1]: u for u in val.toposort() if u.op is Ops.RANGE}
   if AxisType.WARP in rngs: tid, n = rngs[AxisType.LOCAL] * 32 + rngs[AxisType.WARP], rngs[AxisType.LOCAL].src[0].arg * 32
   else: tid, n = rngs[AxisType.LOCAL], 32
-  for off in (16, 8, 4, 2, 1):
+  for off in (offsets or (16, 8, 4, 2, 1)):
     buf = UOp.placeholder((n,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
     other = buf.after(buf[tid].store(val))[tid + off - (tid // off) % 2 * (2 * off)].load()
     val = val.maximum(other) if maximum else val + other
