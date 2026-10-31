@@ -17,6 +17,7 @@ from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
 from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post, GDN_NV_PREP
 from tinygrad.llm.kernels.nv_attn_prep import NV_ATTN_PREP, attn_prep, attn_prep_geometry_ok
+from tinygrad.llm.kernels.nv_sample import nv_sample, nv_sample_ok
 from tinygrad.llm.gguf import gguf_load, ggml_data_to_tensor
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
@@ -1871,7 +1872,8 @@ class Transformer:
       # T4.132: the head's norm fused with its q8 quantize at a concrete small width (nv_fused_norm gates; symbolic T = plain norm)
       return self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x, self.output)), x.contiguous()  # (B,T,vocab), (B,T,D)
     # only run the output projection on the last token
-    logits = self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x[:, -1:], self.output))[:, -1, :]  # T4.125b
+    out = self.output(nv_fused_norm(self.output_norm, self.nv_output_norm_weight, x[:, -1:], self.output))  # T4.125b
+    logits = out[:, -1, :]
     # T4.92: presence penalty -- self.penalty_mask is a (1,vocab) 0/1 buffer, reset in place at the start of generate() and
     # updated in its eager decode loop (never inside this jit'd graph -- see generate()'s own comment); a plain READ here is
     # exactly like reading cache_kv, no AFTER-chaining needed. presence_penalty is a Tensor (not a python float), same reason
@@ -1881,11 +1883,13 @@ class Transformer:
     # greedy: temperature None (explicit-greedy callers, the spec path) -> plain argmax, no RNG kernels. generate() always passes a
     # Tensor (T4.105), so its graph carries both the argmax and the Gumbel sampler and picks at runtime: temperature <= 0 = greedy.
     # The unused branch costs a vocab-sized argmax/softmax per token (~1 % of a decode step); it buys one jit family instead of two.
-    greedy = logits.argmax(-1, keepdim=True)
-    if temperature is None: tok = greedy
+    # T4.146: on the card the same pick as three kernels (nv_sample: the head's split-K sum, the vocab-wide argmax and Gumbel draw)
+    if presence_penalty is None and nv_sample_ok(logits):
+      tok = nv_sample(logits, None if temperature is None else temperature.to(logits.device), MIN_P, split_k_partials(out))
+    elif temperature is None: tok = logits.argmax(-1, keepdim=True)
     else:
       temperature = temperature.to(logits.device)
-      tok = (temperature > 0).reshape(1, 1).where(sample_logits(logits, temperature, MIN_P), greedy)
+      tok = (temperature > 0).reshape(1, 1).where(sample_logits(logits, temperature, MIN_P), logits.argmax(-1, keepdim=True))
     # T4.132: with an MTP head every plain call also returns its per-position pre-norm hidden (B,T,D) -- MTPHead.prefill's input -- so
     # speculative_generate's prompt prefill replays generate()'s own families (the prefill family captured first and pruned: the T4.128
     # memory path; at a 1-token chunk width, CPU's, the decode family) instead of keeping two more 128-wide spec families. The token is
@@ -2467,9 +2471,10 @@ class Transformer:
     ids: Tensor|None = None
     if "draft" in vars(mh): logits, x = mh.draft(self, h, tok, pos), h
     else: (logits, x), ids = mh.draft_step(self, h, tok, pos), mh.draft_ids
-    greedy = logits.argmax(-1)
     s = SPEC_DRAFT_TEMP_SCALE  # T4.145: != 1.0 draws sharper/flatter than the target; q = logits / s keeps the accept exact
-    d = (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp * s if s != 1.0 else temp, MIN_P), greedy)
+    if nv_sample_ok(lg := logits[:, -1, :]):  # T4.146: forward()'s kernels (temp * s > 0 iff temp > 0: the same pick)
+      d = nv_sample(lg, (temp * s if s != 1.0 else temp).to(lg.device), MIN_P)
+    else: d = (temp > 0).reshape(1, 1).where(sample_logits(lg, temp * s if s != 1.0 else temp, MIN_P), logits.argmax(-1))
     q = logits if s == 1.0 else logits / s
     return (d, q, x) if ids is None else (ids[d], mh.full_vocab(q), x)
 
