@@ -15,6 +15,7 @@ from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, ad
   clear_step_caches
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
+from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve, Ops
 from tinygrad.helpers import ContextVar, DEBUG, GlobalCounters
@@ -1015,8 +1016,11 @@ class GatedDeltaNetBlock(FFNBlock):
     runs ONE gemv (nv_f16_gemv_raw) instead of two. Left None (falls back to the two separate calls, _attention's own
     dispatch, below) when config.dim isn't a multiple of 128: nv_f16_gemv_raw's kernel needs that (nv_dense.py's
     nv_dense_eligible check, which the ORIGINAL per-Linear self.ssm_beta(x)/self.ssm_alpha(x) calls apply themselves --
-    this gemv doesn't go through Linear.__call__, so the same check has to happen here)."""
-    if hasattr(self, "ssm_g_a") or self.ssm_norm.weight is None or not nv_decode_kernel_supported(self.ssm_a.device): return
+    this gemv doesn't go through Linear.__call__, so the same check has to happen here).
+    T4.138: also under the prefill gate (nv_custom_kernels_supported): _nv_prefill reads the same weights. Each path still checks its
+    own gate at call time."""
+    dev = self.ssm_a.device
+    if hasattr(self, "ssm_g_a") or self.ssm_norm.weight is None or not (nv_decode_kernel_supported(dev) or nv_custom_kernels_supported(dev)): return
     if self.head_k_dim % 32 or self.head_v_dim % 8 or self.head_v_dim > 256 or self.conv_channels % 32: return  # 32-lane rows, <= 1024 threads
     self.nv_decode_weights = cast(tuple[Tensor, Tensor, Tensor, Tensor], tuple(t.float().contiguous().realize() for t in
       (self.ssm_conv1d["weight"], self.ssm_norm.weight, self.ssm_dt["bias"], self.ssm_a)))
@@ -1057,6 +1061,10 @@ class GatedDeltaNetBlock(FFNBlock):
                         track=self.spec_track if capture else None)
       assert not capture or T - 1 <= cast(tuple[Tensor, Tensor], self.spec_track)[1].shape[0], f"{T=}: more tokens than spec_track slots"
       return self.ssm_out(z)
+
+    # T4.138: every other call on the card's fused-scan path (a prefill chunk: symbolic T, padded to T_pad) -- see _nv_prefill
+    if not capture and not is_kda and self.nv_decode_weights is not None and self.head_v_dim % 32 == 0 and nv_custom_kernels_supported(x.device):
+      return self._nv_prefill(x, start_pos, T, T_pad)
 
     # input processing
     x = x.half()
@@ -1178,6 +1186,25 @@ class GatedDeltaNetBlock(FFNBlock):
     # output; undo the padding before the output projection
     z = (self.ssm_norm(core) * (out_gate.sigmoid() if is_kda else out_gate.silu())).cast(x.dtype).contiguous()
     if symbolic: z = z[:, :T]
+    return self.ssm_out(z.reshape(B, T, -1))
+
+  def _nv_prefill(self, x:Tensor, start_pos:UOp, T:int|UOp, T_pad:int) -> Tensor:
+    """T4.138: a prefill chunk with the glue between the projections and the fused scan as nv_gdn_prep's kernels (the generic graph
+    above: ~15 kernels, ~287 us per block at 128 tokens on the card). The projections run at the padded width T_pad on one contiguous
+    fp16 x (nv_wmma_linear then pads nothing and the f16 gemv copies nothing; zero rows past T); the toks Variable masks the rest."""
+    B, dim = cast(int, x.shape[0]), self.config.dim
+    x = x.half()
+    # contiguous in its 2-D form: the f16 gemv's own .contiguous() then folds (a reshaped CONTIGUOUS would be copied again, E_5120_32_4)
+    x_flat = (x.pad_to((B, T_pad, dim)) if isinstance(T, UOp) else x).reshape(B*T_pad, dim).contiguous()
+    x_pad = x_flat.reshape(B, T_pad, dim)
+    beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x_flat, 2*self.num_v_heads)
+                  if self.nv_beta_alpha_weight is not None else self.ssm_beta(x_pad).cat(self.ssm_alpha(x_pad), dim=-1))
+    conv_w, _, dt_bias, ssm_a = cast(tuple[Tensor, Tensor, Tensor, Tensor], self.nv_decode_weights)
+    core = nv_gdn_prefill(self.attn_qkv(x_pad), beta_alpha, self.conv_state, self.recurrent_state, conv_w, dt_bias, ssm_a, start_pos, T,
+                          k_heads=self.num_k_heads, qk_eps=1e-6).transpose(1, 2)
+    out_gate = self.attn_gate(x_pad).reshape(B, T_pad, self.num_v_heads, self.head_v_dim)
+    z = (self.ssm_norm(core) * out_gate.silu()).cast(x.dtype).contiguous()
+    if isinstance(T, UOp): z = z[:, :T]
     return self.ssm_out(z.reshape(B, T, -1))
 
   spec_track: tuple[Tensor, Tensor]|None = None  # T4.132: (conv (S,B,K-1,C), recurrent (S,B,H,V,K)) -- a VERIFY run's per-token states
