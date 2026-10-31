@@ -205,7 +205,7 @@ def _gdn_decode_kernel(z:UOp, state:UOp, conv_out:UOp, beta_alpha:UOp, dt_bias:U
   initial = start_pos.eq(0)
   previous = {row: tuple(initial.where(0, state[b, h, row, c].load().float()) for c in cols) for row in rows}
   partial = UOp.placeholder((tokens*waves,), dtypes.float32, slot=0, addrspace=AddrSpace.LOCAL) if waves > 1 else None
-  z_stores = []
+  z_stores: list[UOp] = []
   for t in range(tokens):
     r = row_of(t)
     # T4.140: token t reads its inputs only after token t-1's stores. Unordered, the linearizer hoisted every load to the top and sank
