@@ -145,7 +145,7 @@ def nv_f16_gemv(layer:Linear, x:Tensor) -> Tensor|None:
     x_pad.contiguous() if x_pad.dtype == dtypes.float16 else x_pad.cast(dtypes.float16).contiguous()
   out = Tensor.empty(tokens, layer.out_features, dtype=out_dtype, device=x.device)
   fxn = functools.partial(_nv_f16_gemv_kernel, in_features=layer.in_features, out_features=layer.out_features, tokens=tokens,
-                          **_gemv_tile(tokens, layer.out_features))
+                          **_gemv_tile(cast(int, tokens), layer.out_features))  # concrete after the pad (mypy: int|UOp)
   result = Tensor.custom_kernel(out, weight.reshape(-1), xh.reshape(tokens, layer.in_features), fxn=fxn)[0]
   result = result.reshape(*x_pad.shape[:-1], layer.out_features)
   if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], layer.out_features)))
