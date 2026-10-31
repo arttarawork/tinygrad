@@ -15,7 +15,7 @@ intended add -> RMSNorm -> q8 pipeline instead (same idea as test_llm_nv_dense.p
 test_llm_amd.py's own q8_quantize reference formula (scale=max(abs)/127 clamped 1e-8, q=clip(rint(x/scale))).
 T4.125b adds TestKernelRunsOnPythonEmulator: the kernel itself executed on tinygrad's PYTHON emulator device (which does
 model a threadgroup), with only the warp shuffle swapped for an equivalent shared-memory exchange."""
-import itertools, sys, unittest
+import itertools, math, re, sys, unittest
 from unittest import mock
 import numpy as np
 from tinygrad import Tensor, UOp, dtypes, Context
@@ -245,24 +245,25 @@ class TestWrapperBuildsExpectedShapes(unittest.TestCase):
   def test_default_threads_is_the_widest_block(self):
     # T4.125b: <= 1024 threads, a multiple of 32 dividing dim -- 1024 at the standing 5120 (the 256 default was latency-bound).
     # T4.137: dim/threads blocks per token (NV_NORM_SPLIT, default 1), one with NV_NORM_SPLIT=0
-    for dim, threads in ((5120, 1024), (256, 256), (2560, 640)):
-      for split in (1, 0):
-        with self.subTest(dim=dim, split=split), Context(NV_NORM_SPLIT=split):
+    # T4.146: NV_NORM_WORDS=1 (default) runs the split kernel on dim/32/split/4 warps (5120: 8, 2560: 5; 256 has no split)
+    for dim, threads, words_warps in ((5120, 1024, 8), (256, 256, 0), (2560, 640, 5)):
+      for split, words in ((1, 0), (0, 0), (1, 1), (0, 1)):
+        with self.subTest(dim=dim, split=split, words=words), Context(NV_NORM_SPLIT=split, NV_NORM_WORDS=words):
           new_residual = add_rmsnorm_q8(Tensor.empty(2, dim, dtype=dtypes.float32), Tensor.empty(dim, dtype=dtypes.float32), eps=1e-6)[0]
           ranges = [u for u in new_residual.uop.toposort() if u.op is Ops.CALL for u in u.src[0].toposort() if u.op is Ops.RANGE]
-          self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.LOCAL], [threads // 32])
+          self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.LOCAL], [words_warps if split and words and words_warps else threads // 32])
           self.assertEqual([u.src[0].arg for u in ranges if u.arg[-1] is AxisType.GLOBAL], [2 * (dim // threads if split else 1)])
 
 _emu_slot = itertools.count(60)
-def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False, offsets:tuple[int, ...]|None=None) -> UOp:
   """warp_reduce's xor butterfly with each __shfl_xor_sync(v, off) replaced by a block-shared exchange: thread tid writes v at [tid]
   and reads [tid ^ off] -- the same partner a 32-lane xor shuffle reads, since tid = warp*32 + lane. The PYTHON emulator runs the
-  whole block in lockstep (barriers are no-ops), so the store is always seen."""
-  assert full_wave
+  whole block in lockstep (barriers are no-ops), so the store is always seen. T4.146: `offsets` (the words kernel's 8-lane groups)"""
+  assert full_wave or offsets is not None
   rngs = {u.arg[-1]: u for u in val.toposort() if u.op is Ops.RANGE}
   lane, warp = rngs[AxisType.WARP], rngs[AxisType.LOCAL]
   tid = warp * 32 + lane
-  for off in (16, 8, 4, 2, 1):
+  for off in (offsets or (16, 8, 4, 2, 1)):
     buf = UOp.placeholder((warp.src[0].arg * 32,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
     partner = tid + off - (tid // off) % 2 * (2 * off)  # tid ^ off for a power-of-two off, spelled so CHECK_OOB's z3 can bound it
     other = buf.after(buf[tid].store(val))[partner].load()
@@ -280,7 +281,8 @@ class TestKernelRunsOnPythonEmulator(unittest.TestCase):
     residual, weight = rng.standard_normal((tokens, dim)).astype(np.float32), rng.standard_normal(dim).astype(np.float32)
     partials = rng.standard_normal((tokens, dim, C)).astype(np.float32) if C else None
     with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce), \
-         mock.patch.object(nv_quant, "_add_rmsnorm_q8_kernel", nv_quant._add_rmsnorm_q8_kernel.__wrapped__):  # bypass the cache
+         mock.patch.object(nv_quant, "_add_rmsnorm_q8_kernel", nv_quant._add_rmsnorm_q8_kernel.__wrapped__), \
+         mock.patch.object(nv_quant, "_add_rmsnorm_q8_words_kernel", nv_quant._add_rmsnorm_q8_words_kernel.__wrapped__):  # bypass the caches
       outs = add_rmsnorm_q8(Tensor(residual, device="PYTHON"), Tensor(weight, device="PYTHON"), 1e-6, want_fp16=want_fp16, threads=threads,
                             partials=None if partials is None else Tensor(partials, device="PYTHON"))
       new_residual, q, scale = (t.numpy() for t in outs[:3])
@@ -301,13 +303,25 @@ class TestKernelRunsOnPythonEmulator(unittest.TestCase):
 
   def test_split_blocks_are_bit_identical_to_one_block(self):
     # T4.137: NV_NORM_SPLIT (default 1) runs dim/threads = 5 blocks per token at the standing shape, each repeating phase 1 and doing a fifth
-    # of phase 2 -- every output equal to the one-block kernel's (NV_NORM_SPLIT=0), bit for bit; VERIFY's 3 tokens = 15 blocks
-    for C, want_fp16 in ((6, False), (0, True)):
-      with self.subTest(C=C, want_fp16=want_fp16):
-        with Context(NV_NORM_SPLIT=1): split = self._run(3, 5120, C, None, want_fp16)[3:]
+    # of phase 2 -- every output equal to the one-block kernel's (NV_NORM_SPLIT=0), bit for bit; VERIFY's 3 tokens = 15 blocks.
+    # T4.146: both split layouts -- the words kernel (NV_NORM_WORDS=1, the default) and T4.137's (0)
+    for words, (C, want_fp16) in itertools.product((1, 0), ((6, False), (0, True))):
+      with self.subTest(words=words, C=C, want_fp16=want_fp16):
+        with Context(NV_NORM_SPLIT=1, NV_NORM_WORDS=words): split = self._run(3, 5120, C, None, want_fp16)[3:]
         with Context(NV_NORM_SPLIT=0): one = self._run(3, 5120, C, None, want_fp16)[3:]
         for a, b in zip(split, one):
           if a is not None: np.testing.assert_array_equal(a, b)
+
+  def test_words_kernel_at_one_token(self):
+    # T4.146: the decode step itself (1 token, 5 blocks of 256 threads) -- bit-identical to T4.137's split kernel and to numpy's pipeline,
+    # at the ffn_norm site's C=6 partials and the attn_norm site's fp16 copy; dim 2560 = 640 threads' tree on 5 warps of 4 tree warps each
+    for dim, C, want_fp16 in ((5120, 6, False), (5120, 0, True), (2560, 3, True)):
+      with self.subTest(dim=dim, C=C, want_fp16=want_fp16):
+        with Context(NV_NORM_WORDS=1): words = self._run(1, dim, C, None, want_fp16)
+        with Context(NV_NORM_WORDS=0): t4137 = self._run(1, dim, C, None, want_fp16)
+        for a, b in zip(words[3:], t4137[3:]):
+          if a is not None: np.testing.assert_array_equal(a, b)
+        with Context(NV_NORM_WORDS=1): self._check(1, dim, C, None, want_fp16)
 
 @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
 class TestPrefillWidthOnPythonEmulator(unittest.TestCase):
@@ -371,12 +385,45 @@ class TestPrefillWidthRender(unittest.TestCase):
     q = add_rmsnorm_q8(residual, Tensor.empty(5120), 1e-6, partials=partials, want_fp16=want_fp16, q8_fp16=q8_fp16)[1]
     return _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
 
+  # T4.146: the words kernel's decode renders (the default since T4.146), md5-pinned at its commit
+  WORDS_MD5 = {(1, 0, False): "0f9ff95c9c90329b24320f9d286f5a3e", (1, 5, True): "64f83bf1033b8bd6f3f33b888063e972", (4, 5, False): "bb2f08badbce1190affb64b0ed28c547", (4, 0, True): "336ede3dc3647420fa92e29f83245645"}
+
   def test_decode_renders_unchanged(self):
+    # T4.146: T4.137's split kernel is NV_NORM_WORDS=0's now -- byte-identical to before
     import hashlib
     for (tokens, C, want_fp16), digest in self.DECODE_MD5.items():
-      with self.subTest(tokens=tokens, C=C, want_fp16=want_fp16):
+      with self.subTest(tokens=tokens, C=C, want_fp16=want_fp16), Context(NV_NORM_WORDS=0):
         src = self._source(Tensor.empty(tokens, 5120), Tensor.empty(tokens, 5120, C) if C else None, want_fp16)
         self.assertEqual(hashlib.md5(src.encode()).hexdigest(), digest)
+
+  def test_words_decode_renders(self):
+    # T4.146: 5 blocks of 256 threads per token, one barrier, the group max by 3 xor shuffles (4 tree butterflies of 5 before the barrier),
+    # every lane storing one q8 word (no lane gate) and its 4 fp16 values as one half4
+    import hashlib
+    for (tokens, C, want_fp16), digest in self.WORDS_MD5.items():
+      with self.subTest(tokens=tokens, C=C, want_fp16=want_fp16):
+        src = self._source(Tensor.empty(tokens, 5120), Tensor.empty(tokens, 5120, C) if C else None, want_fp16)
+        self.assertIn("__launch_bounds__(256)", src)
+        self.assertEqual([int(n) for n in re.findall(r"threadIdx\.[xyz]; /\* (\d+) \*/", src)], [32, 8])
+        self.assertEqual(math.prod(int(n) for n in re.findall(r"blockIdx\.[xyz]; /\* (\d+) \*/", src)), 5*tokens)
+        self.assertEqual(src.count("__syncthreads()"), 1)
+        pre, post = src.split("__syncthreads()")
+        self.assertEqual((pre.count("__shfl_xor_sync"), post.count("__shfl_xor_sync")), (20, 3))
+        self.assertNotIn("if ((lidx0<8))", src)
+        self.assertEqual(src.count("((half4*)((data"), int(want_fp16))
+        self.assertEqual(hashlib.md5(src.encode()).hexdigest(), digest)
+
+  def test_words_nvrtc_registers_and_spills(self):
+    # the real compiler (the docker nvrtc lane; skipped when it cannot start): 256 threads -- T4.146: 46 registers at the attn_norm sites,
+    # 64 at the ffn_norm site's 6 partials (VERIFY's 3 tokens the same), no spill stack
+    from test.unit.test_llm_nv_gdn_prep import TestNvrtcRegisters
+    for tokens, C, want_fp16 in ((1, 0, True), (1, 6, False), (3, 6, False)):
+      with self.subTest(tokens=tokens, C=C, want_fp16=want_fp16):
+        src = self._source(Tensor.empty(tokens, 5120), Tensor.empty(tokens, 5120, C) if C else None, want_fp16)
+        try: regs, stack = TestNvrtcRegisters._attrs(src)
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        self.assertLessEqual(regs, 255)
+        self.assertEqual(stack, 0)
 
   def test_prefill_kernel_at_the_27b_shape(self):
     view = Tensor.empty(1, 128, 5120)[:, :UOp.variable("toks", 1, 128).bind(77)]

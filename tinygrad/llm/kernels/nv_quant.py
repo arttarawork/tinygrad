@@ -34,6 +34,8 @@ Q8_WORD_LANES = (4, 2, 1)  # T4.138: xor offsets over a 32-group's 8 lanes (one 
 # T4.137: add_rmsnorm_q8's phase 2 over dim/threads blocks per token (1, default) or the one block per token of T4.125b (0, A/B) --
 # bit-identical outputs either way
 NV_NORM_SPLIT = ContextVar("NV_NORM_SPLIT", 1)
+# T4.146: the split decode-width norm on _add_rmsnorm_q8_words_kernel's layout (1, default) or T4.137's (0, A/B) -- bit-identical outputs
+NV_NORM_WORDS = ContextVar("NV_NORM_WORDS", 1)
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
@@ -376,6 +378,71 @@ def _add_rmsnorm_q8_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, w
     if want_fp16: stores.append(cast(UOp, fp16_out)[tok, base + lane].store(own.cast(dtypes.float16)))
   return UOp.group(*stores).end(lane, warp, block).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
 
+def _words_geometry(dim:int, threads:int, split:int) -> int:
+  """T4.146: the real warps of _add_rmsnorm_q8_words_kernel's block (0 = the geometry doesn't fit it): 4 q8 groups per warp, a block's
+  dim/32/split groups, and a whole number of the `threads`-wide tree's warps per real warp"""
+  groups = dim // Q8_GROUP_SIZE
+  if split < 2 or dim % threads or dim // threads != split or groups % (4*split): return 0
+  real = groups // split // 4
+  return real if (threads // 32) % real == 0 else 0
+
+@functools.cache
+def _add_rmsnorm_q8_words_kernel(*params:UOp, tokens:int, dim:int, eps:float, C:int, want_fp16:bool, threads:int, split:int) -> UOp:
+  """T4.146: _add_rmsnorm_q8_kernel's split decode-width kernel (split = dim/threads blocks per token: NV_NORM_SPLIT at tokens <= 4) with
+  the same outputs bit for bit, on a block 4x narrower. Params as _add_rmsnorm_q8_kernel's, minus the prefill extras.
+  T4.137's phase 2 gave each of the block's threads/32 warps ONE q8 group (32 lanes: the max over one element per lane by a 5-shuffle
+  butterfly, then lanes < 8 pack a word while the other 24 compute a clamped copy): every warp issued the whole quantize for 8 useful
+  lanes, ~4/5 of the kernel's instructions on one SM (9.3 us per launch on the card, 10-31 profile, vs the ~5.4 us of an empty one).
+  Here a warp quantizes 4 groups (T4.138's _q8_lane_words layout: each lane one packed word, 4 consecutive normed values, a group = 8
+  adjacent lanes, its max by 3 xor shuffles), so the block has dim/32/split/4 warps (8 at dim 5120) instead of threads/32 (32).
+  Phase 1 keeps T4.137's reduction tree exactly -- element d in lane d % 32 of tree warp (d % threads) // 32, each tree thread's
+  per_thread squares summed in order, the tree warp's 5-shuffle butterfly, the tree warps' sums added in order -- by giving each real warp
+  threads/32/real tree warps (4 at dim 5120): the same lane, the same xor partners, so inv_rms is the same bits. The group max is a max
+  (exact in any order: the same bits up to the sign of an all-zero group, whose scale is the 1e-8 clamp either way); the normed values,
+  the scale and the pack are the same expressions."""
+  warps, per_thread = threads // 32, dim // threads
+  real = _words_geometry(dim, threads, split)
+  assert real, f"{dim=} {threads=} {split=}: no words geometry"
+  per_real, gpb = warps // real, dim // Q8_GROUP_SIZE // split  # tree warps per real warp, groups per block
+  new_residual, q, scale, residual, weight = params[:5]
+  partials = params[5] if C > 0 else None
+  fp16_out = params[5 + (C > 0)] if want_fp16 else None
+  block = UOp.range(tokens * split, 0, AxisType.GLOBAL)
+  tok, part = block // split, block % split
+  warp, lane = UOp.range(real, 1, AxisType.LOCAL), UOp.range(32, -1, AxisType.WARP)  # lane = the hardware lane (threadIdx.x, never split)
+  val_buf = UOp.placeholder((dim,), dtypes.float32, slot=50, addrspace=AddrSpace.LOCAL)
+  wsum_buf = UOp.placeholder((warps,), dtypes.float32, slot=51, addrspace=AddrSpace.LOCAL)
+  # phase 1: tree warp tw = warp*per_real + j, as _add_rmsnorm_q8_kernel's phase 1 builds each of its threads
+  writes = []
+  for j in range(per_real):
+    tw = warp * per_real + j
+    tid = tw * 32 + lane
+    vals = []
+    for r in range(per_thread):
+      d = tid + r*threads
+      val = residual[tok, d].load().float()
+      if C: val = sum((cast(UOp, partials)[tok, d, c].load().float() for c in range(C)), UOp.const(0, dtypes.float32)) + val
+      vals.append(val)
+      writes.append(val_buf[d].store(val))
+    # block `part` stores element row `part` of the tree thread (split == per_thread: one row each)
+    writes.append(new_residual[tok, tid + part*threads].store(functools.reduce(lambda a, i: part.eq(i).where(vals[i], a), range(1, per_thread),
+                                                                                vals[0])))
+    writes.append(wsum_buf[tw.valid(lane.eq(0))].store(warp_reduce(sum((v*v for v in vals), UOp.const(0, dtypes.float32)), full_wave=True)))
+  phase1 = UOp.group(*writes)
+  vb, wsum = val_buf.after(phase1), wsum_buf.after(phase1)
+  total = sum((wsum[w].load() for w in range(warps)), UOp.const(0, dtypes.float32))
+  inv_rms = ((total * (1.0 / dim)) + eps).sqrt().reciprocal()
+  # phase 2: lane -> word lane % 8 of group part*gpb + warp*4 + lane//8
+  group, wl = part * gpb + warp * 4 + lane // 8, lane % 8
+  idx = tuple(group * Q8_GROUP_SIZE + wl * 4 + i for i in range(4))
+  normed = tuple(vb[i].load() * inv_rms * weight[i].load().float() for i in idx)
+  amax = functools.reduce(lambda a, v: a.maximum(v), (v.abs() for v in normed))
+  gscale = (warp_reduce(amax, maximum=True, offsets=Q8_WORD_LANES) / 127).maximum(1e-8)
+  # the scale store: the same bits in the group's 8 lanes (an xor butterfly ends equal in every lane), so no lane gate
+  stores = [q[tok, group, wl].store(_q8_pack(normed, gscale)), scale[tok, group].store(gscale)]
+  if want_fp16: stores += [cast(UOp, fp16_out)[tok, i].store(v.cast(dtypes.float16)) for i, v in zip(idx, normed)]
+  return UOp.group(*stores).end(lane, warp, block).sink(arg=KernelInfo(name="add_rmsnorm_q8_nv", opts_to_apply=()))
+
 def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|None=None, want_fp16:bool=False,
                     threads:int|None=None, q8_fp16:bool=False) -> tuple[Tensor, Tensor, Tensor, Tensor|None]:
   """Thin wrapper (T4.123d) around _add_rmsnorm_q8_kernel: residual (tokens,dim) fp32, optional partials
@@ -416,8 +483,12 @@ def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|No
   # T4.141 (10-31 card): the split pays only at decode width -- at 128 tokens one block per token already fills the SMs and the split's 5 blocks
   # re-read the row + partials (chunk 116.4 ms split vs 114.6 unsplit; decode 9.3 vs 13.4 us). Bit-identical either way (T4.137's tests).
   split = dim // threads if NV_NORM_SPLIT.value and tokens <= 4 else 1
-  fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads, split=split,
-                          toks=kernel_var(toks.src[0]) if isinstance(toks, UOp) else None, kfirst=kfirst, q8_fp16=q8_fp16)
+  # T4.146: NV_NORM_WORDS read here (uncached) too -- the split decode kernel on a 4x narrower block, same outputs
+  if NV_NORM_WORDS.value and isinstance(toks, int) and not kfirst and not q8_fp16 and _words_geometry(dim, threads, split):
+    fxn = functools.partial(_add_rmsnorm_q8_words_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads, split=split)
+  else:
+    fxn = functools.partial(_add_rmsnorm_q8_kernel, tokens=tokens, dim=dim, eps=eps, C=C, want_fp16=want_fp16, threads=threads, split=split,
+                            toks=kernel_var(toks.src[0]) if isinstance(toks, UOp) else None, kfirst=kfirst, q8_fp16=q8_fp16)
   results = srcs[0].custom_kernel(*srcs[1:], fxn=fxn)
   return results[0], results[1], results[2], (results[5 + (C > 0)] if want_fp16 else None)
 
