@@ -7,19 +7,21 @@ form (lanes=1) runs here against numpy and against the generic block graph, plus
 Runs on CPU: gate/import checks and an sm_86 render + nvrtc compile of the kernel at the 35B's real geometry (skips when
 the nvrtc lane -- docker on macOS -- is unavailable). The numerics tests need real NV hardware: mock-NV reports sm_35, so
 the gate is closed there and they skip. Hardware round: DEV=NV PYTHONPATH=. python -m pytest test/unit/test_llm_nv_scan.py"""
-import contextlib, functools, hashlib, math, re, unittest
+import contextlib, functools, hashlib, itertools, math, re, struct, sys, unittest
 from unittest import mock
 import numpy as np
 from tinygrad import Tensor, Device, Context, UOp, TinyJit, dtypes, nn
 from tinygrad.device import CompileError
 from tinygrad.helpers import DEV
-from tinygrad.uop.ops import Ops, KernelInfo
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import AxisType, Ops, KernelInfo
 from tinygrad.llm.gguf import ggml_data_to_tensor
 from tinygrad.llm.kernels.amd import Linear, Q4_0, kernel_var
 from tinygrad.llm.kernels.nv import (
   nv_custom_kernels_supported, nv_decode_kernel_supported, GDN_NV_FUSED_DECODE, gated_delta_prefill, _gated_delta_prefill_kernel,
   _gdn_conv_decode_kernel, _gdn_decode_kernel, _split_k_partials, gdn_decode, GDN_DECODE_TOKENS,
 )
+from tinygrad.llm.kernels import nv
 from tinygrad.llm.kernels.nv_quant import nv_q8_linear
 from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig
 
@@ -376,6 +378,31 @@ class TestGDNDecodeSmallT(unittest.TestCase):
           self.assertEqual(conv_src.count("__syncthreads()"), 0)
           self.assertEqual("data4_92160" in conv_src, track)  # (3,1,3,10240) fp16 conv slots
           self.assertEqual("data8_2359296" in step_src, track)  # (3,1,48,128,128) fp32 state slots
+          # T4.140: token t's loads come after token t-1's stores, so each stretch between barriers holds one token's stores and the next
+          # token's gate partials (8 rows x 5 parts as float4s) -- not every load up front and every store at the end, which spilled
+          segs = step_src.split("__syncthreads()")
+          self.assertEqual([len(re.findall(r"\(data6_\d+\+", seg)) for seg in segs], [10]*tokens + [0])
+          self.assertEqual([seg.count("((half4*)((data0_") for seg in segs], [0] + [2]*tokens)  # z: 8 rows as two half4 stores
+          self.assertEqual([seg.count("*(data8_2359296+") for seg in segs], [0] + [32*track]*(tokens-1) + [0])
+
+  def test_verify_compiles_without_spills(self):
+    # T4.140: the served VERIFY widths (T = 3, 4 with track) compiled by the nvrtc lane: ptxas must fit them in the 128 registers of a
+    # 512-thread block, as T == 1 -- before the per-token ordering their stack frames were 584 / 1368 B per thread (spills: 130 us at T=4)
+    from tinygrad.codegen import to_program
+    from tinygrad.renderer.cstyle import CUDARenderer
+    from tinygrad.runtime.support.elf import elf_loader
+    from tinygrad.runtime.ops_nv import NVProgram
+    try: renderer = CUDARenderer(DEV.target("NV", arch="sm_86"))
+    except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+    for tokens in (3, 4):
+      with self.subTest(tokens=tokens):
+        try: prg = to_program(_decode_sinks(tokens, track=True)[1], renderer)
+        except CompileError: raise
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        _, sections, _ = elf_loader(next(u.arg for u in prg.src if u.op is Ops.BINARY))
+        info = {param: struct.unpack_from("II", data)[1] for sh in sections if sh.name == ".nv.info"
+                for _, param, data in NVProgram._parse_elf_info(None, sh) if param in (0x12, 0x2f)}  # EIATTR_MIN_STACK_SIZE, _REGCOUNT
+        self.assertEqual((info[0x2f], info[0x12]), (128, 0))
 
 class TestGDNDecodeMatchesNumpy(unittest.TestCase):
   """nv.gdn_decode's two kernels in their CPU form (lanes=1: the same graphs minus shuffles and shared memory) against
@@ -428,6 +455,95 @@ class TestGDNDecodeMatchesNumpy(unittest.TestCase):
           np.testing.assert_allclose(z.numpy().astype(np.float32), np.concatenate(want_z, axis=1), rtol=5e-3, atol=1e-3)
           np.testing.assert_allclose(conv_state.numpy().astype(np.float32), conv.astype(np.float16).astype(np.float32), rtol=0, atol=0)
           np.testing.assert_allclose(state.numpy(), st, rtol=1e-5, atol=1e-6)
+
+# ******** T4.140: the decode kernels' card form (lanes=32) EXECUTED on the PYTHON emulator ********
+
+_emu_slot = itertools.count(300)
+def _emulated_warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
+  """nv.warp_reduce with each __shfl_xor_sync(v, off) as a block-shared exchange for the PYTHON emulator (no CUDA intrinsics): thread
+  wave*32 + lane writes v and reads [.. ^ off] (test_llm_nv_norm's _emulated_warp_reduce; here the lane is LOCAL axis 1 and the wave LOCAL
+  axis 2). A sum that does not depend on the wave (token 0's q/k norms) is the same in every wave, so one 32-slot exchange serves them all.
+  The emulator runs the block in lockstep, so the store is always seen."""
+  assert full_wave and not maximum
+  rngs = {u.arg[0]: u for u in val.toposort() if u.op is Ops.RANGE and u.arg[1] is AxisType.LOCAL}
+  lane, wave = rngs[1], rngs.get(2)
+  tid, n = (lane, 32) if wave is None else (wave*32 + lane, wave.src[0].arg*32)
+  for off in (16, 8, 4, 2, 1):
+    buf = UOp.placeholder((n,), dtypes.float32, slot=next(_emu_slot), addrspace=AddrSpace.LOCAL)
+    val = val + buf.after(buf[tid].store(val))[tid + off - (tid // off) % 2 * (2*off)].load()  # tid ^ off, z3-boundable
+  return val
+
+def _card_form(builder):
+  """a decode kernel builder in the card's form (gdn_decode passes lanes=1 off NV), uncached so the emulated shuffle is built in"""
+  return lambda *args, lanes, **kwargs: builder.__wrapped__(*args, lanes=32, **kwargs)
+
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestGDNDecodeOnEmulator(unittest.TestCase):
+  """T4.140: nv.gdn_decode's two kernels in the card's form -- 32-lane warps, value_dim/8 warps per block, the xor-shuffle dots, the rms
+  block reduction through per-token LOCAL slots and a barrier, the lane-0 z store gate, the speculative track stores -- EXECUTED on the
+  PYTHON emulator through gdn_decode itself, only the shuffle swapped for a shared exchange and the lane count forced. Odd batch (3), two
+  key columns per lane, start_pos 0 (zeroed state) and > 0, T = 1..GDN_DECODE_TOKENS with track buffers:
+  (a) a T-token run is BIT-IDENTICAL to T chained single-token calls -- z, conv_state, state and every track slot (the state after call
+      t+1) -- so every T runs the T == 1 kernel's arithmetic (md5-pinned in TestGDNDecodeSmallT). The qkv partials are multiples of 1/16:
+      their sums are exact in fp16, so the chain's conv_state rounding between calls loses nothing.
+  (b) both against an fp64 numpy reference (decode_reference chained, conv window exact)."""
+  B, Hk, H, K, V, P = 3, 2, 4, 64, 32, 3
+
+  def _run(self, qkv, gate, beta_alpha, conv0, state0, weights, pos:int, T:int):
+    B, H, V = self.B, self.H, self.V
+    dev = "PYTHON"
+    def rows(p): return Tensor.custom_kernel(Tensor.empty(*p.shape, device=dev), Tensor(p, device=dev).realize(), fxn=_copy_kernel)[0] \
+                         .sum(-1).reshape(B, T, p.shape[1])
+    conv_state, state = Tensor(conv0, device=dev).contiguous().realize(), Tensor(state0, device=dev).contiguous().realize()
+    track = (Tensor.zeros(GDN_DECODE_TOKENS-1, *conv0.shape, dtype=dtypes.float16, device=dev).contiguous().realize(),
+             Tensor.zeros(GDN_DECODE_TOKENS-1, *state0.shape, device=dev).contiguous().realize())
+    with mock.patch.object(nv, "warp_reduce", _emulated_warp_reduce), \
+         mock.patch.object(nv, "_gdn_decode_kernel", _card_form(nv._gdn_decode_kernel)), \
+         mock.patch.object(nv, "_gdn_conv_decode_kernel", _card_form(nv._gdn_conv_decode_kernel)):
+      z = gdn_decode(rows(qkv), rows(gate), Tensor(beta_alpha, device=dev).reshape(B, T, 2*H), conv_state, state,
+                     *(Tensor(w, device=dev) for w in weights), UOp.variable("start_pos", 0, 63).bind(pos), k_heads=self.Hk, qk_eps=1e-6,
+                     norm_eps=1e-5, track=track if T > 1 else None)
+      return z.numpy().reshape(B, T, H*V), conv_state.numpy(), state.numpy(), track[0].numpy()[:T-1], track[1].numpy()[:T-1]
+
+  def test_run_bit_identical_to_chain_and_matches_fp64(self):
+    B, Hk, H, K, V, P = self.B, self.Hk, self.H, self.K, self.V, self.P
+    C = 2*Hk*K + H*V
+    rng = np.random.default_rng(140)
+    def f32(*s, scale=1.0): return (rng.standard_normal(s) * scale).astype(np.float32)
+    conv0, state0 = f32(B, 3, C).astype(np.float16), f32(B, H, V, K, scale=0.3)
+    weights = (f32(C, 4, scale=0.5), f32(V), f32(H), -np.abs(f32(H)))  # conv, ssm_norm, dt_bias, ssm_a
+    for T in range(1, GDN_DECODE_TOKENS + 1):
+      qkv = (rng.integers(-24, 25, (B*T, C, P)) / 16).astype(np.float32)
+      gate, beta_alpha = f32(B*T, H*V, 2), f32(B*T, 2*H)
+      for pos in (0, 5):
+        with self.subTest(tokens=T, start_pos=pos):
+          z, conv, state, conv_tr, state_tr = self._run(qkv, gate, beta_alpha, conv0, state0, weights, pos, T)
+          # (b) fp64: chained single-token references, the conv window carried exactly
+          want_z, w_conv, w_state = [], conv0.astype(np.float64), state0.astype(np.float64)
+          for t in range(T):
+            r = slice(t, B*T, T)  # (b, t) rows
+            zt, w_conv, w_state = decode_reference(*(x.astype(np.float64) for x in (qkv[r], gate[r], beta_alpha[r, :H], beta_alpha[r, H:])),
+                                                   w_conv, w_state, *(w.astype(np.float64) for w in weights), pos + t, Hk)
+            want_z.append(zt)
+            if t < T-1:
+              np.testing.assert_array_equal(conv_tr[t], w_conv.astype(np.float16), f"conv track slot {t}")
+              np.testing.assert_allclose(state_tr[t], w_state, rtol=1e-5, atol=1e-5, err_msg=f"state track slot {t}")
+          np.testing.assert_allclose(z, np.concatenate(want_z, axis=1), rtol=5e-3, atol=2e-3)
+          np.testing.assert_array_equal(conv, w_conv.astype(np.float16))
+          np.testing.assert_allclose(state, w_state, rtol=1e-5, atol=1e-5)
+          if T == 1: continue
+          # (a) the chain: T single-token calls, each starting from the previous one's conv_state / state
+          c_conv, c_state, c_z = conv0, state0, []
+          for t in range(T):
+            r = slice(t, B*T, T)
+            zt, c_conv, c_state, _, _ = self._run(qkv[r], gate[r], beta_alpha[r], c_conv, c_state, weights, pos + t, 1)
+            c_z.append(zt)
+            if t < T-1:
+              np.testing.assert_array_equal(conv_tr[t], c_conv, f"conv track slot {t} vs the chain")
+              np.testing.assert_array_equal(state_tr[t], c_state, f"state track slot {t} vs the chain")
+          np.testing.assert_array_equal(z, np.concatenate(c_z, axis=1))
+          np.testing.assert_array_equal(conv, c_conv)
+          np.testing.assert_array_equal(state, c_state)
 
 class TestGDNDecodeBlock(unittest.TestCase):
   """GatedDeltaNetBlock._attention at T=1 through nv.gdn_decode (gate mocked open, CPU form) against the generic graph: output and
