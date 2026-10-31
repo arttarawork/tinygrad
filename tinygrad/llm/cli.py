@@ -147,7 +147,7 @@ class FallbackTemplate:
       out += self.end_turn()
     return out + self.role("assistant") if add_generation_prompt else out
 
-from tinygrad.llm.serve import LLMServer, STATE_CACHE_MB, SPEC_TOKENS
+from tinygrad.llm.serve import LLMServer, STATE_CACHE_MB, SPEC_TOKENS, SPEC_TOKENS_SHORT
 
 def main():
   parser = argparse.ArgumentParser()
@@ -202,7 +202,8 @@ def main():
 
   # warmup the JIT
   if args.warmup or args.serve:
-    with Context(DEBUG=max(DEBUG.value, 1)): model.warmup(vision=args.mmproj is not None, spec_k=SPEC_TOKENS)  # T4.132: --mtp's verify widths
+    with Context(DEBUG=max(DEBUG.value, 1)):  # T4.132/T4.143: capture every k's VERIFY widths
+      model.warmup(vision=args.mmproj is not None, spec_k=max(SPEC_TOKENS, SPEC_TOKENS_SHORT))
 
   # start server
   if args.serve:

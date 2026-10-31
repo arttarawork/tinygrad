@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 # T4.65: k for --mtp speculative decoding (LLMServer.spec_k's default) -- see cli.py's --mtp flag. T4.132: speculative_generate and
 # warmup cap it at 3 (model.py spec_k_clamped: VERIFY's k+1 tokens must stay on the 4-token NV decode kernels).
 SPEC_TOKENS = getenv("SPEC_TOKENS", 3)
+# T4.143 (10-31): a second k for prompts shorter than SPEC_SHORT_CONTEXT tokens (SPEC_TOKENS_SHORT 0 = one k everywhere). The card, greedy,
+# with the T4.142 32k draft head: k=3 vs k=2 is 82.9 vs 78.7 tok/s at 2k and 72.6 vs 66.8 at 20k, but 55.8 vs 59.8 at 131k (VERIFY(4)'s
+# attention grows with the fill and fewer drafts get accepted there). Read per call, so tests can patch them; warmup captures max(k).
+SPEC_TOKENS_SHORT, SPEC_SHORT_CONTEXT = getenv("SPEC_TOKENS_SHORT", 0), getenv("SPEC_SHORT_CONTEXT", 65536)
+def spec_k_for(server, prompt_len:int) -> int: return SPEC_TOKENS_SHORT if SPEC_TOKENS_SHORT and prompt_len < SPEC_SHORT_CONTEXT else server.spec_k
 # T4.132: --mtp speculates only while the request's prompt is shorter than this many tokens (0 = always). It was 65536 while VERIFY's
 # attention ran the 16-row prefill kernel (1.04x plain at 131k); T4.134 put VERIFY on the split-KV decode kernel: k=2 on the card
 # (10-30) 1.63x plain at 2k, 1.60x at 20k, 1.46x at 131k -- no cap.
@@ -445,7 +450,7 @@ class Handler(HTTPRequestHandler):
     # let this turn's own output leak into next turn's splice_ids prev_ids (doubling it) and into inject()'s
     # resumed prompt (doubling everything generated before the nudge/budget hit). A copy keeps `ids` the pure
     # prompt for the rest of this function; cli.py's generate() callers still rely on the mutation and are untouched.
-    gen = model.speculative_generate(list(ids), k=self.server.spec_k, temperature=temperature) if use_spec \
+    gen = model.speculative_generate(list(ids), k=spec_k_for(self.server, len(ids)), temperature=temperature) if use_spec \
       else model.generate(list(ids), temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
       # T5.5: image requests are greedy -- only the greedy vision jit family is warmed (each extra prefill family costs
       # ~0.78 GB on the 3090, see model.VISION_CHUNK)
@@ -465,7 +470,7 @@ class Handler(HTTPRequestHandler):
             yield chunk({field:delta})
         # T4.92: presence_penalty carries over -- generate() resets its own mask per call, so without this an active
         # penalty would silently vanish for the rest of the response after a loop-breaker/think-budget injection.
-        gen = model.speculative_generate(ids + out, k=self.server.spec_k, temperature=temperature) if use_spec else \
+        gen = model.speculative_generate(ids + out, k=spec_k_for(self.server, len(ids) + len(out)), temperature=temperature) if use_spec else \
           model.generate(ids + out, temperature=0.0 if vision is not None else temperature, vision=vision, presence_penalty=presence_penalty)
         it = iter(gen)
       loops, nudges = (LoopDetector(LOOP_REPEATS) if LOOP_REPEATS else None), 0

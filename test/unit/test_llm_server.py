@@ -1166,6 +1166,26 @@ class TestSpecInjection(unittest.TestCase):
       list(h.run_model([1, 2, 3, 4], "m"))
     self.assertEqual(seen, ["spec", "plain", "spec"])
 
+  def test_short_prompt_takes_the_short_k(self):
+    # T4.143: SPEC_TOKENS_SHORT drafts for prompts shorter than SPEC_SHORT_CONTEXT, the server's spec_k otherwise; 0 = spec_k everywhere
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import tinygrad.llm.serve as srv
+    ks = []
+    def speculative_generate(ids, k=3, temperature=0.0):
+      ks.append(k)
+      yield 0
+    model = SimpleNamespace(get_start_pos=lambda ids: 0, generate=None, speculative_generate=speculative_generate, mtp_head=object(),
+                            max_context=4096)
+    h = srv.Handler.__new__(srv.Handler)
+    h.server = SimpleNamespace(model=model, tok=self._tok(), mtp=True, spec_k=2, state_cache_mb=0, vision=None, last=None)
+    with patch.object(srv, "SPEC_TOKENS_SHORT", 3), patch.object(srv, "SPEC_SHORT_CONTEXT", 4):
+      list(h.run_model([1, 2, 3], "m"))
+      list(h.run_model([1, 2, 3, 4], "m"))
+    with patch.object(srv, "SPEC_TOKENS_SHORT", 0):
+      list(h.run_model([1, 2, 3], "m"))
+    self.assertEqual(ks, [3, 2, 2])
+
   def test_real_model_budget_restart_resumes_and_matches_plain(self):
     # a tiny GDN+attention model with an MTP head (test_spec_decode's varied one): the think budget lands somewhere in a batch, the
     # speculative restart resumes at the live cache (start_pos = everything before the last emitted token), and its continuation is
