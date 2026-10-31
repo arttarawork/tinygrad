@@ -453,6 +453,15 @@ class TestJitPrune(unittest.TestCase):
     self.assertEqual(counts, [[4, 0], [8, 0], [12, 0]])
     self.assertEqual(got, ref)
 
+  def test_prune_keeps_lazy_random_weight_one_time(self):
+    # T4.139: a random weight drawn BEFORE the capture (lazy, realized by it) is one-time work, not a per-call draw
+    w = Tensor.rand(4)
+    f = TinyJit(lambda x: (x * w).realize(), prune=True)
+    f.cnt = 1
+    x = Tensor.ones(4).contiguous().realize()
+    got = [f(x).tolist() for _ in range(3)]
+    self.assertEqual(got, [w.tolist()] * 3)
+
 
 class TestJitInsideJit(unittest.TestCase):
   def test_jit_jit_error(self):

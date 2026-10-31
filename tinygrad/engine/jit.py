@@ -301,6 +301,13 @@ class _TinyJit(Generic[ReturnType]):
       # jit capture
       assert self.fxn is not None
       if capturing: raise RuntimeError(f"having TinyJit inside another TinyJit is not supported {len(capturing)=} {capturing=}")
+      # T4.139: a pruned replay keeps every kernel that reads Tensor.rand's counter (prune_linear), so a draw made BEFORE the capture and
+      # only realized inside it (a lazily initialized random weight) would replay too and re-randomize the weight every call. Realize
+      # such draws (and a lazy counter) now: the capture's only counter readers are then its own draws.
+      if self.prune and (pending := [t for tref in list(all_tensors) if (t:=tref()) is not None and not t.uop.is_realized and
+                                     any(u.op is Ops.THREEFRY for u in t.uop.toposort())] +
+                                    [c for c in Tensor._device_rng_counters.values() if not c.uop.is_realized]):
+        Tensor.realize(*pending)
       self._linears: list[UOp] = []
       capturing.append(self)
       try:
