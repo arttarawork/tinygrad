@@ -388,7 +388,7 @@ def add_rmsnorm_q8(residual:Tensor, weight:Tensor, eps:float, partials:Tensor|No
   may be in the IMMA gemm's (C, tokens, dim) layout (split_k_partials of an nv_wmma_linear result). q8_fp16: q/scale quantize the fp16
   copy (want_fp16), the value an fp16 consumer reads."""
   *lead, toks, dim = residual.shape
-  tokens = cast(int, residual.max_shape[-2])
+  tokens = residual.max_shape[-2]
   assert all(d == 1 for d in lead) and isinstance(dim, int) and (isinstance(toks, int) or toks.is_bound_var), f"{residual.shape=}"
   if lead and isinstance(toks, int): residual = residual.reshape(toks, dim)
   # T4.125b: default = the widest block (<= 1024 threads): 1024 at dim=5120, i.e. 5 elements per thread and 5 q8 groups per warp
@@ -446,13 +446,13 @@ def _ffn_act_q8_kernel(q:UOp, scale:UOp, gate:UOp, up:UOp, sums:UOp|None=None, *
   token_group, lane = UOp.range(tokens*groups, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   token, group = token_group // groups, token_group % groups
   gate, up = gate.reshape(tokens, groups, 32, C), up.reshape(tokens, groups, 32, C)
-  def act(e:UOp) -> UOp:
+  def act1(e:UOp) -> UOp:  # the decode layout's (the prefill layout's act(tok, grp, e) above returns before this)
     gate_sum = sum((gate[token, group, e, c].float() for c in range(C)), UOp.const(0, dtypes.float32))
     up_sum = sum((up[token, group, e, c].float() for c in range(C)), UOp.const(0, dtypes.float32))
     return gate_sum.silu() * up_sum
-  group_scale = (warp_reduce(act(lane).abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
+  group_scale = (warp_reduce(act1(lane).abs(), maximum=True, full_wave=True) / 127).maximum(1e-8)
   word_lane = lane.minimum(7)
-  xs = tuple(act(word_lane*4+i) for i in range(4))
+  xs = tuple(act1(word_lane*4+i) for i in range(4))
   stores = (q[token, group, lane.valid(lane < 8)].store(_q8_pack(xs, group_scale)),
             scale[token, group.valid(lane.eq(0))].store(group_scale))
   return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="ffn_act_q8_nv", opts_to_apply=()))
