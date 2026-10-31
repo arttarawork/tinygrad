@@ -36,6 +36,9 @@ Q8_WORD_LANES = (4, 2, 1)  # T4.138: xor offsets over a 32-group's 8 lanes (one 
 NV_NORM_SPLIT = ContextVar("NV_NORM_SPLIT", 1)
 # T4.146: the split decode-width norm on _add_rmsnorm_q8_words_kernel's layout (1, default) or T4.137's (0, A/B) -- bit-identical outputs
 NV_NORM_WORDS = ContextVar("NV_NORM_WORDS", 1)
+# T4.146: warps per block of the decode-width (tokens <= 4) ffn_act_q8 on _q8_lane_words' layout, or 0 = T4.127a's one-warp-per-group kernel
+# (A/B) -- bit-identical outputs. Read in ffn_act_q8 (uncached) and passed into the cache key, like NV_Q8_WARPS
+NV_ACT_DECODE_WARPS = ContextVar("NV_ACT_DECODE_WARPS", 2)
 
 def nv_quant_supported(device:str|tuple[str, ...]|None) -> bool:
   if isinstance(device, tuple): device = device[0]
@@ -507,7 +510,11 @@ def _ffn_act_q8_kernel(q:UOp, scale:UOp, gate:UOp, up:UOp, sums:UOp|None=None, *
   T4.141: warps >= 1 = a prefill chunk on q8_quantize's prefill layout (_q8_lane_words: one 32-lane block per (token, group) would be
   69632 one-warp blocks at 128 tokens, T4.128 step 6's latency trap), gate/up in the IMMA gemm's (C, tokens, hidden_dim) layout when
   kfirst, and the group sums (q8_quantize's sums=True) for a Q4_1/Q5_K ffn_down. The same formulas: q/scale/sums bit-identical to
-  q8_quantize of the materialized activation."""
+  q8_quantize of the materialized activation.
+  T4.146: the decode step too (NV_ACT_DECODE_WARPS): the one-warp-per-group kernel below issued its whole quantize per group for 8
+  useful lanes and loaded each element twice (once for the max, again -- 10 more partial loads per value -- by the 4 packing lanes),
+  7.0 us per launch on the card (10-31 profile); the lane-word layout loads each lane's 4 values once (20 consecutive floats of gate and
+  of up) and reduces the max over 8 lanes in 3 shuffles: 136 warps per token instead of 544 one-warp blocks."""
   groups = hidden_dim // Q8_GROUP_SIZE
   if warps:
     g4, u4 = ((p.reshape(C, tokens, groups, 32) if kfirst else p.reshape(tokens, groups, 32, C)) for p in (gate, up))
@@ -543,8 +550,8 @@ def ffn_act_q8(gate_partials:Tensor, up_partials:Tensor, tokens:int, hidden_dim:
   q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=dev)
   scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=dev)
   extra = [Tensor.empty(tokens, groups, dtype=dtypes.float32, device=dev)] if sums else []
-  # T4.141: NV_Q8_WARPS read here (uncached), as q8_quantize does; warps 0 = the decode kernel
-  warps = max(NV_Q8_WARPS.value, 1) if tokens > 4 else 0
+  # T4.141: NV_Q8_WARPS read here (uncached), as q8_quantize does; warps 0 = the decode kernel. T4.146: NV_ACT_DECODE_WARPS at decode width
+  warps = max(NV_Q8_WARPS.value, 1) if tokens > 4 else max(NV_ACT_DECODE_WARPS.value, 0)
   fxn = functools.partial(_ffn_act_q8_kernel, tokens=tokens, hidden_dim=hidden_dim, C=C, warps=warps, kfirst=kfirst)
   outs = Tensor.custom_kernel(q, scale, gate_partials, up_partials, *extra, fxn=fxn)
   return tuple(outs[:2] + outs[4:])

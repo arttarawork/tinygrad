@@ -492,8 +492,8 @@ class TestFFNActQ8Kernel(unittest.TestCase):
     rng = np.random.default_rng(hidden + C)
     gate_p = rng.standard_normal((tokens, hidden, C)).astype(np.float32)
     up_p = rng.standard_normal((tokens, hidden, C)).astype(np.float32)
-    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce_one_warp), \
-         mock.patch.object(nv_quant, "_ffn_act_q8_kernel", nv_quant._ffn_act_q8_kernel.__wrapped__):  # bypass the cache
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce_one_warp), Context(NV_ACT_DECODE_WARPS=0), \
+         mock.patch.object(nv_quant, "_ffn_act_q8_kernel", nv_quant._ffn_act_q8_kernel.__wrapped__):  # bypass the cache; T4.146: this layout
       q, scale = ffn_act_q8(Tensor(gate_p, device="PYTHON"), Tensor(up_p, device="PYTHON"), tokens, hidden)
       q_np, scale_np = q.numpy(), scale.numpy()
     ref_q, ref_scale = self.np_ffn_act_q8(gate_p, up_p)
@@ -547,13 +547,54 @@ class TestFFNActQ8Prefill(unittest.TestCase):
     self.assertEqual(stack, 0)
 
   def test_decode_render_unchanged(self):
+    # T4.146: T4.127a's decode kernel is NV_ACT_DECODE_WARPS=0's now -- byte-identical to before
     import hashlib
     from test.unit.test_llm_nv_scan import _render_cuda
     for tokens, digest in self.DECODE_MD5.items():
-      with self.subTest(tokens=tokens):
+      with self.subTest(tokens=tokens), Context(NV_ACT_DECODE_WARPS=0):
         q = ffn_act_q8(Tensor.empty(tokens, 17408, 17), Tensor.empty(tokens, 17408, 17), tokens, 17408)[0]
         src = _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
         self.assertEqual(hashlib.md5(src.encode()).hexdigest(), digest)
+
+  def test_decode_words_render(self):
+    # T4.146: the decode step's ffn_act_q8 (the 27B: 17408 hidden, the gate/up gemvs' 5 split-K partials) on the lane-word layout -- 2-warp
+    # blocks (68 per token), 3 xor shuffles, no lane gate, each lane's 4 x 5 partials of gate and of up as 5 float4 loads each
+    from test.unit.test_llm_nv_scan import _render_cuda
+    from test.unit.test_llm_nv_gdn_prep import TestNvrtcRegisters
+    for tokens in (1, 3):
+      with self.subTest(tokens=tokens):
+        q = ffn_act_q8(Tensor.empty(tokens, 17408, 5), Tensor.empty(tokens, 17408, 5), tokens, 17408)[0]
+        src = _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
+        self.assertIn("__launch_bounds__(64)", src)
+        self.assertEqual([int(n) for n in re.findall(r"blockIdx\.[xyz]; /\* (\d+) \*/", src)], [68 * tokens])
+        self.assertEqual(src.count("__shfl_xor_sync"), 3)
+        self.assertEqual(src.count("float4 val"), 10)
+        self.assertNotIn("if (", src)
+        try: regs, stack = TestNvrtcRegisters._attrs(src)  # the docker nvrtc lane; 11-01: no spill stack
+        except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
+        self.assertEqual(stack, 0)
+
+  @unittest.skipIf(sys.version_info < (3, 12), "PYTHON emulator float16 needs 3.12+")
+  def test_decode_words_bit_identical_to_the_one_warp_kernel(self):
+    # T4.146: the decode widths (1 and 3 tokens) at the gemv partials' (tokens, hidden, C) layout, 1/2/4-warp blocks (96 hidden = 3 groups:
+    # surplus lanes redo the last group) -- q and scale equal T4.127a's kernel's (NV_ACT_DECODE_WARPS=0) to the bit, and numpy's formula
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce
+    hidden, C = 96, 5
+    for tokens in (1, 3):
+      rng = np.random.default_rng(tokens)
+      gate, up = ((rng.standard_normal((tokens, hidden, C)) * 2).astype(np.float32) for _ in range(2))
+      def run(warps:int):
+        with Context(NV_ACT_DECODE_WARPS=warps), mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce if warps else
+                                                                    _emulated_warp_reduce_one_warp), \
+             mock.patch.object(nv_quant, "_ffn_act_q8_kernel", nv_quant._ffn_act_q8_kernel.__wrapped__):
+          return [t.numpy() for t in ffn_act_q8(Tensor(gate, device="PYTHON"), Tensor(up, device="PYTHON"), tokens, hidden)]
+      one = run(0)
+      for warps in (1, 2, 4):
+        with self.subTest(tokens=tokens, warps=warps):
+          for a, b in zip(run(warps), one): np.testing.assert_array_equal(a, b)
+      ref_q, ref_scale = TestFFNActQ8Kernel.np_ffn_act_q8(gate, up)
+      np.testing.assert_array_equal(one[0].view(np.int8).reshape(ref_q.shape), ref_q)
+      np.testing.assert_allclose(one[1], ref_scale, rtol=1e-6)
 
 def np_q8_quantize(x:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
   """q8_quantize_nv's math on (tokens, in_features) fp32: int8 q (tokens, groups, 32), scale, and T4.128's group sums scale*sum(q)."""
