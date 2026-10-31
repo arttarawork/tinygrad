@@ -162,6 +162,10 @@ NV_ATTN_DEC_KTILES = ContextVar("NV_ATTN_DEC_KTILES", 1)  # 16-key tiles per loo
 # 96), the q A fragments (2 m-tiles x 8 blocks x 4 words, 16 of them the zero half = 48) and the q scales (3 x 8 = 24): 168 of 255
 # before the step's K words, K scales and S partials. ptxas parks 18 of the read-only q values in local memory before the loop and
 # swaps 17 O registers out (STL) for the S phase and back (LDL.LU) for P.V every step -- live state, not an ordering artefact.
+# After (T4.144: VERIFY's q words/scales in shared memory, the prologue split over the block's warps): VERIFY(3) DSPLIT 2 249 regs +
+# 0 B (3464 SASS instructions per warp, was 8304); VERIFY(4) DSPLIT 2 255 + 16 B (3 loop-invariant index words, one LDL each per
+# step; 3424 instructions); VERIFY(2) DSPLIT 2 189 + 0; DSPLIT 4: VERIFY(3) 195 + 0, VERIFY(4) 170 + 0; DSPLIT 1 still spills
+# (VERIFY(3) 736 B, VERIFY(4) 936 B). T == 1 unchanged (194 + 0, 3640 instructions).
 NV_ATTN_DEC_DSPLIT = ContextVar("NV_ATTN_DEC_DSPLIT", 2)
 DEC_IMMA_ARG = ((WMMA_N, WMMA_M, 32), 'CUDA', WARP_SIZE)  # m16n8k32 s8 -> s32 ('CUDA': the PYTHON emulator's fragment model; the
 DEC_HMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)  # renderer ignores the string) and m16n8k16 f16 -> f32
@@ -208,7 +212,9 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   S tile are the B fragment of the next n-tile). K/V words, their dequant and the int8 B fragments are shared by every row group.
   Row r is token r % T and sees keys < valid_kv_len - (T-1) + r % T: one compare per (row group, score) replaces the shared key
   mask (a select, no branch); the loads keep the shared valid_kv_len mask. d_split > 1 splits a slot's head_dim over that many
-  adjacent blocks (NV_ATTN_DEC_DSPLIT); T == 1 at d_split 1 builds exactly the T4.129 graph."""
+  adjacent blocks (NV_ATTN_DEC_DSPLIT); T == 1 at d_split 1 builds exactly the T4.129 graph.
+  T4.144: T > 1 quantizes q cooperatively (the block's warps split the (row group, block) units) into shared memory and the key loop
+  reads the A words and scales from there: same values, one __syncthreads() after the prologue, none in the loop."""
   valid_kv_len = _unbind(valid_kv_len)
   _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
   _, H, M, D = cast(tuple[int, int, int, int], q.shape)
@@ -238,29 +244,56 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   # pins (oh < 2 pins t = 0) into the gated component and then drops a gate whose ranges no longer appear in it
   # (schedule/indexing.py's reshape rewrite, pm_drop_and_clauses) -- a head-gated store rendered unconditional at G in {2, 3}
   zeros = (UOp.const(0, dtypes.int8),) * 4
-  qfrags:list[list[tuple[tuple[UOp, ...], tuple[UOp, ...]]]] = []  # per row group, per block: (even dims, odd dims) as int8
-  sqs:list[list[UOp]] = []
-  for head, head_ok in zip(heads, head_oks):
-    qfrags.append([])
-    sqs.append([])
-    for blk in range(blocks):
-      qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
-      amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
-      amax = amax.maximum(_shfl(amax, lane ^ 1))
-      amax = amax.maximum(_shfl(amax, lane ^ 2))
-      sq = (amax / 127).maximum(1e-8)
-      qfrags[-1].append((_i8x4(_q8_pack(tuple(qv[0::2]), sq)), _i8x4(_q8_pack(tuple(qv[1::2]), sq))))
-      # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
-      sqs[-1].append((amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D)))
-  def half(k:int, blk:int, odd:int) -> tuple[UOp, ...]: return qfrags[k][blk][odd] if k < RG else zeros
-  # m-tile mt's A: rows g = row group 2mt, rows g+8 = row group 2mt+1 (zero past the last group: always at T == 1)
-  afrags = [[UOp.stack(*half(2 * mt, blk, 0), *half(2 * mt + 1, blk, 0), *half(2 * mt, blk, 1), *half(2 * mt + 1, blk, 1))
-             for blk in range(blocks)] for mt in range(-(-RG // 2))]
+  def quant(head:UOp, head_ok:UOp, blk:UOp|int) -> tuple[UOp, UOp, UOp]:
+    # (even-dim word, odd-dim word, the scale S multiplies by) of this lane's 8 dims of (head, block)
+    qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
+    amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
+    amax = amax.maximum(_shfl(amax, lane ^ 1))
+    amax = amax.maximum(_shfl(amax, lane ^ 2))
+    sq = (amax / 127).maximum(1e-8)
+    # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
+    return _q8_pack(tuple(qv[0::2]), sq), _q8_pack(tuple(qv[1::2]), sq), (amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D))
+  if tokens == 1:
+    qfrags:list[list[tuple[tuple[UOp, ...], tuple[UOp, ...]]]] = []  # per row group, per block: (even dims, odd dims) as int8
+    sqs:list[list[UOp]] = []
+    for head, head_ok in zip(heads, head_oks):
+      qfrags.append([])
+      sqs.append([])
+      for blk in range(blocks):
+        even, odd, sqv = quant(head, head_ok, blk)
+        qfrags[-1].append((_i8x4(even), _i8x4(odd)))
+        sqs[-1].append(sqv)
+  else:
+    # T4.144: VERIFY keeps the q words and scales in shared memory instead of registers -- resident across the key loop they cost 72
+    # registers at 3 row groups, which pushed the O accumulators into local memory every step (the diagnosis above). The warps of a
+    # block share (batch, kv head, head_dim part), hence q: warp w quantizes units (row group, block) w, w + warps, ... (surplus warps
+    # redo the last unit: same values, same addresses), add_raw_barrier puts one __syncthreads() after the stores, and the key loop
+    # loads each word where its mma needs it (the .after(step) below keeps the loads inside the loop). Same words, same scales:
+    # the arithmetic is the registers' bit for bit. Layout [unit][parity][lane] / [unit][lane]: a warp's load is 32 consecutive words.
+    units = RG * blocks
+    qbuf = UOp.placeholder((units, 2, WARP_SIZE), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
+    sbuf = UOp.placeholder((units, WARP_SIZE), dtypes.float, slot=101, addrspace=AddrSpace.LOCAL)
+    pstores = []
+    for i in range(-(-units // warps)):
+      u = warp + i * warps if units % warps == 0 else (warp + i * warps).minimum(units - 1)
+      row = g + 8 * (u // blocks)
+      even, odd, sqv = quant(kvh * G + row, row < G, u % blocks)
+      pstores += [qbuf[u, 0, lane].store(even), qbuf[u, 1, lane].store(odd), sbuf[u, lane].store(sqv)]
+    qbuf, sbuf = qbuf.after(*pstores), sbuf.after(*pstores)
   row_max, row_sum = _reg((RG,), 1, SENTINEL, block), _reg((RG,), 2, 0, block)
   # O^T m-tile j x row group k: (dim rows g, g+8) x (rows 2t, 2t+1 of the group)
   o_acc = [tuple(_reg((4,), 10 + k * JD + j, 0, block) for j in range(JD)) for k in range(RG)]
   steps = (live + S - 1) // S
   step = UOp.range(steps, 100, AxisType.REDUCE)
+  if tokens > 1:
+    qb, sb = qbuf.after(step), sbuf.after(step)
+    qfrags = [[(_i8x4(qb[k * blocks + blk, 0, lane].load()), _i8x4(qb[k * blocks + blk, 1, lane].load())) for blk in range(blocks)]
+              for k in range(RG)]
+    sqs = [[sb[k * blocks + blk, lane].load() for blk in range(blocks)] for k in range(RG)]
+  def half(k:int, blk:int, odd:int) -> tuple[UOp, ...]: return qfrags[k][blk][odd] if k < RG else zeros
+  # m-tile mt's A: rows g = row group 2mt, rows g+8 = row group 2mt+1 (zero past the last group: always at T == 1)
+  afrags = [[UOp.stack(*half(2 * mt, blk, 0), *half(2 * mt + 1, blk, 0), *half(2 * mt, blk, 1), *half(2 * mt + 1, blk, 1))
+             for blk in range(blocks)] for mt in range(-(-RG // 2))]
   base = (slot + step * S) * KS
   def unsign(x:UOp) -> UOp: return (x + 0x78787878) ^ 0x80808080  # 4 nibbles (one per byte) -> 4 int8 nibble-8, T4.126
   scores:list[list[UOp]] = [[] for _ in range(RG)]
