@@ -262,6 +262,13 @@ SPEC_TRACE = ContextVar("SPEC_TRACE", 0)
 # sync per iteration (the logits readback), after the loop's own.
 SPEC_DEBUG = ContextVar("SPEC_DEBUG", 0)
 
+# T4.136 (10-31): what the draft chain feeds MTP step i+1 as its hidden. 1 (default): step i's own block output (MTPHead.draft_step's x,
+# before shared_head_norm) -- DeepSeek-style recursive MTP (vLLM's MTP proposer for the Qwen3-Next family does the same); step 0 still
+# takes the main model's hidden. 0: every step reuses the main model's hidden at start_pos-1 (T4.132's chain). Read once, when the
+# ("chain", k_eff) family captures (Transformer._draft_chain): replays keep the value that family was captured with -- on the server that
+# is warmup's, so an A/B needs a restart per value. Draft quality only: correctness never depends on it.
+SPEC_CHAIN_H = ContextVar("SPEC_CHAIN_H", 1)
+
 def spec_check_ids(ids:list[int], vocab:int, where:str) -> None:
   """T4.132 (10-30): an id outside [0, vocab) can only come from NaN logits (an argmax over a NaN row read back as the row width on
   the card) -- never emit it; the server reports the error instead of streaming ids the tokenizer has no bytes for."""
@@ -1387,7 +1394,8 @@ class MTPHead:
   shared_head_norm -> the OWNING Transformer's output head. That last step is output-norm-free: this
   head has its own learned final norm (shared_head_norm) instead of reusing the main model's
   output_norm, same as llama.cpp's DeepSeek-MTP implementation. One token of lookahead per call;
-  T4.64 chains calls (start_pos, start_pos+1, ...), feeding each call's own sampled token back in.
+  T4.64 chains calls (start_pos, start_pos+1, ...), feeding each call's own sampled token back in
+  (T4.136: and its block output as the next call's hidden -- draft_step, SPEC_CHAIN_H).
 
   `draft` takes the owning Transformer as an explicit argument rather than storing it on self: this
   object hangs off Transformer.mtp_head, and nn/state.py's get_state_dict recurses through every plain
@@ -1401,11 +1409,14 @@ class MTPHead:
     self.shared_head_norm = nn.RMSNorm(config.dim, config.norm_eps)
 
   def draft(self, owner:Transformer, h:Tensor, tok_ids:Tensor, start_pos:int|UOp) -> Tensor:
-    """h: (B,1,dim) the main model's last-layer hidden state (pre-output-norm) at position t.
+    """h: (B,1,dim) the main model's last-layer hidden state (pre-output-norm) at position t -- or, T4.136, the draft
+    chain's own: under SPEC_CHAIN_H=1 step i+1 of Transformer._draft_chain takes step i's block output (draft_step's x).
     tok_ids: (B,1) int, the token actually at position t+1. Returns (B,1,vocab) draft logits
     predicting position t+2. `block`'s KV cache advances with start_pos across calls, same as a
     main block's (see FFNBlock._init_state/__call__) -- so calling this again at start_pos+1
-    continues the same drafted sequence instead of overwriting it.
+    continues the same drafted sequence instead of overwriting it. T4.136: = draft_step(...)[0]; the chain calls
+    draft_step (for x too) unless this method is patched on the INSTANCE -- test_spec_decode.py's oracles return
+    logits only, and the chain reuses h for them.
 
     start_pos accepts a bound UOp Variable, not just a plain int (T4.66): TransformerBlock/
     MLATransformerBlock already handle one end-to-end (the same way the main model's own decode step
@@ -1428,8 +1439,13 @@ class MTPHead:
     byte-size accounting (this fork always serves a quantized GGUF, so the copy is the quantized size, not a
     dequantized fp32 one -- `.to()` replicates whatever owner.token_embd.weight is resident as, verbatim, no
     new precision decision here)."""
+    return self.draft_step(owner, h, tok_ids, start_pos)[0]
+
+  def draft_step(self, owner:Transformer, h:Tensor, tok_ids:Tensor, start_pos:int|UOp) -> tuple[Tensor, Tensor]:
+    """T4.136: draft() plus the block's output x (B,1,dim) on self.block's device, before shared_head_norm -- the hidden the draft
+    chain's next step takes (SPEC_CHAIN_H). Both lazy: in the chain's graph x feeds the next step's hnorm directly (same device)."""
     x = self.block(self._block_in(owner, h, tok_ids), start_pos)
-    return owner.output(self.shared_head_norm(x).to(owner.output.weight.device))
+    return owner.output(self.shared_head_norm(x).to(owner.output.weight.device)), x
 
   def _block_in(self, owner:Transformer, h:Tensor, tok_ids:Tensor) -> Tensor:
     """eh_proj(concat(enorm(embed(tok_ids)), hnorm(h))) on self.block's device -- (B,T,dim) f32 from h (B,T,dim) and
@@ -2274,23 +2290,31 @@ class Transformer:
   # chain, VERIFY, the accept test (+ the next iteration's inputs + the MTP cache rewrite), and on a partial accept the adopt -- 3-4
   # replays and the one readback. Step 6's form (one replay per draft step, the chunk cat, the anchor upload, h_last's copy and the
   # rewrite's input prep as eager realizes) cost ~20 ms of host time per eager realize on the card's host (10-30 phase table).
-  def _draft_step(self, h:Tensor, tok:Tensor, pos:UOp, temp:Tensor) -> tuple[Tensor, Tensor]:
-    """One MTP draft step: (h_last, the token at pos) -> the drafted id (B,1) and its logits (B,1,vocab). Greedy or sampled is decided
-    inside the graph from `temp` (forward()'s T4.105 where-select), so one family serves both; the sampled draw is sample_logits'
-    Gumbel-max over softmax(logits/temp) with MIN_P -- the ancestral q spec_accept_tensor's proof assumes."""
+  def _draft_step(self, h:Tensor, tok:Tensor, pos:UOp, temp:Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """One MTP draft step: (h, the token at pos) -> the drafted id (B,1), its logits (B,1,vocab) and the head block's output x (B,1,dim,
+    T4.136: MTPHead.draft_step's, the next step's hidden under SPEC_CHAIN_H; an instance-patched draft -- the eager oracles, logits
+    only -- hands h back instead). Greedy or sampled is decided inside the graph from `temp` (forward()'s T4.105 where-select), so one
+    family serves both; the sampled draw is sample_logits' Gumbel-max over softmax(logits/temp) with MIN_P -- the ancestral q
+    spec_accept_tensor's proof assumes."""
     assert self.mtp_head is not None
-    logits = self.mtp_head.draft(self, h, tok, pos)
+    if "draft" in vars(self.mtp_head): logits, x = self.mtp_head.draft(self, h, tok, pos), h
+    else: logits, x = self.mtp_head.draft_step(self, h, tok, pos)
     greedy = logits.argmax(-1)
-    return (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp, MIN_P), greedy), logits
+    return (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp, MIN_P), greedy), logits, x
 
   def _draft_chain(self, h:Tensor, tok:Tensor, temp:Tensor, *pos:UOp) -> tuple[Tensor, ...]:
     """T4.132: the draft chain as one graph -- len(pos) MTP steps (_draft_step), each fed the previous step's id at its own bound position
     (draft_pos_i: distinct names, so every step binds once per replay). Returns VERIFY's chunk [tok, d0..] (1,n) on the head's device,
     the same chunk on the first block's device (VERIFY's input; the same tensor on one device) and each step's logits (the sampled
-    accept's q). One family per k_eff = len(pos)."""
+    accept's q). One family per k_eff = len(pos).
+    T4.136: step 0 takes `h` (the main model's hidden at start_pos-1); under SPEC_CHAIN_H=1 every later step takes the previous step's
+    block output x -- a lazy edge inside this one graph, on the head's device (the block's own), so no realize and no copy is added.
+    SPEC_CHAIN_H is read here, i.e. once, when the ("chain", k_eff) family captures; its replays keep that value."""
+    chain_h = bool(SPEC_CHAIN_H.value)
     ids, qs = [tok], []
     for p in pos:
-      d, lg = self._draft_step(h, ids[-1], p, temp)
+      d, lg, x = self._draft_step(h, ids[-1], p, temp)
+      if chain_h: h = x
       ids.append(d)
       qs.append(lg)
     chunk = ids[0].cat(*ids[1:], dim=1).contiguous()
@@ -2304,8 +2328,9 @@ class Transformer:
     verify_h[:, m] (1,1,D); the graph also realizes the MTP cache rewrite below. One family per (n, greedy): the sampled one draws its
     uniforms inside the graph.
     The MTP rewrite (T4.66l) refills mtp_head.block's cache slots start_pos+1..start_pos+k_eff (mtp_pos = start_pos+1) from the TRUE
-    per-position hidden: the draft chain wrote slot start_pos+i from (h_last, chunk[i]) -- the right token, but h_last is position
-    start_pos-1's hidden at every step -- while slot t+1 belongs to (h_t, tok_{t+1}) = (verify_h[:, j], chunk[j+1]) for t = start_pos+j.
+    per-position hidden: the draft chain wrote slot start_pos+i from (its hidden, chunk[i]) -- the right token, but that hidden is position
+    start_pos-1's (h_last) at step 0 and, T4.136 (SPEC_CHAIN_H=1), the head's own previous block output at every step i >= 1 (h_last
+    again under 0) -- while slot t+1 belongs to (h_t, tok_{t+1}) = (verify_h[:, j], chunk[j+1]) for t = start_pos+j.
     T4.132: all k_eff slots unconditionally (step 6 rewrote the m accepted ones, which needed m on the host): for j >= m the pair is a
     rejected draft's, but those slots are >= the next iteration's start_pos' = start_pos+m+1, and MTPHead.draft at position p writes
     slot p (the block's store) before attending to slots <= p, so the next chain overwrites each before anything reads it (the
@@ -2534,16 +2559,15 @@ class Transformer:
         if trace_on: iter_t0 = time.perf_counter()
         k_eff = min(k, self.max_context - 1 - len(tokens))
 
-        # (a) DRAFT: chain mtp_head.draft k_eff times. h_last is reused UNCHANGED across the whole chain --
-        # MTPHead.draft's signature only takes one hidden-state argument, so it's the one anchor into the
-        # main model's context available without changing that (fixed, already-tested) signature; only
-        # tok_ids and start_pos advance per call, and `block`'s own KV cache (see MTPHead.draft's docstring)
-        # is what actually carries the chain's positional continuity from call to call. This never touches
+        # (a) DRAFT: chain the MTP step k_eff times. Step 0 takes h_last (the main model's hidden at start_pos-1, the one
+        # anchor into its context); T4.136: under SPEC_CHAIN_H=1 (default) every later step takes the previous step's own
+        # block output (MTPHead.draft_step's x, before shared_head_norm -- DeepSeek-style recursive MTP), under 0 h_last is
+        # reused UNCHANGED (T4.132's chain). tok_ids and start_pos advance per call, and `block`'s own KV cache (see
+        # MTPHead.draft's docstring) carries the chain's positional continuity from call to call. This never touches
         # the MAIN model's state -- mtp_head.block is always attention-only, never GatedDeltaNet (see
         # from_gguf's MTP branch) -- so drafting alone never touches the main model's GDN state; only verify does.
-        # Draft quality has zero effect on correctness (see the forced-mismatch test in test_spec_decode.py);
-        # a richer per-step hidden (threading the block's own pre-norm output between calls) is a quality-only
-        # lever for later, not something this task's gate depends on.
+        # Draft quality has zero effect on correctness (see the forced-mismatch test in test_spec_decode.py): the hidden
+        # each step takes moves only the acceptance rate.
         #
         # T4.132: the drafted ids stay on device -- the greedy argmax, or (temperature>0) a Gumbel-max sample from
         # softmax(logits/temperature) (sample_logits: the exact ancestral draw spec_accept_tensor's proof assumes; the
@@ -2551,7 +2575,7 @@ class Transformer:
         # is ONE replay (_draft_chain, family ("chain", k_eff)) whose inputs are buffers already on device: h_last and the
         # anchor, the previous accept replay's outputs (the prefill's on the first iteration), and its outputs are VERIFY's
         # input chunk and the draft logits. A draft patched onto the MTPHead INSTANCE (test_spec_decode.py's forced-accept
-        # oracles read the position in python) cannot be replayed: the chain runs eagerly then.
+        # oracles read the position in python) cannot be replayed: the chain runs eagerly then, reusing h_last (they return logits only).
         n = k_eff + 1
         if trace_on: draft_t0 = time.perf_counter()
         if k_eff:
