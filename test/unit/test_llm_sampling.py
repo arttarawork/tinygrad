@@ -40,6 +40,20 @@ class TestGreedySampling(unittest.TestCase):
       if caps.get(k) is not None: self.assertIs(j.captured, caps[k])
     self.assertIsNotNone(model.jit[(False, False, None, False)].captured)
 
+class TestPrefillFamilySampling(unittest.TestCase):
+  """T4.139: the pruned prefill family samples every request's first token; its Gumbel draw must advance Tensor.rand's counter on every
+  replay -- a pruned draw repeated the capture's noise, so a prompt at temperature 1.0 got the same first token every time."""
+  def test_first_token_draw_advances_every_request(self):
+    model = _tiny_model()
+    dev = model.blk[-1].device
+    def first(prompt):
+      before = Tensor._device_rng_counters[dev].tolist()[0]
+      tok = next(model.generate(prompt, temperature=1.0))  # the prefill chunk's own draw, no decode step
+      return tok, Tensor._device_rng_counters[dev].tolist()[0] - before
+    got = [first([1, 2, 3]) for _ in range(6)] + [first([4, 5, 6]) for _ in range(2)]
+    self.assertEqual([d for _, d in got], [100] * 8)  # one vocab-sized draw per request
+    self.assertGreater(len({t for t, _ in got[:6]}), 1, got)
+
 if __name__ == '__main__':
   unittest.main()
 
