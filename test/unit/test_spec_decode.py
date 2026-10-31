@@ -1393,6 +1393,29 @@ class TestDraftChainHidden(unittest.TestCase):
     self.assertEqual(cast(TinyJit, model.spec_jit[("chain", self.K)]).cnt, 3)  # captured on the first call, replayed on the second
     return [q.numpy() for q in out[2:]]
 
+  def test_draft_temperature_scale_scales_the_draw_and_q(self):
+    # T4.145: under SPEC_DRAFT_TEMP_SCALE=s the draft draws at temp*s and hands the accept logits/s (softmax((logits/s)/temp) == the draw's);
+    # 1.0 leaves both untouched
+    from unittest.mock import patch
+    import tinygrad.llm.model as mm
+    from tinygrad.llm.model import sample_logits, MIN_P
+    m = _load_gdn(seed=0)
+    m.mtp_head.ready(m, 2)
+    dev = m.output.weight.device
+    h = Tensor(np.random.default_rng(0).standard_normal((1, 1, DIM)).astype(np.float32), device=dev)
+    tok, v = Tensor([[3]], dtype="int32", device=dev), UOp.variable("draft_pos_0", 0, m.max_context - 1).bind(5)
+    lg, _ = m.mtp_head.draft_step(m, h, tok, v)
+    with patch.object(mm, "SPEC_DRAFT_TEMP_SCALE", 0.5):
+      Tensor.manual_seed(1)
+      d, q, _ = m._draft_step(h, tok, v, Tensor([1.0], device=dev))
+      np.testing.assert_allclose(q.numpy(), lg.numpy() / 0.5, rtol=1e-6, atol=1e-6)
+      Tensor.manual_seed(1)
+      d2 = sample_logits(lg[:, -1, :], Tensor([0.5], device=dev), MIN_P)  # the same draw at temp * s
+      self.assertEqual(int(d.item()), int(d2.item()))
+    with patch.object(mm, "SPEC_DRAFT_TEMP_SCALE", 1.0):
+      _, q1, _ = m._draft_step(h, tok, v, Tensor([1.0], device=dev))
+      np.testing.assert_allclose(q1.numpy(), lg.numpy(), rtol=1e-6, atol=1e-6)
+
   def test_chain_feeds_each_step_the_heads_own_hidden(self):
     # split models (head on CPU:1, blk[0] on CPU), so the captured graph's copies are visible too
     ref = _load_gdn(seed=0)
