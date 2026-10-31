@@ -53,7 +53,7 @@ from tinygrad.llm.kernels.amd import (Linear, Q4_0, Q8_0, Q4_1, IQ4_NL, Q4_K, Q5
 from tinygrad.runtime.autogen import ggml_common as _ggml
 from tinygrad.helpers import ContextVar
 from tinygrad.llm.kernels.nv import _nv_device_ok, iq_grid
-from tinygrad.llm.kernels.nv_quant import q8_quantize
+from tinygrad.llm.kernels.nv_quant import q8_quantize, _register_split_k
 
 NV_WMMA = ContextVar("NV_WMMA", 1)  # inside NV_CUSTOM_QUANT=1: 0 = keep the generic prefill matmul (A/B lever for the bench)
 NV_WMMA_TOKEN_TILE = ContextVar("NV_WMMA_TOKEN_TILE", 64)  # T4.124c: card knob -- more/fewer token-tile warps per block (PB.3)
@@ -731,9 +731,13 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
     params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
     kernel = _linear_imma_nv(*params, ggml_type=layer.ggml_type, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
     result = Tensor(out.after(kernel))
+    partials = result if imma["splitk"] > 1 else result.reshape(1, tokens, out_features)  # T4.141: (C, tokens, out) for split_k_partials
     if imma["splitk"] > 1: result = result.sum(0)
     result = result.reshape(*x_pad.shape[:-1], out_features)
     if symbolic: result = result.shrink(tuple((0, s) for s in (*x.shape[:-1], out_features)))
+    # T4.141: the fused prefill norm/activation kernels (model.py's _ffn_output, _feed_forward) read the gemm's raw output and sum the
+    # split-K partials themselves -- the reduce above is then never scheduled (nv_q8_linear's T4.125b trick)
+    if layer.bias is None: _register_split_k(result, partials)
     return result if layer.bias is None else result + layer.bias
   xh = x_pad.cast(dtypes.float16).contiguous().reshape(tokens, in_features)
   raw = (layer.packed_bytes if layer.packed_bytes is not None else layer.weight).uop.buf_uop  # always the byte view, see _byte

@@ -12,7 +12,7 @@ from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attentio
 from tinygrad.llm.kernels.nv import gated_delta_prefill as nv_gated_delta_prefill, nv_custom_kernels_supported, nv_decode_kernel_supported, \
   gdn_decode as nv_gdn_decode, GDN_DECODE_TOKENS
 from tinygrad.llm.kernels.nv_quant import nv_quant_supported, NV_QUANT_TYPES, add_rmsnorm_q8, register_fused_q8, split_k_partials, ffn_act_q8, \
-  clear_step_caches
+  clear_step_caches, _register_split_k, register_padded, padded_source
 from tinygrad.llm.kernels.nv_dense import nv_f16_gemv_raw
 from tinygrad.llm.kernels.nv_attn import MAX_PREFILL_ROWS, nv_decode_attention, nv_decode_attention_ok, nv_prefill_attention, nv_verify_attention
 from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill as nv_gdn_prefill, gdn_post as nv_gdn_post, GDN_NV_PREP
@@ -459,6 +459,19 @@ class TransformerConfig:
 # run the GDN decode kernels cover (GDN_DECODE_TOKENS) -- i.e. a decode step (1) or speculative decoding's VERIFY (<= k+1).
 NV_SMALL_T = 4
 
+# T4.141: the same fused kernels at a PREFILL chunk's padded width (nv_prefill_tokens): every norm site (attention q/k/v, the head,
+# ffn_norm with the residual add, GDN's attn_norm) hands the IMMA gemms (kernels/nv_gemm.py) their q8 activations, summing the producing
+# gemm's split-K partials in-kernel. 0 = the generic graphs at T > NV_SMALL_T (card A/B, rollback); read at call time in nv_fused_norm,
+# _ffn_output and GatedDeltaNetBlock._normed_for_attention.
+NV_PREFILL_FUSED_NORM = ContextVar("NV_PREFILL_FUSED_NORM", 1)
+
+def nv_prefill_tokens(x:Tensor) -> int|None:
+  """T4.141: the token count a prefill chunk x (1, T, D) runs the fused kernels at -- T's bound when T is symbolic (the width
+  nv_wmma_linear pads it to), else T -- or None: knob off, a batch, a decode-sized run, or a width the gemm's 16-row tiles don't divide
+  (nv_wmma_linear would not read the q8 activations). The q8 key is the consumer's own pad of the norm output: t.pad_to(t.max_shape)."""
+  tokens = x.max_shape[1]
+  return tokens if NV_PREFILL_FUSED_NORM.value and x.shape[0] == 1 and tokens > NV_SMALL_T and tokens % 16 == 0 else None
+
 @functools.cache
 def spec_k_clamped(k:int) -> int:
   """T4.132: speculative_generate's draft count, capped so VERIFY (k+1 tokens) stays on the NV_SMALL_T-token decode kernels -- at k=4 the
@@ -470,13 +483,17 @@ def nv_fused_norm(norm:nn.RMSNorm, weight:Tensor|None, x:Tensor, *consumers:Line
   """norm(x) -- T4.125b: on the NV decode path (concrete T <= NV_SMALL_T, `weight` = norm's fp32 copy prepared at load, every consumer
   an NV-quantized Linear) the RMSNorm and the consumers' shared q8 quantize run as ONE add_rmsnorm_q8 kernel (no residual add):
   register_fused_q8 hands that quantize the kernel's (q, scale), so the RMSNorm graph returned here is never read -- _ffn_output's
-  trick at the attention blocks' attn_norm (q/k/v) and at output_norm (the head). Anything else: plain norm(x), byte-identical."""
+  trick at the attention blocks' attn_norm (q/k/v) and at output_norm (the head). T4.141: also a prefill chunk at its padded width
+  (nv_prefill_tokens; the q8 rows past the chunk are the generic pad's zeros). Anything else: plain norm(x), byte-identical."""
   T, dim = x.shape[1], x.shape[-1]
-  if not (isinstance(T, int) and T <= NV_SMALL_T and isinstance(dim, int) and dim % 256 == 0 and weight is not None
-          and nv_quant_supported(weight.device) and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
-  tokens = T * cast(int, x.shape[0])
-  _, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), weight, norm.eps)
-  register_fused_q8(normed := norm(x), tokens, dim, q, scale)
+  if not (isinstance(dim, int) and dim % 256 == 0 and weight is not None and nv_quant_supported(weight.device)
+          and all(c.ggml_type in NV_QUANT_TYPES for c in consumers)): return norm(x)
+  if isinstance(T, int) and T <= NV_SMALL_T: tokens, residual = T * cast(int, x.shape[0]), x.reshape(T * cast(int, x.shape[0]), dim)
+  elif (T_pad := nv_prefill_tokens(x)) is not None: tokens, residual = T_pad, x  # T4.141: the (1, T, D) chunk (add_rmsnorm_q8's docstring)
+  else: return norm(x)
+  _, q, scale, _ = add_rmsnorm_q8(residual, weight, norm.eps)
+  normed = norm(x)
+  register_fused_q8(normed.pad_to(normed.max_shape), tokens, dim, q, scale)
   return normed
 
 class FFNBlock:
@@ -616,21 +633,32 @@ class FFNBlock:
     ffn_gate/ffn_up's nv_q8_linear (shared between the two since T4.123a) return the kernel's own (q, scale)
     instead of re-deriving them, so the RMSNorm graph's only readers never read its VALUE -- dead code, never
     lowered. Every other path (MoE, tensor-parallel FFN, symbolic T, non-NV, ggml_type not yet probed or not
-    NV-quantized, norm weights not prepared by prepare_nv_norms) keeps the original two-step byte-identical form."""
+    NV-quantized, norm weights not prepared by prepare_nv_norms) keeps the original two-step byte-identical form.
+    T4.141: a prefill chunk (nv_prefill_tokens) whose attn_out is an IMMA gemm's (ssm_out/attn_output: split_k_partials of an
+    nv_wmma_linear result) takes the same kernel at the padded width, h sliced back to the chunk."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T <= NV_SMALL_T and dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
+    if (dim % 256 == 0 and not hasattr(self, 'ffn_gate_exps') and not hasattr(self, 'ffn_gate_tp')
         and nv_quant_supported(self.ffn_gate.weight.device) and self.ffn_gate.ggml_type in NV_QUANT_TYPES
         and self.ffn_up.ggml_type in NV_QUANT_TYPES and self.nv_norm_weights is not None):
-      tokens = T * cast(int, x.shape[0])
-      # T4.125b: the producing gemv's own split-K partials (ssm_out/attn_output via nv_q8_linear), summed in-kernel -- attn_out's
-      # summing reduce is then never read; anything else (a generic Linear) still folds in as one C=1 "split"
-      partials = split_k_partials(attn_out)
-      new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[1], self.ffn_norm.eps,
-                                                   partials=attn_out.reshape(tokens, dim, 1) if partials is None else partials)
-      h = new_residual.reshape(x.shape)
-      normed = self.ffn_norm(h)
-      register_fused_q8(normed, tokens, dim, q, scale)
-      return h + self._feed_forward(normed)
+      if isinstance(T, int) and T <= NV_SMALL_T:
+        tokens = T * cast(int, x.shape[0])
+        # T4.125b: the producing gemv's own split-K partials (ssm_out/attn_output via nv_q8_linear), summed in-kernel -- attn_out's
+        # summing reduce is then never read; anything else (a generic Linear) still folds in as one C=1 "split"
+        partials = split_k_partials(attn_out)
+        new_residual, q, scale, _ = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[1], self.ffn_norm.eps,
+                                                     partials=attn_out.reshape(tokens, dim, 1) if partials is None else partials)
+        h = new_residual.reshape(x.shape)
+        normed = self.ffn_norm(h)
+        register_fused_q8(normed, tokens, dim, q, scale)
+        return h + self._feed_forward(normed)
+      if (T_pad := nv_prefill_tokens(x)) is not None and (partials := split_k_partials(attn_out)) is not None:
+        # T4.141: x + attn_out (its gemm's split-K partials summed in-kernel), ffn_norm and ffn_gate/up's q8 activations in one kernel
+        # instead of the norm's reduce + apply (attn_out's reduce and the add folded into both) and a q8_quantize_nv
+        new_residual, q, scale, _ = add_rmsnorm_q8(x, self.nv_norm_weights[1], self.ffn_norm.eps, partials=partials)
+        h = new_residual.reshape(1, T_pad, dim)[:, :T]
+        normed = self.ffn_norm(h)
+        register_fused_q8(normed.pad_to(normed.max_shape), T_pad, dim, q, scale)
+        return h + self._feed_forward(normed)
     h = x + attn_out
     return h + self._feed_forward(self.ffn_norm(h))
 
@@ -1022,16 +1050,31 @@ class GatedDeltaNetBlock(FFNBlock):
     its internal `.half()` a no-op, so _attention needs no change at all (this task's GDN restriction).
     T4.125b: attn_qkv/attn_gate ARE q8 consumers (Q4_0 on the 27B: nv_q8_linear quantized this fp16 copy again, one
     q8_quantize_nv per GDN block per step) -- register_fused_q8 hands them the kernel's own (q, scale), quantized from
-    the fp32 normed value instead of its fp16 rounding (a small numerics change); ssm_beta/ssm_alpha keep the fp16 copy."""
+    the fp32 normed value instead of its fp16 rounding (a small numerics change); ssm_beta/ssm_alpha keep the fp16 copy.
+    T4.141: a prefill chunk headed for _nv_prefill takes the same kernel at the padded width: its fp16 copy (zero past the chunk) IS the
+    projections' padded input (padded_source -- no pad copy), and attn_qkv/attn_gate's q8 activations are quantized from that fp16 copy,
+    as their own q8_quantize_nv of it did."""
     T, dim = x.shape[1], self.config.dim
-    if (isinstance(T, int) and T <= NV_SMALL_T and dim % 256 == 0 and self.nv_norm_weights is not None
-        and nv_quant_supported(self.nv_norm_weights[0].device)):
-      tokens = T * cast(int, x.shape[0])
-      _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
-      assert fp16_out is not None
-      register_fused_q8(normed := fp16_out.reshape(x.shape), tokens, dim, q, scale)
-      return normed
+    if dim % 256 == 0 and self.nv_norm_weights is not None and nv_quant_supported(self.nv_norm_weights[0].device):
+      if isinstance(T, int) and T <= NV_SMALL_T:
+        tokens = T * cast(int, x.shape[0])
+        _, q, scale, fp16_out = add_rmsnorm_q8(x.reshape(tokens, dim), self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True)
+        assert fp16_out is not None
+        register_fused_q8(normed := fp16_out.reshape(x.shape), tokens, dim, q, scale)
+        return normed
+      if (T_pad := nv_prefill_tokens(x)) is not None and self._nv_prefill_ok(x.device):
+        _, q, scale, fp16_out = add_rmsnorm_q8(x, self.nv_norm_weights[0], self.attn_norm.eps, want_fp16=True, q8_fp16=True)
+        assert fp16_out is not None
+        register_fused_q8(x_pad := fp16_out.reshape(1, T_pad, dim), T_pad, dim, q, scale)  # the key of _nv_prefill's x_pad
+        register_padded(normed := x_pad[:, :T], fp16_out)
+        return normed
     return self.attn_norm(x)
+
+  def _nv_prefill_ok(self, device:str|tuple[str, ...]|None) -> bool:
+    """T4.138: _attention's gate for the prefill glue kernels (_nv_prefill; GDN_NV_PREP=0: the generic glue) -- T4.141: shared with
+    _normed_for_attention, whose fused prefill norm only feeds _nv_prefill"""
+    return bool(GDN_NV_PREP.value and not hasattr(self, "ssm_g_a") and self.nv_decode_weights is not None and self.head_v_dim % 32 == 0
+                and nv_custom_kernels_supported(device))
 
   def prepare_nv_decode(self) -> None:
     """T4.123f+g: realized fp32 copies of the four small weights kernels/nv.py's gdn_decode reads -- made once at load (from_gguf), never
@@ -1090,9 +1133,7 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # T4.138: every other call on the card's fused-scan path (a prefill chunk: symbolic T, padded to T_pad) -- see _nv_prefill.
     # GDN_NV_PREP=0: the generic glue below around the same fused scan (A/B, rollback)
-    if (GDN_NV_PREP.value and not capture and not is_kda and self.nv_decode_weights is not None and self.head_v_dim % 32 == 0
-        and nv_custom_kernels_supported(x.device)):
-      return self._nv_prefill(x, start_pos, T, T_pad)
+    if not capture and self._nv_prefill_ok(x.device): return self._nv_prefill(x, start_pos, T, T_pad)
 
     # input processing
     x = x.half()
@@ -1224,7 +1265,9 @@ class GatedDeltaNetBlock(FFNBlock):
     B, dim = cast(int, x.shape[0]), self.config.dim
     x = x.half()
     # contiguous in its 2-D form: the f16 gemv's own .contiguous() then folds (a reshaped CONTIGUOUS would be copied again, E_5120_32_4)
-    x_flat = (x.pad_to((B, T_pad, dim)) if isinstance(T, UOp) else x).reshape(B*T_pad, dim).contiguous()
+    # T4.141: or the fused prefill attn_norm's own padded fp16 buffer (_normed_for_attention), already that 2-D form
+    if (x_flat := padded_source(x)) is None:
+      x_flat = (x.pad_to((B, T_pad, dim)) if isinstance(T, UOp) else x).reshape(B*T_pad, dim).contiguous()
     x_pad = x_flat.reshape(B, T_pad, dim)
     beta_alpha = (nv_f16_gemv_raw(self.nv_beta_alpha_weight, x_flat, 2*self.num_v_heads)
                   if self.nv_beta_alpha_weight is not None else self.ssm_beta(x_pad).cat(self.ssm_alpha(x_pad), dim=-1))
@@ -1234,7 +1277,11 @@ class GatedDeltaNetBlock(FFNBlock):
     z, q, scale, sums = nv_gdn_post(core, self.attn_gate(x_pad), norm_w, T, self.ssm_norm.eps)
     register_fused_q8(z, B*T_pad, self.num_v_heads*self.head_v_dim, q, scale, sums)
     out = self.ssm_out(z)
-    return out[:, :T] if isinstance(T, UOp) else out
+    if not isinstance(T, UOp): return out
+    # T4.141: the chunk's rows keep the gemm's split-K partials (_ffn_output sums them in its fused prefill norm)
+    sliced = out[:, :T]
+    if (partials := split_k_partials(out)) is not None: _register_split_k(sliced, partials)
+    return sliced
 
   spec_track: tuple[Tensor, Tensor]|None = None  # T4.132: (conv (S,B,K-1,C), recurrent (S,B,H,V,K)) -- a VERIFY run's per-token states
   def __call__(self, x:Tensor, start_pos:int|UOp, rope:int|UOp|Tensor|None=None, spec:int=0) -> Tensor:

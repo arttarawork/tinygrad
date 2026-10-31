@@ -11,7 +11,7 @@ from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import DEV
 from tinygrad.uop.ops import Ops, KernelInfo, AxisType
 from tinygrad.llm.gguf import ggml_data_to_tensor
-from tinygrad.llm.kernels.amd import Linear, Q4_0, kernel_var
+from tinygrad.llm.kernels.amd import Linear, Q4_0, Q4_1, kernel_var
 from tinygrad.llm.kernels import nv, nv_gemm, nv_gdn_prep
 from tinygrad.llm.kernels.nv_gdn_prep import gdn_prefill, gdn_post, _gdn_prep_kernel, _gdn_conv_state_kernel, _gdn_post_kernel
 from tinygrad.llm.model import GatedDeltaNetBlock, SSMConfig, TransformerConfig, Transformer
@@ -423,6 +423,90 @@ class TestNVPrefillGenerate(unittest.TestCase):
       np.testing.assert_allclose(ca, cb, rtol=5e-3, atol=1e-3)
       np.testing.assert_allclose(sa, sb, rtol=1e-3, atol=1e-3)
 
+# ******** T4.141: the served prefill path with the fused norm/activation kernels, executed on the PYTHON emulator ********
+
+def _q4_linear(ggml_type:int, in_features:int, out_features:int, seed:int, device:str) -> Linear:
+  from test.unit.test_llm_nv_gemm import _blocks
+  blocks = _blocks(ggml_type, np.random.default_rng(seed), out_features, in_features // 32)
+  raw = Tensor(np.pad(blocks.reshape(-1), (4, 0)), device=device).contiguous().realize()[4:]
+  lin = Linear(in_features, out_features, bias=False)
+  nn.state.load_state_dict(lin, {"weight": ggml_data_to_tensor(raw, in_features*out_features, ggml_type).reshape(out_features, in_features)},
+                           verbose=False, realize=False)
+  lin.set_quantized(lin.weight)
+  return lin
+
+@contextlib.contextmanager
+def emulated_card():
+  """every gate of the card's prefill path opened on the PYTHON device: the q8/norm/activation kernels' shuffles emulated (their cached
+  builders bypassed), the IMMA gemms on the emulator's WMMA (test_llm_nv_gemm.TestImmaEndToEndOnEmulator), chunks of 16"""
+  from test.unit.test_llm_nv_gemm import _emulated_lane_reduce
+  from tinygrad.llm.kernels import nv_quant
+  with Context(NV_CUSTOM_QUANT=1, NV_IMMA=1, NV_IMMA_WARPS=2, GDN_CHUNK=16), \
+       mock.patch("tinygrad.llm.model.nv_quant_supported", return_value=True), \
+       mock.patch("tinygrad.llm.kernels.nv_quant.nv_quant_supported", return_value=True), \
+       mock.patch("tinygrad.llm.model.nv_custom_kernels_supported", return_value=True), mock.patch.object(nv_gemm, "_nv_wmma_ok", lambda d: True), \
+       mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+       mock.patch.object(nv_quant, "_add_rmsnorm_q8_kernel", nv_quant._add_rmsnorm_q8_kernel.__wrapped__), \
+       mock.patch.object(nv_quant, "_ffn_act_q8_kernel", nv_quant._ffn_act_q8_kernel.__wrapped__), \
+       mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):
+    yield
+
+def _card_model(device:str="PYTHON") -> Transformer:
+  """a GDN block then an attention block at dim 256 (the fused norms' 256 alignment), every projection and FFN linear Q4_0 on the IMMA gemm
+  (the attention block's ffn_down Q4_1: the activation sums), ssm_beta/ssm_alpha and the head generic. Call inside emulated_card()."""
+  ssm = SSMConfig(conv_kernel=4, state_size=32, group_count=2, time_step_rank=4, inner_size=128)
+  config = TransformerConfig(num_blocks=2, dim=256, hidden_dim=256, n_heads=2, n_kv_heads=1, norm_eps=1e-5, vocab_size=64, head_dim=64,
+                             rope_theta=1e4, rope_dim=64, v_head_dim=64, max_context=64, attn_output_gate=True, ssm_layers=(True, False), ssm=ssm)
+  m, rng = Transformer(config), np.random.default_rng(1)
+  for k, p in nn.state.get_state_dict(m).items():
+    norm = "norm" in k and "ssm" not in k
+    p.replace(Tensor((rng.standard_normal(p.shape) * (0.1 if norm else 0.3) + norm).astype(np.float32), device=device))
+  seed = 10
+  for b in m.blk:
+    gdn = isinstance(b, GatedDeltaNetBlock)
+    if gdn: b.ssm_a.replace(-b.ssm_a.abs())
+    for n in (["attn_qkv", "attn_gate", "ssm_out"] if gdn else ["attn_q", "attn_k", "attn_v", "attn_output"]) + ["ffn_gate", "ffn_up", "ffn_down"]:
+      lin = getattr(b, n)
+      setattr(b, n, _q4_linear(Q4_1 if n == "ffn_down" and not gdn else Q4_0, lin.in_features, lin.out_features, seed, device))
+      seed += 1
+    if gdn:
+      for lin in (b.ssm_beta, b.ssm_alpha): lin.use_custom_quant = False
+  m.output.use_custom_quant = False
+  Tensor.realize(*nn.state.get_parameters(m))
+  for b in m.blk:
+    b.prepare_nv_norms()
+    if isinstance(b, GatedDeltaNetBlock):
+      b.prepare_nv_decode()
+      b.nv_beta_alpha_weight = None  # the combined f16 gemv's tile kernel has no emulated form here: two generic gemvs
+  return m
+
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestFusedPrefillServedOnEmulator(unittest.TestCase):
+  """T4.141 (trap 3: a gate is only as good as the path it executes): Transformer.generate's PRUNED capture-first prefill family on the
+  emulator, a 37-token prompt in chunks of 16 (16 + 16 + 5: two replays, the last a remainder whose padded rows read stale arena rows),
+  every prefill norm site on the fused kernel. The jit == JIT=0 bit for bit (first token, both GDN states, the KV cache),
+  and both == the generic norms (NV_PREFILL_FUSED_NORM=0) up to fp32 reduction order."""
+  def test_jitted_prefill_matches_eager_and_generic(self):
+    prompt = [int(t) for t in np.random.default_rng(5).integers(1, 64, 37)]
+    got = {}
+    for name, jit, knob in (("jit", 1, 1), ("eager", 0, 1), ("generic", 1, 0)):
+      with emulated_card(), Context(JIT=jit, NV_PREFILL_FUSED_NORM=knob):
+        m = _card_model()
+        self.assertTrue(all(b.nv_norm_weights is not None for b in m.blk) and m.blk[0].nv_decode_weights is not None)
+        tok = next(m.generate(list(prompt), chunk_size=16, temperature=0.0))
+        gdn, attn = m.blk
+        got[name] = (tok, gdn.conv_state.numpy().astype(np.float32), gdn.recurrent_state.numpy(),
+                     attn.cache_kv.numpy()[..., :37, :].astype(np.float32))
+        if jit:
+          family = m.jit[(True, False, 16, False)]
+          names = [call.src[0].arg.name for call in family.captured.linear.src if hasattr(call.src[0].arg, "name")]
+          # per chunk: 2 norm sites per block; q8_quantize_nv for attn_output's input (attn * gate) and each block's ffn_down input
+          self.assertEqual((names.count("add_rmsnorm_q8_nv"), names.count("q8_quantize_nv")), (4, 3) if knob else (0, 7))
+    self.assertEqual(got["jit"][0], got["eager"][0])
+    for a, b in zip(got["jit"][1:], got["eager"][1:]): np.testing.assert_array_equal(a, b)
+    self.assertEqual(got["jit"][0], got["generic"][0])
+    for a, b in zip(got["jit"][1:], got["generic"][1:]): np.testing.assert_allclose(a, b, rtol=1e-3, atol=2e-4)
+
 # ******** the sm_86 renders (no nvrtc: test_llm_nv_scan._render_cuda) ********
 
 def _prep_sinks(T:int=128, H:int=48, Hk:int=16, K:int=128, V:int=128, toks=None):
@@ -522,8 +606,15 @@ class TestPrefillCensus(unittest.TestCase):
   # step 2: ssm_norm's reduce, the gated elementwise, z's pad copy and ssm_out's q8_quantize_nv -> gdn_post_nv
   STEP2 = STEP1[:10] + ["gdn_post_nv"] + STEP1[14:]
 
+  # T4.141 (model.py NV_PREFILL_FUSED_NORM) step 1: attn_norm's reduce + apply/pad + q8_quantize_nv -> add_rmsnorm_q8_nv (its fp16 copy is
+  # the f16 gemv's and the IMMA gemms' padded input, its q8 the gemms' activations); x + ssm_out, ffn_norm's reduce + apply and the ffn
+  # input's q8_quantize_nv -> add_rmsnorm_q8_nv (ssm_out's split-K partials summed in-kernel)
+  T4141 = ["E_28toks2A4029_128", "add_rmsnorm_q8_nv", "linear_q4_0_imma_nv", "linear_f16_gemv_nv", "linear_q4_0_imma_nv", "gdn_prep_nv",
+           "gdn_conv_state_nv", "gated_delta_prefill_nv", "gdn_post_nv", "linear_q4_0_imma_nv", "add_rmsnorm_q8_nv", "linear_q4_0_imma_nv",
+           "linear_q4_0_imma_nv", "E_28toks2A13629_128", "E_16_272_8_16_4", "q8_quantize_nv", "linear_q4_0_imma_nv", "E_28toks2A4029_128"]
+
   def test_gdn_prefill_kernels(self):
-    self.assertEqual(prefill_census(card_block()), self.STEP2)
+    self.assertEqual(prefill_census(card_block()), self.T4141)
 
   def test_q5_k_ssm_out_takes_the_fused_sums(self):
     # the card's ssm_out is Q5_K: its IMMA gemm asks q8_quantize for sums, which gdn_post_nv's registered entry carries
@@ -531,13 +622,19 @@ class TestPrefillCensus(unittest.TestCase):
     from tinygrad.llm.kernels.amd import Q5_K
     block = card_block()
     block.ssm_out = _quantized_linear(Q5_K, 5120, 6144)
-    self.assertEqual(prefill_census(block), self.STEP2[:11] + ["linear_q5_k_imma_nv"] + self.STEP2[12:])
+    with Context(NV_PREFILL_FUSED_NORM=0): self.assertEqual(prefill_census(block), self.STEP2[:11] + ["linear_q5_k_imma_nv"] + self.STEP2[12:])
+    self.assertEqual(prefill_census(block), self.T4141[:9] + ["linear_q5_k_imma_nv"] + self.T4141[10:])
+
+  def test_fused_norm_knob_off_is_step_2(self):
+    with Context(NV_PREFILL_FUSED_NORM=0): self.assertEqual(prefill_census(card_block()), self.STEP2)
 
   def test_knob_off_is_step_0(self):
-    with Context(GDN_NV_PREP=0): self.assertEqual(prefill_census(card_block()), self.BEFORE)
+    with Context(GDN_NV_PREP=0, NV_PREFILL_FUSED_NORM=0): self.assertEqual(prefill_census(card_block()), self.BEFORE)
+    # T4.141: GDN's attn_norm site only feeds _nv_prefill (it stays generic here); the ffn_norm site still fuses
+    with Context(GDN_NV_PREP=0): self.assertEqual(prefill_census(card_block()), self.BEFORE[:27] + ["add_rmsnorm_q8_nv"] + self.BEFORE[30:])
 
   def test_gate_closed_is_step_0(self):
-    with mock.patch("tinygrad.llm.model.nv_gdn_prefill", side_effect=AssertionError("taken")):
+    with mock.patch("tinygrad.llm.model.nv_gdn_prefill", side_effect=AssertionError("taken")), Context(NV_PREFILL_FUSED_NORM=0):
       block = card_block()
       block.nv_decode_weights = None  # unprepared (e.g. kda, or a geometry the kernels don't cover): the generic graph
       self.assertEqual(prefill_census(block), self.BEFORE)

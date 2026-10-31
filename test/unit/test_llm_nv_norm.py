@@ -309,4 +309,83 @@ class TestKernelRunsOnPythonEmulator(unittest.TestCase):
         for a, b in zip(split, one):
           if a is not None: np.testing.assert_array_equal(a, b)
 
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestPrefillWidthOnPythonEmulator(unittest.TestCase):
+  """T4.141: the kernel at a prefill chunk's padded width, executed on the emulator: the residual is the chunk's (1, toks, dim) view of a
+  (1, tokens, dim) buffer whose rows past toks hold NaN (stale arena memory), the partials come in the IMMA gemm's (C, tokens, dim)
+  layout. The chunk's rows match the numpy pipeline, every padded row is the generic zero pad's (residual 0, q 0, scale 1e-8, fp16 0)."""
+  TOKENS, TOKS, DIM = 16, 11, 256
+
+  def _run(self, C:int, want_fp16:bool=False, q8_fp16:bool=False, threads:int|None=64):
+    rng = np.random.default_rng(C)
+    residual = rng.standard_normal((1, self.TOKENS, self.DIM)).astype(np.float32)
+    residual[:, self.TOKS:] = np.nan
+    weight = rng.standard_normal(self.DIM).astype(np.float32)
+    partials = rng.standard_normal((C, self.TOKENS, self.DIM)).astype(np.float32)
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_warp_reduce), \
+         mock.patch.object(nv_quant, "_add_rmsnorm_q8_kernel", nv_quant._add_rmsnorm_q8_kernel.__wrapped__):
+      view = Tensor(residual, device="PYTHON")[:, :UOp.variable("toks", 1, self.TOKENS).bind(self.TOKS)]
+      outs = add_rmsnorm_q8(view, Tensor(weight, device="PYTHON"), 1e-6, partials=Tensor(partials, device="PYTHON"), want_fp16=want_fp16,
+                            threads=threads, q8_fp16=q8_fp16)
+      got = [None if t is None else t.numpy() for t in outs]
+    return residual[0], partials, weight, got
+
+  def test_chunk_rows_match_numpy_and_padded_rows_are_the_zero_pad(self):
+    n = self.TOKS
+    for C, threads in ((3, 64), (1, 256)):  # 64 threads: 4 elements per thread, 4 blocks per token (NV_NORM_SPLIT)
+      with self.subTest(C=C, threads=threads):
+        residual, partials, weight, (new_residual, q, scale, _) = self._run(C, threads=threads)
+        ref_residual, ref_q, ref_scale, _ = np_add_rmsnorm_q8(residual[:n], partials[:, :n].transpose(1, 2, 0), weight, 1e-6)
+        np.testing.assert_array_equal(new_residual[:n], ref_residual)
+        np.testing.assert_array_equal(q[:n].view(np.int8).reshape(ref_q.shape), ref_q)
+        np.testing.assert_allclose(scale[:n], ref_scale, rtol=1e-6)
+        np.testing.assert_array_equal(new_residual[n:], 0)
+        np.testing.assert_array_equal(q[n:], 0)
+        np.testing.assert_array_equal(scale[n:], np.float32(1e-8))
+
+  def test_q8_fp16_quantizes_the_fp16_copy(self):
+    # GDN's prefill attn_norm site: q/scale must be q8_quantize OF the fp16 copy (what _nv_prefill's projections read), not of the fp32
+    # value -- the late codegen folds a plain cast(half).float() back to fp32, so the kernel stages the rounded values in shared memory
+    from test.unit.test_llm_nv_gemm import _emulated_lane_reduce
+    n = self.TOKS
+    residual, partials, weight, (_, q, scale, fp16) = self._run(2, want_fp16=True, q8_fp16=True)
+    ref_normed = np_add_rmsnorm_q8(residual[:n], partials[:, :n].transpose(1, 2, 0), weight, 1e-6)[3]
+    np.testing.assert_allclose(fp16[:n].astype(np.float32), ref_normed.astype(np.float16).astype(np.float32), rtol=1e-3, atol=1e-3)
+    np.testing.assert_array_equal(fp16[n:], 0)
+    with mock.patch.object(nv_quant, "warp_reduce", _emulated_lane_reduce), \
+         mock.patch.object(nv_quant, "_q8_quantize_kernel", nv_quant._q8_quantize_kernel.__wrapped__):
+      ref_q, ref_scale = (t.numpy() for t in nv_quant.q8_quantize(Tensor(fp16, device="PYTHON"), self.TOKENS, self.DIM))
+    np.testing.assert_array_equal(q, ref_q)
+    np.testing.assert_array_equal(scale, ref_scale)
+
+class TestPrefillWidthRender(unittest.TestCase):
+  """T4.141: the sm_86 source (no nvrtc lane: test_llm_nv_scan._render_cuda) of the prefill kernel at the 27B shape -- 128 padded tokens x
+  5 blocks of 1024 threads, ssm_out/attn_output's 4 split-K partials in the IMMA layout -- and the decode renders, md5-pinned at
+  c685345f4 (before T4.141): the prefill variant must leave them byte-identical."""
+  DECODE_MD5 = {(1, 0, False): "ddc3ffdc7546feef07aa2144bd9b3f91", (1, 5, True): "8c7127624561d0ceb175dc802de5a74a",
+                (4, 5, False): "3cb0ffc632af9591d401b8da86857fa4", (4, 0, True): "cfaa4b5a10f8ba643aef0f543e61653e"}
+
+  @staticmethod
+  def _source(residual:Tensor, partials:Tensor|None=None, want_fp16:bool=False, q8_fp16:bool=False) -> str:
+    from test.unit.test_llm_nv_scan import _render_cuda
+    q = add_rmsnorm_q8(residual, Tensor.empty(5120), 1e-6, partials=partials, want_fp16=want_fp16, q8_fp16=q8_fp16)[1]
+    return _render_cuda(next(u.src[0] for u in q.uop.toposort() if u.op is Ops.CALL))
+
+  def test_decode_renders_unchanged(self):
+    import hashlib
+    for (tokens, C, want_fp16), digest in self.DECODE_MD5.items():
+      with self.subTest(tokens=tokens, C=C, want_fp16=want_fp16):
+        src = self._source(Tensor.empty(tokens, 5120), Tensor.empty(tokens, 5120, C) if C else None, want_fp16)
+        self.assertEqual(hashlib.md5(src.encode()).hexdigest(), digest)
+
+  def test_prefill_kernel_at_the_27b_shape(self):
+    view = Tensor.empty(1, 128, 5120)[:, :UOp.variable("toks", 1, 128).bind(77)]
+    for want_fp16 in (False, True):
+      with self.subTest(want_fp16=want_fp16):
+        src = self._source(view, Tensor.empty(4, 128, 5120), want_fp16, q8_fp16=want_fp16)
+        self.assertIn("__launch_bounds__(1024)", src)
+        self.assertRegex(src, r"const int data\d+_\) \{")  # the chunk width is the last argument: one kernel serves every remainder chunk
+        self.assertEqual(src.count("__syncthreads()"), 2 if want_fp16 else 1)  # q8_fp16: the staged fp16 values' own barrier
+        self.assertEqual("half" in src, want_fp16)
+
 if __name__ == "__main__": unittest.main()

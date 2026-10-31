@@ -1097,6 +1097,34 @@ class TestFFNNormSiteFusion(unittest.TestCase):
     self.assertEqual(str(new_err.exception), str(old_err.exception))
     self.assertIn("ffn_gate_inp", str(new_err.exception))
 
+@unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+class TestPrefillFFNSiteOnEmulator(unittest.TestCase):
+  """T4.141: FFNBlock._ffn_output -> _feed_forward on an 11-token chunk of a 16-row bound, executed on the PYTHON emulator with the IMMA
+  gemms (test_llm_nv_gdn_prep.emulated_card): attn_out comes from an IMMA gemm in one or four split-K partials (summed inside
+  add_rmsnorm_q8), ffn_gate/up Q4_0, ffn_down Q4_1. The fused path replaces the generic norm kernels and the ffn input's quantize and
+  matches the generic graph (NV_PREFILL_FUSED_NORM=0) to fp32 reduction order."""
+  def test_fused_matches_generic(self):
+    from test.unit.test_llm_nv_gdn_prep import emulated_card, _q4_linear
+    dim, hidden, chunk, n = 256, 512, 16, 11
+    config = TransformerConfig(num_blocks=1, dim=dim, hidden_dim=hidden, n_heads=1, n_kv_heads=1, norm_eps=1e-5, vocab_size=8, head_dim=dim,
+                               rope_theta=1e4, rope_dim=dim, v_head_dim=dim)
+    block, rng = FFNBlock(config), np.random.default_rng(0)
+    block.ffn_gate, block.ffn_up = _q4_linear(Q4_0, dim, hidden, 1, "PYTHON"), _q4_linear(Q4_0, dim, hidden, 2, "PYTHON")
+    block.ffn_down, proj = _q4_linear(Q4_1, hidden, dim, 3, "PYTHON"), _q4_linear(Q4_0, 128, dim, 4, "PYTHON")
+    block.attn_norm.weight, block.ffn_norm.weight = (Tensor(rng.uniform(0.5, 1.5, dim).astype(np.float32), device="PYTHON") for _ in range(2))
+    xs, ys = (Tensor(rng.standard_normal((1, chunk, d)).astype(np.float32), device="PYTHON").realize() for d in (dim, 128))
+    toks = UOp.variable("toks", 1, chunk).bind(n)
+    outs = {}
+    for knob, splitk in ((1, 1), (1, 4), (0, 1)):
+      with self.subTest(knob=knob, splitk=splitk), emulated_card(), Context(NV_PREFILL_FUSED_NORM=knob, NV_IMMA_SPLITK=splitk):
+        block.prepare_nv_norms()
+        out = block._ffn_output(xs[:, :toks], proj(ys[:, :toks]))
+        names = [u.src[0].arg.name for u in out.uop.toposort() if u.op is Ops.CALL and isinstance(u.src[0].arg, KernelInfo)]
+        self.assertEqual(names.count("q8_quantize_nv"), 2 if knob else 3)  # proj's own input, ffn_down's; generic: + the ffn input
+        self.assertEqual(names.count("add_rmsnorm_q8_nv"), knob)
+        outs[(knob, splitk)] = out.pad_to((1, chunk, dim)).numpy()[0, :n]
+    for key in ((1, 1), (1, 4)): np.testing.assert_allclose(outs[key], outs[(0, 1)], rtol=0, atol=1e-5 * np.abs(outs[(0, 1)]).max())
+
 class TestGDNAttnNormSiteFusion(unittest.TestCase):
   """T4.123e: GatedDeltaNetBlock._normed_for_attention (model.py) fuses attn_norm's RMSNorm into add_rmsnorm_q8
   on the NV decode path, feeding _attention its want_fp16 output directly -- _attention's own `x = x.half()`

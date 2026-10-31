@@ -561,6 +561,23 @@ class TestImmaDispatch(unittest.TestCase):
       with Context(NV_IMMA=1, NV_IMMA_PIPE=1, NV_IMMA_STAGE=0):
         self.assertIs(_kernels(nv_gemm.nv_wmma_linear(lin, x))[name], _imma_sink(64, 256, in_features, 64, 4, 2, 0, ggml_type))
 
+  def test_result_maps_to_its_raw_split_k_partials(self):
+    # T4.141: the returned (shrunk) result -> the gemm's raw output in the (C, tokens, out) layout, which model.py's fused prefill
+    # norm/activation kernels sum themselves (the result's own reduce is then never scheduled)
+    from tinygrad import Context, UOp as U
+    from tinygrad.llm.kernels.nv_quant import split_k_partials
+    lin = _quantized_linear(Q4_0, 256, 512)  # 16 groups: stage 4 -> 4 steps
+    x = Tensor.empty(1, 64, 512, dtype=dtypes.float32)[:, :U.variable("T", 1, 64).bind(48)]
+    for splitk in (1, 4):
+      with self.subTest(splitk=splitk), Context(NV_IMMA=1, NV_IMMA_SPLITK=splitk):
+        out = nv_gemm.nv_wmma_linear(lin, x)
+        partials = split_k_partials(out)
+        assert partials is not None
+        self.assertEqual(partials.shape, (splitk, 64, 256))
+        self.assertIn("linear_q4_0_imma_nv", _kernels(partials))
+        if splitk == 1: self.assertIs(partials.uop.base, out.uop.base)  # a view of the very buffer the result views
+        else: self.assertIs(partials.sum(0).reshape(1, 64, 256).shrink(((0, 1), (0, x.shape[1]), (0, 256))).uop, out.uop)
+
   def test_symbolic_chunk_pads_and_shrinks(self):
     from tinygrad import Context, UOp as U
     lin = _quantized_linear(Q4_0, 256, 128)
