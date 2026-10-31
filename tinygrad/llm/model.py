@@ -1708,6 +1708,10 @@ def spec_accept_tensor(draft_ids:Tensor, q_logits:Tensor, p_logits:Tensor, tempe
   return m, correction.contiguous().cat(bonus.contiguous(), dim=-1)
 
 MIN_P = getenv("MIN_P", 0.0)  # T4.85: min-p tail cut for sampled decoding (0 = off, byte-identical to the plain Gumbel-max sampler)
+# T4.145 (10-31): the draft draws at temperature * SPEC_DRAFT_TEMP_SCALE (1.0 = the target's temperature) and hands the accept logits / scale,
+# so the q the accept normalizes at `temperature` is exactly the draw's distribution -- the Leviathan test holds for ANY q, only the accept
+# rate moves. Read when the ("chain", k) family captures (one process per value for an A/B).
+SPEC_DRAFT_TEMP_SCALE = getenv("SPEC_DRAFT_TEMP_SCALE", 1.0)
 
 def sample_logits(logits:Tensor, temperature:Tensor, min_p:float=0.0) -> Tensor:
   """One sampled token id per row of `logits` (B, vocab) -> (B, 1). Gumbel-max: argmax(logits/temp - log(-log(u))) is a sample
@@ -2457,8 +2461,10 @@ class Transformer:
     if "draft" in vars(mh): logits, x = mh.draft(self, h, tok, pos), h
     else: (logits, x), ids = mh.draft_step(self, h, tok, pos), mh.draft_ids
     greedy = logits.argmax(-1)
-    d = (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp, MIN_P), greedy)
-    return (d, logits, x) if ids is None else (ids[d], mh.full_vocab(logits), x)
+    s = SPEC_DRAFT_TEMP_SCALE  # T4.145: != 1.0 draws sharper/flatter than the target; q = logits / s keeps the accept exact
+    d = (temp > 0).reshape(1, 1).where(sample_logits(logits[:, -1, :], temp * s if s != 1.0 else temp, MIN_P), greedy)
+    q = logits if s == 1.0 else logits / s
+    return (d, q, x) if ids is None else (ids[d], mh.full_vocab(q), x)
 
   def _draft_chain(self, h:Tensor, tok:Tensor, temp:Tensor, *pos:UOp) -> tuple[Tensor, ...]:
     """T4.132: the draft chain as one graph -- len(pos) MTP steps (_draft_step), each fed the previous step's id at its own bound position
