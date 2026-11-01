@@ -24,7 +24,7 @@ warp-shuffle dot per key, as decode); memory is O(tile) -- the planned partials 
 produces exp2(-inf - -inf) = NaN."""
 from __future__ import annotations
 import functools, math
-from typing import cast
+from typing import Callable, cast
 from tinygrad import Tensor, UOp
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import ContextVar
@@ -181,6 +181,18 @@ def _shfl(val:UOp, src_lane:UOp) -> UOp:
   """T4.129: __shfl_sync from hardware lane src_lane (the kernel's lane range is AxisType.WARP: lane IS the hardware lane)."""
   return UOp(Ops.CUSTOM, src=(val, src_lane.cast(dtypes.int32)), arg=("__shfl_sync(0xffffffff, {0}, {1})", dtypes.float))
 
+def _q8_lane_block(qv:list[UOp], quad_max:Callable[[UOp], UOp], D:int) -> tuple[UOp, UOp, UOp]:
+  """T4.129: (even-dim word, odd-dim word, the scale S multiplies by) of a lane's 8 dims 8t..8t+7 of a 32-wide q block whose other 24
+  dims sit in the 3 other lanes of its fragment row (quad_max = the max over those 4 lanes): q8_quantize's rounding, and the scale
+  times log2(e)/sqrt(D) so S comes out in the exp2 domain. T4.148: shared by the decode and the prefill GQA kernels."""
+  from tinygrad.llm.kernels.nv_quant import _q8_pack
+  amax = quad_max(functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv)))
+  sq = (amax / 127).maximum(1e-8)
+  # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
+  return _q8_pack(tuple(qv[0::2]), sq), _q8_pack(tuple(qv[1::2]), sq), (amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D))
+
+def _nib8(x:UOp) -> UOp: return (x + 0x78787878) ^ 0x80808080  # 4 nibbles (one per byte) -> 4 int8 nibble-8, T4.126 (no carry: n + 0x78 <= 0x87)
+
 def _decode_mma_ok(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None) -> bool:
   # KV_INT4 (uint8 nibbles) with 32-wide scale blocks, G <= 8 heads per kv head (rows of one m-tile), D in 64/128/256 (each of the
   # 8 mma row groups owns D/8 dims inside ONE scale block), sm_80+ (the int8 mma)
@@ -242,7 +254,6 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   g, t = lane // 4, lane % 4
   # prologue: this lane's A fragments (head g, dims 32*blk+8t..+7) and the per-(head, block) scales, q8_quantize's rounding
   from tinygrad.llm.kernels.nv_gemm import _i8x4
-  from tinygrad.llm.kernels.nv_quant import _q8_pack
   rows = [g] + [g + 8 * k for k in range(1, RG)]  # T4.134: this lane's row in each row group
   heads = [kvh * G + row for row in rows]
   head_oks = [row < G for row in rows]
@@ -253,12 +264,10 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   def quant(head:UOp, head_ok:UOp, blk:UOp|int) -> tuple[UOp, UOp, UOp]:
     # (even-dim word, odd-dim word, the scale S multiplies by) of this lane's 8 dims of (head, block)
     qv = [q[b, head, 0, (blk * 32 + 8 * t + i).valid(head_ok)].load().float() for i in range(8)]
-    amax = functools.reduce(lambda a, x: a.maximum(x), (v.abs() for v in qv))
-    amax = amax.maximum(_shfl(amax, lane ^ 1))
-    amax = amax.maximum(_shfl(amax, lane ^ 2))
-    sq = (amax / 127).maximum(1e-8)
-    # sq * log2(e)/sqrt(D) as its own max(): as sq * const the symbolic pass pulls the constant out of every product (one more FMUL per term)
-    return _q8_pack(tuple(qv[0::2]), sq), _q8_pack(tuple(qv[1::2]), sq), (amax * (LOG2E / math.sqrt(D) / 127)).maximum(1e-8 * LOG2E / math.sqrt(D))
+    def quad_max(a:UOp) -> UOp:
+      a = a.maximum(_shfl(a, lane ^ 1))
+      return a.maximum(_shfl(a, lane ^ 2))
+    return _q8_lane_block(qv, quad_max, D)
   if tokens == 1:
     qfrags:list[list[tuple[tuple[UOp, ...], tuple[UOp, ...]]]] = []  # per row group, per block: (even dims, odd dims) as int8
     sqs:list[list[UOp]] = []
@@ -301,7 +310,6 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
   afrags = [[UOp.stack(*half(2 * mt, blk, 0), *half(2 * mt + 1, blk, 0), *half(2 * mt, blk, 1), *half(2 * mt + 1, blk, 1))
              for blk in range(blocks)] for mt in range(-(-RG // 2))]
   base = (slot + step * S) * KS
-  def unsign(x:UOp) -> UOp: return (x + 0x78787878) ^ 0x80808080  # 4 nibbles (one per byte) -> 4 int8 nibble-8, T4.126
   scores:list[list[UOp]] = [[] for _ in range(RG)]
   oks, tiles = [], []
   for kt in range(k_tiles):
@@ -315,7 +323,7 @@ def _decode_mma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, scale:UOp, *, va
       s = [[UOp.const(0, dtypes.float), UOp.const(0, dtypes.float)] for _ in range(RG)]
       for blk in range(blocks):
         word = cache_kv[0, b, kvh, kb, 4 * blk + t].load()
-        bfrag = UOp.stack(*_i8x4(unsign(word & 0x0F0F0F0F)), *_i8x4(unsign((word >> 4) & 0x0F0F0F0F)))
+        bfrag = UOp.stack(*_i8x4(_nib8(word & 0x0F0F0F0F)), *_i8x4(_nib8((word >> 4) & 0x0F0F0F0F)))
         for mt, afrag in enumerate(afrags):
           c = (UOp.wmma(afrag[blk], bfrag, UOp.const((0,) * 4, dtypes.int32), *DEC_IMMA_ARG) + MAGIC).bitcast(dtypes.float32)
           # (c - 1.5*2**23) * d, never (c + s) - 1.5*2**23: the symbolic pass reassociates a constant out of an add chain
