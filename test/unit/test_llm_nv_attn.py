@@ -590,7 +590,7 @@ class TestPrefillGQAKernel(unittest.TestCase):
     kv = Tensor.zeros(2, 1, KVH, N, Dh // 2, dtype=dtypes.uint8).contiguous().realize()
     scale = Tensor.ones(2, 1, KVH, N, Dh // 32, dtype=dtypes.float16).contiguous().realize()
     q = Tensor.ones(1, Hq, 6, Dh, dtype=dtypes.float16)
-    def route(gqa:int, int8:int=1, cache:Tensor=kv, cache_scale:Tensor=scale):
+    def route(gqa:int, int8:int=1, cache:Tensor=kv, cache_scale:Tensor|None=scale):
       with Context(NV_ATTN_WMMA=1, NV_ATTN_GQA=gqa, NV_ATTN_GQA_INT8=int8): out = nv_attn.nv_prefill_attention(q, cache, cache_scale, 106, 100)
       nodes = list(out.uop.toposort())
       calls = [u for u in nodes if u.op is Ops.CALL]

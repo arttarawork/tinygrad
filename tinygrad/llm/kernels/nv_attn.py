@@ -869,7 +869,7 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
     izero = UOp.const((0,) * 4, dtypes.int32)
     s_vals = []
     for j in range(NT):
-      acc = None
+      acc: UOp|None = None
       for pair in range(BLKS // 2):
         sks = [ks_tile[ks_index(j, pair, t) + i].load() for i in range(4)]  # keys 2t, 2t+1 at block 2*pair, then at 2*pair+1
         for par in range(2):
