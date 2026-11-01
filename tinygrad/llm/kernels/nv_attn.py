@@ -711,6 +711,7 @@ def _prefill_wmma_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, va
 NV_ATTN_GQA = ContextVar("NV_ATTN_GQA", 1)  # T4.130: inside NV_ATTN_WMMA=1, the shared-tile kernel below (0 = the T4.113 kernel, byte-identical)
 NV_ATTN_GQA_WARPS = ContextVar("NV_ATTN_GQA_WARPS", 8)  # T4.130: m-tiles (one warp each) sharing a staged K/V tile; 10-29 card: 8 best
 NV_ATTN_GQA_KEYS = ContextVar("NV_ATTN_GQA_KEYS", 32)  # T4.130: keys per staged tile (16 or 32: K + V tiles are 4*keys*head_dim bytes); card knob
+NV_ATTN_GQA_INT8 = ContextVar("NV_ATTN_GQA_INT8", 1)  # T4.148: S = Q.K^T on the int8 tensor cores for a KV_INT4 cache (0 = fp16 S, byte-identical)
 # the CUDA renderer ignores the wmma device string; the PYTHON emulator keys its NVIDIA fragment model on 'CUDA' (nv_gemm.IMMA_ARG)
 GQA_WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'CUDA', WARP_SIZE)
 SMEM_BYTES = 48 * 1024  # static __shared__ cap
@@ -733,7 +734,7 @@ def _kv_halves(cache_kv:UOp, sc:UOp|None, kv:int, b:UOp, h:UOp, key:UOp, d0:UOp,
 
 @functools.cache
 def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, valid_kv_len:int|UOp, q_start:int|UOp, max_kv_len:int,
-                        warps:int, keys:int) -> UOp:
+                        warps:int, keys:int, int8:int=0) -> UOp:
   """_prefill_wmma_kernel's contract and arithmetic (m16n8k16, fp32 online softmax per row, P kept in registers as the P.V A operand)
   with the K/V work shared across the GQA group. The G query heads of a kv head x the chunk's rows are G*T/16 query m-tiles; a block
   = `warps` of them (one warp each) x a chunk slot. Per `keys`-key tile, every thread of the block dequantises a share of the tile
@@ -747,7 +748,26 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   of lane (g, t) inside its group is rotated by a function of the operand (K: t + n-tile + k-step pair mod 4, V: g + n-tile/2 mod 8)
   -- a permutation, so reads stay conflict-free, and it spreads the dequant threads' stores (which all write the same (g, t) slot of
   different groups) over the banks. lane is AxisType.WARP (threadIdx.x, never split), the warp a LOCAL range (_linear_imma_nv's
-  layout); the barriers come from add_raw_barrier (stores -> loads of a tile) and add_war_barrier (end of the tile loop)."""
+  layout); the barriers come from add_raw_barrier (stores -> loads of a tile) and add_war_barrier (end of the tile loop).
+
+  T4.148 int8 = 1 (a KV_INT4 cache, head_dim a multiple of 64): S = Q.K^T on mma.m16n8k32 s8 x s8 -> s32 -- the int8 tensor cores
+  run 4x the fp16-with-fp32-accumulate rate on GA102 -- with the decode kernel's numerics (T4.129: q rounded to int8 per (row,
+  32-dim block), K's nibbles exact as int8); P.V, the online softmax and the stats are the fp16 path's. Prologue: each lane
+  quantizes its rows g, g+8 at dims 32*blk + 8t..8t+7 (_q8_lane_block: the row's absmax over the 4 lanes of its quad by two xor
+  shuffles) into the A fragment a0..a3 = (row g even dims, row g+8 even, row g odd, row g+8 odd) -- the dims a lane's int4 K word
+  gives as (low nibbles, high nibbles), so the mma's k order is a permutation inside the block and the int32 C is the block's exact
+  dot -- and keeps sq[row, blk] (times log2(e)/sqrt(D): S lands in the exp2 domain): 8 x 4 words + 16 scales instead of 16 x 4 fp16
+  A registers. Per (8-key n-tile, block): S += (float(C) - 1.5*2**23) * sk * sq in fp32, 8 blocks per 256-dim head: float(C) by the
+  MAGIC add folded into the mma's C (T4.126, no I2F), the subtraction exact, times the fp16-valued sk = ONE rounding of the exact
+  C*sk (the IMMA gemm's _int_times_half value -- not its FFMA form: nvcc contracted the other product here, FMUL f*sk then FFMA
+  sk*-1.5*2**23, which rounds f*sk first), then one FFMA with sq. Card cost per element and block: FADD + FMUL + FFMA.
+  The staged K tile is int8 in fragment order, KT*D bytes (half the fp16 tile): a 32-lane group per (n-tile j, block), lane (g, t)'s
+  8-byte slot = (b0, b1) = the nibble-8 bytes of word 4*blk + t of key 8j + g (low, high nibbles: _nib8), slot 4g + (t + j +
+  2*(g//4)) % 4 -- a permutation per group (reads conflict-free: 256 contiguous bytes), and a staging warp's 8-byte stores (lane =
+  key, one block) cover all 32 banks per half-warp. The K scales go to their own fp32 tile as (n-tile, block pair, t, block parity,
+  key parity): lane (g, t) reads sk of keys 8j+2t, 8j+2t+1 at blocks 2p, 2p+1 as one 16-byte load, 4 distinct per warp (64
+  contiguous bytes, a broadcast). sm_86 cubin (nvrtc lane, model geometry 8 warps x 32 keys, chunk 128 or 32): 255 registers, 0 B
+  spill stack, 1566 SASS instructions per key-tile iteration (fp16 S: 247 + 0, 1354)."""
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start)
   sc = scale[0] if scale else None
   _, B, H_KV, N, _ = cast(tuple[int, int, int, int, int], cache_kv.shape)
@@ -771,12 +791,32 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   mtile = mgroup * W + warp
   q_head = kv_head * G + mtile % G
   rows = ((mtile // G) * WMMA_M + g, (mtile // G) * WMMA_M + g + 8)  # this lane's two fragment rows
-  # Q's A fragments for all k-steps, once per block (registers): a0 a1 = row g, cols 2t/+1; a2 a3 = row g+8; a4..a7 = cols +8/+9
-  afrags = [UOp.stack(*(q[b, q_head, rows[r], ks * WMMA_K + 2 * t + c8 + c].load().cast(dtypes.float16)
-                        for c8 in (0, 8) for r in (0, 1) for c in (0, 1))) for ks in range(KS)]
+  BLKS = D // 32  # 32-dim scale blocks
+  if int8:
+    # T4.148: q's m16n8k32 A fragment and S scales per block, once per block (registers): a0..a3 = row g even dims, row g+8 even,
+    # row g odd, row g+8 odd; sqv = (sq[g], sq[g], sq[g+8], sq[g+8]), C's m index
+    from tinygrad.llm.kernels.nv_gemm import _i8x4
+    assert cache_kv.dtype == dtypes.uint32 and sc is not None and BLKS % 2 == 0, "the int8 S path reads the int4 cache as uint32 words"
+    qfrags, sqv = [], []
+    for blk in range(BLKS):
+      words, sqs = [], []
+      for r in (0, 1):
+        qv = [q[b, q_head, rows[r], blk * 32 + 8 * t + i].load().float() for i in range(8)]
+        even, odd, sq = _q8_lane_block(qv, lambda a: _shfl_xor(_shfl_xor(a, 1, maximum=True), 2, maximum=True), D)
+        words.append((even, odd))
+        sqs.append(sq)
+      qfrags.append(UOp.stack(*_i8x4(words[0][0]), *_i8x4(words[1][0]), *_i8x4(words[0][1]), *_i8x4(words[1][1])))
+      sqv.append(UOp.stack(sqs[0], sqs[0], sqs[1], sqs[1]))
+  else:
+    # Q's A fragments for all k-steps, once per block (registers): a0 a1 = row g, cols 2t/+1; a2 a3 = row g+8; a4..a7 = cols +8/+9
+    afrags = [UOp.stack(*(q[b, q_head, rows[r], ks * WMMA_K + 2 * t + c8 + c].load().cast(dtypes.float16)
+                          for c8 in (0, 8) for r in (0, 1) for c in (0, 1))) for ks in range(KS)]
   o_acc = tuple(_reg((4,), 10 + n, 0, block) for n in range(OT))
   row_max, row_sum = _reg((2,), 1, SENTINEL, block), _reg((2,), 2, 0, block)
-  k_tile = UOp.placeholder((KT * D,), dtypes.float16, slot=100, addrspace=AddrSpace.LOCAL)
+  if int8:  # T4.148: the int8 K tile as uint32 words (b0, b1 per lane slot) + the K scales in fp32
+    k_tile = UOp.placeholder((KT * D // 4,), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
+    ks_tile = UOp.placeholder((KT * BLKS,), dtypes.float, slot=102, addrspace=AddrSpace.LOCAL)
+  else: k_tile = UOp.placeholder((KT * D,), dtypes.float16, slot=100, addrspace=AddrSpace.LOCAL)
   v_tile = UOp.placeholder((KT * D,), dtypes.float16, slot=101, addrspace=AddrSpace.LOCAL)
   steps = (valid_chunks + group_count - 1) // group_count
   offset, sub = UOp.range(steps, 100, AxisType.REDUCE), UOp.range(BLOCK_N // KT, 101, AxisType.REDUCE)
@@ -788,11 +828,22 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   # rotations, not XORs: CHECK_OOB's z3 pass (CI) has no XOR with a constant; the bank argument only needs a permutation per group
   def k_slot(j, ks, gg, tt): return (j * KS + ks) * WARP_SIZE + 4 * gg + (tt + j + NT * (ks // 2)) % 4
   def v_slot(kstep, n, gg, tt): return (kstep * OT + n) * WARP_SIZE + 4 * ((gg + n // 2) % 8) + tt
+  def k8_slot(j, blk, gg, tt): return (j * BLKS + blk) * WARP_SIZE + 4 * gg + (tt + j + 2 * (gg // 4)) % 4  # T4.148
+  def ks_index(j, pair, tt): return ((j * (BLKS // 2) + pair) * 4 + tt) * 4  # T4.148: + 2 * block parity + key parity
   stores = []
   # K: a task = (key, 32-dim scale block) -> the b0/b1 pairs of 4 lanes x 2 k-steps of its n-tile
   for task in tasks(KT * D // 32):
     kn, blk = task % KT, task // KT
     key = key0 + kn
+    if int8:
+      # T4.148: the block's 4 words -> lanes (kn % 8, tt) of group (kn // 8, blk) as int8 (b0, b1), and its scale
+      key_ok = key.valid(key < valid_kv_len)
+      for tt in range(4):
+        word, slot = cache_kv[0, b, kv_head, key_ok, blk * 4 + tt].load(), k8_slot(kn // 8, blk, kn % 8, tt)
+        stores += [k_tile[2 * slot].store(_nib8(word & 0x0F0F0F0F)), k_tile[2 * slot + 1].store(_nib8((word >> 4) & 0x0F0F0F0F))]
+      kidx = ks_index(kn // 8, blk // 2, kn % 8 // 2) + 2 * (blk % 2) + kn % 2
+      stores.append(ks_tile[kidx].store(cast(UOp, sc)[0, b, kv_head, key_ok, blk].load().float()))
+      continue
     vals = _kv_halves(cache_kv, sc, 0, b, kv_head, key.valid(key < valid_kv_len), blk * 32, 32)
     for kso in range(2):
       for tt in range(4):
@@ -811,13 +862,32 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
         slot = v_slot(kstep, half * 2 + np_, gg, tq)
         stores += [v_tile[slot * 4 + i].store(vrows[i][8 * np_ + gg]) for i in range(4)]
   k_tile, v_tile = k_tile.after(*stores), v_tile.after(*stores)
-  # S = Q.K^T over the tile's NT n-tiles (8 keys each), all k-steps unrolled (static register indices for the Q fragments)
-  zero = UOp.const((0.0,) * 4, dtypes.float)
-  s_vals = [zero] * NT
-  for ks in range(KS):
+  if int8:
+    # T4.148: S per n-tile = sum over the blocks of round(C * sk) * sq (the q scales already carry log2(e)/sqrt(D)). (c - 1.5*2**23) * sk,
+    # never c * sk - 1.5*2**23 * sk: nvcc may contract either product of the latter (see the docstring); a subtraction cannot be
+    ks_tile = ks_tile.after(*stores)
+    izero = UOp.const((0,) * 4, dtypes.int32)
+    s_vals = []
     for j in range(NT):
-      bfrag = UOp.stack(*(k_tile[k_slot(j, ks, g, t) * 4 + i].load() for i in range(4)))
-      s_vals[j] = UOp.wmma(afrags[ks], bfrag, s_vals[j], *GQA_WMMA_ARG)
+      acc = None
+      for pair in range(BLKS // 2):
+        sks = [ks_tile[ks_index(j, pair, t) + i].load() for i in range(4)]  # keys 2t, 2t+1 at block 2*pair, then at 2*pair+1
+        for par in range(2):
+          blk, slot = 2 * pair + par, k8_slot(j, 2 * pair + par, g, t)
+          bfrag = UOp.stack(*_i8x4(k_tile[2 * slot].load()), *_i8x4(k_tile[2 * slot + 1].load()))
+          skv = UOp.stack(*(sks[2 * par + i % 2] for i in range(4)))  # C's n index: key 2t for c0/c2, 2t+1 for c1/c3
+          c = (UOp.wmma(qfrags[blk], bfrag, izero, *DEC_IMMA_ARG) + MAGIC).bitcast(dtypes.float32)
+          term = ((c - 12582912.0) * skv) * sqv[blk]
+          acc = term if acc is None else acc + term
+      s_vals.append(cast(UOp, acc))
+  else:
+    # S = Q.K^T over the tile's NT n-tiles (8 keys each), all k-steps unrolled (static register indices for the Q fragments)
+    zero = UOp.const((0.0,) * 4, dtypes.float)
+    s_vals = [zero] * NT
+    for ks in range(KS):
+      for j in range(NT):
+        bfrag = UOp.stack(*(k_tile[k_slot(j, ks, g, t) * 4 + i].load() for i in range(4)))
+        s_vals[j] = UOp.wmma(afrags[ks], bfrag, s_vals[j], *GQA_WMMA_ARG)
   # masked scores (rows[0] at c0/c1, rows[1] at c2/c3; keys 2t, 2t+1 of each 8-key n-tile), online softmax as _prefill_wmma_kernel
   scale_log2 = LOG2E / math.sqrt(D)
   scores, oks = [], []
@@ -826,7 +896,10 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
       key, row = key0 + j * WMMA_N + 2 * t + (i % 2), rows[i // 2]
       ok = (key < valid_kv_len) & (key <= q_start + row)
       oks.append(ok)
-      scores.append(ok.where(s_vals[j][i] * scale_log2, UOp.const(SENTINEL, dtypes.float)))
+      # T4.148: int8 S + (0 | SENTINEL), not a select: as ok.where(S, ...) nvcc sank each score's 8-block epilogue under a branch on
+      # its mask, which kept all 32 mma results live across the branches (spills). The same values: S + SENTINEL rounds to SENTINEL
+      # in fp32 for any |S| < 2**75, and S + 0 = S
+      scores.append(s_vals[j][i] + ok.where(0.0, SENTINEL) if int8 else ok.where(s_vals[j][i] * scale_log2, UOp.const(SENTINEL, dtypes.float)))
   prev_max, prev_sum = row_max.after(sub), row_sum.after(sub)
   new_max, alphas = [], []
   for r in range(2):
@@ -834,6 +907,10 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
     nm = prev_max[r].load().maximum(_shfl_xor(_shfl_xor(m, 1, maximum=True), 2, maximum=True))
     new_max.append(nm)
     alphas.append((prev_max[r].load() - nm).exp2())
+  # T4.148: int8 takes p's mask from the score itself (a masked score is exactly SENTINEL, a live one finite far above it -- the same
+  # mask): the 16 key/row predicates then die at the scores instead of living across the max shuffles; they were the S phase's last
+  # two registers over the budget (8 B of spill stack, 2 STL/LDL per key tile)
+  if int8: oks = [sv > SENTINEL for sv in scores]
   ps = [ok.where((s - new_max[idx % 4 // 2]).exp2(), UOp.const(0, dtypes.float)) for idx, (s, ok) in enumerate(zip(scores, oks))]
   lane_sums = [functools.reduce(lambda a, p: a + p, [p for idx, p in enumerate(ps) if idx % 4 // 2 == r], UOp.const(0, dtypes.float))
                for r in range(2)]
@@ -861,16 +938,19 @@ def _prefill_gqa_kernel(out:UOp, stats:UOp, q:UOp, cache_kv:UOp, *scale:UOp, val
   out_stores += [stats[b, stats_head, rows[r], block_n, i].store(x) for r in range(2) for i, x in enumerate((row_max[r].load() / LOG2E, sums[r]))]
   return UOp.group(*out_stores).end(block, warp, lane).sink(arg=KernelInfo(name="flash_prefill_gqa_nv", opts_to_apply=()))
 
-def _gqa_geometry(H:int, H_KV:int, T_pad:int, D:int) -> dict[str, int]|None:
+def _gqa_geometry(H:int, H_KV:int, T_pad:int, D:int, int4:bool=False) -> dict[str, int]|None:
   """T4.130: the shared-tile kernel's shape from the NV_ATTN_GQA_* knobs (read here, never inside the cached builder), or None (-> the
   T4.113 kernel) when NV_ATTN_GQA is off or head_dim isn't whole 32-wide scale blocks. warps = the largest divisor of the m-tile
-  count (G * T_pad/16) <= the knob; keys = the knob rounded down to a power of two in [16, 128] whose K + V tiles fit SMEM_BYTES."""
+  count (G * T_pad/16) <= the knob; keys = the knob rounded down to a power of two in [16, 128] whose K + V tiles fit SMEM_BYTES
+  (sized for fp16 K: the int8 K tile + its scales are smaller). T4.148: int8 = NV_ATTN_GQA_INT8 for a KV_INT4 cache (int4) whose
+  head_dim is whole 64-dim block pairs, else 0."""
   if not NV_ATTN_GQA.value or D % 32 or H % H_KV: return None
   mtiles = H // H_KV * T_pad // WMMA_M
   warps = max(w for w in range(1, max(NV_ATTN_GQA_WARPS.value, 1) + 1) if mtiles % w == 0)
   keys = WMMA_K
   while keys * 2 <= min(NV_ATTN_GQA_KEYS.value, BLOCK_N) and 4 * keys * 2 * D <= SMEM_BYTES: keys *= 2
-  return {"warps": warps, "keys": keys} if 4 * keys * D <= SMEM_BYTES else None
+  int8 = int(bool(NV_ATTN_GQA_INT8.value) and int4 and D % 64 == 0)
+  return {"warps": warps, "keys": keys, "int8": int8} if 4 * keys * D <= SMEM_BYTES else None
 
 def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, valid_kv_len:int|UOp, q_start:int|UOp,
                          lanes:int=WARP_SIZE) -> Tensor:
@@ -878,7 +958,8 @@ def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, 
   T may be a bound Variable: the queries are padded to the chunk's static width (padded rows attend every valid key and are
   sliced off), exactly amd.py's flash_attention. Returns (B,H,T,D) float32. `lanes` is only for the CPU test (lanes=1).
   NV_ATTN_WMMA=1 (T4.113) takes the tensor-core kernel when head_dim allows it (16-row tiles); otherwise the T4.107b kernel.
-  T4.130: under NV_ATTN_WMMA=1, NV_ATTN_GQA=1 (default) takes the shared-tile kernel (_gqa_geometry); 0 = the T4.113 kernel."""
+  T4.130: under NV_ATTN_WMMA=1, NV_ATTN_GQA=1 (default) takes the shared-tile kernel (_gqa_geometry); 0 = the T4.113 kernel.
+  T4.148: on a KV_INT4 cache that kernel computes S on the int8 tensor cores (NV_ATTN_GQA_INT8=1, default; 0 = fp16 S)."""
   B, H, T, D = q.shape
   d_split = NV_ATTN_WMMA_DSPLIT.value
   wmma = bool(NV_ATTN_WMMA.value) and lanes == WARP_SIZE and cast(int, D) % WMMA_K == 0 and cast(int, D) % (WMMA_N * d_split) == 0
@@ -893,7 +974,7 @@ def nv_prefill_attention(q:Tensor, cache_kv:Tensor, cache_kv_scale:Tensor|None, 
   partial = Tensor.empty(B, H, T_pad, chunks, D, dtype="float32", device=q.device)
   stats = Tensor.empty(B, H, T_pad, chunks, 2, dtype="float32", device=q.device)
   srcs = (partial, stats, q.contiguous(), cache_kv) + ((cache_kv_scale,) if cache_kv_scale is not None else ())
-  if wmma and (gqa := _gqa_geometry(cast(int, H), cast(int, cache_kv.shape[2]), T_pad, cast(int, D))) is not None:
+  if wmma and (gqa := _gqa_geometry(cast(int, H), cast(int, cache_kv.shape[2]), T_pad, cast(int, D), cache_kv.dtype == dtypes.uint8)) is not None:
     # T4.130: Tensor.custom_kernel's call by hand so the int4 cache's parameter can be uint32 words over the same uint8 buffer (a
     # kernel argument is a pointer: no view, no copy -- a Tensor-level bitcast of the stored cache schedules a full copy)
     params = [UOp.placeholder_like(s.uop, slot=i) for i, s in enumerate(srcs)]

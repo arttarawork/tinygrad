@@ -3,7 +3,8 @@ with its 32 lanes as one warp, the merge and the in-kernel dequant convention ag
 NV_CUSTOM_ATTN gate leaves every other path untouched. Kernel numerics on the card: extra/nv_attn_validate_real.py.
 T4.129 (TestDecodeMMAKernel): the tensor-core KV_INT4 decode kernel EXECUTED on the PYTHON emulator against numpy (the warp
 shuffle swapped for a shared exchange, as test_llm_nv_norm does), its sm_86 render, the store gates at small G, the dispatch.
-T4.130: the GQA shared-tile prefill kernel is executed on the PYTHON emulator against numpy (TestPrefillGQAKernel).
+T4.130: the GQA shared-tile prefill kernel is executed on the PYTHON emulator against numpy (TestPrefillGQAKernel); T4.148: its
+int8 S path (NV_ATTN_GQA_INT8) the same way against fp64 with the plain and the q8-rounded q, its renders, registers and spills.
 T4.134 (TestVerifyMMAKernel): the decode mma kernel over speculative VERIFY runs of 2..4 tokens, on the emulator against numpy; its
 T == 1 renders pinned by md5."""
 import contextlib, itertools, math, pickle, re, sys, unittest
@@ -362,7 +363,7 @@ def _random_cache(rng:np.random.Generator, dtype, KVH:int, N:int, Dh:int, device
     if dtype != dtypes.float16 else None
   return kv, scale, _dequant_reference_np(kv, scale, Dh)
 
-def _gqa_sink(dtype, N:int, valid, q_start, M:int=128, warps:int=4, keys:int=32):
+def _gqa_sink(dtype, N:int, valid, q_start, M:int=128, warps:int=4, keys:int=32, int8:int=0):
   """the kernel graph at the model's geometry: the int4 cache arrives as nv_prefill_attention binds it, uint32 words over the uint8 buffer"""
   kv, scale = _cache(dtype, N)
   chunks = min(nv_attn.PREFILL_CHUNKS * 32 // max(M, 32), N // BLOCK_N)
@@ -370,7 +371,7 @@ def _gqa_sink(dtype, N:int, valid, q_start, M:int=128, warps:int=4, keys:int=32)
           Tensor.empty(B, H, M, D, dtype=dtypes.float16).uop, kv.uop] + ([scale.uop] if scale is not None else [])
   params = [UOp.placeholder_like(s, slot=i) for i, s in enumerate(srcs)]
   if dtype == dtypes.uint8: params[3] = UOp.placeholder((2, B, KVH, N, D // 8), dtypes.uint32, slot=3)
-  return nv_attn._prefill_gqa_kernel(*params, valid_kv_len=valid, q_start=q_start, max_kv_len=N, warps=warps, keys=keys)
+  return nv_attn._prefill_gqa_kernel(*params, valid_kv_len=valid, q_start=q_start, max_kv_len=N, warps=warps, keys=keys, int8=int8)
 
 def _sm86_source(sink:UOp, renderer=None):
   from tinygrad.codegen import to_program
@@ -378,6 +379,23 @@ def _sm86_source(sink:UOp, renderer=None):
   from tinygrad.helpers import DEV
   prg = to_program(sink, renderer or CUDARenderer(DEV.target("NV", arch="sm_86")))
   return prg, next(u.arg for u in prg.src if u.op is Ops.SOURCE)
+
+def _cubin_regs_stack(test, src:str) -> tuple[int, int]:
+  """(registers, spill stack bytes per thread) of src's sm_86 cubin through the real compiler (on macOS tinygrad's docker nvrtc lane, as
+  the server; skips the test when it cannot start): EIATTR_REGCOUNT / EIATTR_MIN_STACK_SIZE, what ops_nv reads"""
+  import struct
+  from tinygrad.runtime.support.compiler_cuda import NVRTCCompiler
+  from tinygrad.runtime.support.elf import elf_loader
+  try: lib = NVRTCCompiler("sm_86", ptx=False, cache_key="nv").compile(src)
+  except Exception as e: test.skipTest(f"nvrtc lane unavailable: {e!r}")
+  attrs = {}
+  for sh in elf_loader(lib, force_section_align=128)[1]:
+    off = 0
+    while sh.name == ".nv.info" and off < sh.header.sh_size:
+      typ, param, sz = struct.unpack_from("BBH", sh.content, off)
+      if typ == 0x4 and sz >= 8: attrs[param] = struct.unpack_from("II", sh.content, off + 4)[1]
+      off += (sz if typ == 0x4 else 0) + 4
+  return attrs[0x2f], attrs[0x12]
 
 class TestPrefillGQAKernel(unittest.TestCase):
   """T4.130: _prefill_gqa_kernel = the T4.113 kernel's contract with each K/V tile dequantised once into shared memory for `warps`
@@ -426,14 +444,17 @@ class TestPrefillGQAKernel(unittest.TestCase):
     except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
     self.assertIn(b"flash_prefill_gqa_nv", ptx)
 
-  def _run_emulated(self, dtype, Hq:int, KVH:int, Dh:int, N:int, T:int, q_start:int, warps:int, keys:int, slots:int|None=None, seed:int=0):
-    """nv_prefill_attention on the PYTHON device vs the numpy causal softmax; returns (got, ref, partial, stats, dequantised kv, q)"""
+  def _run_emulated(self, dtype, Hq:int, KVH:int, Dh:int, N:int, T:int, q_start:int, warps:int, keys:int, slots:int|None=None, seed:int=0,
+                    int8:int=0):
+    """nv_prefill_attention on the PYTHON device vs the numpy causal softmax; returns (got, ref, partial, stats, dequantised kv, q).
+    T4.148: int8 = NV_ATTN_GQA_INT8 (the int8 S path for the int4 cache; 0 keeps the T4.130 tests on the fp16 S path)"""
     rng = np.random.default_rng(seed)
     kv, scale, ref_kv = _random_cache(rng, dtype, KVH, N, Dh, "PYTHON")
     q_np = (rng.standard_normal((1, Hq, T, Dh)) * 2).astype(np.float16)
     q = Tensor(q_np, device="PYTHON").contiguous().realize()
     captured, merge = {}, nv_attn._merge_partials
     def capture(partial, stats, valid):
+      captured["mmas"] = {u.arg[0] for c in partial.uop.toposort() if c.op is Ops.CALL for u in c.src[0].toposort() if u.op is Ops.WMMA}
       captured["partial"], captured["stats"] = partial.numpy()[0], stats.numpy()[0]
       return merge(partial, stats, valid)
     patches = [mock.patch.object(nv_attn, "_shfl_xor", _emulated_shfl_xor),
@@ -442,8 +463,9 @@ class TestPrefillGQAKernel(unittest.TestCase):
     if slots is not None: patches.append(mock.patch.object(nv_attn, "PREFILL_CHUNKS", slots))  # fewer slots than live chunks: passes per slot
     with contextlib.ExitStack() as stack:
       for p in patches: stack.enter_context(p)
-      with Context(NV_ATTN_WMMA=1, NV_ATTN_GQA=1, NV_ATTN_GQA_WARPS=warps, NV_ATTN_GQA_KEYS=keys):
+      with Context(NV_ATTN_WMMA=1, NV_ATTN_GQA=1, NV_ATTN_GQA_WARPS=warps, NV_ATTN_GQA_KEYS=keys, NV_ATTN_GQA_INT8=int8):
         got = nv_attn.nv_prefill_attention(q, kv, scale, q_start + T, q_start).numpy()[0]
+    self.assertEqual(captured["mmas"], {(8, 16, 16), (8, 16, 32)} if int8 and dtype == dtypes.uint8 else {(8, 16, 16)})  # the path under test
     ref = TestPrefillKernel._reference(self, q_np[0], ref_kv, q_start + T, q_start)
     self.assertFalse(np.isnan(got).any())
     return got, ref, captured["partial"], captured["stats"], ref_kv, q_np[0]
@@ -464,28 +486,102 @@ class TestPrefillGQAKernel(unittest.TestCase):
         # fp16 operands (K, V, P) against an fp64 softmax: the absolute error scales with |V| (int8 x scale reaches ~6)
         np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3 * max(1.0, float(np.abs(kv[1]).max())))
 
+  # T4.148: md5 of the fp16-S sm_86 renders (int8=0 = NV_ATTN_GQA_INT8=0) as rendered at 9d1526238 (the served T4.130 kernel), by
+  # _lower_sm86: the model at chunk 128 (8 warps) and 32 (6 warps), the int8 and fp16 caches
+  FP16_MD5 = {"model": "cd2ae7775cb12bec5a841ce98cdebb33", "model_c32": "9822af46da1e58b87453436159f425c4",
+              "int8_cache": "a4311bbb63ecc6514373368931839d3d", "fp16_cache": "f48b415c4229ed75a37450ed2432452f"}
+
+  def test_fp16_render_unchanged(self):
+    import hashlib
+    N = 262144
+    sp, sp32 = UOp.variable("start_pos", 0, N - 128), UOp.variable("start_pos", 0, N - 32)
+    sinks = {"model": _gqa_sink(dtypes.uint8, N, sp + 128, sp, M=128, warps=8, keys=32),
+             "model_c32": _gqa_sink(dtypes.uint8, N, sp32 + 32, sp32, M=32, warps=6, keys=32),
+             "int8_cache": _gqa_sink(dtypes.int8, 4096, 4095, 3967, M=128, warps=4, keys=32),
+             "fp16_cache": _gqa_sink(dtypes.float16, 4096, 4095, 3967, M=128, warps=4, keys=32)}
+    for name, sink in sinks.items():
+      with self.subTest(sink=name):
+        self.assertEqual(hashlib.md5(_lower_sm86(sink)[1].encode()).hexdigest(), self.FP16_MD5[name], f"the fp16-S {name} render changed")
+
+  def test_int8_render_for_sm86(self):
+    # T4.148: the model's geometry at chunk 128 (8 warps) and 32 (6 warps): S on the int8 m16n8k32 mma (one per 8-key n-tile x 32-dim
+    # block), P.V on m16n8k16, the lane unsplit on threadIdx.x; staged: the int8 K tile (32 keys x 256 bytes as uint32 words), the fp16
+    # V tile and the fp32 K scales; the lowered PROGRAM pickles for the compile pool
+    N = 262144
+    for M, warps in ((128, 8), (32, 6)):
+      with self.subTest(M=M, warps=warps):
+        sp = UOp.variable("start_pos", 0, N - M)
+        prg, src = _lower_sm86(_gqa_sink(dtypes.uint8, N, sp + M, sp, M=M, warps=warps, keys=32, int8=1))
+        self.assertIn("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32", src)
+        self.assertIn("int lidx0 = threadIdx.x; /* 32 */", src)
+        self.assertIn(f"int lidx1 = threadIdx.y; /* {warps} */", src)
+        self.assertEqual(src.count("__WMMA_8_16_32_signed_char_int("), 1 + 4 * 8)  # the helper + S (4 n-tiles x 8 blocks)
+        self.assertEqual(src.count("__WMMA_8_16_16_half_float("), 1 + 2 * 32)      # the helper + P.V (2 k-steps x 32 n-tiles)
+        self.assertEqual(len(re.findall(r"__shared__ __align__\(16\) uint buf\d+\[2048\];", src)), 1)
+        self.assertEqual(len(re.findall(r"__shared__ __align__\(16\) half buf\d+\[8192\];", src)), 1)
+        self.assertEqual(len(re.findall(r"__shared__ __align__\(16\) float buf\d+\[256\];", src)), 1)
+        self.assertIn("start_pos", src)
+        self.assertLess(len(pickle.dumps(prg)), 2_000_000)
+
+  def test_int8_compiles_without_spills_on_the_nvrtc_lane(self):
+    # T4.148: the sm_86 cubins' registers and spill stack (the fp16-S kernel: 247 + 0 B). The int8 S path first spilled 888 bytes per
+    # thread (nvcc sank each masked score's 8-block epilogue under a branch, all 32 mma results live across them), then 16 / 8 (the
+    # key/row mask predicates alive across the max shuffles); the 16-key tile (NV_ATTN_GQA_KEYS=16) too
+    N = 262144
+    for M, warps, keys in ((128, 8, 32), (32, 6, 32), (128, 8, 16)):
+      sp = UOp.variable("start_pos", 0, N - M)
+      regs, stack = _cubin_regs_stack(self, _lower_sm86(_gqa_sink(dtypes.uint8, N, sp + M, sp, M=M, warps=warps, keys=keys, int8=1))[1])
+      self.assertLessEqual(regs, 255, f"{M=} {warps=} {keys=}")
+      self.assertEqual(stack, 0, f"{M=} {warps=} {keys=}")
+
+  @unittest.skipIf(sys.version_info < (3, 12), "the PYTHON emulator has no float16 before 3.12")
+  def test_int8_matches_numpy_on_python_emulator(self):
+    # T4.148: the int8 S path end to end (q8 prologue, int8 K tile, the per-block epilogue, the masks, P.V, stats, merge, slice) on the
+    # emulator against fp64: with q rounded as the kernel rounds it the arithmetic must sit in the fp16 path's own band (K is exact, P
+    # and V*sv round to fp16 as there), and with the plain q the int8 rounding must stay in that band too on random data. G = 2, 3, 6;
+    # fills ending mid-tile and mid-slot; starts 0, 1 and 5; chunks 16 / 32 / 128; several passes over a slot; 1..8 warps; 16- and
+    # 32-key tiles; head_dim 64 / 128 / 256; two kv heads
+    for Hq, KVH, Dh, N, T, q_start, warps, keys, slots in (
+        (2, 1, 64, 256, 16, 37, 1, 16, None),     # G=2, 53 valid keys, 16-key tiles
+        (6, 2, 64, 512, 32, 300, 3, 32, None),    # G=3, two kv heads, 6 m-tiles / 3 warps, 3 slots
+        (6, 1, 64, 512, 32, 1, 4, 32, None),      # G=6 from start 1 (rows see 2..33 keys), 12 m-tiles / 4 warps
+        (6, 1, 64, 512, 32, 0, 6, 32, None),      # start 0, the served chunk-32 shape (6 warps)
+        (3, 1, 128, 512, 32, 203, 3, 32, 1),      # head_dim 128, 235 keys = 2 live chunks on ONE slot (two passes)
+        (6, 1, 64, 256, 128, 5, 8, 32, None),     # chunk 128: 48 m-tiles / 8 warps (the served shape), rows 0..122 inside slot 0
+        (2, 1, 256, 512, 128, 77, 8, 32, None)):  # the model's head_dim at chunk 128 (8 blocks per head, 205 keys)
+      with self.subTest(Hq=Hq, KVH=KVH, Dh=Dh, N=N, T=T, q_start=q_start, warps=warps, keys=keys, slots=slots):
+        got, ref, _, _, kv, q = self._run_emulated(dtypes.uint8, Hq, KVH, Dh, N, T, q_start, warps, keys, slots, int8=1)
+        atol = 2e-3 * max(1.0, float(np.abs(kv[1]).max()))
+        ref_q8 = TestPrefillKernel._reference(self, _q8_round_np(q.astype(np.float32)), kv, q_start + T, q_start)
+        np.testing.assert_allclose(got, ref_q8, rtol=2e-3, atol=atol)
+        np.testing.assert_allclose(got, ref, rtol=2e-3, atol=atol)
+
   def test_partials_and_stats_layout(self):
     # the per-slot (acc, m, l) the kernel writes, in _merge_partials' convention (m in the NATURAL domain, as the decode and T4.107b
     # kernels store it: the online softmax runs in the exp2 domain and converts on the way out); a slot with no visible key for a row
-    # (q_start 120: rows 0..7 end before slot 1's first key) carries (SENTINEL-scaled m, l=0, acc=0) and weighs nothing in the merge
-    dtype, Hq, KVH, Dh, N, T, q_start = dtypes.float16, 2, 1, 32, 256, 16, 120
-    got, ref, partial, stats, kv, q = self._run_emulated(dtype, Hq, KVH, Dh, N, T, q_start, 1, 32)
-    np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
-    self.assertEqual((partial.shape, stats.shape), ((Hq, T, 2, Dh), (Hq, T, 2, 2)))  # (H, T_pad, slots, D) / (H, T_pad, slots, 2)
-    for h in range(Hq):
-      for r in range(T):
-        for s in range(2):
-          keys = np.arange(s * BLOCK_N, min((s + 1) * BLOCK_N, q_start + r + 1))
-          if not len(keys):
-            self.assertLess(stats[h, r, s, 0], -1e29)
-            self.assertEqual(stats[h, r, s, 1], 0)
-            np.testing.assert_array_equal(partial[h, r, s], 0)
-            continue
-          sc = kv[0, h // 2][keys].astype(np.float64) @ q[h, r].astype(np.float64) / math.sqrt(Dh)
-          e = np.exp(sc - sc.max())
-          np.testing.assert_allclose(stats[h, r, s, 0], sc.max(), rtol=1e-5, atol=1e-5)
-          np.testing.assert_allclose(stats[h, r, s, 1], e.sum(), rtol=1e-4, atol=1e-5)
-          np.testing.assert_allclose(partial[h, r, s], e @ kv[1, h // 2][keys].astype(np.float64), rtol=2e-3, atol=2e-3)
+    # (q_start 120: rows 0..7 end before slot 1's first key) carries (SENTINEL-scaled m, l=0, acc=0) and weighs nothing in the merge.
+    # T4.148: the int8 S path (its masked scores are S + SENTINEL, its p mask the score itself) against the q8-rounded q
+    for dtype, Dh, int8 in ((dtypes.float16, 32, 0), (dtypes.uint8, 64, 1)):
+      with self.subTest(int8=int8):
+        Hq, KVH, N, T, q_start = 2, 1, 256, 16, 120
+        got, ref, partial, stats, kv, q = self._run_emulated(dtype, Hq, KVH, Dh, N, T, q_start, 1, 32, int8=int8)
+        np.testing.assert_allclose(got, ref, rtol=2e-3, atol=2e-3)
+        if int8: q = _q8_round_np(q.astype(np.float32))
+        self.assertEqual((partial.shape, stats.shape), ((Hq, T, 2, Dh), (Hq, T, 2, 2)))  # (H, T_pad, slots, D) / (H, T_pad, slots, 2)
+        for h in range(Hq):
+          for r in range(T):
+            for s in range(2):
+              keys = np.arange(s * BLOCK_N, min((s + 1) * BLOCK_N, q_start + r + 1))
+              if not len(keys):
+                self.assertLess(stats[h, r, s, 0], -1e29)
+                self.assertEqual(stats[h, r, s, 1], 0)
+                np.testing.assert_array_equal(partial[h, r, s], 0)
+                continue
+              sc = kv[0, h // 2][keys].astype(np.float64) @ q[h, r].astype(np.float64) / math.sqrt(Dh)
+              e = np.exp(sc - sc.max())
+              np.testing.assert_allclose(stats[h, r, s, 0], sc.max(), rtol=1e-5, atol=1e-5)
+              np.testing.assert_allclose(stats[h, r, s, 1], e.sum(), rtol=1e-4, atol=1e-5)
+              np.testing.assert_allclose(partial[h, r, s], e @ kv[1, h // 2][keys].astype(np.float64), rtol=2e-3, atol=2e-3)
 
   def test_routing_knob_and_geometry(self):
     # NV_ATTN_GQA=1 (default) under NV_ATTN_WMMA=1 routes to the shared-tile kernel with the int4 cache bound as uint32 words (no copy:
@@ -494,12 +590,13 @@ class TestPrefillGQAKernel(unittest.TestCase):
     kv = Tensor.zeros(2, 1, KVH, N, Dh // 2, dtype=dtypes.uint8).contiguous().realize()
     scale = Tensor.ones(2, 1, KVH, N, Dh // 32, dtype=dtypes.float16).contiguous().realize()
     q = Tensor.ones(1, Hq, 6, Dh, dtype=dtypes.float16)
-    def route(gqa:int):
-      with Context(NV_ATTN_WMMA=1, NV_ATTN_GQA=gqa): out = nv_attn.nv_prefill_attention(q, kv, scale, 106, 100)
+    def route(gqa:int, int8:int=1, cache:Tensor=kv, cache_scale:Tensor=scale):
+      with Context(NV_ATTN_WMMA=1, NV_ATTN_GQA=gqa, NV_ATTN_GQA_INT8=int8): out = nv_attn.nv_prefill_attention(q, cache, cache_scale, 106, 100)
       nodes = list(out.uop.toposort())
       calls = [u for u in nodes if u.op is Ops.CALL]
       names = [u.arg.name for u in nodes if u.op is Ops.SINK and isinstance(u.arg, KernelInfo)]
       return names, calls
+    def mmas(calls) -> set: return {u.arg[0] for c in calls for u in c.src[0].toposort() if u.op is Ops.WMMA}
     names, calls = route(1)
     self.assertEqual(names, ["flash_prefill_gqa_nv"])
     self.assertEqual(len(calls), 1)
@@ -507,10 +604,21 @@ class TestPrefillGQAKernel(unittest.TestCase):
     self.assertEqual((params[3].dtype, params[3].shape), (dtypes.uint32, (2 * KVH * N * Dh // 8,)))  # D/8 words per key
     self.assertIs(calls[0].src[4].base.buf_uop, kv.uop.base.buf_uop)  # srcs: out, stats, q, cache, scale -- the cache buffer as stored
     self.assertEqual(route(0)[0], ["flash_prefill_wmma_nv"])
+    # T4.148: NV_ATTN_GQA_INT8=1 (default) puts S on the int8 mma for the int4 cache; 0, or an int8/fp16 cache, keeps the fp16 S
+    self.assertEqual(mmas(calls), {(8, 16, 32), (8, 16, 16)})
+    self.assertEqual(mmas(route(1, int8=0)[1]), {(8, 16, 16)})
+    kv8 = Tensor.zeros(2, 1, KVH, N, Dh, dtype=dtypes.int8).contiguous().realize()
+    self.assertEqual(mmas(route(1, cache=kv8)[1]), {(8, 16, 16)})
+    self.assertEqual(mmas(route(1, cache=Tensor.zeros(2, 1, KVH, N, Dh, dtype=dtypes.float16).contiguous().realize(), cache_scale=None)[1]),
+                     {(8, 16, 16)})
     # the geometry from the knobs: warps = the largest divisor of the m-tile count (G * T_pad / 16) <= NV_ATTN_GQA_WARPS, keys the
-    # largest power of two <= NV_ATTN_GQA_KEYS whose K + V fp16 tiles fit the 48 KB static shared-memory cap
-    self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 8, "keys": 32})  # the model: 48 m-tiles per kv head; default 8 (10-29)
-    with Context(NV_ATTN_GQA_WARPS=16, NV_ATTN_GQA_KEYS=128): self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 16, "keys": 32})
+    # largest power of two <= NV_ATTN_GQA_KEYS whose K + V fp16 tiles fit the 48 KB static shared-memory cap; int8 for an int4 cache
+    self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 8, "keys": 32, "int8": 0})  # the model: 48 m-tiles per kv head
+    self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256, True), {"warps": 8, "keys": 32, "int8": 1})  # ... with its KV_INT4 cache
+    with Context(NV_ATTN_GQA_INT8=0): self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256, True)["int8"], 0)
+    self.assertEqual(nv_attn._gqa_geometry(4, 2, 16, 32, True)["int8"], 0)  # head_dim 32: no whole 64-dim block pair
+    with Context(NV_ATTN_GQA_WARPS=16, NV_ATTN_GQA_KEYS=128):
+      self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256), {"warps": 16, "keys": 32, "int8": 0})
     with Context(NV_ATTN_GQA_WARPS=5): self.assertEqual(nv_attn._gqa_geometry(24, 4, 128, 256)["warps"], 4)
     with Context(NV_ATTN_GQA_KEYS=128): self.assertEqual(nv_attn._gqa_geometry(4, 2, 16, 64)["keys"], 128)  # 4*128*64 = 32 KB fits
     with Context(NV_ATTN_GQA=0): self.assertIsNone(nv_attn._gqa_geometry(24, 4, 128, 256))
@@ -585,10 +693,12 @@ def _dequant_int4_np(kv:np.ndarray, scale:np.ndarray, Dh:int) -> np.ndarray:
 
 def _q8_round_np(q:np.ndarray) -> np.ndarray:
   """the kernel's prologue: q rounded to int8 per 32-wide block (absmax/127, round half to even, clip) -- the one approximation the
-  tensor-core path adds over the T4.107a kernel (P and V*scale go to fp16 for the P.V mma, like the T4.113 prefill kernel)"""
+  tensor-core path adds over the T4.107a kernel (P and V*scale go to fp16 for the P.V mma, like the T4.113 prefill kernel).
+  T4.148: in the kernel's fp32 steps (absmax * fp32(1/127), then v * (1/scale)): fp16 q values hit exact .5 ties often enough that
+  numpy's true division rounded some of them the other way (a 1e-3 score error in the int8 prefill kernel's stats check)"""
   blk = q.reshape(*q.shape[:-1], q.shape[-1] // 32, 32).astype(np.float32)
-  sq = np.maximum(np.abs(blk).max(-1, keepdims=True) / 127, 1e-8)
-  return (np.clip(np.rint(blk / sq), -127, 127) * sq).reshape(q.shape)
+  sq = np.maximum(np.abs(blk).max(-1, keepdims=True) * np.float32(1 / 127), np.float32(1e-8))
+  return (np.clip(np.rint(blk * (np.float32(1) / sq)), -127, 127) * sq).reshape(q.shape)
 
 class TestDecodeMMAKernel(unittest.TestCase):
   """T4.129: the tensor-core decode kernel (one warp per partial slot, KS = 16*k_tiles keys per step, int8 mma for Q.K^T, fp16 mma
@@ -803,22 +913,11 @@ class TestVerifyMMAKernel(unittest.TestCase):
     # server; skipped when it cannot start): the sm_86 cubin's register count and spill stack (EIATTR_REGCOUNT / EIATTR_MIN_STACK_SIZE,
     # what ops_nv reads). Unsplit, VERIFY(3) spilled 1120 bytes per thread (more than L1 holds at two blocks per SM); d_split 2: 160
     # (VERIFY(4): 272). T4.144 (q words in shared memory): VERIFY(3) 0, VERIFY(4) 16 (three loop-invariant index words)
-    import struct
-    from tinygrad.runtime.support.compiler_cuda import NVRTCCompiler
-    from tinygrad.runtime.support.elf import elf_loader
     for T, max_stack in ((3, 0), (4, 16)):
       _, src = _lower_sm86(_mma_sink(262144, UOp.variable("start_pos", 0, 262144 - T) + T, T=T, d_split=nv_attn.NV_ATTN_DEC_DSPLIT.value))
-      try: lib = NVRTCCompiler("sm_86", ptx=False, cache_key="nv").compile(src)
-      except Exception as e: self.skipTest(f"nvrtc lane unavailable: {e!r}")
-      attrs = {}
-      for sh in elf_loader(lib, force_section_align=128)[1]:
-        off = 0
-        while sh.name == ".nv.info" and off < sh.header.sh_size:
-          typ, param, sz = struct.unpack_from("BBH", sh.content, off)
-          if typ == 0x4 and sz >= 8: attrs[param] = struct.unpack_from("II", sh.content, off + 4)[1]
-          off += (sz if typ == 0x4 else 0) + 4
-      self.assertLessEqual(attrs[0x2f], 255, f"T={T}")        # EIATTR_REGCOUNT
-      self.assertLessEqual(attrs[0x12], max_stack, f"T={T}")  # EIATTR_MIN_STACK_SIZE: the spill stack, bytes per thread
+      regs, stack = _cubin_regs_stack(self, src)
+      self.assertLessEqual(regs, 255, f"T={T}")
+      self.assertLessEqual(stack, max_stack, f"T={T}")  # the spill stack, bytes per thread
 
   def test_dispatch(self):
     # graph-level, on CPU with the sm_80 check mocked: a concrete 2..4-token run on a KV_INT4 cache takes the mma kernel over H*T rows;
