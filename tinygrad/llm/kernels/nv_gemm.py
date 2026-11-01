@@ -490,6 +490,31 @@ class _RegRaw:
     if self.regs is not None: self.stores.append(self.regs[k].store(self.raw[idx]))
     return self.raw[idx]
 
+# T4.147 step 1: the SASS of this kernel at the card's geometry (nvrtc docker lane, cuobjdump -sass; tinygrad-bench-data
+# logs/t4147/diag.py; 128 tokens, the served knobs: token tile 64, 4 warps, 2 n-tiles, stage 4, __launch_bounds__(128, 3)).
+# The step loop is one stage (S=4 groups x 2 n-tiles x 4 m-tiles = 32 IMMA.16832.S8.S8), not unrolled, byte-identical at all
+# four Q4_0 shapes (5120->17408, 17408->5120, 5120->5120, 5120->10240). Instructions per mma in the loop:
+#                     Q4_0 (555/32)   Q4_1 (689/32)   Q5_K (1009/32)
+#   IMMA                  1.00            1.00            1.00
+#   FFMA / FMUL       8.00 / 0.50    12.00 / 0.50    12.00 / 1.50   epilogue: 2 FFMA per element (+1 for M*xsum), -K*d per column
+#   LDS                   3.00            4.00            4.00       A words 2.00 + xd 1.00 (+ xsum 1.00)
+#   LDG                   1.19            1.00            0.75       Q4_0: 0.50 qs + 0.50 d (LDG.E.U16), 0.19 the stage fill
+#   LOP3/IADD3/SHF/PRMT   2.19            1.06            9.38       the nibble unpack (Q5_K: + qh bits and 6-bit scales)
+#   HADD2.F32 / I2FP  0.50 / 0        1.00 / 0        0.25 / 1.00
+#   IMAD/MOV/LEA/STS/BAR/other 1.96   0.98            2.65
+#   total                17.34           21.53           31.53
+# Registers 158 / 158 / 165, no spills -> 3 blocks = 12 warps per SM. The +0x4B400000 IS folded into the mma's C operand (four
+# MOV Rc, 0x4b400000 per step, the same C quad for all 32 IMMAs) -- no I2F anywhere in the Q4_0 loop.
+# Issue floor: GA102 retires 256 int8 MAC/clk per SM sub-partition, so one m16n8k32 (4096 MAC) holds its tensor core 16 clk
+# while the sub-partition issues one instruction per clk: 17.34 issue slots per 16 tensor clocks caps Q4_0 at ~92 % of the int8
+# peak. Measured (10-31 profile, 128-token chunk): 86 ms for 845 M mma over 328 sub-partitions = ~57 clk per mma = 28 %. The
+# loop is NOT at its issue floor; FFMA (half the slots) is at the bit-identity floor anyway (2 roundings per element).
+# What the step does spend: L1TEX wavefronts. Per warp and step: 32 LDG.E.U16 of the weights, each touching 8 (qs: rows g) or 4
+# (d: rows 2t+j) different 128-byte lines (row strides 2880 / 9792 B = 64 mod 128: no two rows share a line) = 192 wavefronts
+# for 1152 bytes, + 96 LDS + 36 for the stage fill = 324 per 32 mma -> ~40 L1TEX cycles per 16 tensor cycles per SM: <= 40 %
+# of the tensor peak, 59 % of it the 2-byte weight loads. That model fits the card history the issue model does not: 2 -> 3
+# blocks per SM +2 % (T4.131: not latency), NV_IMMA_WPREFETCH / NV_IMMA_PIPE no gain (the same loads, moved), 1 n-tile per
+# warp 1.46x slower (A's LDS doubled, T4.126 sweep), and 40 % x the gate/up wave tail (544 blocks / 246 slots) ~= 28 %.
 @functools.cache
 def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
                     token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0, wprefetch:int=0, splitk:int=1) -> UOp:
