@@ -82,6 +82,10 @@ NV_IMMA_WPREFETCH = ContextVar("NV_IMMA_WPREFETCH", 0)
 # 1 = off (today's kernel); 0 = auto (the smallest divisor of the step count that gives ~2 waves of resident blocks, else the
 # largest <= 8; the wide layers keep one pass); n = that split wherever it divides the step count
 NV_IMMA_SPLITK = ContextVar("NV_IMMA_SPLITK", 1)
+# T4.147: 1 = Q4_0's weight rows staged in shared memory with the activation tile (coalesced word loads; the fragments and scales
+# read back conflict-free) instead of 32 scattered 2-byte global loads per warp and step; same B words and scales, so the same
+# bits out. 0 = the T4.126/T4.131 kernel, byte-identical. Needs a stage tile with an even group count (the geometry falls back)
+NV_IMMA_WTILE = ContextVar("NV_IMMA_WTILE", 1)
 
 WMMA_M, WMMA_N, WMMA_K, WARP_SIZE = 16, 8, 16, 32  # mma.sync.aligned.m16n8k16, fp16 in / fp32 accumulate
 WMMA_ARG = ((WMMA_N, WMMA_M, WMMA_K), 'NV', WARP_SIZE)  # UOp.wmma's `dims` is (N,M,K), matching TensorCore.dims
@@ -429,7 +433,9 @@ def _q4_0_imma_b(raw:UOp, n:UOp, groups:int, group:UOp, t:UOp) -> tuple[UOp, UOp
   # same bytes (gguf.py), so qs[4t..4t+3]'s low nibbles are b0 and its high nibbles b1; nibble-8 per byte is (n + 0x78) ^ 0x80
   # (no carry: n + 0x78 <= 0x87)
   base16 = (n*groups + group)*9
-  qs = raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16)
+  return _q4_0_b(raw[base16 + 1 + 2*t].cast(dtypes.uint32) | (raw[base16 + 2 + 2*t].cast(dtypes.uint32) << 16))
+
+def _q4_0_b(qs:UOp) -> tuple[UOp, UOp]:  # qs[4t..4t+3] as one little-endian uint32 -> the lane's (b0, b1)
   def unsign(nib:UOp) -> UOp: return (nib + 0x78787878) ^ 0x80808080
   return unsign(qs & 0x0F0F0F0F), unsign((qs >> 4) & 0x0F0F0F0F)
 
@@ -515,13 +521,21 @@ class _RegRaw:
 # of the tensor peak, 59 % of it the 2-byte weight loads. That model fits the card history the issue model does not: 2 -> 3
 # blocks per SM +2 % (T4.131: not latency), NV_IMMA_WPREFETCH / NV_IMMA_PIPE no gain (the same loads, moved), 1 n-tile per
 # warp 1.46x slower (A's LDS doubled, T4.126 sweep), and 40 % x the gate/up wave tail (544 blocks / 246 slots) ~= 28 %.
+# T4.147 step 2 (NV_IMMA_WTILE=1, Q4_0): the weight rows staged with the activations. Per step and warp the 32 LDG.E.U16 + 4 PRMT
+# become 9 LDG.E (the fill) + 9 STS + 28 LDS from the tile (12 qs words, 16 scale words) + 4 PRMT: 560 instructions (17.50 per
+# mma), 144 registers (was 158; the fill's addresses are one base + immediates), no spills; the weights' L1TEX cost ~192 -> ~86
+# wavefronts (fill loads ~40 for 2 rows x 64 B per chunk load, ~18 STS at a 2-way overlap, 28 LDS conflict-free), the step's
+# total ~324 -> ~218. With NV_IMMA_PIPE=1 on top: 168 registers, no spills, one barrier per step, and the next stage's weight AND
+# activation loads both issue before this stage's mmas (the 10-28 pipe left the weights' latency exposed at the top of every step).
 @functools.cache
 def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggml_type:int, out_features:int, in_features:int,
-                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0, wprefetch:int=0, splitk:int=1) -> UOp:
+                    token_tile:int, warps:int, out_tiles:int, stage:int, pipe:int=0, minblocks:int=0, wprefetch:int=0, splitk:int=1,
+                    wtile:int=0) -> UOp:
   """T4.126: Q4_0 prefill gemm on the int8 tensor cores (mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32): one mma per
   (16-token m-tile, 8-output n-tile, 32-wide group) from a zero int32 accumulator -- exact int dot -- then
   acc += (float(c) * d_w[n]) * xd[m] in fp32, llama.cpp MMQ's numerics. Inputs: out (tokens, out_features) fp32, raw = the
-  Q4_0 weight's uint16 view (amd.py packed_u16; 9 u16 per 18-byte block: d, then qs[0:16]), xq/xd = nv_quant.q8_quantize's
+  Q4_0 weight's uint16 view (amd.py packed_u16; 9 u16 per 18-byte block: d, then qs[0:16]; T4.147 wtile=1: its uint32 view,
+  packed_u32, staged into shared memory per stage and read back as words), xq/xd = nv_quant.q8_quantize's
   (tokens, groups, 8) uint32 words (4 int8 per word, element 4w+i = byte i) and (tokens, groups) fp32 scales.
   T4.128: the same kernel for Q4_1 and Q5_K -- IMMA_FORMATS supplies the B registers and the per-output (D, M); with an M the
   group adds M[n] * xsum[m] after the D term (one more FFMA per output element), xsum = q8_quantize(sums=True)'s third output,
@@ -559,6 +573,8 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
   imma_b, imma_scales, name = IMMA_FORMATS[ggml_type]
   groups, S = in_features // Q8_GROUP_SIZE, max(stage, 1)  # S groups per REDUCE iteration
   assert (groups // S) % splitk == 0, f"split-K {splitk} must divide the {groups // S} stage steps"
+  # T4.147: the weight tile needs Q4_0's u32 view and whole words per row and stage (18 bytes per group: groups and S even)
+  assert not wtile or (ggml_type == Q4_0 and stage % 2 == 0 and stage > 0 and groups % 2 == 0 and not wprefetch), "wtile: Q4_0, even stage"
   steps = groups // S // splitk  # T4.131: stage steps per block (every step of the one pass when splitk == 1)
   # output_block gets the lower axis id so the token blocks of one output block are adjacent in the launch order (gidx0 is the
   # LAST global axis): they run together and share their weight rows through L2 instead of each streaming them from DRAM
@@ -589,22 +605,38 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
     wstride, dstride, threads, copies = 8*S + 4, S + 1, warps*WARP_SIZE, 2 if pipe else 1
     xs_buf = UOp.placeholder((copies*token_tile*wstride,), dtypes.uint32, slot=100, addrspace=AddrSpace.LOCAL)
     xd_buf = UOp.placeholder((copies*token_tile*dstride,), dtypes.float32, slot=101, addrspace=AddrSpace.LOCAL)
-    tiles = [(xs_buf, wstride, 8*S, 4, lambda at, r, c: xq[t0 + r, at*S + c // 8, c % 8]),
-             (xd_buf, dstride, S, 1, lambda at, r, c: xd[t0 + r, at*S + c])]
+    # (buffer, rows, row stride, words per row, words per thread, global load, first column) per tile
+    tiles = [(xs_buf, token_tile, wstride, 8*S, 4, lambda at, r, c: xq[t0 + r, at*S + c // 8, c % 8], 0),
+             (xd_buf, token_tile, dstride, S, 1, lambda at, r, c: xd[t0 + r, at*S + c], 0)]
     if xsum is not None:  # T4.128: the sums ride along with the scales (same layout, same fill index)
-      tiles.append((sum_buf := UOp.placeholder((copies*token_tile*dstride,), dtypes.float32, slot=102, addrspace=AddrSpace.LOCAL), dstride,
-                    S, 1, lambda at, r, c: xsum[t0 + r, at*S + c]))
+      tiles.append((sum_buf := UOp.placeholder((copies*token_tile*dstride,), dtypes.float32, slot=102, addrspace=AddrSpace.LOCAL),
+                    token_tile, dstride, S, 1, lambda at, r, c: xsum[t0 + r, at*S + c], 0))
+    if wtile:
+      # T4.147: the block's weight rows for these S groups staged next to the activations, raw: row n's stage run is 18S contiguous
+      # bytes = 9S/2 words of the u32 view (n*groups*18 and at*18S are multiples of 4: groups and S even, amd.py's view offset % 4
+      # == 0). The fill reads them as consecutive words -- each warp load covers ~2 rows' runs, a few 128-byte lines -- where the
+      # direct path's 32 LDG.U16 per warp and step each touch 8 (qs) or 4 (d) lines (step 1 above). Row stride wrun+pad = 4 mod 8
+      # words: the fragment reads (rows g, words t + const) and the scale reads (rows 2t+j) are conflict-free. The fill goes in
+      # 16-column chunks (S=4: columns 0-15, then 16-17): a power-of-two row width keeps every thread's rows and columns a shift and
+      # a mask of its id, so its loads and stores are one address + immediates (a width-18 fill's per-load div/mod by 18 held 18
+      # registers across the loop: 168 registers + spills under __launch_bounds__(128, 3)); a warp's chunk load is 2 rows x 64 bytes
+      wrows, wrun, wtstride = warps*out_tiles*WMMA_N, S*9//2, _wtile_stride(S)
+      wt_buf = UOp.placeholder((copies*wrows*wtstride,), dtypes.uint32, slot=104, addrspace=AddrSpace.LOCAL)
+      for col0 in range(0, wrun, 16):
+        tiles.append((wt_buf, wrows, wtstride, min(16, wrun - col0), 1,
+                      lambda at, r, c: raw[(output_block*wrows + r)*(groups*9//2) + at*wrun + c], col0))
     def fill(at, copy) -> UOp:  # stage `at`'s tiles into tile copy `copy` (None: the one copy of the unpipelined kernel)
       fills = []
       # each thread fills 4 consecutive words (a 16-byte-aligned run in both buffers: 8S and 8S+4 are multiples of 4), which the
       # coalescer turns into one uint4 LDG + one uint4 STS; the scales go one float per thread
-      for buf, stride, per_row, vec, load in tiles:
-        total = token_tile*per_row//vec
+      for buf, rows, stride, per_row, vec, load, col0 in tiles:
+        total = rows*per_row//vec
         for i in range(-(-total // threads)):
           idx = warp*WARP_SIZE + lane + i*threads
           if total % threads: idx = idx.minimum(total - 1)  # surplus threads rewrite the last element with its own value: no gate
           r, c0 = idx // (per_row//vec), idx % (per_row//vec) * vec
-          base = r * stride + c0 if copy is None else copy*(token_tile*stride) + r*stride + c0
+          if col0: c0 = c0 + col0
+          base = r * stride + c0 if copy is None else copy*(rows*stride) + r*stride + c0
           fills += [buf[base + j].store(load(at, r, c0 + j)) for j in range(vec)]
       return UOp.group(*fills)
     if pipe:
@@ -620,12 +652,15 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
       prefetch.append(fill(stage_of((step + 1).minimum(steps - 1)), 1 - (step & 1)))
     else: ready, cur = fill(stage_of(step), None), None
     xs, xds = xs_buf.after(ready), xd_buf.after(ready)
-    def at_copy(i, stride:int): return i if cur is None else cur*(token_tile*stride) + i
-    def word(row, w:int, s:int): return xs[at_copy(row*wstride + s*8 + w, wstride)]
-    def scale(row, s:int): return xds[at_copy(row*dstride + s, dstride)]
+    def at_copy(i, size:int): return i if cur is None else cur*size + i  # size: one tile copy's elements
+    def word(row, w:int, s:int): return xs[at_copy(row*wstride + s*8 + w, token_tile*wstride)]
+    def scale(row, s:int): return xds[at_copy(row*dstride + s, token_tile*dstride)]
     if xsum is not None:
       sums = sum_buf.after(ready)
-      def gsum(row, s:int): return sums[at_copy(row*dstride + s, dstride)]
+      def gsum(row, s:int): return sums[at_copy(row*dstride + s, token_tile*dstride)]
+    if wtile:
+      wts = wt_buf.after(ready)
+      def wword(row, w:int): return wts[at_copy(row*wtstride + w, wrows*wtstride)]
   else:  # stage 0: every warp loads its fragments straight from global (the pre-staging kernel, kept as a card A/B)
     def word(row, w:int, s:int): return xq[t0 + row, stage_of(step), w]
     def scale(row, s:int): return xd[t0 + row, stage_of(step)]
@@ -658,6 +693,20 @@ def _linear_imma_nv(out:UOp, raw:UOp, xq:UOp, xd:UOp, xsum:UOp|None=None, *, ggm
     ahead = _RegRaw(wr.after(*replay.loads), raw)
     wside(ahead, stage_of((step + 1).minimum(steps - 1)))
     prefetch += ahead.stores
+  elif wtile:
+    # T4.147: the same B words and D values as _q4_0_imma_b/_q4_0_imma_scales (so the same bits out), read from the weight tile.
+    # Block s of a row's run starts at byte 18s = word 9u (s = 2u) or 9u + 4.5 (s = 2u+1): its qs[4t..4t+3] (bytes 18s+2+4t..) are
+    # word 9u+5+t when s is odd and straddle words 9u+t, 9u+t+1 when s is even; its fp16 d is the low half of word 9u (s even) or
+    # the high half of word 9u+4 (s odd)
+    wvals = []
+    for s in range(S):
+      u, odd = divmod(s, 2)
+      for o in range(out_tiles):
+        rl = (warp*out_tiles + o)*WMMA_N  # this n-tile's first row in the tile
+        qs = wword(rl + g, 9*u + 5 + t) if odd else (wword(rl + g, 9*u + t) >> 16) | (wword(rl + g, 9*u + t + 1) << 16)
+        bfrag = UOp.stack(*(b for word32 in _q4_0_b(qs) for b in _i8x4(word32)))
+        dw = tuple(wword(rl + 2*t + j, 9*u + 4*odd) for j in (0, 1))
+        wvals.append((bfrag, tuple((_half(w >> 16 if odd else w), None) for w in dw)))
   else: wvals = wside(raw, stage_of(step))
   running = [[acc.after(step) for acc in row] for row in accs]
   for s in range(S):
@@ -697,9 +746,12 @@ def _wmma_kernel(out:UOp, raw:UOp, x:UOp, grid:UOp|None=None, *, out_features:in
   layout = _wmma_layout_nv(out, out_features, token_tile, _output_tiles_for(out_features))
   return _quant_linear_wmma_nv(out, raw, x, out_features, in_features, layout, dequant4, name)
 
-def _imma_weight(layer:Linear) -> Tensor|None:
-  # T4.128: the aligned view each IMMA format reads (amd.py set_quantized): Q4_0's u16 view, Q4_1's u32 view, Q5_K's word view
-  return {Q4_0: layer.packed_u16, Q4_1: layer.packed_u32, Q5_K: layer.weight}.get(cast(int, layer.ggml_type))
+def _imma_weight(layer:Linear, wtile:int=0) -> Tensor|None:
+  # T4.128: the aligned view each IMMA format reads (amd.py set_quantized): Q4_0's u16 view, Q4_1's u32 view, Q5_K's word view;
+  # T4.147: the weight tile's fill reads Q4_0's u32 view
+  return {Q4_0: layer.packed_u32 if wtile else layer.packed_u16, Q4_1: layer.packed_u32, Q5_K: layer.weight}.get(cast(int, layer.ggml_type))
+
+def _wtile_stride(stage:int) -> int: return (run := stage*9//2) + (4 - run) % 8  # T4.147: the weight tile's row stride in words
 
 def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   # T4.126: the IMMA kernel's shape arguments from the NV_IMMA_* knobs, or None (-> the fp16 WMMA kernel) when NV_IMMA is off,
@@ -713,11 +765,18 @@ def _imma_geometry(layer:Linear, tokens:int) -> dict[str, int]|None:
   stage = NV_IMMA_STAGE.value and math.gcd(NV_IMMA_STAGE.value, groups)  # must divide the groups; 0 = off
   scale_rows = 1 if layer.ggml_type == Q4_0 else 2  # T4.128: the sums buffer is a second scale-sized tile
   copies = 2 if NV_IMMA_PIPE.value and stage else 1  # T4.128: the pipelined kernel holds two copies of the stage tile
+  # T4.147: the weight tile wants Q4_0's u32 view and whole words per row and stage (an even group count and stage)
+  wtile = int(bool(NV_IMMA_WTILE.value) and layer.ggml_type == Q4_0 and layer.packed_u32 is not None and groups % 2 == 0)
+  def smem(st:int) -> int:
+    wt = warps*out_tiles*WMMA_N*_wtile_stride(st) if wtile and st % 2 == 0 else 0  # T4.147: + the block's weight rows
+    return copies*(token_tile*((8*st + 4) + scale_rows*(st + 1)) + wt)*4
   # static __shared__ is capped at 48 KB: shrink the stage rather than hand nvrtc a kernel it rejects mid-serve
-  while stage > 1 and copies*token_tile*((8*stage + 4) + scale_rows*(stage + 1))*4 > 48*1024: stage = math.gcd(stage // 2, groups)
+  while stage > 1 and smem(stage) > 48*1024: stage = math.gcd(stage // 2, groups)
+  wtile = int(wtile and stage > 0 and stage % 2 == 0)
   return {"token_tile": token_tile, "warps": warps, "out_tiles": out_tiles, "stage": stage, "pipe": int(copies == 2),
-          "minblocks": NV_IMMA_MINBLOCKS.value, "wprefetch": NV_IMMA_WPREFETCH.value,
-          "splitk": _imma_splitk(groups // max(stage, 1), layer.out_features // (WMMA_N*out_tiles*warps) * (tokens // token_tile))}
+          "minblocks": NV_IMMA_MINBLOCKS.value, "wprefetch": 0 if wtile else NV_IMMA_WPREFETCH.value,
+          "splitk": _imma_splitk(groups // max(stage, 1), layer.out_features // (WMMA_N*out_tiles*warps) * (tokens // token_tile)),
+          "wtile": wtile}
 
 def _imma_splitk(steps:int, blocks:int) -> int:
   # T4.131: NV_IMMA_SPLITK's rule for a kernel of `blocks` (output tiles x token blocks) each walking `steps` stage steps. 0 = auto:
@@ -752,7 +811,7 @@ def nv_wmma_linear(layer:Linear, x:Tensor) -> Tensor|None:
     # reduce loop runs them, from a zero accumulator -- a different fp32 order than the one-pass kernel's serial accumulation, so
     # not bit-identical to it; each partial is bit-exact for its own groups)
     out = Tensor.empty(*((imma["splitk"], tokens) if imma["splitk"] > 1 else (tokens,)), out_features, dtype=dtypes.float32, device=x.device).uop
-    all_srcs = (out, cast(Tensor, _imma_weight(layer)).uop.buf_uop, *(a.uop for a in acts))
+    all_srcs = (out, cast(Tensor, _imma_weight(layer, imma["wtile"])).uop.buf_uop, *(a.uop for a in acts))
     params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate(all_srcs))
     kernel = _linear_imma_nv(*params, ggml_type=layer.ggml_type, out_features=out_features, in_features=in_features, **imma).call(*all_srcs)
     result = Tensor(out.after(kernel))

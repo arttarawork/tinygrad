@@ -120,7 +120,9 @@ class Linear(nn.Linear):
     # halves its load-instruction count with 16-bit instead of 8-bit loads. raw_offset % 4 == 0 is already
     # asserted above, so % 2 == 0 (all this view needs) holds too; every block width here (18, 18, 210) is even.
     self.packed_u16 = Tensor(UOp.from_buffer(buffer.view(nbytes // 2, dtypes.uint16, raw_offset))) if self.ggml_type in (Q4_0, IQ4_NL, Q6_K) else None
-    self.packed_u32 = Tensor(UOp.from_buffer(buffer.view(nbytes // 4, dtypes.uint32, raw_offset))) if self.ggml_type == Q4_1 else None
+    # T4.147: and Q4_0 (whole words: the IMMA prefill's weight tile reads a group run's 18 bytes per group as aligned words)
+    self.packed_u32 = Tensor(UOp.from_buffer(buffer.view(nbytes // 4, dtypes.uint32, raw_offset))) \
+      if self.ggml_type == Q4_1 or (self.ggml_type == Q4_0 and nbytes % 4 == 0) else None
   def __call__(self, x:Tensor) -> Tensor:
     from tinygrad.llm.kernels import nv_quant, nv_dense, nv_gemm  # local: both import Linear/QUANT_SIZES etc. from here --
                                                           # a module-level import there of this module would cycle (T4.98c)
