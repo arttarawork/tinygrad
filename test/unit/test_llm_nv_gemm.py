@@ -333,15 +333,18 @@ class TestImmaKernel(unittest.TestCase):
     except Exception as e: self.skipTest(f"CUDA renderer unavailable: {e!r}")
     for ggml_type, shapes in MODEL_SHAPES.items():
       for out_features, in_features in shapes:
-        with self.subTest(ggml_type=ggml_type, out=out_features, inp=in_features):
-          srcs = [next(u.arg for u in to_program(_imma_sink(128, out_features, in_features, ggml_type=ggml_type, pipe=pipe), renderer).src
-                       if u.op is Ops.SOURCE) for pipe in (0, 1)]
-          head, loop = srcs[1].split("  for (int Ridx3 = 0;")
-          self.assertEqual((head.count("__syncthreads();"), loop.count("__syncthreads();")), (1, 1))
-          self.assertTrue(loop.split("\n  }\n")[0].endswith("__syncthreads();"), "the step's barrier must close the loop body")
-          body = loop.split("\n  }\n")[0]
-          self.assertLess(body.rindex("__WMMA_8_16_32_signed_char_int("), body.index("*((uint4*)((buf8+"))
-          self.assertEqual(_shared_bytes(srcs[1]), 2 * _shared_bytes(srcs[0]))
+        for wtile in (0, 1) if ggml_type == Q4_0 else (0,):  # T4.147: the weight tile is piped with the activations
+          with self.subTest(ggml_type=ggml_type, out=out_features, inp=in_features, wtile=wtile):
+            srcs = [next(u.arg for u in to_program(_imma_sink(128, out_features, in_features, ggml_type=ggml_type, pipe=pipe, wtile=wtile),
+                                                   renderer).src if u.op is Ops.SOURCE) for pipe in (0, 1)]
+            head, loop = srcs[1].split("  for (int Ridx3 = 0;")
+            self.assertEqual((head.count("__syncthreads();"), loop.count("__syncthreads();")), (1, 1))
+            self.assertTrue(loop.split("\n  }\n")[0].endswith("__syncthreads();"), "the step's barrier must close the loop body")
+            body = loop.split("\n  }\n")[0]
+            self.assertLess(body.rindex("__WMMA_8_16_32_signed_char_int("), body.index("*((uint4*)((buf8+"))
+            if wtile:  # the next stage's weight-tile stores after the mmas too (buf10: the third __shared__ buffer)
+              self.assertLess(body.rindex("__WMMA_8_16_32_signed_char_int("), min(m.start() for m in re.finditer(r"\*\(buf10\+\(.*\) = val", body)))
+            self.assertEqual(_shared_bytes(srcs[1]), 2 * _shared_bytes(srcs[0]))
 
   def test_wprefetch_loads_next_stage_before_the_mmas_and_stores_the_registers_after(self):
     # T4.131: the weight-prefetch kernel, as rendered, at every model shape: the prologue loads stage 0's words into the register
